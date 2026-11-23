@@ -14,8 +14,8 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable
-from contextlib import closing
+from collections.abc import Callable, Iterator
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -213,6 +213,45 @@ def lifecycle_fields(db: sqlite3.Connection, local: object) -> tuple[str, str, l
     return "closed" if row[0] else "open", "recorded" if row[1] else "unmapped", delivery
 
 
+# A checkpoint contains only the definite reply to an actual charger call.
+def retained_start_reply(
+    db: sqlite3.Connection, request: str, ticket: str, pending_wire: tuple[str, str | None] | None
+) -> str:
+    prefix = "retained_transaction_reply_owner:"
+    keys = (
+        ((prefix + pending_wire[0],),)
+        if pending_wire is not None
+        else db.execute("SELECT key FROM meta WHERE key GLOB ? AND length(key)=?", (prefix + "*", len(prefix) + 34))
+    )
+    result = UNKNOWN
+    for (key,) in keys:
+        wire = key[len(prefix) :]
+        if not re.fullmatch(r"l-[a-f0-9]{32}", wire):
+            continue
+        saved = metadata(db, key)
+        boot, reply = saved.get("boot"), saved.get("reply")
+        if (
+            saved.keys() != {"wire", "request", "ticket", "boot", "action", "local", "limit_a", "reply"}
+            or (saved["wire"], saved["request"], saved["ticket"], saved["action"])
+            != (wire, request, ticket, "RemoteStartTransaction")
+            or saved["local"] is not None
+            or saved["limit_a"] is not None
+            or (boot is not None and identifier(boot) is None)
+            or reply not in ("Accepted", "Rejected")
+        ):
+            continue
+        if pending_wire is not None:
+            if boot != pending_wire[1]:
+                continue
+        elif db.execute("SELECT 1 FROM owner_command_wires WHERE wire=?", (wire,)).fetchone() is not None:
+            # This ID already belongs to a different durable call.
+            continue
+        if result != UNKNOWN:
+            return UNKNOWN
+        result = reply.lower()
+    return result
+
+
 # Read the exact saved wire receipt, with the completed Start stage available on older journals.
 def saved_start_reply(db: sqlite3.Connection, request: str, ticket: str, stage: str) -> str:
     if stage in ("accepted", "rejected"):
@@ -220,32 +259,47 @@ def saved_start_reply(db: sqlite3.Connection, request: str, ticket: str, stage: 
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_command_wires'").fetchone():
         return UNKNOWN
     rows = db.execute(
-        "SELECT reply FROM owner_command_wires "
-        "WHERE request=? AND ticket=? AND action='RemoteStartTransaction' AND reply IS NOT NULL LIMIT 2",
+        "SELECT wire,boot,local,limit_a,reply FROM owner_command_wires "
+        "WHERE request=? AND ticket=? AND action='RemoteStartTransaction' LIMIT 2",
         (request, ticket),
     ).fetchall()
-    if len(rows) != 1:
+    if len(rows) > 1:
         return UNKNOWN
-    return {
-        "Accepted": "accepted",
-        "Rejected": "rejected",
-        "error": "call_error",
-        "other": "other",
-        "NotSupported": "other",
-        "Unknown": "other",
-    }.get(rows[0][0], UNKNOWN)
+    pending_wire = None
+    if rows:
+        wire, boot, local, limit, reply = rows[0]
+        if reply is not None:
+            return {
+                "Accepted": "accepted",
+                "Rejected": "rejected",
+                "error": "call_error",
+                "other": "other",
+                "NotSupported": "other",
+                "Unknown": "other",
+            }.get(reply, UNKNOWN)
+        if not isinstance(wire, str) or local is not None or limit is not None:
+            return UNKNOWN
+        pending_wire = wire, boot
+    return retained_start_reply(db, request, ticket, pending_wire) if stage in ("issued", "reconciled") else UNKNOWN
 
 
-# Use a single read-only WAL snapshot with no service lock, normalization, socket or recovery call.
+# Read one private WAL snapshot with no service lock, normalization, socket or recovery call.
+@contextmanager
+def read_journal(path: Path) -> Iterator[sqlite3.Connection]:
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("incident requires a private regular journal file")
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as db:
+        db.execute("PRAGMA query_only=ON")
+        db.execute("BEGIN")
+        yield db
+
+
+# Assemble Start facts from the same SQLite read transaction.
 def journal_facts(path: Path) -> dict[str, Any]:
     result: dict[str, Any] = {"available": False, "intent": None, "request": None, "start": None}
     try:
-        info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-            return result
-        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as db:
-            db.execute("PRAGMA query_only=ON")
-            db.execute("BEGIN")
+        with read_journal(path) as db:
             intent = intent_fields(metadata(db, "managed_control_intent"))
             claim = decode_pause_claim(metadata(db, OWNER_PAUSE))
             if intent is not None:

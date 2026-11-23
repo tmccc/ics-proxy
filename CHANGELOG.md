@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added read-only incident reports for local and vendor Stops and included saved backup replies in Start reports.
 - Fixed a timing issue that could prevent Pause from recording and stopping a session the charger reported late.
 - Rechecked current charger evidence before sending a session-only Stop and preserved pending Pause through history repair.
 - Preserved Stop confirmation through a temporary receipt write failure and supported retrying the first listener bind.

@@ -26,6 +26,7 @@ PROXY_INPUTS = (
     "tools/managed_proxy.py",
     "tools/managed_reporting.py",
     "tools/managed_incident.py",
+    "tools/managed_stop_incident.py",
     "tools/trial_proxy.py",
     "requirements-offline.txt",
     "requirements-trial.txt",

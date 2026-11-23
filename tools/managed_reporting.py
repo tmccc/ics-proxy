@@ -30,7 +30,12 @@ def software(root: Path) -> dict[str, Any]:
         names += [
             root / "tools" / name
             for name in (
-                "__init__.py", "managed_proxy.py", "managed_reporting.py", "managed_incident.py", "trial_proxy.py"
+                "__init__.py",
+                "managed_proxy.py",
+                "managed_reporting.py",
+                "managed_incident.py",
+                "managed_stop_incident.py",
+                "trial_proxy.py",
             )
         ]
         digest = hashlib.sha256()

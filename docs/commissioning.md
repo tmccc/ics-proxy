@@ -62,7 +62,20 @@ protected state files, and systemd watchdog support. Adapt the executable, check
 Management settings use `host`, `port`, and `token_file` in a private JSON file. The host is `127.0.0.1`.
 The token file contains a JSON object with `token`, a private 64-character lowercase hexadecimal value.
 
-Use `managed_proxy.py health` for the saved status or `managed_proxy.py incident` to inspect classified information
-about a particular problem. A missing latest observation or a pending charger reply can hold or defer controls.
-Keep the state directory across upgrades. An offline reconciliation requires the service to be stopped and the
-corresponding evidence of the exact action. See [release and rollback](release-process.md).
+Use `managed_proxy.py health` for the saved status. The read-only `incident` command uses the same private
+service configuration and reports the most recent local Start by default.
+
+```bash
+python tools/managed_proxy.py incident --config /path/to/service.json
+python tools/managed_proxy.py incident --config /path/to/service.json --kind stop
+python tools/managed_proxy.py incident --config /path/to/service.json --kind vendor-stop
+```
+
+The Start report includes a matching reply saved separately before it reached the normal command record.
+The Stop reports select the latest retained local session-only Stop or vendor-app Stop, respectively.
+They show possible dispatch, any recorded reply, and evidence of closure for that exact session. The reports label the
+latest service status and recent process starts separately so those observations can be compared with the request.
+A command can remain uncertain until the charger reports more evidence.
+
+Keep the state directory across upgrades. Offline reconciliation requires the service to be stopped and
+evidence of the exact action. See [release and rollback](release-process.md).

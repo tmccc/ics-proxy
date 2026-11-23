@@ -6,6 +6,7 @@ import hashlib
 import json
 import socket
 import uuid
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
@@ -250,7 +251,10 @@ async def test_incident_output_failure_keeps_committed_reply(tmp_path, model_tls
 
 # Intent: an incident export can read a private configuration without networking or creating a new journal.
 # Why: an absent installation should be reported as unknown without changing its state.
-def test_incident_cli_uses_local_read_only_sources(tmp_path, tls, capsys, monkeypatch):
+@pytest.mark.parametrize(
+    "arguments,kind", [([], None), (["--kind", "stop"], "stop-session"), (["--kind", "vendor-stop"], "vendor-stop")]
+)
+def test_incident_cli_uses_local_read_only_sources(tmp_path, tls, capsys, monkeypatch, arguments, kind):
     config, file = config_files(tmp_path, 21010, 21011)
 
     # Fail immediately if incident constructs a charger transport or resolves any connection.
@@ -260,9 +264,21 @@ def test_incident_cli_uses_local_read_only_sources(tmp_path, tls, capsys, monkey
     monkeypatch.setattr(socket, "socket", forbidden)
     monkeypatch.setattr(socket, "getaddrinfo", forbidden)
     before = sorted(tmp_path.iterdir())
-    assert managed_proxy.main(["incident", "--config", str(file)]) == 0
+    assert managed_proxy.main(["incident", "--config", str(file), *arguments]) == 0
     result = json.loads(capsys.readouterr().out)
-    assert not result["journal"]["available"] and result["wire"]["send"] == "unknown"
+    assert result["schema_version"] == 1 and result["observations"] == []
+    assert result["journal"]["available"] is False and result["journal"]["request"] is None
+    if kind is None:
+        assert "kind" not in result and result["journal"]["start"] is None
+        assert result["wire"] == {"request": None, "ticket": None, "send": "unknown", "observed_reply": "unknown"}
+    else:
+        assert result["kind"] == kind and result["journal"]["lifecycle"] == "unknown"
+        assert result["wire"] == {
+            "dispatch": "unknown",
+            "reply": "unknown",
+            "reply_source": None,
+            "joined_attempts": [],
+        }
     assert not config.journal.exists() and sorted(tmp_path.iterdir()) == before
 
 
@@ -331,6 +347,122 @@ def test_incident_reads_the_exact_saved_start_reply(tmp_path, wire_reply, shown,
     assert result["journal"]["start"]["lifecycle"] == "unbound"
     assert result["wire"]["send"] == "matching_reply" and result["wire"]["observed_reply"] == "unknown"
     assert result["waiting_for_evidence"] == [waiting]
+
+
+# Intent: show a real reply checkpoint before the normal wire receipt or Start result is published.
+# Why: a refused write must preserve matched evidence without implying control authority or a real session.
+@pytest.mark.parametrize("dispatch_saved", [True, False], ids=["saved-dispatch", "refused-dispatch"])
+@pytest.mark.parametrize(
+    "reply,waiting", [("Accepted", "start_lifecycle"), ("Rejected", "saved_start_reply_settlement")]
+)
+def test_incident_reads_retained_owner_start_reply(tmp_path, dispatch_saved, reply, waiting):
+    path = tmp_path / "journal.db"
+    events = tmp_path / "journal.start-events.jsonl"
+    request, ticket, boot = (uuid.uuid4().hex for _ in range(3))
+    wire_id = "l-" + uuid.uuid4().hex
+    key = "retained_transaction_reply_owner:" + wire_id
+    journal = Journal(path, "OFFLINE001")
+    try:
+        ManagedRequests(journal).accept(request, "start", 0)
+        journal.put("managed_test_charge", {"id": request, "start_rpc_accepted": False})
+        journal.starts.prepare(ticket, "tag-digest", request)
+        journal.starts.record(ticket, "issued")
+        scope = journal.outcomes.owner_scope(request, ticket, boot)
+        if dispatch_saved:
+            wire = scope.sent(wire_id, "RemoteStartTransaction", {})
+        journal.db.execute(
+            "CREATE TEMP TRIGGER refuse_start_wire BEFORE INSERT ON owner_command_wires "
+            "BEGIN SELECT RAISE(ABORT, 'owner wire storage unavailable'); END"
+        )
+        if not dispatch_saved:
+            wire = scope.sent(wire_id, "RemoteStartTransaction", {})
+        assert wire is not None
+        scope.received(wire, [3, wire_id, {"status": reply}])
+        checkpoint = journal.get(key)
+        assert checkpoint == {**asdict(wire), "reply": reply}
+        stored = journal.db.execute("SELECT reply FROM owner_command_wires WHERE wire=?", (wire_id,)).fetchall()
+        assert [tuple(row) for row in stored] == ([(None,)] if dispatch_saved else [])
+
+        report = incident_report(path, events)
+        assert report["journal"]["start"] == {
+            "ticket": hashlib.sha256(ticket.encode()).hexdigest()[:32],
+            "stage": "issued",
+            "saved_reply": reply.lower(),
+            "authority_published": False,
+            "lifecycle": "unbound",
+            "cloud_mapping": "unknown",
+            "pending_delivery": [],
+        }
+        assert report["wire"]["send"] == "matching_reply" and report["wire"]["observed_reply"] == "unknown"
+        assert report["waiting_for_evidence"] == [waiting]
+        assert wire_id not in json.dumps(report) and journal.get(key) == checkpoint
+        assert journal.starts.receipt()["stage"] == "issued"
+
+        journal.db.execute("DROP TRIGGER refuse_start_wire")
+        journal.outcomes.retry_owner_writes()
+        assert journal.get(key) is None
+        assert incident_report(path, events)["journal"]["start"]["stage"] == reply.lower()
+    finally:
+        journal.close()
+
+
+# Intent: ignore a checkpoint from another binding or one that contradicts the durable wire.
+# Why: only the original issued Start can lend its reply to this report.
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("request", "0" * 32),
+        ("ticket", "1" * 32),
+        ("action", "RemoteStopTransaction"),
+        ("wire", "l-" + "2" * 32),
+        ("boot", "3" * 32),
+        ("local", 42),
+        ("limit_a", 6),
+        ("reply", "other"),
+    ],
+)
+def test_incident_ignores_malformed_or_unrelated_start_checkpoint(tmp_path, field, value):
+    path = tmp_path / "journal.db"
+    events = tmp_path / "journal.start-events.jsonl"
+    request, ticket, boot = (uuid.uuid4().hex for _ in range(3))
+    wire_id = "l-" + uuid.uuid4().hex
+    key = "retained_transaction_reply_owner:" + wire_id
+    journal = Journal(path, "OFFLINE001")
+    try:
+        ManagedRequests(journal).accept(request, "start", 0)
+        journal.starts.prepare(ticket, "tag-digest", request)
+        journal.starts.record(ticket, "issued")
+        wire = journal.outcomes.owner_scope(request, ticket, boot).sent(wire_id, "RemoteStartTransaction", {})
+        assert wire is not None
+        checkpoint = {**asdict(wire), "reply": "Accepted"}
+        journal.put(key, {**checkpoint, field: value})
+        other = "l-" + uuid.uuid4().hex
+        journal.put("retained_transaction_reply_owner:" + other, {**checkpoint, "wire": other})
+
+        report = incident_report(path, events)
+        assert report["journal"]["start"]["saved_reply"] == "unknown"
+        assert report["wire"]["send"] == "unknown"
+        assert report["waiting_for_evidence"] == ["start_outcome_or_lifecycle"]
+    finally:
+        journal.close()
+
+
+# Intent: preserve a completed Start stage when reading a journal from before per-wire records.
+# Why: an older installation can have a definite result even when the newer receipt table is absent.
+@pytest.mark.parametrize("stage", ["issued", "accepted", "rejected"])
+def test_incident_preserves_historical_start_receipt(tmp_path, stage):
+    path = tmp_path / "journal.db"
+    journal = Journal(path, "OFFLINE001")
+    request, ticket = uuid.uuid4().hex, uuid.uuid4().hex
+    try:
+        ManagedRequests(journal).accept(request, "start", 0)
+        journal.put("local_start_receipt", {"request_id": request, "ticket": ticket, "stage": stage, "local": None})
+        journal.db.execute("DROP TABLE owner_command_wires")
+        report = incident_report(path, tmp_path / "journal.start-events.jsonl")
+        assert report["journal"]["start"]["saved_reply"] == ("unknown" if stage == "issued" else stage)
+        assert report["journal"]["start"]["lifecycle"] == "unbound"
+    finally:
+        journal.close()
 
 
 # Intent: project only exact retained reply and lifecycle records, with a bounded and redacted event excerpt.

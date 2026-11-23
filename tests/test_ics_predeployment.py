@@ -117,16 +117,19 @@ def test_proxy_change_detection_includes_packaged_unit(releases):
     assert checks.changed_proxy(repo, candidate, installed) is True
 
 
-# Intent: include an initializer-only change in release rehearsal and in the startup fingerprint.
-# Why: importing the service helpers executes their package initializer on every startup.
-def test_proxy_release_and_fingerprint_include_tools_initializer(releases):
+# Intent: include changes to the tools initializer and Stop incident reader in release rehearsal and fingerprinting.
+# Why: both are imported by the installed service and its diagnostic command.
+@pytest.mark.parametrize("runtime_input", ["__init__.py", "managed_stop_incident.py"])
+def test_proxy_release_and_fingerprint_include_imported_tools(releases, runtime_input):
     repo, _, _, _ = releases
-    for name in ("managed_reporting.py", "managed_incident.py", "trial_proxy.py"):
-        commit(repo, f"tools/{name}", "# runtime helper\n")
-    installed = commit(repo, "tools/__init__.py", "PACKAGE_REVISION = 1\n")
+    tools = ("__init__.py", "managed_reporting.py", "managed_incident.py", "managed_stop_incident.py", "trial_proxy.py")
+    for name in tools:
+        if name != runtime_input:
+            commit(repo, f"tools/{name}", "# runtime helper\n")
+    installed = commit(repo, f"tools/{runtime_input}", "REVISION = 1\n")
     before = software(repo)["proxy_source_sha256"]
 
-    candidate = commit(repo, "tools/__init__.py", "PACKAGE_REVISION = 2\n")
+    candidate = commit(repo, f"tools/{runtime_input}", "REVISION = 2\n")
     after = software(repo)["proxy_source_sha256"]
     assert checks.changed_proxy(repo, candidate, installed)
     assert before is not None and after is not None and before != after

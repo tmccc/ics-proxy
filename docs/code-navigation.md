@@ -12,6 +12,7 @@ has its own package at `custom_components/ics_proxy`. Open these entry points fi
 | Session-only Stop | [managed_session_stop.py](../ics_proxy_core/engine/managed_session_stop.py), [command_outcomes.py](../ics_proxy_core/engine/command_outcomes.py) | [test_managed_session_stop.py](../tests/test_managed_session_stop.py) |
 | Native evidence and recovery | [native_bounded_handover.py](../ics_proxy_core/engine/native_bounded_handover.py), [recovery_control.py](../ics_proxy_core/engine/recovery_control.py), [native_history_recovery.py](../ics_proxy_core/engine/native_history_recovery.py) | [test_native_history_recovery.py](../tests/test_native_history_recovery.py) |
 | Transactions and cloud delivery | [store.py](../ics_proxy_core/engine/store.py), [delivery_reply.py](../ics_proxy_core/engine/delivery_reply.py), [managed_stop_delivery.py](../ics_proxy_core/engine/managed_stop_delivery.py) | [test_managed_stop_reply_recovery.py](../tests/test_managed_stop_reply_recovery.py) |
+| Read-only incident reports | [managed_incident.py](../tools/managed_incident.py), [managed_stop_incident.py](../tools/managed_stop_incident.py) | [Start](../tests/test_managed_incident.py), [Stop](../tests/test_managed_stop_incident.py) |
 | HA client and display | [api.py](../custom_components/ics_proxy/api.py), [session_service.py](../custom_components/ics_proxy/session_service.py), [display example](../examples/solar-display-2/README.md) | [tests_ha_proxy](../tests_ha_proxy) |
 
 ```mermaid

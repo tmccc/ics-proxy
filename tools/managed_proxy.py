@@ -29,6 +29,7 @@ from ics_proxy_core.engine.trial_config import TrialConfig, file_identity, priva
 from ics_proxy_core.engine.trial_session import TrialSession, preflight, save_private  # noqa: E402
 from tools.managed_incident import MAX_EVENT_BYTES, IncidentRecorder, incident_report  # noqa: E402
 from tools.managed_reporting import Reporting, ReportWriter  # noqa: E402
+from tools.managed_stop_incident import stop_incident_report  # noqa: E402
 from tools.trial_proxy import native_spec  # noqa: E402
 
 _SUPERVISION_POLL_SECONDS = 5
@@ -224,11 +225,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--native-bounded-spec", type=Path)
     parser.add_argument("--management-config", type=Path)
+    parser.add_argument("--kind", choices=("start", "stop", "vendor-stop"), help="incident type (default: start)")
     args = parser.parse_args(argv)
+    if args.kind is not None and args.action != "incident":
+        parser.error("--kind applies to incident")
     try:
         if args.action == "incident":
             config = TrialConfig.load(args.config)
-            print(json.dumps(incident_report(config.journal, config.incident_events), sort_keys=True))
+            if args.kind in (None, "start"):
+                report = incident_report(config.journal, config.incident_events)
+            else:
+                report = stop_incident_report(config.journal, config.incident_events, vendor=args.kind == "vendor-stop")
+            print(json.dumps(report, sort_keys=True))
             return 0
         if args.action == "health":
             config = TrialConfig.load(args.config)
