@@ -98,10 +98,15 @@ async def test_start_child_publishes_all_authority_or_retains_accepted_debt(
             c.command(identifier, "start", intent.revision)
             await asyncio.wait_for(c.charging.settle(), 5)
             if boundary == "accepted_commit":
-                # The reader saves the actual wire reply first. After rollback the child retries the same fact.
-                received, witness = observations
+                # The reader sees the reply first. The delivery pump can also retry its receipt while zero is restored.
+                received = observations[0]
+                (witness,) = (row for row in observations if row["attempt"] is not None)
                 assert received == witness | {"attempt": None}
                 assert witness["receipt"]["stage"] == "issued"
+                assert all(
+                    row["transaction"] and row["receipt"] == witness["receipt"] and row["intent"] == intent
+                    for row in observations
+                )
             else:
                 (witness,) = observations
             assert witness["transaction"]

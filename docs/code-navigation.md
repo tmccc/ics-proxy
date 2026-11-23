@@ -40,7 +40,8 @@ flowchart LR
 - Compare the session Stop and Pause paths. A session Stop closes the exact session while retaining app or schedule
   mode. An uncertain ordinary Stop is tied to its original attempt. A protective Pause can hold at zero and stop the
   exact session under the shared controller. With current independent zero evidence, Pause and the vendor app can
-  wait for the same unresolved Stop. Lost zero or fresh draw still permits a separately authorized protective Stop.
+  wait for the same unresolved Stop on their current charger connection. A newer Pause can act after reconnecting.
+  Lost zero or fresh draw still permits a separately authorized protective Stop.
 - Check recovery before allowing positive current again. The owner combines the saved intent, current charger Boot,
   native evidence, and the journal. Reconciliation can preserve reports for normal delivery without performing a
   new charging action.

@@ -677,12 +677,13 @@ class CommandOutcomes:
         )
 
     # A possibly sent vendor Stop can still have happened when the device returns an error.
-    def vendor_stop_dispatches(self, local: int) -> tuple[str, ...]:
+    def vendor_stop_dispatches(self, local: int, *, boot: str | None = None) -> tuple[str, ...]:
         rows = self.journal.db.execute(
             "SELECT token,wire_request FROM vendor_command_scope JOIN mutations ON mutation=token "
-            "WHERE local=? AND origin='vendor' AND action='RemoteStopTransaction' "
+            "WHERE local=:local AND origin='vendor' AND action='RemoteStopTransaction' "
+            "AND (:boot IS NULL OR charger_boot=:boot) "
             "AND wire_result IN ('dispatched','call_error') AND state IN ('pending','uncertain') ORDER BY token",
-            (local,),
+            {"local": local, "boot": boot},
         )
         pending = []
         for row in rows:
@@ -697,27 +698,29 @@ class CommandOutcomes:
         return tuple(pending)
 
     # Check the exact forwarded dispatches without treating a prepared request as sent.
-    def unanswered_vendor_stop(self, local: int) -> bool:
-        return bool(self.vendor_stop_dispatches(local))
+    def unanswered_vendor_stop(self, local: int, *, boot: str | None = None) -> bool:
+        return bool(self.vendor_stop_dispatches(local, boot=boot))
 
-    # Pause and other owner Stops may have crossed the wire without a session-only receipt.
-    def unanswered_owner_stop(self, local: int) -> bool:
+    # A pending owner wire can cover this session during the same authenticated charger Boot.
+    def unanswered_owner_stop(self, local: int, boot: str) -> bool:
         tickets = {
             row[0]
             for row in self.journal.db.execute(
                 "SELECT DISTINCT ticket FROM owner_command_wires WHERE action='RemoteStopTransaction' AND local=? "
+                "AND boot=? "
                 "AND (reply IS NULL OR reply NOT IN ('Accepted','Rejected'))",
-                (local,),
+                (local, boot),
             )
         }
         tickets.update(
             wire.ticket
             for wire in self._owner_writes.values()
-            if wire.action == "RemoteStopTransaction" and wire.local == local
+            if wire.action == "RemoteStopTransaction" and wire.local == local and wire.boot == boot
         )
         return any(
             wire.action == "RemoteStopTransaction"
             and wire.local == local
+            and wire.boot == boot
             and wire.reply not in ("Accepted", "Rejected")
             for ticket in tickets
             for wire in self.owner_wires("ticket", ticket)

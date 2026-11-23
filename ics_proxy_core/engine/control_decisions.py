@@ -2157,9 +2157,10 @@ class ControlDecisions:
             if (
                 not protecting
                 and join_unanswered
+                and (boot := self.control.boot()) is not None
                 and (
-                    self.journal.outcomes.unanswered_vendor_stop(session.local)
-                    or self.journal.outcomes.unanswered_owner_stop(session.local)
+                    self.journal.outcomes.unanswered_vendor_stop(session.local, boot=boot)
+                    or self.journal.outcomes.unanswered_owner_stop(session.local, boot)
                 )
             ):
                 return StopDecision.WAIT_FOR_REPORT
