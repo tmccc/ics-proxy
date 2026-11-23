@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+# Modified for the standalone iCS proxy repository.
+"""Persistent owner app and schedule proxy service with guarded Start, Pause, Return and current controls."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import signal
+import socket
+import sqlite3
+import sys
+import time
+from functools import partial
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from ics_proxy_core.engine.managed import ManagedController  # noqa: E402
+from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings  # noqa: E402
+from ics_proxy_core.engine.managed_view import health_snapshot, publish_poll  # noqa: E402
+from ics_proxy_core.engine.policy import DeniedError  # noqa: E402
+from ics_proxy_core.engine.security import SecurityError  # noqa: E402
+from ics_proxy_core.engine.store import RecoveryRequiredError  # noqa: E402
+from ics_proxy_core.engine.trial_config import TrialConfig, file_identity, private_json  # noqa: E402
+from ics_proxy_core.engine.trial_session import TrialSession, preflight, save_private  # noqa: E402
+from tools.managed_incident import MAX_EVENT_BYTES, IncidentRecorder, incident_report  # noqa: E402
+from tools.managed_reporting import Reporting, ReportWriter  # noqa: E402
+from tools.trial_proxy import native_spec  # noqa: E402
+
+_SUPERVISION_POLL_SECONDS = 5
+
+
+# The manager receives only short classified status; no protocol bodies, identities or credential paths are sent.
+def notify(value: str) -> None:
+    destination = os.environ.get("NOTIFY_SOCKET")
+    if not destination:
+        return
+    address = "\0" + destination[1:] if destination.startswith("@") else destination
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as stream:
+            stream.setblocking(False)
+            stream.sendto(value.encode(), address)
+    except OSError:
+        pass  # Running outside a manager must not break the independent charger receiver.
+
+
+# A responsive event loop stays supervised even during a bounded native read or ordinary vendor outage.
+async def watchdog(stopped: asyncio.Event) -> None:
+    while not stopped.is_set():
+        notify("WATCHDOG=1")
+        try:
+            await asyncio.wait_for(stopped.wait(), 5)
+        except TimeoutError:
+            pass
+
+
+# The extra mode input cannot alias any file the service writes or rotates.
+def check_spec_path(config: TrialConfig, path: Path) -> None:
+    if file_identity(path) in {file_identity(output) for output in config.output_paths()}:
+        raise SecurityError("managed specification must not alias service outputs")
+
+
+# Keep bounded durable fault/state transitions beside the journal without storing private native bodies in logs.
+def event(path: Path, value: dict[str, Any], *, maximum: int = 2 * 1024 * 1024) -> None:
+    if path.exists() and path.stat().st_size > maximum:
+        path.replace(path.with_suffix(path.suffix + ".1"))
+    descriptor = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "a") as stream:
+        size = os.fstat(descriptor).st_size
+        # Mark an incomplete last line invalid before appending fresh evidence.
+        separator = "!\n" if size and os.pread(descriptor, 1, size - 1) != b"\n" else ""
+        stream.write(separator + json.dumps(value, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+# Human/monitor checks read private status only: no connection, journal ownership or physical command is created.
+def health(path: Path, now: float | None = None) -> dict[str, Any]:
+    return health_snapshot(private_json(path), now)
+
+
+# Check the same management settings offline and at service startup.
+def management_settings(config: TrialConfig, path: Path | None) -> ManagementSettings | None:
+    if path is None:
+        return None
+    check_spec_path(config, path)
+    management = ManagementSettings.load(path)
+    check_spec_path(config, management.token_file)
+    if management.token_file in (config.native_secret, config.incoming_secret, config.upstream_secret):
+        raise SecurityError("management credential must be independent")
+    if config.listener_host == "127.0.0.1" and config.listener_port == management.port:
+        raise SecurityError("management and charger listeners require separate ports on loopback")
+    return management
+
+
+# Start one journal owner and retain the same zero/recovery/event semantics through every supervised replacement.
+async def serve(config_path: Path, spec_path: Path, management_path: Path | None = None) -> int:
+    prepared = preflight(config_path)
+    check_spec_path(prepared.config, spec_path)
+    spec = native_spec(spec_path, prepared)
+    expires = prepared.tls.certificate_expires_at
+    management = management_settings(prepared.config, management_path)
+    session = TrialSession(prepared, native_bounded=spec, allow_local_start=False, allow_unplugged_native=True)
+    stopped = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    controller: ManagedController | None = None
+
+    # Signal synchronously retires pending positive authority before asynchronous session shutdown starts.
+    def request_stop() -> None:
+        stopped.set()
+        if controller is not None:
+            try:
+                controller.request_stop()
+            except DeniedError, sqlite3.Error, OSError:
+                pass  # A completed/frozen cleanup already has no positive managed release authority.
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, request_stop)
+    task = asyncio.create_task(watchdog(stopped))
+    status_path = prepared.config.journal.with_suffix(".status.json")
+    events_path = prepared.config.journal.with_suffix(".events.jsonl")
+    started = time.time()
+    reporting = Reporting(ROOT)
+    writer: ReportWriter | None = None
+    published: dict[str, Any] = {"running": True, "state": "starting"}
+    api: ManagementServer | None = None
+    incident: IncidentRecorder | None = None
+    try:
+        ownership = None
+        try:
+            ownership = session.journal.retain_ownership()
+            writer = ReportWriter(
+                partial(
+                    reporting.write, status_path=status_path, events_path=events_path, save=save_private, event=event
+                ),
+                ownership=ownership,
+            )
+        except OSError, RuntimeError:
+            if ownership is not None:
+                ownership.close()
+            reporting.output_errors += 1
+        await session.start()
+        if not session.started:
+            raise RecoveryRequiredError("managed startup requires an open charger listener")
+        controller = ManagedController(session)
+        try:
+            incident = IncidentRecorder(prepared.config.incident_events, partial(event, maximum=MAX_EVENT_BYTES))
+        except OSError, RuntimeError:
+            pass  # Local evidence recording is optional even when its worker cannot start.
+        if incident is not None:
+            session.gateway.controls.incident_observer = incident.observe
+        if management is not None:
+            api = ManagementServer(management, controller, lambda: dict(published))
+        notify("READY=1\nSTATUS=Waiting for verified charger and owner control")
+        while not stopped.is_set():
+            session.runtime.require_vendor_worker()
+            if api is not None and api.server is None:
+                try:
+                    await api.start()
+                except OSError:
+                    pass  # Retry the optional loopback socket without retiring charger supervision.
+            status = await controller.tick()
+            if api is not None:
+                status["management_available"] = api.server is not None
+            previous = reporting.previous
+            published = publish_poll(
+                controller, status, pid=os.getpid(), started=started, expires=expires, observe=reporting.observe
+            )
+            if writer is not None:
+                writer.submit(published)
+            if reporting.previous != previous:
+                notify("STATUS=App/schedule control: " + str(published.get("state")))
+            try:
+                await asyncio.wait_for(stopped.wait(), _SUPERVISION_POLL_SECONDS)
+            except TimeoutError:
+                pass
+    finally:
+        request_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        notify("STOPPING=1\nSTATUS=Checking final charger hold")
+        try:
+            try:
+                if api is not None:
+                    await api.close()
+            finally:
+                try:
+                    if controller is not None:
+                        await controller.current.close()
+                        await controller.charging.close()
+                        await controller.session_stop.close()
+                        if controller.pause_task is not None:
+                            await asyncio.gather(controller.pause_task, return_exceptions=True)
+                finally:
+                    await session.close()
+        finally:
+            if incident is not None:
+                incident.close()
+            shutdown_uncertain = (session.final_status or {}).get("shutdown_attempt_uncertain") is not False
+            if writer is not None:
+                await writer.close(
+                    {
+                        "running": False,
+                        "state": "stopped",
+                        "checked_at": time.time(),
+                        "pid": os.getpid(),
+                        "shutdown_uncertain": shutdown_uncertain,
+                    }
+                )
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.remove_signal_handler(sig)
+    return 2 if shutdown_uncertain else 0
+
+
+# Explicit serve is the only networking action; other actions read local files.
+def main(argv: list[str] | None = None) -> int:
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("check", "serve", "health", "incident"))
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--native-bounded-spec", type=Path)
+    parser.add_argument("--management-config", type=Path)
+    args = parser.parse_args(argv)
+    try:
+        if args.action == "incident":
+            config = TrialConfig.load(args.config)
+            print(json.dumps(incident_report(config.journal, config.incident_events), sort_keys=True))
+            return 0
+        if args.action == "health":
+            config = TrialConfig.load(args.config)
+            result = health(config.journal.with_suffix(".status.json"))
+            print(json.dumps(result, sort_keys=True))
+            return 0 if result["healthy"] else 1
+        if args.native_bounded_spec is None:
+            raise ValueError("an explicit native bounded specification is required")
+        if args.action == "check":
+            prepared = preflight(args.config)
+            check_spec_path(prepared.config, args.native_bounded_spec)
+            native_spec(args.native_bounded_spec, prepared)
+            management_settings(prepared.config, args.management_config)
+            remaining = prepared.tls.certificate_expires_at - time.time()
+            print(
+                json.dumps(
+                    {**prepared.summary(), "managed_mode": "app_schedule", "certificate_remaining_seconds": remaining}
+                )
+            )
+            return 0
+        return asyncio.run(serve(args.config, args.native_bounded_spec, args.management_config))
+    except Exception as error:
+        # The executable boundary exposes a classification only, never native responses, credentials or parser text.
+        print(json.dumps({"managed_action_failed": type(error).__name__}), flush=True)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

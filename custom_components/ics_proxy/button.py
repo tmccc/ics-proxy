@@ -1,0 +1,73 @@
+"""Explicit local Start, pause and bounded test controls; setup never initiates charging."""
+
+from __future__ import annotations
+
+from homeassistant.components.button import ButtonEntity
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+from . import ProxyEntry
+from .api import ProxyError
+from .coordinator import ProxyCoordinator
+from .entity import ProxyEntity
+
+
+# Register user-invoked actions only; adding or reloading these entities performs no physical operation.
+async def async_setup_entry(hass: HomeAssistant, entry: ProxyEntry, add_entities: AddEntitiesCallback) -> None:
+    add_entities(
+        [
+            ProxyButton(entry.runtime_data, "start", "Start charging"),
+            ProxyButton(entry.runtime_data, "pause", "Pause charger"),
+            ProxyButton(entry.runtime_data, "app_control", "Return to app / schedule"),
+            ProxyButton(entry.runtime_data, "start_test", "Test charge (2 minutes)"),
+        ]
+    )
+
+
+class ProxyButton(ProxyEntity, ButtonEntity):
+    """A press waits for durable physical confirmation and never optimistically marks a hold as released."""
+
+    # Persist stable action keys separately from their user-facing labels.
+    def __init__(self, coordinator: ProxyCoordinator, action: str, name: str) -> None:
+        super().__init__(coordinator, "button", action, name)
+        self.action = action
+        self._attr_icon = {
+            "start": "mdi:play-circle-outline",
+            "pause": "mdi:pause-circle",
+            "app_control": "mdi:calendar-clock",
+            "start_test": "mdi:play-circle-outline",
+        }[action]
+
+    # Pause can use the last valid status because the proxy accepts a stale revision for this restrictive command.
+    @property
+    def available(self) -> bool:
+        data = self.coordinator.data or {}
+        if self.action == "pause":
+            return data.get("can_pause") is True
+        key = {"start": "can_start", "app_control": "can_return", "start_test": "can_start_test"}[self.action]
+        fresh = self.coordinator.fresh_local_healthy if self.action == "start" else self.coordinator.fresh_healthy
+        requested = data.get("requested_current_a", 6)
+        return (
+            super().available
+            and data.get(key) is True
+            and fresh
+            and (self.action != "start_test" or type(requested) is int and requested == 6)
+        )
+
+    # A normal Start names the selected resume limit, while the separate two-minute test stays fixed at six amps.
+    @property
+    def name(self) -> str | None:
+        current = self.coordinator.data.get("requested_current_a")
+        if self.action == "start" and type(current) is int and 6 <= current <= 32:
+            return f"Start charging ({current} A)"
+        return super().name
+
+    # A deliberately chosen action uses one request id; a timeout refreshes status without repeating the write.
+    async def async_press(self) -> None:
+        try:
+            await self.coordinator.client.command(self.action, self.coordinator.data["control_revision"])
+        except ProxyError as error:
+            raise HomeAssistantError(str(error)) from None
+        finally:
+            await self.coordinator.async_request_refresh()

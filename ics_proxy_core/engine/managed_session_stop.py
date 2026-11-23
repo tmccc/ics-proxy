@@ -1,0 +1,276 @@
+"""End one verified charger session without changing the requested control mode."""
+
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+import time
+from dataclasses import dataclass
+from functools import partial
+from typing import TYPE_CHECKING, Any
+
+from ..commands import remote_stop_transaction
+from .command_processor import CommandPriority
+from .connection_scope import ControlScope, control_scope_matches, current_control_scope
+from .control_decisions import StopDecision
+from .managed_intent import ControlIntent, insert_request, request_pending
+from .native_http import NativeTransportUnavailableError
+from .policy import DeniedError
+from .rpc import UnavailableError
+from .security import SecurityError, StaleEvidenceError
+from .store import JournalStartBusy, RecoveryRequiredError, encoded, fingerprint
+
+if TYPE_CHECKING:
+    from .managed import ManagedController
+    from .trial_handover_evidence import HandoverEvidence
+
+STOP_SESSION = "stop_session"
+CONFIRMATION_SECONDS = 20
+STOP_COMPLETION_FIELDS = "state='completed',result=json_set(result,'$.session_stopped',json('true'))"
+CLOSED_REQUESTS = (
+    "action=? AND state IN ('accepted','running','uncertain') AND EXISTS ("
+    "SELECT 1 FROM transactions WHERE local=json_extract(managed_requests.result,'$._session_stop.local') "
+    "AND stop IS NOT NULL)"
+)
+
+
+@dataclass(frozen=True)
+class SessionStop:
+    """The identity chosen at admission survives later UI and charger updates."""
+
+    identifier: str
+    target: str
+    local: int
+    intent: ControlIntent
+    connection: ControlScope
+
+
+class ManagedSessionStop:
+    """Use the shared Stop decision and settle only against the exact session's closure."""
+
+    # Replacement can retire an unsent request. A dispatch marker still owns its original possible effect.
+    def __init__(self, controller: ManagedController) -> None:
+        self.controller = controller
+        self.worker: asyncio.Task[None] | None = None
+        self.expire(replaced=True)
+
+    # Expose an opaque target only for a verified sample of the exact current open session.
+    def target(self) -> str | None:
+        c, j, g = self.controller, self.controller.session.journal, self.controller.session.gateway
+        native, local, connection = c.current_native_sample(), j.active(), current_control_scope(g)
+        if (
+            c.stopping
+            or not j.phase.read().active
+            or local is None
+            or connection is None
+            or native is None
+            or not native.physical.transaction_open
+            or native.physical.native_transaction_id != local
+            or not 0 <= time.time() - native.physical.observed_at <= 15
+        ):
+            return None
+        scope, generation = connection
+        return fingerprint((scope.boot, scope.epoch, scope.metadata_revision, generation, local))
+
+    # Persist the exact target and revision before a worker can act, with no change to Pause or Return intent.
+    def accept(self, identifier: str, revision: int, target: str) -> dict[str, Any]:
+        c, j, g = self.controller, self.controller.session.journal, self.controller.session.gateway
+        existing = c.requests.existing(identifier, STOP_SESSION, revision)
+        if existing is not None:
+            if c.requests.receipt(identifier, include_binding=True).get("target") != target:
+                raise SecurityError("request identifier already binds another Stop target")
+            return existing
+        intent, local, connection = c.requests.intent(), j.active(), current_control_scope(g)
+        if revision != intent.revision or local is None or connection is None or self.target() != target:
+            raise RecoveryRequiredError("Stop requires the current verified session")
+        if not c.requests.has_capacity():
+            raise RecoveryRequiredError("management receipt capacity requires operator maintenance")
+        if self.worker is not None and not self.worker.done():
+            raise RecoveryRequiredError("the current session Stop is still being sent")
+        accepted = time.time()
+        with j.atomic():
+            insert_request(
+                j,
+                identifier,
+                STOP_SESSION,
+                revision,
+                {"accepted_at": accepted, "target": target, "_session_stop": {"local": local, "dispatched": False}},
+            )
+        scope = SessionStop(identifier, target, local, intent, connection)
+        self.worker = c.commands.start(partial(self._send, scope), priority=CommandPriority.RESTRICT)
+        return {"id": identifier, "action": STOP_SESSION, "state": "accepted", "result": {"accepted_at": accepted}}
+
+    # Only the original owner, Boot and session can dispatch this Stop, even after another command enters the gate.
+    async def _send(self, scope: SessionStop) -> None:
+        c, j, g = self.controller, self.controller.session.journal, self.controller.session.gateway
+        boot = scope.connection[0].boot
+
+        # Reject a new target or an expired/replaced request both before and at the actual write boundary.
+        def guard() -> None:
+            if (
+                c.stopping
+                or c.requests.intent() != scope.intent
+                or not control_scope_matches(g, scope.connection)
+                or self.target() != scope.target
+                or not request_pending(j, scope.identifier, STOP_SESSION, scope.intent.revision)
+            ):
+                raise RecoveryRequiredError("Stop lost its current session or request")
+
+        # Commit possible dispatch before the sender can write, including when the wire reply is lost.
+        def dispatch(_action: str) -> None:
+            decision = g.controls.decisions.session_stop_send_decision(scope.local, boot)
+            if decision is StopDecision.CLOSED:
+                raise StopAlreadyHandledError
+            with j.atomic():
+                binding: dict[str, Any] = {"dispatched": 1} if decision is StopDecision.SEND else {"joined": 1}
+                if decision is StopDecision.WAIT_FOR_REPORT and not j.outcomes.unanswered_shutdown_stop(scope.local):
+                    binding["local_attempts"] = j.outcomes.session_stop_dispatches(scope.local)
+                    binding["vendor_attempts"] = j.outcomes.vendor_stop_dispatches(scope.local)
+                j.db.execute(
+                    "UPDATE managed_requests SET state='running',result=json_patch(result,?) WHERE id=?",
+                    (encoded({"_session_stop": binding}), scope.identifier),
+                )
+            if decision is not StopDecision.SEND:
+                raise StopAlreadyHandledError
+
+        wire_scope = j.outcomes.owner_scope(scope.identifier, scope.identifier, boot)
+        try:
+            async with g.charger.sequence(
+                0, guard, on_dispatch=dispatch, owner_scope=wire_scope, late_reply_action="RemoteStopTransaction"
+            ) as call:
+                answer = await call("RemoteStopTransaction", remote_stop_transaction(scope.local))
+            if answer[0] == 3 and answer[2] == {"status": "Rejected"}:
+                c.commands.decide(partial(self._fail, scope.identifier, "stop_rejected"))
+        except StopAlreadyHandledError:
+            pass  # The original session's real closure can also satisfy this waiting request.
+        except DeniedError, RecoveryRequiredError, SecurityError, UnavailableError, TimeoutError, sqlite3.Error:
+            # The original request stays readable. Supervision retires an unresolved live wait at its deadline.
+            pass
+
+    # A known rejection permits another deliberate attempt without forgetting the original wire result.
+    def _fail(self, identifier: str, reason: str) -> None:
+        self.controller.session.journal.db.execute(
+            "UPDATE managed_requests SET state='failed',result=json_set(result,'$.classification',?) "
+            "WHERE id=? AND state IN ('accepted','running')",
+            (reason, identifier),
+        )
+
+    # Retire the client wait without resending or erasing a Stop that might still take effect.
+    def expire(self, *, replaced: bool = False) -> None:
+        self._update_receipts(
+            "state='failed',result=json_set(result,'$.classification','stop_rejected')",
+            (),
+            "action=? AND state IN ('running','uncertain') AND EXISTS ("
+            "SELECT 1 FROM owner_command_wires WHERE request=managed_requests.id AND reply='Rejected')",
+            (STOP_SESSION,),
+        )
+        self._update_receipts(
+            "state='failed',result=json_set(result,'$.classification','stop_rejected')",
+            (),
+            "action=? AND state IN ('running','uncertain') "
+            "AND (json_array_length(result,'$._session_stop.local_attempts') "
+            "+ json_array_length(result,'$._session_stop.vendor_attempts')) > 0 "
+            "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.local_attempts') a "
+            "WHERE NOT EXISTS (SELECT 1 FROM owner_command_wires w WHERE w.request=a.value "
+            "AND w.local=json_extract(managed_requests.result,'$._session_stop.local') "
+            "AND w.action='RemoteStopTransaction' AND w.reply='Rejected')) "
+            "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.vendor_attempts') a "
+            "WHERE NOT EXISTS (SELECT 1 FROM vendor_command_scope v JOIN mutations m ON m.token=v.mutation "
+            "WHERE v.mutation=a.value AND v.local=json_extract(managed_requests.result,'$._session_stop.local') "
+            "AND m.origin='vendor' AND m.action='RemoteStopTransaction' AND v.wire_result='Rejected'))",
+            (STOP_SESSION,),
+        )
+        self._update_receipts(
+            "state=CASE WHEN json_extract(result,'$._session_stop.dispatched') "
+            "OR json_extract(result,'$._session_stop.joined') "
+            "THEN 'uncertain' ELSE 'failed' END,result=json_set(result,'$.classification',?)",
+            ("process_replaced" if replaced else "stop_not_confirmed",),
+            "action=? AND state IN ('accepted','running') AND (? OR json_extract(result,'$.accepted_at')<=?)",
+            (STOP_SESSION, replaced, time.time() - CONFIRMATION_SECONDS),
+        )
+
+    # Only a real receipt transition needs a write lock. A busy begin can wait for the next poll.
+    def _update_receipts(self, assignments: str, values: tuple[Any, ...], where: str, binding: tuple[Any, ...]) -> None:
+        j = self.controller.session.journal
+        if j.db.execute(f"SELECT 1 FROM managed_requests WHERE {where} LIMIT 1", binding).fetchone() is None:
+            return
+        try:
+            with j.atomic(retry_busy=True):
+                j.db.execute(f"UPDATE managed_requests SET {assignments} WHERE {where}", values + binding)
+        except JournalStartBusy:
+            return  # The existing receipt is still accurate because the write never began.
+
+    # A fresh native observation and the genuine Stop report must agree before a receipt completes.
+    def observed(self, native: HandoverEvidence) -> None:
+        j = self.controller.session.journal
+        active = j.active()
+        if (
+            native.physical.transaction_open != (active is not None)
+            or native.physical.native_transaction_id != active
+            or not 0 <= time.time() - native.physical.observed_at <= 5
+            or active is None
+            and (native.physical.power_w != 0 or any(value != 0 for value in native.currents_a + native.powers_w))
+        ):
+            return
+        self._update_receipts(
+            STOP_COMPLETION_FIELDS,
+            (),
+            CLOSED_REQUESTS,
+            (STOP_SESSION,),
+        )
+
+    # Cloud reconciliation must not erase an independently confirmed local closure.
+    async def confirm_while_blocked(self) -> None:
+        c, j = self.controller, self.controller.session.journal
+        if (
+            c.stopping
+            or j.db.execute(
+                f"SELECT 1 FROM managed_requests WHERE {CLOSED_REQUESTS} LIMIT 1",
+                (STOP_SESSION,),
+            ).fetchone()
+            is None
+        ):
+            return
+        try:
+            native = await c.native.read(stop_only=True)
+            c.native.require_known_session(native)
+            c.commands.decide(partial(self.observed, native), priority=CommandPriority.RESTRICT)
+        except (
+            DeniedError,
+            NativeTransportUnavailableError,
+            RecoveryRequiredError,
+            SecurityError,
+            StaleEvidenceError,
+            UnavailableError,
+            TimeoutError,
+        ):
+            pass  # Neither an unavailable local reading nor a cloud fault proves closure.
+
+    # During a real Stop, either of the two observations can confirm closure before the other.
+    def closure_pending(self, native: HandoverEvidence) -> bool:
+        j, physical = self.controller.session.journal, native.physical
+        if physical.power_w != 0 or any(value != 0 for value in native.currents_a + native.powers_w):
+            return False
+        active = j.active()
+        if not physical.transaction_open and physical.native_transaction_id is None and active is not None:
+            return j.outcomes.session_stop_tracks_closure(active)
+        local = physical.native_transaction_id
+        if not physical.transaction_open or local is None or active is not None:
+            return False
+        latest = j.db.execute("SELECT local,stop FROM transactions ORDER BY local DESC LIMIT 1").fetchone()
+        return bool(
+            latest is not None
+            and latest["local"] == local
+            and latest["stop"] is not None
+            and j.outcomes.session_stop_tracks_closure(local)
+        )
+
+    # Retire the wire worker before the journal closes. Its dispatch marker survives cancellation.
+    async def close(self) -> None:
+        if self.worker is not None:
+            self.worker.cancel()
+            await asyncio.gather(self.worker, return_exceptions=True)
+
+
+class StopAlreadyHandledError(RecoveryRequiredError):
+    """A previous dispatch or real closure already owns this session's Stop."""

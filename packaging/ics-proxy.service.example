@@ -1,0 +1,31 @@
+[Unit]
+Description=iCS local charging proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=ics-proxy
+Group=ics-proxy
+WorkingDirectory=/opt/ics-proxy
+StateDirectory=ics-proxy
+StateDirectoryMode=0700
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=TMPDIR=/var/lib/ics-proxy/tmp
+ExecStartPre=/usr/bin/mkdir -p /var/lib/ics-proxy/tmp
+ExecStartPre=/opt/ics-proxy/.venv/bin/python -B /opt/ics-proxy/tools/managed_proxy.py check --config /etc/ics-proxy/proxy.json --native-bounded-spec /etc/ics-proxy/native-spec.json --management-config /etc/ics-proxy/management.json
+ExecStart=/opt/ics-proxy/.venv/bin/python -B /opt/ics-proxy/tools/managed_proxy.py serve --config /etc/ics-proxy/proxy.json --native-bounded-spec /etc/ics-proxy/native-spec.json --management-config /etc/ics-proxy/management.json
+Restart=on-failure
+TimeoutStopSec=45
+WatchdogSec=45
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/ics-proxy
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

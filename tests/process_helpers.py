@@ -1,0 +1,355 @@
+# Modified for the standalone iCS proxy repository.
+"""Parent-owned physical/native/cloud peers and real managed-service subprocesses share no engine objects."""
+
+import asyncio
+import json
+import os
+import signal
+import sqlite3
+import sys
+import uuid
+from contextlib import asynccontextmanager, closing
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Literal
+
+from websockets.asyncio.client import connect
+
+from ics_proxy_core.engine.trial_session import save_private
+from tests.connected_rig import strategy_file
+from tests.current_rig import commissioned
+from tests.handover_helpers import NativeVehiclePeer, crash
+from tests.managed_rig import OwnerBench
+from tests.management_peer import TOKEN, call
+from tests.prototype_rig import BOOT, START
+
+ProcessTiming = Literal["production", "fast-poll", "fast-start-expiry", "fast-cloud-retry"]
+
+
+class ServiceProcess:
+    """A child owns the real journal/controller; this parent owns only its independent peers and control transport."""
+
+    # Allocate distinct management paths while preserving the same genuine journal and physical installation.
+    def __init__(self, rig, directory, port, timing: ProcessTiming = "production"):
+        self.rig, self.directory, self.port = rig, directory, port
+        self.timing = timing
+        self.process = self.socket = self.reader = self.collector = None
+        self.events = asyncio.Queue()
+        self.generation = 0
+        self.kills = []
+        save_private(directory / "process-management-token.json", {"token": TOKEN})
+        save_private(
+            directory / "process-management.json",
+            {"host": "127.0.0.1", "port": port, "token_file": str(directory / "process-management-token.json")},
+        )
+
+    # Start the real service from the selected build, optionally arming one observation before charger Boot.
+    async def start(
+        self, *, arm: tuple[str, str] | None = None, source: Path | None = None, commission_route: bool = False
+    ):
+        self.generation += 1
+        self.events = asyncio.Queue()
+        log = (self.directory / f"process-{self.generation}.stderr.log").open("w")
+        self.process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            *(("-E",) if source is not None else ()),
+            "-B",
+            "-m",
+            "tests.process_service_child",
+            str(self.directory / "trial.json"),
+            str(self.directory / "process-strategy.json"),
+            str(self.directory / "process-management.json"),
+            str(self.rig.prepared.observer.port),
+            self.timing,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=log,
+            cwd=source,
+            env={**os.environ, "NOTIFY_SOCKET": "", "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        log.close()
+        self.collector = asyncio.create_task(self.collect())
+        async with asyncio.timeout(15):
+            while True:
+                assert self.process.returncode is None, self.error_log()
+                try:
+                    self.socket = await self.rig.bench.connection_to(SimpleNamespace(prepared=self.rig.prepared))
+                    break
+                except OSError:
+                    await asyncio.sleep(0.05)
+        if commission_route:
+            self.rig.route_to_trial()
+        if arm is not None:
+            await self.arm(*arm)
+        self.reader = asyncio.create_task(self.rig.bench.read_charger(self.socket))
+        assert (await self.rig.bench.call(self.socket, uuid.uuid4().hex, "BootNotification", BOOT))[0] == 3
+
+    # Collect only test observation markers; service status text remains a separately retained transcript.
+    async def collect(self):
+        assert self.process.stdout is not None
+        with (self.directory / f"process-{self.generation}.stdout.log").open("w") as log:
+            while raw := await self.process.stdout.readline():
+                log.write(raw.decode())
+                value = json.loads(raw)
+                if "test_event" in value:
+                    await self.events.put(value)
+
+    # A classified service failure should expose its actual private synthetic stderr when a bounded test fails.
+    def error_log(self):
+        return (self.directory / f"process-{self.generation}.stderr.log").read_text()[-6000:]
+
+    # Use the actual authenticated management protocol; the parent never calls a controller method.
+    async def request(self, command, **fields):
+        async with connect(
+            f"ws://127.0.0.1:{self.port}/management",
+            additional_headers={"Authorization": "Bearer " + TOKEN},
+            subprotocols=["ics-proxy.v1"],
+            proxy=None,
+        ) as socket:
+            return await call(socket, command, **fields)
+
+    # Wait for an actual supervisor publication on the polling cadence selected for this case.
+    async def status(self, predicate=lambda status: status.get("healthy") is True):
+        async with asyncio.timeout(25):
+            while True:
+                assert self.process.returncode is None, self.error_log()
+                result = await self.request("status")
+                if result.get("ok") is True and predicate(result["result"]):
+                    return result["result"]
+                await asyncio.sleep(0.25)
+
+    # Arm before the management request or replacement Boot that can reach this exact observation.
+    async def arm(self, phase, identifier):
+        self.process.stdin.write(json.dumps({"phase": phase, "id": identifier}).encode() + b"\n")
+        await self.process.stdin.drain()
+        async with asyncio.timeout(3):
+            value = await self.events.get()
+            assert value == {"test_event": "armed", "phase": phase, "id": identifier}
+
+    # Observe the exact blocked real SQL boundary and prove the marker belongs to this actual child/request.
+    async def gate(self, phase, identifier):
+        async with asyncio.timeout(15):
+            value = await self.events.get()
+        assert value["test_event"] == "gate" and value["phase"] == phase and value["id"] == identifier
+        assert value["pid"] == self.process.pid
+        return value
+
+    # An independent read-only connection observes only durable committed facts, including a live WAL.
+    def durable(self):
+        with closing(sqlite3.connect("file:" + str(self.rig.prepared.config.journal) + "?mode=ro", uri=True)) as db:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
+            metadata = {key: json.loads(value) for key, value in db.execute("SELECT key,value FROM meta")}
+            requests = [
+                dict(zip(("id", "action", "revision", "state", "result"), row))
+                for row in db.execute("SELECT id,action,revision,state,result FROM managed_requests")
+            ]
+            db.row_factory = sqlite3.Row
+            transactions = [dict(row) for row in db.execute("SELECT * FROM transactions")]
+            outbox = [dict(row) for row in db.execute("SELECT * FROM outbox")]
+            return {"metadata": metadata, "requests": requests, "transactions": transactions, "outbox": outbox}
+
+    # Observe genuine committed cloud mapping and ACK drain without manufacturing delivery evidence.
+    async def delivered(self, local, *, closed=False):
+        async with asyncio.timeout(10):
+            while True:
+                snapshot = self.durable()
+                row = next((row for row in snapshot["transactions"] if row["local"] == local), None)
+                if (
+                    row is not None
+                    and row["vendor"] is not None
+                    and (not closed or row["stop"] is not None)
+                    and not any(item["local"] == local for item in snapshot["outbox"])
+                ):
+                    return row
+                await asyncio.sleep(0.05)
+
+    # Wait for the exact accepted control receipt without driving a controller or trusting older published status.
+    async def completed_control(self, identifier):
+        async with asyncio.timeout(25):
+            while True:
+                result = await self.request("receipt", request_id=identifier)
+                assert result["ok"]
+                receipt = result["result"]
+                assert receipt.get("id") == identifier
+                if receipt["state"] == "completed":
+                    return receipt
+                assert receipt["state"] in ("accepted", "running", "uncertain"), receipt
+                await asyncio.sleep(0.1)
+
+    # Four actual HTTP failures establish protective zero; fresh owner and physical evidence establish repair.
+    async def native_outage(self, expected, demand):
+        peer, firmware = self.rig.peer, self.rig.bench.firmware
+        while not peer.failed_reads.empty():
+            peer.failed_reads.get_nowait()
+        peer.unavailable = True
+        try:
+            async with asyncio.timeout(25):
+                for _ in range(4):
+                    assert (await peer.failed_reads.get())["action"] == "getConfig"
+            await self.status(lambda value: value.get("fault") == "native_observation_unavailable")
+            assert firmware.effective_limit() == 0
+        finally:
+            peer.unavailable = False
+        await self.status(
+            lambda value: (
+                value.get("owner_control_enabled") is True
+                and value.get("station_ceiling_a") == expected
+                and value.get("current_a") == (expected if demand else 0)
+                and firmware.effective_limit() == expected
+            )
+        )
+
+    # Independent real charger reports and native power retain lifecycle supervision after process replacement.
+    async def ordinary_recovery(self, expected, demand, *, start_minute=0):
+        state = await self.status(lambda value: value.get("charger_connected") is True)
+        paused = await self.request("pause", revision=state["control_revision"])
+        assert paused["ok"]
+        await self.completed_control(paused["result"]["id"])
+        state = await self.status(lambda value: value.get("local_hold_verified") is True)
+        assert self.rig.bench.firmware.effective_limit() == 0
+        returned = await self.request("app_control", revision=state["control_revision"])
+        assert returned["ok"]
+        await self.completed_control(returned["result"]["id"])
+        await self.status(
+            lambda value: value.get("owner_control_enabled") is True and value.get("station_ceiling_a") == expected
+        )
+        return await self.scheduled_sessions(expected, demand, start_minute=start_minute)
+
+    # Exercise the restored native schedule without another management request.
+    async def scheduled_sessions(self, expected, demand, *, start_minute=0):
+        locals_seen = []
+        demands = demand if isinstance(demand, tuple) else (demand, demand)
+        for epoch, demand in enumerate(demands):
+            result = await self.rig.bench.call(
+                self.socket,
+                uuid.uuid4().hex,
+                "StartTransaction",
+                START
+                | {
+                    "idTag": "NATIVE_TIMER",
+                    "meterStart": 2000 + epoch * 100,
+                    "timestamp": f"2026-01-01T00:{start_minute + epoch * 2:02}:00Z",
+                },
+            )
+            assert result[0] == 3 and result[2]["idTagInfo"]["status"] == "Accepted"
+            local = result[2]["transactionId"]
+            assert local not in locals_seen
+            locals_seen.append(local)
+            self.rig.peer.plan_session = (local, 9)
+            self.rig.peer.paused, self.rig.peer.permission_enabled = False, demand
+            self.rig.bench.cp, self.rig.bench.connection = ("C", "Charging") if demand else ("B", "Plug")
+            self.rig.bench.firmware.fire_plan(9)
+            self.rig.bench.firmware.requested_current = 32 if demand else 0
+            await self.status(
+                lambda value: (
+                    value.get("owner_control_enabled") is True
+                    and value.get("station_ceiling_a") == expected
+                    and value.get("current_a") == (expected if demand else 0)
+                    and self.rig.bench.firmware.effective_limit() == expected
+                )
+            )
+            await self.native_outage(expected, demand)
+            stop = await self.rig.bench.call(
+                self.socket,
+                uuid.uuid4().hex,
+                "StopTransaction",
+                {
+                    "transactionId": local,
+                    "meterStop": 2100 + epoch * 100,
+                    "timestamp": f"2026-01-01T00:{start_minute + epoch * 2 + 1:02}:00Z",
+                },
+            )
+            assert stop[0] == 3
+            self.rig.peer.permission_enabled = False
+            row = await self.delivered(local, closed=True)
+            # Correlate the actual cloud's allocation and final Stop with the independently read durable mapping.
+            cloud = self.rig.bench
+            start_calls = [
+                frame
+                for frame in cloud.calls
+                if frame[0] == 2
+                and frame[2] == "StartTransaction"
+                and frame[3]["timestamp"] == f"2026-01-01T00:{start_minute + epoch * 2:02}:00Z"
+                and frame[3]["meterStart"] == 2000 + epoch * 100
+            ]
+            tokens = {frame[1] for frame in start_calls}
+            assert len(tokens) == 1
+            allocations = {
+                frame[2]["transactionId"] for frame in cloud.sent_vendor_replies if frame[0] == 3 and frame[1] in tokens
+            }
+            assert allocations == {row["vendor"]}
+            assert any(
+                frame[0] == 2
+                and frame[2] == "StopTransaction"
+                and frame[3]["transactionId"] == row["vendor"]
+                and frame[3]["timestamp"] == f"2026-01-01T00:{start_minute + epoch * 2 + 1:02}:00Z"
+                for frame in cloud.calls
+            )
+            await self.status(lambda value: value.get("can_start") is True)
+        assert len(locals_seen) == len(set(locals_seen)) == 2
+        return locals_seen
+
+    # SIGKILL bypasses all service finally/signal cleanup while the parent device/cloud/native peers survive.
+    async def kill(self):
+        pid = self.process.pid
+        self.process.kill()
+        assert await asyncio.wait_for(self.process.wait(), 5) == -signal.SIGKILL
+        self.kills.append({"pid": pid, "generation": self.generation, "returncode": self.process.returncode})
+        await self.disconnect()
+
+    # Retire only parent-owned socket readers after death or ordinary final service shutdown.
+    async def disconnect(self):
+        if self.socket is not None:
+            await self.socket.close()
+        if self.reader is not None:
+            self.reader.cancel()
+            await asyncio.gather(self.reader, return_exceptions=True)
+        if self.collector is not None:
+            await self.collector
+        self.socket = self.reader = self.collector = None
+
+    # Final teardown may gracefully stop a surviving replacement; the tested death never uses this path.
+    async def close(self):
+        if self.process is not None and self.process.returncode is None:
+            self.process.terminate()
+            try:
+                await asyncio.wait_for(self.process.wait(), 15)
+            except TimeoutError:
+                self.process.kill()
+                await self.process.wait()
+        await self.disconnect()
+
+
+# Commission actual bounded authority once, then release journal ownership before any child is created.
+@asynccontextmanager
+async def process_rig(
+    directory,
+    tls,
+    listener,
+    management,
+    monkeypatch,
+    current=6,
+    *,
+    native_peer: type[NativeVehiclePeer] = NativeVehiclePeer,
+    bench_type: type[OwnerBench] = OwnerBench,
+    timing: ProcessTiming = "production",
+):
+    async with commissioned(
+        directory, tls, listener, monkeypatch, current, cli_route=True, native_peer=native_peer, bench_type=bench_type
+    ) as original:
+        rig = original.rig
+        value = json.loads((directory / "trial.json").read_text())
+        value["local_tags"] = ["APP_OWNER", "NATIVE_TIMER"]
+        save_private(directory / "trial.json", value)
+        digest = rig.spec.digest
+        strategy = strategy_file(rig, directory)
+        assert rig.spec.digest == digest
+        save_private(directory / "process-strategy.json", json.loads(strategy.read_text()))
+        await original.controller.charging.close()
+        await crash(original.session)
+        child = ServiceProcess(rig, directory, management, timing)
+        try:
+            yield child
+        finally:
+            await child.close()

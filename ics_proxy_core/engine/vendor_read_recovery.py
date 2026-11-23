@@ -1,0 +1,88 @@
+"""Retire only a legacy read-only RPC marker without acknowledging any physical command."""
+
+from __future__ import annotations
+
+import time
+from typing import Any
+
+from .managed_intent import ControlIntent, unfinished_owner_requests, write_intent
+from .policy import READS
+from .store import Journal
+
+
+# Legacy markers contain no payload, so only fixed protocol read action names establish harmlessness.
+def recover_legacy_vendor_read(journal: Journal) -> bool:
+    with journal.atomic():
+        marker = journal.get("uncertain_vendor_command")
+        if (
+            not isinstance(marker, dict)
+            or set(marker) != {"action", "digest"}
+            or not isinstance(marker.get("action"), str)
+            or marker["action"] not in READS
+            or not isinstance(marker.get("digest"), str)
+            or len(marker["digest"]) != 64
+            or any(character not in "0123456789abcdef" for character in marker["digest"])
+        ):
+            return False
+        control = journal.get("control", {})
+        intent = journal.get("managed_control_intent", {})
+        fault = journal.fault.read()
+        mode = journal.get("managed_mode", {})
+        local_start = journal.get("local_start_receipt", {})
+        charge = journal.get("managed_test_charge", {})
+        current = journal.current_change.read().value
+        if (
+            not all(isinstance(value, dict) for value in (control, intent, mode, local_start, charge, current))
+            or mode.get("mode") != "app_schedule"
+            or mode.get("local_start") is not False
+            or set(intent) != {"mode", "revision"}
+            or intent.get("mode") not in ("app", "paused")
+            or type(intent.get("revision")) is not int
+            or not 0 <= intent["revision"] < 2**53 - 1
+            or not journal.phase.read().supervised
+            or fault is not None
+            and not isinstance(fault, dict)
+            or fault is not None
+            and fault.get("classification") != "owner_control_or_delivery_uncertain"
+            or journal.get("trial_preservation_fault")
+            or journal.get("trial_inventory_fault")
+            or journal.get("native_bounded_handover", {}).get("fault")
+            or journal.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
+            or control.get("start_pending")
+            or journal.get("vendor_start_grant")
+            or local_start.get("local") is None
+            and local_start.get("stage") in ("prepared", "issued", "accepted")
+            or charge.get("start_rpc_accepted") is True
+            and charge.get("local_transaction") is None
+            or charge.get("state") in ("armed", "starting", "awaiting_power", "charging", "running", "stopping")
+            or current.get("state") not in (None, "completed", "cancelled")
+            or journal.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
+            or journal.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1").fetchone()
+            or journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
+        ):
+            return False
+        managed_requests = journal.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='managed_requests'"
+        ).fetchone()
+        if managed_requests and unfinished_owner_requests(journal):
+            return False
+        if fault is not None and (
+            (journal.get("managed_stop_wire_acknowledgment") or {}).get("fault") == fault
+            or any(
+                denial.get("completed") is None and denial.get("fault") == fault
+                for denial in journal.get("managed_start_denials", {}).values()
+            )
+            or any(
+                entry.get("completed") is None and entry["proof"].get("prior_fault") == fault
+                for entry in journal.get("managed_delivery_reconciliations", {}).values()
+            )
+        ):
+            return False
+        migration: dict[str, Any] = {"marker": marker, "prior_fault": fault, "at_epoch": time.time()}
+        journal.put("vendor_read_failure_recovery", migration)
+        journal.db.execute("DELETE FROM meta WHERE key='uncertain_vendor_command'")
+        if fault is not None and fault.get("classification") == "owner_control_or_delivery_uncertain":
+            journal.fault.clear()
+        write_intent(journal, ControlIntent(intent["mode"], intent["revision"]), "paused", coalesce=True)
+        journal.phase.restrict(control)
+        return True

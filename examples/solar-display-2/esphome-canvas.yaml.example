@@ -1,0 +1,369 @@
+# Editable Home Assistant screen with generic touch coordinates.
+# Only an image-scoped credential is sent to Home Assistant. Normal layout
+# changes happen in the GeekMagic editor and need no firmware update.
+http_request:
+  id: canvas_http
+  timeout: 5s
+  follow_redirects: false
+
+image:
+  - platform: online_image
+    id: canvas_image
+    http_request_id: canvas_http
+    url: !secret canvas_image_url
+    request_headers:
+      Authorization: !secret canvas_authorization
+    format: PNG
+    type: RGB565
+    transparency: opaque
+    resize: 480x480
+    buffer_size: 16384
+    update_interval: 10s
+    on_download_finished:
+      - lambda: |-
+          // LVGL only sees this completed front frame, never the decoder's
+          // working buffer. A304 validates liveness without redrawing it.
+          auto &frame = solar_display::canvas_frame();
+          if (!cached) {
+            auto result = frame.commit(*id(canvas_image));
+            if (result == solar_display::StableCanvasFrame::CommitResult::INVALID) {
+              ESP_LOGW("canvas_frame", "Completed image could not be committed");
+              id(reset_canvas_image).execute();
+              return;
+            }
+            if (result == solar_display::StableCanvasFrame::CommitResult::CHANGED) {
+              // Invalidate cached pixels and the initial1x1 header together.
+              lv_image_cache_drop(frame.get_lv_image_dsc());
+              if (frame.commit_count() == 1) {
+                esphome::lvgl::lv_image_set_src(id(canvas_image_widget), &frame);
+              } else {
+                // Keep the image source attached and repaint only changed
+                // pixel bands instead of flushing the entire480x480 panel.
+                for (const auto &region : frame.dirty_regions()) {
+                  if (!region.valid()) continue;
+                  lv_area_t area = {region.x1, region.y1, region.x2, region.y2};
+                  lv_obj_invalidate_area(id(canvas_image_widget), &area);
+                }
+              }
+            }
+          } else if (!frame.ready()) {
+            id(reset_canvas_image).execute();
+            return;
+          }
+          id(canvas_last_success_ms) = millis();
+          id(canvas_image_ready) = true;
+          id(show_canvas_dashboard).execute();
+          if (!cached) {
+            const auto control = frame.control_marker();
+            if (control != id(canvas_frame_control)) {
+              // Flush the updated buttons before allowing a touch to use their new target.
+              lv_refr_now(lv_obj_get_display(id(canvas_image_widget)));
+              id(canvas_frame_control) = control;
+              id(canvas_frame_control_changed_ms) = millis();
+              id(canvas_pressed_control).clear();
+            }
+          }
+          id(show_ics_request_feedback).execute();
+    on_error:
+      # The front frame survives a failed download; retry in the back buffer.
+      # The normal45-second liveness limit still controls the offline screen.
+      - script.execute: reset_canvas_image
+
+globals:
+  - id: canvas_last_success_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: canvas_image_ready
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: canvas_showing
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  - id: canvas_frame_control
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: canvas_pressed_control
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: canvas_pressed_button
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: canvas_frame_control_changed_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: canvas_last_touch_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: canvas_touch_event_count
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: canvas_touch_x
+    type: int
+    restore_value: false
+    initial_value: "-1"
+  - id: canvas_touch_y
+    type: int
+    restore_value: false
+    initial_value: "-1"
+  - id: canvas_touch_age_seconds
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+text_sensor:
+  - platform: homeassistant
+    id: canvas_ics_request_state
+    entity_id: input_select.general_display_2_ics_request
+    internal: true
+    on_value:
+      - script.execute: show_ics_request_feedback
+  - platform: template
+    id: canvas_screen_source
+    name: Screen source
+    entity_category: diagnostic
+    lambda: |-
+      return id(canvas_showing) ? "Home Assistant" : "Offline";
+    update_interval: 5s
+
+sensor:
+  - platform: homeassistant
+    id: canvas_ics_pending_runs
+    entity_id: automation.general_display_2_ics_charger_buttons
+    attribute: current
+    internal: true
+    on_value:
+      - script.execute: show_ics_request_feedback
+
+script:
+  - id: show_ics_request_feedback
+    mode: restart
+    then:
+      - lambda: |-
+          // Show the accepted tap immediately from HA state, between image downloads.
+          const bool busy = id(canvas_ics_pending_runs).state > 0;
+          const bool starting = busy && id(canvas_ics_request_state).state == "starting";
+          const bool stopping = busy && id(canvas_ics_request_state).state == "stopping";
+          auto *start_button = id(canvas_ics_start_feedback);
+          auto *stop_button = id(canvas_ics_stop_feedback);
+          if (start_button == nullptr || stop_button == nullptr) return;
+          if (!starting && !stopping) {
+            lv_obj_add_flag(start_button, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(stop_button, LV_OBJ_FLAG_HIDDEN);
+            return;
+          }
+          auto format = [](lv_obj_t *button, lv_obj_t *label, bool pending,
+                           const char *pending_text, const char *idle_text) {
+            lv_obj_set_style_bg_color(button, lv_color_hex(pending ? 0x805523 : 0x1C2B33), 0);
+            lv_obj_set_style_border_color(button, lv_color_hex(pending ? 0xFFC477 : 0x30414C), 0);
+            lv_obj_set_style_text_color(label, lv_color_hex(pending ? 0xFFF3DD : 0x718490), 0);
+            lv_label_set_text(label, pending ? pending_text : idle_text);
+            lv_obj_clear_flag(button, LV_OBJ_FLAG_HIDDEN);
+          };
+          format(start_button, id(canvas_ics_start_feedback_label), starting, "STARTING...", "START ICS");
+          format(stop_button, id(canvas_ics_stop_feedback_label), stopping, "STOPPING...", "STOP ICS");
+  - id: reset_canvas_image
+    mode: restart
+    then:
+      - online_image.release: canvas_image
+      - lambda: id(canvas_image_ready) = solar_display::canvas_frame().ready();
+      - script.execute: check_canvas_freshness
+  - id: show_canvas_dashboard
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(dashboard_ha_connected) &&
+                  api::global_api_server->is_connected_with_state_subscription() &&
+                  id(canvas_image_ready) &&
+                  uint32_t(millis() - id(canvas_last_success_ms)) < 45000;
+          then:
+            - if:
+                condition:
+                  not:
+                    lvgl.page.is_showing: canvas_dashboard
+                then:
+                  - lvgl.page.show: canvas_dashboard
+            - globals.set:
+                id: canvas_showing
+                value: "true"
+            - text_sensor.template.publish:
+                id: canvas_screen_source
+                state: Home Assistant
+  - id: check_canvas_freshness
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(canvas_showing) &&
+                  (!id(dashboard_ha_connected) ||
+                   !api::global_api_server->is_connected_with_state_subscription() ||
+                   !id(canvas_image_ready) ||
+                   uint32_t(millis() - id(canvas_last_success_ms)) >= 45000);
+          then:
+            - globals.set:
+                id: canvas_showing
+                value: "false"
+            - lvgl.page.show: offline_dashboard
+            - text_sensor.template.publish:
+                id: canvas_screen_source
+                state: Offline
+            - script.execute: update_dashboard
+
+interval:
+  - interval: 1s
+    then:
+      - script.execute: check_canvas_freshness
+
+lvgl:
+  pages:
+    - id: canvas_dashboard
+      bg_color: 0x0B1020
+      pad_all: 0
+      scrollbar_mode: "OFF"
+      widgets:
+        - image:
+            id: canvas_image_widget
+            x: 0
+            y: 0
+            width: 480
+            height: 480
+            # Starts with a valid1x1placeholder. Completed frames are copied
+            # into this independent image only after a successful decode.
+            src: !lambda return &solar_display::canvas_frame();
+        - obj:
+            x: 0
+            y: 474
+            width: 480
+            height: 6
+            bg_color: 0x0B1119
+            border_width: 0
+            radius: 0
+            clickable: false
+        - obj:
+            id: canvas_ics_start_feedback
+            x: 20
+            y: 366
+            width: 212
+            height: 62
+            pad_all: 0
+            radius: 16
+            border_width: 2
+            scrollbar_mode: "OFF"
+            hidden: true
+            widgets:
+              - label:
+                  id: canvas_ics_start_feedback_label
+                  align: CENTER
+                  text_font: montserrat_22
+                  text: START ICS
+        - obj:
+            id: canvas_ics_stop_feedback
+            x: 248
+            y: 366
+            width: 212
+            height: 62
+            pad_all: 0
+            radius: 16
+            border_width: 2
+            scrollbar_mode: "OFF"
+            hidden: true
+            widgets:
+              - label:
+                  id: canvas_ics_stop_feedback_label
+                  align: CENTER
+                  text_font: montserrat_22
+                  text: STOP ICS
+        # LVGL gives post-rotation visible pixels. The full-screen hit surface
+        # lets HA route future controls without further firmware changes.
+        - button:
+            id: canvas_touch_button
+            x: 0
+            y: 0
+            width: 480
+            height: 442
+            bg_opa: TRANSP
+            border_width: 0
+            shadow_width: 0
+            radius: 0
+            pad_all: 0
+            pressed:
+              bg_opa: TRANSP
+            on_press:
+              - lambda: |-
+                  const auto press_point = esphome::lvgl::LvglComponent::get_touch_relative_to_obj(
+                      id(canvas_touch_button));
+                  const auto button = solar_display::charger_button_at(press_point.x, press_point.y);
+                  id(canvas_pressed_button) = static_cast<int>(button);
+                  id(canvas_pressed_control).clear();
+                  if (button != solar_display::ChargerButton::NONE &&
+                      uint32_t(millis() - id(canvas_frame_control_changed_ms)) >= 100) {
+                    id(canvas_pressed_control) = id(canvas_frame_control);
+                  }
+            on_click:
+              - if:
+                  condition:
+                    lambda: |-
+                      const auto point = esphome::lvgl::LvglComponent::get_touch_relative_to_obj(
+                          id(canvas_touch_button));
+                      const uint32_t now = millis();
+                      const uint32_t age_ms = now - id(canvas_last_success_ms);
+                      using solar_display::ChargerButton;
+                      const auto button = solar_display::charger_button_at(point.x, point.y);
+                      const bool charger_button = button != ChargerButton::NONE;
+                      if (charger_button &&
+                          (static_cast<int>(button) != id(canvas_pressed_button) ||
+                           id(canvas_pressed_control) != id(canvas_frame_control) ||
+                           (button == ChargerButton::START && !id(canvas_pressed_control).starts_with("start:")) ||
+                           (button == ChargerButton::STOP && !id(canvas_pressed_control).starts_with("stop:")))) {
+                        return false;
+                      }
+                      if (point.x < 0 || point.x >= 480 || point.y < 0 || point.y >= 442 ||
+                          (charger_button && id(canvas_ics_pending_runs).state > 0) ||
+                          !id(canvas_showing) || !id(canvas_image_ready) ||
+                          !solar_display::canvas_frame().ready() || age_ms >= 45000 ||
+                          !id(dashboard_ha_connected) ||
+                          !api::global_api_server->is_connected_with_state_subscription() ||
+                          (id(canvas_touch_event_count) != 0 &&
+                           uint32_t(now - id(canvas_last_touch_ms)) < 500)) return false;
+                      id(canvas_last_touch_ms) = now;
+                      id(canvas_touch_x) = point.x;
+                      id(canvas_touch_y) = point.y;
+                      id(canvas_touch_age_seconds) = age_ms / 1000;
+                      ++id(canvas_touch_event_count);
+                      return true;
+                  then:
+                    - homeassistant.event:
+                        event: esphome.general_display_touch
+                        data:
+                          display: general_display_2
+                          x: !lambda return to_string(id(canvas_touch_x));
+                          y: !lambda return to_string(id(canvas_touch_y));
+                          canvas_age_seconds: !lambda return to_string(id(canvas_touch_age_seconds));
+                          frame_control: !lambda return id(canvas_pressed_control);
+        - button:
+            id: canvas_brightness_button
+            x: 0
+            y: 442
+            width: 480
+            height: 38
+            bg_opa: TRANSP
+            border_width: 0
+            shadow_width: 0
+            radius: 0
+            pad_all: 0
+            pressed:
+              bg_opa: TRANSP
+            on_click:
+              - script.execute: toggle_display_brightness

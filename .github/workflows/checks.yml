@@ -1,0 +1,138 @@
+# Modified for the standalone iCS proxy repository.
+name: Checks
+
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# Selection belongs to the committed commands; inherited runner variables must never filter a suite.
+env:
+  PYTEST_ADDOPTS: ""
+  PYTEST_PLUGINS: ""
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install -r requirements-offline.txt
+
+      - name: Version check
+        run: python tools/version.py check
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Validate YAML
+        run: python -c "import pathlib, yaml; [yaml.safe_load(path.read_text()) for pattern in ('*.yml', '*.yaml') for path in pathlib.Path('.').rglob(pattern)]"
+
+      - name: Format check
+        run: ruff format --check ics_proxy_core custom_components
+
+      - name: Type check
+        run: mypy --strict --follow-imports=skip ics_proxy_core custom_components/ics_proxy/api.py
+
+      - name: Compile
+        run: python3 -m compileall -f ics_proxy_core custom_components
+
+      - name: Diff check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}"
+          else
+            base=$(git rev-parse --verify -q HEAD^ || git hash-object -t tree /dev/null)
+            git diff --check "$base" HEAD
+          fi
+
+      - name: Collect the complete engine suite
+        run: |
+          mkdir -p "${RUNNER_TEMP}/engine-plan"
+          TMPDIR="${RUNNER_TEMP}/engine-plan" python tools/qualification_collection.py \
+            --source "$PWD" --suite engine-model --output "${RUNNER_TEMP}/engine-plan/collection.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: engine-plan
+          path: ${{ runner.temp }}/engine-plan/collection.json
+          if-no-files-found: error
+          overwrite: true
+
+  # The Home Assistant layer (config flow, setup, entities, diagnostics) against the real Home Assistant test harness.
+  # The separate dependency files pin each supported Home Assistant version.
+  ha-layer:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: proxy-ha10
+            collection_suite: ha-proxy-2026.10
+            requirements: requirements-ha-proxy-2026.10.txt
+          - suite: proxy-ha11
+            collection_suite: ha-proxy
+            requirements: requirements-ha-proxy.txt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install -r "${{ matrix.requirements }}"
+
+      - name: Test the Home Assistant layer
+        run: python tools/run_hosted_ha.py --suite "${{ matrix.collection_suite }}" --output "${RUNNER_TEMP}/ha"
+
+  engine:
+    needs: static
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        run: pip install -r requirements-offline.txt
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: engine-plan
+          path: ${{ runner.temp }}/engine-plan
+      - name: Run assigned engine and model cases
+        run: |
+          python tools/run_model_shard.py --shard ${{ matrix.shard }} --output "${RUNNER_TEMP}/engine" \
+            --engine-collection "${RUNNER_TEMP}/engine-plan/collection.json"
+      - name: Preserve shard evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: engine-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/engine
+          if-no-files-found: error
+
+  checks:
+    if: ${{ always() }}
+    needs: [static, engine, ha-layer]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all checks to pass
+        env:
+          STATIC_RESULT: ${{ needs.static.result }}
+          ENGINE_RESULT: ${{ needs.engine.result }}
+          HA_RESULT: ${{ needs.ha-layer.result }}
+        run: |
+          test "$STATIC_RESULT" = success
+          test "$ENGINE_RESULT" = success
+          test "$HA_RESULT" = success

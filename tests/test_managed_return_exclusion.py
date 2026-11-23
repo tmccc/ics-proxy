@@ -1,0 +1,143 @@
+# Modified for the standalone iCS proxy repository.
+"""Running Return retains exclusive admission across actual native HTTP waits."""
+
+import asyncio
+import uuid
+
+import pytest
+from websockets.asyncio.client import connect
+
+from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
+from tests.charge_rig import ready
+from tests.current_rig import adjustable
+from tests.handover_helpers import NativeVehiclePeer
+from tests.managed_rig import healthy, starts
+from tests.management_peer import TOKEN, call
+from tests.test_managed_current_tick_race import OneNativeResponseGate, chain
+from tests.tls_support import tls as tls
+
+
+class SlowSnapshotPeer(NativeVehiclePeer):
+    """Individual HTTP reads finish within five seconds, while one complete snapshot exceeds fifteen."""
+
+    # The fake device owns latency independently of the management controller.
+    def __init__(self, bench):
+        super().__init__(bench)
+        self.slow = False
+        self.delayed_requests = 0
+
+    # Delay exactly one actual snapshot; later evidence can become healthy without retrying the Return command.
+    async def handle(self, reader, writer):
+        if self.slow:
+            self.delayed_requests += 1
+            if self.delayed_requests == 9:
+                self.slow = False
+            await asyncio.sleep(1.8)
+        await super().handle(reader, writer)
+
+
+# Intent: an aggregate native timeout ends Return before sending and permits a new request after recovery.
+# Why: leaving its receipt running forever hides healthy admission behind an operation that no longer exists.
+@pytest.mark.parametrize("slow", [False, True])
+async def test_return_snapshot_timeout_is_terminal(tmp_path, tls, unused_tcp_port, monkeypatch, slow):
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=SlowSnapshotPeer) as b:
+        c, peer = b.controller, b.rig.peer
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        request = uuid.uuid4().hex
+        c.command(request, "app_control", c.requests.intent().revision)
+        peer.slow = slow
+        try:
+            await c.tick()
+        finally:
+            peer.slow = False
+        status = await healthy(c)
+        assert c.requests.receipt(request)["state"] == ("failed" if slow else "completed")
+        assert not c.requests.return_in_progress() and not starts(b.rig)
+        if slow:
+            assert peer.delayed_requests == 9 and status["local_hold_verified"]
+            assert b.rig.bench.firmware.effective_limit() == 0
+            fresh = uuid.uuid4().hex
+            c.command(fresh, "app_control", c.requests.intent().revision)
+            assert (await healthy(c))["owner_control_enabled"]
+            assert c.requests.receipt(fresh)["state"] == "completed"
+            assert c.requests.receipt(request)["result"] == {"classification": "return_not_sent"}
+        assert b.rig.bench.firmware.effective_limit() == 6 and not starts(b.rig)
+
+
+# Intent: accepted and running Return refuse Start/current while a newer Pause can still retain zero.
+# Why: execution selects accepted work only, but admission must remain exclusive throughout its actual I/O.
+@pytest.mark.parametrize("action", ["start", "set_current", "pause"])
+async def test_running_return_keeps_positive_admission_closed(
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch, action
+):
+    context = (
+        adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch, native_peer=OneNativeResponseGate)
+        if action == "set_current"
+        else ready(
+            tmp_path,
+            tls,
+            unused_tcp_port_factory(),
+            monkeypatch,
+            owner_tag="APP_OWNER",
+            native_peer=OneNativeResponseGate,
+        )
+    )
+    async with context as b:
+        c, peer = b.controller, b.rig.peer
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
+        port = unused_tcp_port_factory()
+        api = ManagementServer(ManagementSettings(port, tmp_path / "unused-secret", TOKEN), c, lambda: published)
+        await api.start()
+        tick = None
+        try:
+            async with connect(
+                f"ws://127.0.0.1:{port}/management",
+                additional_headers={"Authorization": "Bearer " + TOKEN},
+                subprotocols=["ics-proxy.v1"],
+                proxy=None,
+            ) as socket:
+                revision, returning = c.requests.intent().revision, uuid.uuid4().hex
+                assert (await call(socket, "app_control", id=returning, revision=revision))["ok"]
+                for running in (False, True):
+                    if running:
+                        peer.arm = True
+                        tick = asyncio.create_task(c.tick())
+                        await asyncio.wait_for(peer.entered.wait(), 2)
+                        assert "return_requested" in chain(tick)
+                        assert peer.gated_request["action"] == "getConfig"
+                        assert c.requests.receipt(returning)["state"] == "running"
+                    status = (await call(socket, "status"))["result"]
+                    assert not any(status[k] for k in ("can_start", "can_start_test", "can_set_current", "can_return"))
+                    assert (await call(socket, "app_control", revision=revision)).get("ok") is False
+                    if action != "pause":
+                        fields = {"current_a": 16} if action == "set_current" else {}
+                        assert (await call(socket, action, revision=revision, **fields)).get("ok") is False
+                    assert not starts(b.rig) and b.rig.bench.firmware.effective_limit() == 0
+                if action == "pause":
+                    assert (await call(socket, "pause", revision=revision))["ok"]
+                peer.release.set()
+                await asyncio.wait_for(tick, 5)
+                published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
+                if action == "pause":
+                    assert published["local_hold_verified"] and b.rig.bench.firmware.effective_limit() == 0
+                    assert c.requests.receipt(returning)["state"] != "completed"
+                else:
+                    assert c.requests.receipt(returning)["state"] == "completed"
+                    assert published["owner_control_enabled"] and b.rig.bench.firmware.effective_limit() == 6
+                    fields = {"current_a": 16} if action == "set_current" else {}
+                    assert (await call(socket, action, revision=c.requests.intent().revision, **fields))["ok"]
+                    if action == "start":
+                        await c.charging.settle()
+                        assert len(starts(b.rig)) == 1 and b.rig.bench.firmware.effective_limit() == 6
+                    else:
+                        await c.current.settle()
+                        assert c.current.selected() == 16 and b.rig.bench.firmware.effective_limit() == 16
+                        assert not starts(b.rig)
+                assert not b.session.journal.get("managed_control_fault")
+        finally:
+            peer.release.set()
+            if tick is not None:
+                await asyncio.gather(tick, return_exceptions=True)
+            await api.close()

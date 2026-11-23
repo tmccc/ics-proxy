@@ -1,0 +1,386 @@
+# Modified for the standalone iCS proxy repository.
+"""Expiry at a real final Pause recheck stays inside managed supervision."""
+
+import asyncio
+import copy
+import json
+import sqlite3
+import sys
+import time
+import uuid
+from types import SimpleNamespace
+
+import pytest
+
+from ics_proxy_core.constants import HUB_PROFILE_ID
+from ics_proxy_core.engine import trial_evidence
+from ics_proxy_core.engine.managed_view import refresh_for_read
+from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
+from tests.charge_rig import actual_stop, owner_start, positive_flow, ready
+from tests.current_rig import commissioned
+from tests.managed_rig import healthy, starts
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
+from tests.trial_peer import Bench
+
+
+# Intent: a new charger lifecycle report retires the earlier dashboard measurement before the next poll.
+# Why: the viewer cannot use power or session state taken before a genuine Start or Stop.
+@pytest.mark.parametrize("event", ["start", "stop", "start-stop"])
+async def test_charger_lifecycle_change_retires_older_live_measurement(
+    tmp_path, tls, unused_tcp_port, monkeypatch, event
+):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j = b.controller, b.session.journal
+        observed = await healthy(c)
+        local = await positive_flow(b, "daily")
+        if event == "stop":
+            observed = await healthy(c)
+            assert observed["charging_session_open"] is True and observed["power_w"] == 1440
+        else:
+            assert observed["charging_session_open"] is False and j.active() == local
+        if event != "start":
+            reply = await b.rig.bench.call(
+                b.charger,
+                "daily-natural-stop",
+                "StopTransaction",
+                {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100},
+            )
+            assert reply[0] == 3 and j.active() is None
+            b.rig.peer.permission_enabled = False
+            b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+            await until(lambda: j.next_delivery() is None)
+        stale = refresh_for_read(c, dict(observed, running=True, certificate_remaining_seconds=86400))
+        assert stale["charging_session_open"] is None and stale["power_w"] is None
+        assert not stale["healthy"] and not stale["owner_control_enabled"]
+        assert not stale["can_start"] and not stale["can_set_current"]
+        fresh = await healthy(c)
+        assert fresh["charging_session_open"] is (event == "start")
+        if event == "start":
+            c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+            await actual_stop(b, local)
+
+
+# Intent: record a genuine Stop when the optional tag cache cannot be read.
+# Why: an optional authorization detail must never keep a closed session open in the journal.
+async def test_stop_records_closure_when_tag_cache_read_fails(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        journal = b.session.journal
+        local = await positive_flow(b, "daily")
+        refused = False
+
+        # Leave the real STOP transaction writable; fail only the optional tag lookup.
+        def authorize(action, table, column, database, trigger):
+            nonlocal refused
+            if action == sqlite3.SQLITE_READ and (table, column) == ("auth_info", "info"):
+                refused = True
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        journal.db.set_authorizer(authorize)
+        try:
+            reply = await b.rig.bench.call(
+                b.charger,
+                "daily-tagged-stop",
+                "StopTransaction",
+                {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100, "idTag": "NATIVE_TIMER"},
+            )
+            assert refused and reply[0] == 3 and journal.active() is None
+            b.rig.peer.permission_enabled = False
+            b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+        finally:
+            journal.db.set_authorizer(None)
+        await until(lambda: journal.next_delivery() is None)
+
+
+# Intent: a strict native observation after validation but before wiring a Start invalidates that dispatch.
+# Why: later evidence must win even while connection, control ticket and user intent are unchanged.
+async def test_send_rechecks_native_validation_after_new_strict_refusal(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, peer = b.controller, b.session.gateway.charger
+        await healthy(c)
+        validate = peer.validate_send
+        assert validate is not None
+        refused = False
+
+        # Deliver one real contradictory sample after the original native validation completes.
+        async def validation(action, body):
+            nonlocal refused
+            result = await validate(action, body)
+            if action == "RemoteStartTransaction":
+                with monkeypatch.context() as native:
+                    native.setitem(b.rig.peer.configuration, "maxOutCurrent0", "31")
+                    with pytest.raises(SecurityError):
+                        await c.native.read()
+                    assert c.native.last_verified_at == 0
+                refused = True
+            return result
+
+        monkeypatch.setattr(peer, "validate_send", validation)
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        assert refused and not starts(b.rig)
+
+
+# Intent: a native output limit above the selected current invalidates an otherwise healthy active session.
+# Why: zero or low vehicle draw cannot confirm the ceiling the charger reports for its output.
+async def test_active_native_output_limit_must_match_selected_current(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 16) as b:
+        c = b.controller
+        await positive_flow(b, "daily")
+        assert (await healthy(c))["station_ceiling_a"] == 16
+        original = b.rig.peer.native
+
+        # Keep the actual profile and draw unchanged while the independent reader reports a higher output limit.
+        def higher_limit(key):
+            value = original(key)
+            if key == "CONNECTOR":
+                value[0]["outLimit"] = 240
+            return value
+
+        monkeypatch.setattr(b.rig.peer, "native", higher_limit)
+        status = await c.tick()
+        assert status["state"] == "degraded" and c.native.last_verified_at == 0
+
+
+# Intent: a later independent failed native audit withdraws the earlier healthy dashboard sample immediately.
+# Why: a known configuration contradiction cannot coexist with a fresh-looking control or power reading.
+async def test_strict_native_refusal_revokes_status_before_next_poll(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c = b.controller
+        published = dict(await healthy(c), running=True, certificate_remaining_seconds=86400)
+        with monkeypatch.context() as configuration:
+            configuration.setitem(b.rig.peer.configuration, "maxOutCurrent0", "31")
+            with pytest.raises(SecurityError):
+                await c.native.read()
+            assert c.native.last_verified_at == 0 and c.latest_native is not None
+            status = refresh_for_read(c, published)
+            assert not status["healthy"] and not status["owner_control_enabled"]
+            assert status["power_w"] is None and not status["can_start"]
+        assert (await healthy(c))["owner_control_enabled"]
+
+
+# Intent: a refused Start report immediately withdraws stale health from before the station profile changed.
+# Why: the profile-only observation can prove the old sample invalid without a second supervision poll.
+async def test_reported_start_ceiling_refusal_revokes_status(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, journal = b.controller, b.session.journal
+        published = dict(await healthy(c), running=True, certificate_remaining_seconds=86400)
+        assert refresh_for_read(c, published)["healthy"]
+        b.rig.bench.firmware.profiles.pop(HUB_PROFILE_ID)
+        result = await b.rig.bench.call(
+            b.charger, uuid.uuid4().hex, "StartTransaction", START | {"idTag": "NATIVE_TIMER"}
+        )
+        assert result[0] == 4 and journal.active() is None
+        latest = refresh_for_read(c, published)
+        assert c.native.last_verified_at == 0
+        assert not latest["healthy"] and not latest["owner_control_enabled"] and not latest["can_start"]
+
+
+# Intent: the same actual native sample can expire at observed's final Pause check without ending supervision.
+# Why: moving the check must keep genuine pending Stop debt and withhold healthy publication of stale evidence.
+@pytest.mark.parametrize("source", ["local", "cloud"])
+async def test_observed_recheck_expires_inside_supervision(tmp_path, tls, unused_tcp_port, monkeypatch, source):
+    stop_seen, release_ack = asyncio.Event(), asyncio.Event()
+    targets = set()
+    vendor = Bench.vendor
+
+    class GateConnection:
+        # Delegate all non-gated transport details to the real websocket.
+        def __init__(self, connection):
+            self.connection = connection
+
+        # Observe only real Stop frames received by the independent cloud.
+        def __aiter__(self):
+            # Keep the original wire stream intact while identifying the one held Stop reply.
+            async def frames():
+                async for raw in self.connection:
+                    frame = json.loads(raw)
+                    if frame[0] == 2 and frame[2] == "StopTransaction":
+                        targets.add(frame[1])
+                        stop_seen.set()
+                    yield raw
+
+            return frames()
+
+        # Withhold only its actual correlated successful acknowledgement.
+        async def send(self, raw):
+            frame = json.loads(raw)
+            if frame[0] == 3 and frame[1] in targets:
+                async with asyncio.timeout(8):
+                    await release_ack.wait()
+            await self.connection.send(raw)
+
+    # Keep the original independent cloud responsible for every reply body.
+    async def gated_vendor(bench, connection):
+        await vendor(bench, GateConnection(connection))
+
+    monkeypatch.setattr(Bench, "vendor", gated_vendor)
+    try:
+        async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, duration=60, startup=60) as b:
+            c, j, g = b.controller, b.session.journal, b.session.gateway
+            # Increase only the fake transport budget, BEFORE the Stop call is allocated.
+            old_timeout = g.vendor.timeout
+            g.vendor.timeout = 6
+            try:
+                identifier = uuid.uuid4().hex
+                c.command(identifier, "start_test" if source == "local" else "arm_cloud_test", 0)
+                if source == "local":
+                    await c.charging.settle()
+                else:
+                    await owner_start(b)
+                local = await positive_flow(b, source)
+                await healthy(c)
+                lease = c.charging.lease
+                assert lease is not None and not lease.normal
+                assert c.charging.state()["state"] == "charging"
+                # Existing live-deadline pattern: the real independent task owns Pause/zero/Stop.
+                lease.deadline = time.monotonic() - 1
+                c.charging.changed.set()
+                await asyncio.wait_for(b.rig.bench.remote_stop.wait(), 3)
+                assert c.charging.state()["state"] == "stopping"
+                assert c.requests.intent().mode == "paused" and c.charging.lease is lease
+                reply = await b.rig.bench.call(
+                    b.charger,
+                    uuid.uuid4().hex,
+                    "StopTransaction",
+                    {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100},
+                )
+                assert reply[0] == 3
+                b.rig.peer.permission_enabled = False
+                await asyncio.wait_for(stop_seen.wait(), 3)
+                if c.pause_task is not None:
+                    await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
+                await until(lambda: not g.charger._pending and not g.controls._operations)
+                pending = j.next_delivery()
+                assert j.active() is None and pending is not None and pending.action == "StopTransaction"
+                assert pending.state not in ("ambiguous", "rejected") and g.vendor._pending
+                assert targets and not release_ack.is_set() and not j.get("managed_control_fault")
+                assert c.charging.lease is lease and c.charging.state()["state"] == "stopping"
+                assert b.rig.bench.firmware.active is None and b.rig.bench.firmware.effective_limit() == 0
+                # Do NOT call healthy()/tick()/actual_stop() between this prefix and the target tick.
+                intent, receipt = c.requests.intent(), copy.deepcopy(c.requests.receipt(identifier))
+                latest, unavailable = c.latest_native, c.native_unavailable
+                assert unavailable == 0
+                start_count = len(starts(b.rig))
+                wire = len(b.rig.bench.device_calls)
+                seen_tick, seen_observed, mismatches = [], [], []
+                offset = 0.0
+                real_now = time.time
+                fresh_code = trial_evidence.Evidence.require_fresh.__code__
+                pause_code = type(c).require_paused.__code__
+                tick_code = type(c)._tick.__code__
+                supervise_code = type(c)._accept_supervision.__code__
+                observed_code = type(c.charging).observed.__code__
+
+                # Supply wall time only; inspect real call/sample identity without replacing a validator.
+                def scoped_time():
+                    nonlocal offset
+                    now = real_now()
+                    fresh = sys._getframe(1)
+                    node = pause = caller = None
+                    try:
+                        if fresh.f_code is not fresh_code or fresh.f_locals.get("max_age") != 5:
+                            return now + offset
+                        node = fresh
+                        has_tick = False
+                        while node is not None:
+                            if node.f_code is tick_code and node.f_locals.get("self") is c:
+                                has_tick = True
+                            if node.f_code is pause_code and node.f_locals.get("self") is c:
+                                pause = node
+                            node = node.f_back
+                        if pause is None or not has_tick:
+                            return now + offset
+                        caller = pause.f_back
+                        native = pause.f_locals.get("native")
+                        physical = fresh.f_locals.get("self")
+                        if native is None or native.physical is not physical:
+                            return now + offset
+                        sample = (id(native), id(physical), physical.observed_at)
+                        if caller is not None and caller.f_code is supervise_code and caller.f_locals.get("self") is c:
+                            seen_tick.append((sample, now + offset - physical.observed_at))
+                        elif (
+                            caller is not None
+                            and caller.f_code is observed_code
+                            and caller.f_locals.get("self") is c.charging
+                        ):
+                            matches = (
+                                len(seen_tick) == 1
+                                and sample == seen_tick[0][0]
+                                and c.charging.lease is lease
+                                and not seen_observed
+                            )
+                            if matches:
+                                offset = 6.0
+                            else:
+                                mismatches.append(sample)
+                            seen_observed.append((sample, now + offset - physical.observed_at))
+                        return now + offset
+                    finally:
+                        # Never retain frame objects in the witness data.
+                        del fresh, node, pause, caller
+
+                escaped = status = None
+                # Scope only this module NAME; never patch the shared time.time function.
+                with monkeypatch.context() as clock_patch:
+                    clock_patch.setattr(trial_evidence, "time", SimpleNamespace(time=scoped_time))
+                    try:
+                        status = await c.tick()
+                    except StaleEvidenceError as error:
+                        escaped = error
+                # The clock is real again BEFORE any further awaits/new native observations.
+                assert len(seen_tick) == len(seen_observed) == 1 and not mismatches
+                assert seen_tick[0][0] == seen_observed[0][0]
+                assert 0 <= seen_tick[0][1] <= 5 < seen_observed[0][1] and offset == 6
+                assert c.charging.lease is lease and c.charging.state()["state"] == "stopping"
+                assert c.requests.intent() == intent and c.requests.receipt(identifier) == receipt
+                assert not release_ack.is_set() and j.next_delivery().action == "StopTransaction"
+                assert b.rig.bench.firmware.effective_limit() == b.rig.bench.firmware.current == 0
+                assert len(starts(b.rig)) == start_count
+                assert not any(
+                    f[2] in ("RemoteStartTransaction", "RemoteStopTransaction") for f in b.rig.bench.device_calls[wire:]
+                )
+                # This exact assertion is RED on old code, AFTER proving the target boundary fired.
+                assert escaped is None, "real observed StaleEvidenceError escaped the controller tick"
+                assert status["state"] == "degraded" and status["fault"] == "native_observation_unavailable"
+                assert status["owner_control_enabled"] is False
+                assert c.native_unavailable == unavailable + 1 and c.latest_native is latest
+                assert j.get("managed_native_failure")["type"] == "StaleEvidenceError"
+                release_ack.set()
+                await until(lambda: j.next_delivery() is None and not g.vendor._pending)
+                assert (await healthy(c))["local_hold_verified"]
+                assert c.charging.state()["state"] == "completed" and c.charging.lease is None
+                assert c.requests.receipt(identifier) == receipt and c.requests.intent() == intent
+                assert b.rig.bench.firmware.effective_limit() == 0 and len(starts(b.rig)) == start_count
+            finally:
+                # Also runs on old/red failure, before ready() closes its real peers.
+                release_ack.set()
+                g.vendor.timeout = old_timeout
+    finally:
+        release_ack.set()
+
+
+# Intent: ordinary idle and paused checks do not rewrite a digest they already recorded.
+# Why: a refusal of a redundant write cannot stop supervision of the same verified charger state.
+@pytest.mark.parametrize("paused", [False, True])
+async def test_unchanged_inventory_recheck_does_not_need_a_write(tmp_path, tls, unused_tcp_port, monkeypatch, paused):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j = b.controller, b.session.journal
+        if paused:
+            c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        verified = await healthy(c)
+        assert verified["local_hold_verified"] is paused
+        assert j.db.execute("SELECT observed_digest FROM trial_resources WHERE key='profile:7001'").fetchone()[0]
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_same_digest BEFORE UPDATE OF observed_digest ON trial_resources "
+            "WHEN OLD.observed_digest IS NEW.observed_digest "
+            "BEGIN SELECT RAISE(ABORT,'same observation needs no write'); END"
+        )
+        try:
+            status = await c.tick()
+            assert status["state"] == "healthy" and status["local_hold_verified"] is paused
+        finally:
+            j.db.execute("DROP TRIGGER refuse_same_digest")

@@ -1,0 +1,10 @@
+input_select:
+  general_display_2_ics_request:
+    name: General Display 2 ICS Request
+    options:
+      - idle
+      - starting
+      - stopping
+      - starting_timeout
+      - stopping_timeout
+    initial: idle

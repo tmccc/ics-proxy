@@ -1,0 +1,764 @@
+# Modified for the standalone iCS proxy repository.
+"""Ordinary managed process replacement recovers local zero authority through real TLS and native HTTP peers."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import socket
+import ssl
+import time
+import uuid
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+import pytest
+
+from ics_proxy_core.engine import managed_charging as charge_tests
+from ics_proxy_core.engine.managed import ManagedController
+from ics_proxy_core.engine.managed_intent import OFFLINE_PAUSE
+from ics_proxy_core.engine.managed_view import refresh_for_read
+from ics_proxy_core.engine.rpc import UnavailableError
+from ics_proxy_core.engine.security import SecurityError
+from ics_proxy_core.engine.store import RecoveryRequiredError
+from tests.charge_rig import ChargeRig
+from tests.current_rig import adjustable, locally_ready, select
+from tests.handover_helpers import crash
+from tests.managed_rig import OwnerBench, healthy, managed_session, starts
+from tests.peer_mutation_helpers import matches_operation
+from tests.prototype_rig import BOOT, START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
+
+
+@dataclass
+class OfflineRecovery:
+    """The replacement has a real refused vendor endpoint while its local native and charger peers remain alive."""
+
+    test: ChargeRig
+    original_vendor_url: str
+    prior_mode: str
+    prior_revision: int
+    prior_transaction_count: int
+    first_recovery_profile: int
+
+
+# Real previous Start/Stop facts at zero watts create historical delivery debt without ever drawing test current.
+async def prior_lifecycle_debt(test: ChargeRig, *, mapped_start: bool = False) -> None:
+    if not mapped_start:
+        await test.session.runtime.stop_vendor()
+    answer = await test.rig.bench.call(test.charger, "prior-native-authorize", "Authorize", {"idTag": "NATIVE_TIMER"})
+    assert answer[2]["idTagInfo"]["status"] == "Accepted"
+    reply = await test.rig.bench.call(
+        test.charger, "prior-native-start", "StartTransaction", START | {"idTag": "NATIVE_TIMER"}
+    )
+    local = reply[2]["transactionId"]
+    assert reply[2]["idTagInfo"]["status"] == "Accepted"
+    if mapped_start:
+        await until(lambda: test.session.journal.vendor_id(local) is not None)
+        await test.session.runtime.stop_vendor()
+    await test.rig.bench.call(
+        test.charger,
+        "prior-native-stop",
+        "StopTransaction",
+        {"transactionId": local, "timestamp": START["timestamp"], "meterStop": START["meterStart"]},
+    )
+    assert test.session.journal.active() is None and test.rig.bench.firmware.current == 0
+
+
+# Replace the ordinary real session; only its vendor destination is changed to a reserved non-listening loopback port.
+@asynccontextmanager
+async def replacement_offline(
+    directory: Path,
+    contexts: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    initial: str = "app",
+    selected: int = 16,
+    debt: str | None = None,
+    refuse_vendor: bool = True,
+) -> AsyncIterator[OfflineRecovery]:
+    async with adjustable(directory, contexts, port, monkeypatch) as first:
+        await select(first, selected)
+        await healthy(first.controller)
+        if initial == "paused":
+            first.controller.command(uuid.uuid4().hex, "pause", first.controller.requests.intent().revision)
+            await healthy(first.controller)
+        await until(lambda: first.session.journal.next_delivery() is None and not first.session.gateway.vendor._pending)
+        if debt in ("lifecycle", "mapped-stop"):
+            await prior_lifecycle_debt(first, mapped_start=debt == "mapped-stop")
+        elif debt == "mutation":
+            first.session.journal.mutation_intent(
+                "vendor", "ChangeConfiguration", {"key": "HeartbeatInterval", "value": "30"}
+            )
+        previous = first.controller.requests.intent()
+        transactions = first.session.journal.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        await first.controller.current.close()
+        await first.controller.charging.close()
+        profile_index = len(first.rig.bench.received_limits)
+        await crash(first.session)
+
+        with socket.socket() as unavailable:
+            unavailable.bind(("127.0.0.1", 0))
+            replacement = managed_session(first.rig)
+            transport = replacement.runtime.transport
+            vendor = transport.config.vendor_url
+            url = urlsplit(vendor)
+            if refuse_vendor:
+                transport.config = replace(
+                    transport.config,
+                    vendor_url=urlunsplit(
+                        (
+                            url.scheme,
+                            "127.0.0.1:" + str(unavailable.getsockname()[1]),
+                            url.path,
+                            url.query,
+                            url.fragment,
+                        )
+                    ),
+                )
+            await replacement.start()
+            controller = ManagedController(replacement)
+            try:
+                async with first.rig.charger(replacement) as charger:
+                    yield OfflineRecovery(
+                        ChargeRig(first.rig, replacement, controller, charger),
+                        vendor,
+                        previous.mode,
+                        previous.revision,
+                        transactions,
+                        profile_index,
+                    )
+            finally:
+                controller.request_stop()
+                await controller.current.close()
+                await controller.charging.close()
+                if controller.pause_task is not None:
+                    await asyncio.gather(controller.pause_task, return_exceptions=True)
+                await replacement.close()
+
+
+# A genuine new charger Boot must complete its native introduction while the vendor connection really fails.
+async def local_boot(recovery: OfflineRecovery, token: str = "offline-replacement-boot") -> None:
+    test = recovery.test
+    answer = await test.rig.bench.call(test.charger, token, "BootNotification", BOOT)
+    assert answer[0] == 3
+    await until(
+        lambda: (
+            test.session.gateway.controls.ready
+            and test.controller.native.introduced_epoch == test.session.gateway._charger_epoch
+        )
+    )
+    await until(lambda: test.session.runtime.status.vendor_failed_charger_epoch == test.session.gateway._charger_epoch)
+    assert not test.session.runtime.status.vendor_connected
+    assert test.session.journal.get("trial_phase") == "recovering"
+
+
+# Queue genuine nonmutating observations through the independent device's actual TLS connection.
+async def observations(test: ChargeRig) -> None:
+    await test.rig.bench.call(
+        test.charger,
+        "offline-real-status",
+        "StatusNotification",
+        {"connectorId": 1, "errorCode": "NoError", "status": "Preparing"},
+    )
+    await test.rig.bench.call(
+        test.charger,
+        "offline-real-meter",
+        "MeterValues",
+        {
+            "connectorId": 1,
+            "meterValue": [
+                {"timestamp": START["timestamp"], "sampledValue": [{"measurand": "Power.Active.Import", "value": "0"}]}
+            ],
+        },
+    )
+
+
+# Intent: idle app and paused services recover fresh local zero authority with selected16/32 and never issue Start.
+# Why: an unavailable vendor must not strand a safe local receiver or automatically raise its retained current.
+@pytest.mark.parametrize("initial", ["app", "paused"])
+@pytest.mark.parametrize("selected", [16, 32])
+async def test_offline_replacement_recovers_verified_pause_without_start_or_new_transaction(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    initial: str,
+    selected: int,
+) -> None:
+    async with replacement_offline(
+        tmp_path, tls, unused_tcp_port, monkeypatch, initial=initial, selected=selected
+    ) as recovery:
+        test = recovery.test
+        assert (await test.controller.tick())["state"] == "starting"
+        assert test.session.journal.get("trial_phase") == "recovering"
+        await local_boot(recovery)
+        status = await locally_ready(test.controller)
+        assert status["phase"] == "active" and status["local_hold_verified"]
+        assert status["desired_control"] == "paused" and not status["cloud_connected"]
+        reason = refresh_for_read(test.controller, status).get("pause_reason")
+        assert reason == ("cloud_connection_failed" if initial == "app" else None)
+        assert status["requested_current_a"] == selected and status["native_limit_a"] == 32
+        assert status["normal_start_ready"] and status["power_w"] == status["station_ceiling_a"] == 0
+        assert test.controller.requests.intent().revision == recovery.prior_revision + (initial == "app")
+        assert all(limit == 0 for limit in test.rig.bench.received_limits[recovery.first_recovery_profile :])
+        assert not starts(test.rig)
+        assert test.session.journal.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+
+
+# Intent: a remembered Boot body or a newly connected socket cannot substitute for actual current introduction.
+# Why: offline mode must still fence every persisted setting until its authenticated charger has freshly registered.
+async def test_offline_recovery_requires_actual_new_boot(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch) as recovery:
+        test = recovery.test
+        assert test.session.journal.get("boot")
+        for _ in range(2):
+            status = await test.controller.tick()
+            assert status["state"] == "starting" and not status.get("local_healthy", False)
+        assert test.session.journal.get("trial_phase") == "recovering"
+        assert not test.session.gateway.current_boot_seen(test.session.gateway._charger_epoch)
+        assert not starts(test.rig)
+
+
+# Intent: a real connection awaiting its first Boot acknowledgement does not count as an offline failure.
+# Why: the ordinary registration window must preserve prior app intent until actual connection failure is observed.
+@pytest.mark.parametrize("previous_failure", [False, True])
+async def test_delayed_online_boot_acknowledgement_does_not_force_offline_pause(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    previous_failure: bool,
+) -> None:
+    enabled = [False]
+    boot_waiting, release = asyncio.Event(), asyncio.Event()
+    actual_vendor = OwnerBench.vendor
+
+    # Delay only the independent backend's genuine Boot reply on its real TLS socket.
+    async def delayed_vendor(bench: OwnerBench, connection: Any) -> None:
+        actual_send = connection.send
+
+        # The backend still records and processes every real request; its selected Boot ACK waits at this boundary.
+        async def send(message: Any) -> None:
+            frame = json.loads(message)
+            boot = frame[0] == 3 and any(
+                call[0] == 2 and call[1] == frame[1] and call[2] == "BootNotification" for call in bench.calls
+            )
+            if enabled[0] and boot:
+                boot_waiting.set()
+                await release.wait()
+            await actual_send(message)
+
+        monkeypatch.setattr(connection, "send", send)
+        await actual_vendor(bench, connection)
+
+    monkeypatch.setattr(OwnerBench, "vendor", delayed_vendor)
+    async with (
+        replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch, refuse_vendor=previous_failure) as recovery,
+        AsyncExitStack() as stack,
+    ):
+        test = recovery.test
+        previous_failed_epoch = None
+        if previous_failure:
+            await local_boot(recovery, "previous-failed-generation-boot")
+            previous_failed_epoch = test.session.runtime.status.vendor_failed_charger_epoch
+            await test.session.runtime.stop_vendor()
+            await test.charger.close()
+            test.charger = await stack.enter_async_context(test.rig.charger(test.session))
+            transport = test.session.runtime.transport
+            transport.config = replace(transport.config, vendor_url=recovery.original_vendor_url)
+        enabled[0] = True
+        try:
+            reply = await test.rig.bench.call(test.charger, "delayed-online-device-boot", "BootNotification", BOOT)
+            assert reply[0] == 3
+            if previous_failure:
+                assert previous_failed_epoch != test.session.gateway._charger_epoch
+                test.session.runtime._runner = asyncio.create_task(test.session.runtime._vendor_runner())
+            await asyncio.wait_for(boot_waiting.wait(), 3)
+            await until(lambda: test.session.gateway.controls.ready)
+            assert test.session.runtime.status.vendor_connected
+            assert test.session.runtime.status.vendor_failed_charger_epoch == previous_failed_epoch
+            assert test.session.gateway.vendor_registration != "Accepted"
+            status = await test.controller.tick()
+            assert status["state"] == "waiting_for_cloud"
+            assert test.controller.requests.intent().mode == "app"
+            assert test.controller.requests.intent().revision == recovery.prior_revision
+            assert test.rig.bench.firmware.effective_limit() == 0 and not starts(test.rig)
+
+            release.set()
+            await until(lambda: test.session.gateway.vendor_registration == "Accepted")
+            status = await healthy(test.controller)
+            assert status["desired_control"] == "app" and status["station_ceiling_a"] == 16
+            assert test.controller.requests.intent().revision == recovery.prior_revision
+            assert not starts(test.rig) and test.session.journal.active() is None
+        finally:
+            release.set()
+
+
+# Intent: queued Status/Meter survives local recovery and cloud reconnection releases only its own clean Pause.
+# Why: App/schedule can resume after real delivery, and a newer owner Pause or an old unbound marker stays at zero.
+@pytest.mark.parametrize("pause", ["automatic", "owner", "legacy"])
+async def test_cloud_reconnect_flushes_observations_and_restores_only_its_own_pause(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    pause: str,
+) -> None:
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch) as recovery:
+        test = recovery.test
+        await local_boot(recovery)
+        await observations(test)
+        queue = [tuple(row) for row in test.session.journal.db.execute("SELECT * FROM outbox ORDER BY seq")]
+        assert {row[0] for row in test.session.journal.db.execute("SELECT action FROM outbox")} == {
+            "StatusNotification",
+            "MeterValues",
+        }
+        status = await locally_ready(test.controller)
+        assert status["normal_start_ready"] and status["local_hold_verified"]
+        assert queue == [tuple(row) for row in test.session.journal.db.execute("SELECT * FROM outbox ORDER BY seq")]
+        c, j = test.controller, test.session.journal
+        intent = c.requests.intent()
+        assert j.get(OFFLINE_PAUSE) == intent.revision
+        assert not starts(test.rig) and test.rig.bench.firmware.effective_limit() == 0
+        if pause == "owner":
+            c.command(uuid.uuid4().hex, "pause", intent.revision)
+            status = await locally_ready(c)
+            assert status["local_hold_verified"] and j.get(OFFLINE_PAUSE) is None
+            intent = c.requests.intent()
+        elif pause == "legacy":
+            j.put(OFFLINE_PAUSE, True)
+        transport = test.session.runtime.transport
+        transport.config = replace(transport.config, vendor_url=recovery.original_vendor_url)
+        await until(
+            lambda: (
+                test.session.gateway.vendor_registration == "Accepted" and test.session.journal.next_delivery() is None
+            )
+        )
+        status = await healthy(c)
+        if pause == "automatic":
+            assert c.requests.intent() == intent.next("app")
+            assert status["desired_control"] == "app" and status["station_ceiling_a"] == 16
+            assert j.get(OFFLINE_PAUSE) is None and "pause_reason" not in refresh_for_read(c, status)
+        else:
+            assert status["local_hold_verified"] and c.requests.intent() == intent
+            reason = refresh_for_read(c, status).get("pause_reason")
+            assert reason == ("cloud_connection_failed" if pause == "legacy" else None)
+            assert test.rig.bench.firmware.effective_limit() == 0
+        assert not starts(test.rig)
+        assert j.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == recovery.prior_transaction_count
+        assert j.db.execute("SELECT 1 FROM managed_requests WHERE action='app_control' LIMIT 1").fetchone() is None
+
+
+# Intent: a newer owner Pause revokes the automatic return while its real native read is outstanding.
+# Why: reconnecting the cloud cannot move the station above zero on stale owner authority.
+async def test_owner_pause_overtakes_automatic_return_during_native_read(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch) as recovery:
+        test = recovery.test
+        c, j = test.controller, test.session.journal
+        await local_boot(recovery)
+        await locally_ready(c)
+        intent = c.requests.intent()
+        transport = test.session.runtime.transport
+        transport.config = replace(transport.config, vendor_url=recovery.original_vendor_url)
+        await until(lambda: test.session.gateway.vendor_registration == "Accepted")
+        entered, proceed = asyncio.Event(), asyncio.Event()
+        actual = c.native.read_result
+
+        # Delay an authentic native result only inside the automatic release worker.
+        async def delayed(*args: Any, **kwargs: Any) -> Any:
+            native = await actual(*args, **kwargs)
+            if c.recovery.pending() and not entered.is_set():
+                entered.set()
+                await proceed.wait()
+            return native
+
+        monkeypatch.setattr(c.native, "read_result", delayed)
+        mark = len(test.rig.bench.received_limits)
+        task = asyncio.create_task(c.tick())
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            request = uuid.uuid4().hex
+            c.command(request, "pause", intent.revision)
+            proceed.set()
+            await task
+            status = await healthy(c)
+            assert status["local_hold_verified"] and c.requests.intent() == intent.next("paused")
+            assert c.requests.receipt(request)["state"] == "completed" and j.get(OFFLINE_PAUSE) is None
+            assert all(limit == 0 for limit in test.rig.bench.received_limits[mark:])
+            assert test.rig.bench.firmware.effective_limit() == 0 and not starts(test.rig)
+        finally:
+            proceed.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+# Intent: an explicit Return arriving during the automatic positive reply can share the verified result.
+# Why: the same owner choice must not revoke an issued release and turn a successful return into a fault.
+async def test_explicit_return_can_share_automatic_release_after_dispatch(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch) as recovery:
+        test = recovery.test
+        c, j, bench = test.controller, test.session.journal, test.rig.bench
+        await local_boot(recovery)
+        await locally_ready(c)
+        intent = c.requests.intent()
+        transport = test.session.runtime.transport
+        transport.config = replace(transport.config, vendor_url=recovery.original_vendor_url)
+        await until(lambda: test.session.gateway.vendor_registration == "Accepted")
+        entered, proceed = asyncio.Event(), asyncio.Event()
+
+        # Withhold only the real reply after the fake charger applies the restored station limit.
+        async def delay_positive(action: str, payload: dict[str, Any]) -> None:
+            if not entered.is_set() and matches_operation("restore", action, payload):
+                entered.set()
+                await proceed.wait()
+
+        monkeypatch.setattr(bench, "before_reply", delay_positive)
+        mark = len(bench.received_limits)
+        task = asyncio.create_task(c.tick())
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            assert bench.firmware.effective_limit() == 16 and c.requests.intent() == intent
+            request = uuid.uuid4().hex
+            c.command(request, "app_control", intent.revision)
+            proceed.set()
+            await task
+            status = await healthy(c)
+            assert status["desired_control"] == "app" and c.requests.intent() == intent.next("app")
+            assert c.requests.receipt(request)["state"] == "completed" and not j.fault.latched()
+            assert bench.received_limits[mark:] == [16] and not starts(test.rig)
+        finally:
+            proceed.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+# Intent: the strict legacy acknowledgement still refuses queued data while the explicit managed local path retains it.
+# Why: enabling offline managed recovery must not silently broaden unrelated commissioning/recovery callers.
+async def test_default_resume_stays_strict_and_local_only_retains_real_observation_queue(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch) as recovery:
+        test = recovery.test
+        await local_boot(recovery)
+        await observations(test)
+        test.controller.prepare_offline_pause()
+        queue = [tuple(row) for row in test.session.journal.db.execute("SELECT * FROM outbox")]
+        with pytest.raises(RecoveryRequiredError):
+            await test.controller.native.resume()
+        assert test.session.journal.get("trial_phase") == "recovering"
+        result = await test.controller.native.resume(local_only=True)
+        assert result == {"recovery_acknowledged": True, "zero_hold_retained": True, "charging_resumed": False}
+        assert queue == [tuple(row) for row in test.session.journal.db.execute("SELECT * FROM outbox")]
+        assert test.session.journal.get("trial_phase") == "active" and not starts(test.rig)
+
+
+# Intent: genuine lifecycle debt or an unresolved mutation prevents offline acknowledgement at actual zero.
+# Why: the new path permits observations only, never unresolved charging or mutating work from an earlier process.
+@pytest.mark.parametrize("debt", ["lifecycle", "mapped-stop", "mutation"])
+async def test_prior_lifecycle_or_mutation_debt_blocks_offline_readiness(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    debt: str,
+) -> None:
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch, debt=debt) as recovery:
+        test = recovery.test
+        await local_boot(recovery)
+        status = await test.controller.tick()
+        assert not status.get("local_healthy", False)
+        assert test.session.journal.get("trial_phase") == "recovering"
+        assert test.session.journal.get(OFFLINE_PAUSE) is True
+        assert test.rig.bench.firmware.effective_limit() == 0 and not starts(test.rig)
+        assert test.session.journal.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == (
+            recovery.prior_transaction_count
+        )
+
+
+# Intent: incomplete Start or Stop delivery at interruption retains the explicit Return path after backfill.
+# Why: a recovery that began with unsettled charging work must not inherit the clean idle release permission.
+@pytest.mark.parametrize("debt", ["lifecycle", "mapped-stop"])
+async def test_offline_lifecycle_debt_requires_return_after_backfill(tmp_path, tls, unused_tcp_port, monkeypatch, debt):
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch, debt=debt) as recovery:
+        test = recovery.test
+        c, j = test.controller, test.session.journal
+        await local_boot(recovery)
+        assert not (await c.tick()).get("local_healthy", False)
+        intent = c.requests.intent()
+        assert intent.mode == "paused" and j.get(OFFLINE_PAUSE) is True
+        transport = test.session.runtime.transport
+        transport.config = replace(transport.config, vendor_url=recovery.original_vendor_url)
+        await until(lambda: test.session.gateway.vendor_registration == "Accepted" and j.next_delivery() is None)
+        status = await healthy(c)
+        assert status["local_hold_verified"] and c.requests.intent() == intent
+        assert status["station_ceiling_a"] == test.rig.bench.firmware.effective_limit() == 0
+        request = uuid.uuid4().hex
+        c.command(request, "app_control", intent.revision)
+        status = await healthy(c)
+        assert status["desired_control"] == "app" and status["station_ceiling_a"] == 16
+        assert c.requests.receipt(request)["state"] == "completed" and not starts(test.rig)
+
+
+# Intent: verified zero can complete a Pause receipt even while a previous genuine Stop awaits the cloud.
+# Why: reporting the physical hold must not invent an acknowledgement or reactivate the installation.
+async def test_offline_replacement_confirms_pause_with_retained_stop(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch, debt="mapped-stop") as recovery:
+        test = recovery.test
+        c, j = test.controller, test.session.journal
+        await local_boot(recovery)
+        debt = j.next_delivery()
+        assert debt is not None and debt.action == "StopTransaction" and debt.state == "queued"
+        assert j.active() is None and debt.transaction is not None and j.vendor_id(debt.transaction) is not None
+        mark = len(test.rig.bench.device_calls)
+        request = uuid.uuid4().hex
+        c.command(request, "pause", c.requests.intent().revision)
+        assert (await c.tick())["state"] == "reconciling"
+        receipt = c.requests.receipt(request)
+        assert receipt["state"] == "completed" and receipt["result"]["pause_verified"] is True
+        assert j.phase.read().value == "recovering" and j.next_delivery() == debt
+        assert test.rig.bench.firmware.effective_limit() == 0 and not starts(test.rig)
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls[mark:])
+
+
+# Intent: unknown native activity cannot be adopted or receive a guessed Stop merely to make offline recovery available.
+# Why: owned zero and a remembered session counter do not authorize control of an external charging transaction.
+async def test_unknown_native_session_blocks_local_recovery_without_guessed_stop(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch) as recovery:
+        test = recovery.test
+        await local_boot(recovery)
+        test.rig.bench.firmware.active = 9999999
+        test.rig.bench.cp, test.rig.bench.connection = "C", "Charging"
+        test.rig.bench.history.append({"transactionId": 9999999, "origin": "unknown-native-session"})
+        status = await test.controller.tick()
+        assert not status.get("local_healthy", False) and test.session.journal.get("trial_phase") == "recovering"
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls)
+        assert not starts(test.rig) and test.rig.bench.firmware.effective_limit() == 0
+
+
+# Intent: a newer Pause, process shutdown or actual new Boot overtakes a delayed local-only native acknowledgement.
+# Why: complete native evidence from an older generation cannot reactivate a retired recovery request.
+@pytest.mark.parametrize("boundary", ["pause", "shutdown", "boot"])
+async def test_local_recovery_rechecks_authority_after_awaited_native_read(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch) as recovery, AsyncExitStack() as stack:
+        test = recovery.test
+        await local_boot(recovery)
+        test.controller.prepare_offline_pause()
+        actual = test.controller.native.observe
+        entered, proceed = asyncio.Event(), asyncio.Event()
+        delayed_once = False
+
+        # Preserve the real native HTTP result while delaying only the first acknowledgement's completion.
+        async def delayed() -> Any:
+            nonlocal delayed_once
+            native = await actual()
+            if not delayed_once:
+                delayed_once = True
+                entered.set()
+                await proceed.wait()
+            return native
+
+        monkeypatch.setattr(test.controller.native, "observe", delayed)
+        task = asyncio.create_task(test.controller.native.resume(local_only=True))
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            if boundary == "pause":
+                test.controller.command(uuid.uuid4().hex, "pause", test.controller.requests.intent().revision)
+            elif boundary == "shutdown":
+                test.controller.request_stop()
+            else:
+                new_charger = await stack.enter_async_context(test.rig.charger(test.session))
+                answer = await test.rig.bench.call(new_charger, "overtaking-real-boot", "BootNotification", BOOT)
+                assert answer[0] == 3
+            proceed.set()
+            with pytest.raises((RecoveryRequiredError, UnavailableError, SecurityError)):
+                await task
+            assert test.session.journal.get("trial_phase") == "recovering"
+            assert test.rig.bench.firmware.effective_limit() == 0 and not starts(test.rig)
+        finally:
+            proceed.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+# Intent: a normal Start after verified offline recovery must outlive its startup lease once actually observed.
+# Why: restored Pause readiness does not itself mark this epoch released, so ordinary return can mask Start proof.
+@pytest.mark.parametrize("initial", ["app", "paused"])
+async def test_normal_start_after_offline_pause_retires_startup_budget(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    initial: str,
+) -> None:
+    async with replacement_offline(
+        tmp_path, tls, unused_tcp_port, monkeypatch, initial=initial, selected=16
+    ) as recovery:
+        test = recovery.test
+        c, j, rig = test.controller, test.session.journal, test.rig
+        await local_boot(recovery)
+        status = await locally_ready(c)
+        assert status["local_hold_verified"] and status["normal_start_ready"]
+        assert not status["cloud_connected"] and c.released_epoch != test.session.gateway._charger_epoch
+        before = c.requests.intent()
+        monkeypatch.setattr(charge_tests, "STARTUP_BUDGET", 2)
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "start", before.revision)
+        await c.charging.settle()
+        lease = c.charging.lease
+        assert lease is not None and lease.normal
+        startup_deadline = lease.deadline
+        assert len(starts(rig)) == 1
+
+        # The real offline lifecycle cannot wait for cloud transaction mapping or an empty delivery queue.
+        reply = await rig.bench.call(
+            test.charger,
+            uuid.uuid4().hex,
+            "StartTransaction",
+            START | {"idTag": starts(rig)[0][3]["idTag"]},
+        )
+        assert reply[0] == 3 and reply[2]["idTagInfo"]["status"] == "Accepted"
+        local = reply[2]["transactionId"]
+        rig.peer.plan_session = (local, 987654)
+        rig.peer.paused, rig.peer.permission_enabled = False, True
+        rig.bench.cp, rig.bench.connection = "C", "Charging"
+        rig.bench.firmware.fire_plan(9)
+        for _ in range(5):
+            status = await c.tick()
+            if c.requests.receipt(identifier)["state"] == "completed":
+                break
+            await asyncio.sleep(0.02)
+        assert c.requests.receipt(identifier)["state"] == "completed"
+        assert c.charging.lease is None and c.charging.state()["state"] == "running"
+        assert j.active() == local and status["power_w"] > 0
+
+        # Crossing the original monotonic budget must not expire an already verified regular session.
+        await asyncio.sleep(max(0, startup_deadline - time.monotonic()) + 0.1)
+        status = await c.tick()
+        assert c.requests.intent().mode == "app" and c.requests.intent().revision == before.revision + 1
+        assert c.requests.receipt(identifier)["state"] == "completed" and c.charging.lease is None
+        assert j.active() == local and rig.bench.firmware.current == 16
+        assert status["local_healthy"] and not status["cloud_connected"]
+        assert j.next_delivery() is not None and test.session.journal.vendor_id(local) is None
+        assert len(starts(rig)) == 1
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)
+
+
+# Intent: a failed durable owner-epoch transition cannot publish an accepted normal Start as released app authority.
+# Why: even a genuine accepted RemoteStart must fall back to a zero hold if its intent/state transaction rolls back.
+@pytest.mark.parametrize("failure", ["statement", "commit"])
+async def test_normal_start_owner_epoch_persistence_failure_keeps_pause_authority(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    async with replacement_offline(
+        tmp_path, tls, unused_tcp_port, monkeypatch, initial="paused", selected=16
+    ) as recovery:
+        test = recovery.test
+        c, j, rig, g = test.controller, test.session.journal, test.rig, test.session.gateway
+        await local_boot(recovery)
+        assert (await locally_ready(c))["normal_start_ready"]
+        before, saved_epoch, memory_epoch = c.requests.intent(), j.get("managed_owner_epoch"), c.released_epoch
+        assert before.mode == "paused" and memory_epoch != g._charger_epoch
+        attempts = []
+
+        # Record the exact new release fact attempted by the real worker; no gateway or storage result is mocked.
+        def epoch_attempt(value):
+            attempts.append(json.loads(value))
+            return 0
+
+        j.db.create_function("review_owner_epoch_attempt", 1, epoch_attempt)
+        if failure == "statement":
+            effect = "SELECT RAISE(ABORT,'independent owner epoch storage refusal');"
+        else:
+            # A deferred real foreign key fails only when the full intent/state transaction attempts COMMIT.
+            j.db.execute("CREATE TABLE review_owner_epoch_parent(id INTEGER PRIMARY KEY)")
+            j.db.execute(
+                "CREATE TABLE review_owner_epoch_child("
+                "id REFERENCES review_owner_epoch_parent(id) DEFERRABLE INITIALLY DEFERRED)"
+            )
+            effect = "INSERT INTO review_owner_epoch_child VALUES(123);"
+        j.db.execute(
+            "CREATE TEMP TRIGGER review_owner_epoch_refusal BEFORE INSERT ON meta "
+            "WHEN NEW.key='managed_owner_epoch' BEGIN SELECT review_owner_epoch_attempt(NEW.value); " + effect + " END"
+        )
+        identifier = uuid.uuid4().hex
+        try:
+            c.command(identifier, "start", before.revision)
+            await c.charging.settle()
+        finally:
+            j.db.execute("DROP TRIGGER review_owner_epoch_refusal")
+        if c.pause_task is not None:
+            await asyncio.wait_for(c.pause_task, 8)
+        await until(lambda: rig.bench.firmware.effective_limit() == 0)
+        assert attempts == [g._charger_epoch] and not j.db.in_transaction
+        assert j.get("managed_owner_epoch") == saved_epoch and c.released_epoch == memory_epoch
+        assert c.requests.intent() == before and before.mode == "paused"
+        assert c.requests.receipt(identifier)["state"] == "uncertain"
+        assert c.requests.receipt(identifier)["result"]["classification"] == "start_not_confirmed"
+        state = c.charging.state()
+        assert state["start_attempted"] and not state["start_rpc_accepted"]
+        assert state["failure"]["type"] == "IntegrityError" and state["failure"]["effects_started"]
+        assert c.charging.lease is None and j.active() is None
+        assert j.get("local_start_receipt")["stage"] == "accepted"
+        assert len(starts(rig)) == 1
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)
+        status = await c.tick()
+        assert status["desired_control"] == "paused" and not status.get("normal_start_ready", False)
+        assert not status["owner_control_enabled"] and rig.bench.firmware.effective_limit() == 0
+        assert len(starts(rig)) == 1
+
+
+# Intent: choosing a current while cloud recovery holds zero preserves the original automatic Return.
+# Why: the revision advances for a current selection, but the owner did not request a separate Pause.
+async def test_current_selection_preserves_the_automatic_outage_pause(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch) as recovery:
+        test = recovery.test
+        c, j = test.controller, test.session.journal
+        await local_boot(recovery)
+        status = await locally_ready(c)
+        assert status["local_hold_verified"]
+        before = c.requests.intent()
+        assert j.get(OFFLINE_PAUSE) == before.revision and j.next_delivery() is None
+
+        receipt = await select(test, 24)
+        assert c.requests.receipt(receipt)["state"] == "completed"
+        selected = c.requests.intent()
+        assert selected == before.next("paused") and j.get(OFFLINE_PAUSE) == selected.revision
+        assert test.rig.bench.firmware.effective_limit() == 0
+        assert refresh_for_read(c, await locally_ready(c))["pause_reason"] == "cloud_connection_failed"
+
+        transport = test.session.runtime.transport
+        transport.config = replace(transport.config, vendor_url=recovery.original_vendor_url)
+        await until(lambda: test.session.gateway.vendor_registration == "Accepted")
+        restored = await healthy(c)
+        assert c.requests.intent() == selected.next("app")
+        assert j.get(OFFLINE_PAUSE) is None and restored["station_ceiling_a"] == 24
+        assert not starts(test.rig)

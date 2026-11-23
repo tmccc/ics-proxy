@@ -1,0 +1,31 @@
+[project]
+name = "ics-proxy"
+version = "0.2.3"
+description = "Local OCPP 1.6 proxy for supported iCS charge points with a Home Assistant client"
+requires-python = ">=3.14"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Mark Bovee" }]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+exclude = [".git", ".venv", ".venv-ha", "venv", "__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+strict = true
+python_version = "3.14"
+exclude = [".git", ".venv", ".venv-ha", "venv"]
+
+[[tool.mypy.overrides]]
+module = ["homeassistant.*", "aiohttp.*", "yaml"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "recovery_replay: short standalone proxy regressions with real journal and simulated charger observations",
+]

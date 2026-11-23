@@ -1,0 +1,743 @@
+# Modified for the standalone iCS proxy repository.
+"""Regular six-ampere Start uses real TLS/native authority without inheriting a two-minute charge timer."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import ssl
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+import pytest
+from websockets.asyncio.client import connect
+
+from ics_proxy_core.engine.managed import ManagedController
+from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
+from ics_proxy_core.engine.policy import DeniedError
+from ics_proxy_core.engine.recovery_contracts import GateDecision
+from ics_proxy_core.engine.security import SecurityError
+from ics_proxy_core.engine.store import RecoveryRequiredError
+from ics_proxy_core.engine.trial_evidence import profile_projection
+from tests.charge_rig import ChargeRig, actual_stop, owner_rig, owner_start, positive_flow
+from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_session, starts
+from tests.management_peer import TOKEN, call
+from tests.prototype_rig import START
+from tests.runtime_rig import until
+from tests.tls_support import tls as tls
+
+
+# A known real transaction may wait at zero watts while the vehicle decides whether to accept its six-ampere offer.
+async def zero_power_session(test: ChargeRig) -> int:
+    local = await positive_flow(test)
+    test.rig.peer.paused = True
+    test.rig.bench.cp, test.rig.bench.connection = "B", "Plug"
+    return local
+
+
+# Submit genuine device closure without inventing a remote Stop or changing the controller's requested mode.
+async def natural_stop(test: ChargeRig, local: int) -> None:
+    result = await test.rig.bench.call(
+        test.charger,
+        "natural-regular-stop",
+        "StopTransaction",
+        {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100},
+    )
+    assert result[0] == 3
+    test.rig.peer.permission_enabled = False
+    await until(lambda: test.session.journal.active() is None and test.session.journal.next_delivery() is None)
+
+
+# Intent: explicit regular Start works from app authority or a verified pause and continues beyond both short budgets.
+# Why: normal charging must not inherit the two-minute test cutoff or a retired startup permission after real Start.
+@pytest.mark.parametrize("initial", ["app", "paused"])
+async def test_regular_start_continues_until_explicit_pause(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    initial: str,
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.6) as test:
+        controller = test.controller
+        if initial == "paused":
+            controller.command(uuid.uuid4().hex, "pause", 0)
+            assert (await healthy(controller))["local_hold_verified"]
+        before = controller.requests.intent()
+        identifier = uuid.uuid4().hex
+        controller.command(identifier, "start", before.revision)
+        await controller.charging.settle()
+        assert controller.requests.intent().mode == "app"
+        assert controller.requests.intent().revision == before.revision + 1
+        assert len(starts(test.rig)) == 1
+        local = await positive_flow(test)
+        assert (await healthy(controller))["power_w"] == 1440
+        assert controller.requests.receipt(identifier)["state"] == "completed"
+
+        await asyncio.sleep(0.75)
+        assert controller.requests.intent().mode == "app"
+        assert test.rig.bench.firmware.current == 6 and test.session.journal.active() == local
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls)
+        assert controller.charging.lease is None
+        assert not test.session.gateway.policy.allow_local_start
+        with pytest.raises(DeniedError, match="local Start is disabled"):
+            await test.session.command({"command": "start"})
+        controller.command(uuid.uuid4().hex, "pause", controller.requests.intent().revision)
+        assert (await actual_stop(test, local))["local_hold_verified"]
+        assert test.rig.bench.firmware.effective_limit() == 0 and len(starts(test.rig)) == 1
+
+
+# Intent: an expired Start applies zero before waiting on native readings, and still Stops if zero is refused.
+# Why: neither a slow reading nor a failed limit can leave the exact known session without protection.
+@pytest.mark.parametrize("scenario", ["zero-before-read", "zero-refused", "native-closed"])
+async def test_expired_start_protects_its_exact_session(tmp_path, tls, unused_tcp_port, monkeypatch, scenario):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        c, j, bench = test.controller, test.session.journal, test.rig.bench
+        request = uuid.uuid4().hex
+        c.command(request, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await positive_flow(test)
+        assert bench.firmware.current == 6 and c.charging.lease is not None
+        actual_answer = bench.firmware.answer
+        actual_read = c.native.read
+        refused = []
+        reading, resume = asyncio.Event(), asyncio.Event()
+        read_count = 0
+        refuse_zero = scenario != "zero-before-read"
+
+        # Leave the independently observed station profile intact while refusing attempts to change it to zero.
+        def answer(action, payload):
+            if refuse_zero and action == "SetChargingProfile" and profile_projection(payload)["limit"] == 0:
+                refused.append(payload)
+                return {"status": "Rejected"}
+            return actual_answer(action, payload)
+
+        # Delay the first open reading, or close the device session before the later protective read.
+        async def read(*args, **kwargs):
+            nonlocal read_count
+            if kwargs.get("closing_local") == local:
+                read_count += 1
+                if scenario == "native-closed" and read_count == 2:
+                    bench.firmware.active = None
+                    bench.cp, bench.connection = "B", "Plug"
+                    test.rig.peer.permission_enabled = False
+                if not refuse_zero:
+                    reading.set()
+                    await resume.wait()
+            return await actual_read(*args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(bench.firmware, "answer", answer)
+            patch.setattr(c.native, "read", read)
+            c.charging.lease.deadline = time.monotonic() - 1
+            c.charging.changed.set()
+            try:
+                if not refuse_zero:
+                    await asyncio.wait_for(reading.wait(), 4)
+                    assert bench.firmware.effective_limit() == 0
+            finally:
+                resume.set()
+            await until(lambda: c.pause_task is not None and c.pause_task.done())
+            stops = [call[3] for call in bench.device_calls if call[2] == "RemoteStopTransaction"]
+            assert bool(refused) is refuse_zero and j.active() == local
+            if scenario == "native-closed":
+                assert read_count >= 2 and not stops
+            else:
+                assert stops == [{"transactionId": local}] and bench.firmware.current == 0
+        if scenario == "native-closed":
+            await natural_stop(test, local)
+            assert (await healthy(c))["local_hold_verified"]
+        else:
+            assert (await actual_stop(test, local))["local_hold_verified"]
+
+
+# Intent: an unsupported Start reply cannot publish app control from an existing Pause.
+# Why: the proxy must still treat the sent Start as unresolved and verify zero even if the body says Accepted.
+async def test_normal_start_reply_requires_exact_confirmation(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        c, j = test.controller, test.session.journal
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        mode = c.requests.intent()
+        firmware = test.rig.bench.firmware
+        answer = firmware.answer
+
+        # Alter only the simulated charger's actual Start result, preserving the rest of its device behavior.
+        def extra_start_result(action, payload):
+            result = answer(action, payload)
+            return {**result, "extra": True} if action == "RemoteStartTransaction" else result
+
+        monkeypatch.setattr(firmware, "answer", extra_start_result)
+        request = uuid.uuid4().hex
+        c.command(request, "start", mode.revision)
+        await c.charging.settle()
+        assert c.requests.intent() == mode and len(starts(test.rig)) == 1
+        assert j.get("local_start_receipt")["stage"] == "issued"
+        assert c.requests.receipt(request)["state"] == "uncertain"
+        assert test.rig.bench.firmware.effective_limit() == 0
+
+
+# Intent: a transient write refusal does not interrupt an exact running local Start.
+# Why: the next native sample must settle the same request without sending another charger command.
+async def test_running_start_receipt_retries_after_storage_refusal(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, startup=2) as test:
+        c, j = test.controller, test.session.journal
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await positive_flow(test)
+        assert c.charging.lease is not None
+        original_deadline = c.charging.lease.deadline
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_running_start BEFORE UPDATE OF state ON managed_requests "
+            f"WHEN NEW.id='{identifier}' AND NEW.state='completed' "
+            "BEGIN SELECT RAISE(ABORT,'Start confirmation write refused'); END"
+        )
+        try:
+            assert (await c.tick())["state"] == "reconciling"
+            assert c.requests.receipt(identifier)["state"] == "accepted"
+            assert test.rig.bench.firmware.current == 6 and j.active() == local
+            assert c.charging.lease is not None and c.charging.lease.deadline > original_deadline
+            await asyncio.sleep(max(0, original_deadline - time.monotonic()) + 0.05)
+            assert j.active() == local and not test.rig.bench.remote_stop.is_set()
+            assert c.requests.intent().mode == "app"
+        finally:
+            j.db.execute("DROP TRIGGER refuse_running_start")
+        assert (await healthy(c))["power_w"] == 1440
+        assert c.requests.receipt(identifier)["state"] == "completed" and c.charging.lease is None
+        assert len(starts(test.rig)) == 1 and not test.rig.bench.remote_stop.is_set()
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await actual_stop(test, local))["local_hold_verified"]
+
+
+# Intent: a failed closure write leaves an already verified session ended and retains its original Start outcome.
+# Why: an incidental metadata refusal cannot turn a natural charger Stop into a process shutdown.
+async def test_running_start_closure_retries_after_storage_refusal(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        c, j = test.controller, test.session.journal
+        identifier = uuid.uuid4().hex
+        c.command(identifier, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await positive_flow(test)
+        await healthy(c)
+        receipt = c.requests.receipt(identifier)
+        await natural_stop(test, local)
+        test.rig.bench.cp, test.rig.bench.connection = "B", "Plug"
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_closed_start BEFORE INSERT ON meta WHEN NEW.key='managed_test_charge' "
+            "AND json_extract(NEW.value,'$.state')='completed' "
+            "BEGIN SELECT RAISE(ABORT,'closed Start metadata refused'); END"
+        )
+        try:
+            assert (await c.tick())["state"] == "reconciling"
+            assert c.requests.receipt(identifier) == receipt and j.active() is None
+        finally:
+            j.db.execute("DROP TRIGGER refuse_closed_start")
+        assert (await healthy(c))["charging_session_open"] is False
+        assert c.charging.state()["state"] == "completed"
+        assert c.requests.receipt(identifier) == receipt
+        assert not test.rig.bench.remote_stop.is_set()
+
+
+# Intent: a known real session completes the Start receipt even when the car draws no current.
+# Why: protocol acceptance and a real transaction must not be misreported as positive charging power.
+async def test_regular_start_confirms_known_zero_power_session_without_invented_flow(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        identifier = uuid.uuid4().hex
+        test.controller.command(identifier, "start", 0)
+        await test.controller.charging.settle()
+        assert test.controller.requests.receipt(identifier)["state"] == "accepted"
+        local = await zero_power_session(test)
+        status = await healthy(test.controller)
+        receipt = test.controller.requests.receipt(identifier)
+        assert status["charging_session_open"] and status["power_w"] == status["current_a"] == 0
+        assert status["local_charge"] == {"state": "running", "charging": False}
+        assert receipt["state"] == "completed" and not receipt["result"].get("positive_power_verified", False)
+        assert test.controller.charging.lease is None
+
+        # A changing measurement is displayed directly, even if the stored Start cannot be updated.
+        journal = test.session.journal
+        journal.db.execute(
+            "CREATE TEMP TRIGGER refuse_charge_label BEFORE INSERT ON meta WHEN NEW.key='managed_test_charge' "
+            "BEGIN SELECT RAISE(ABORT,'charge metadata is unavailable'); END"
+        )
+        try:
+            test.rig.peer.paused = False
+            test.rig.bench.cp, test.rig.bench.connection = "C", "Charging"
+            status = await healthy(test.controller)
+            assert status["local_charge"] == {"state": "running", "charging": True}
+            assert journal.active() == local and not test.rig.bench.remote_stop.is_set()
+        finally:
+            journal.db.execute("DROP TRIGGER refuse_charge_label")
+        test.controller.command(uuid.uuid4().hex, "pause", test.controller.requests.intent().revision)
+        assert (await actual_stop(test, local))["local_hold_verified"]
+
+
+# Intent: a Start acknowledged without an actual transaction expires to zero without a guessed transaction Stop.
+# Why: normal charging loses its startup timer only after genuine known-session evidence, not an RPC reply alone.
+async def test_no_session_startup_timeout_holds_zero_without_guessed_stop(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.4) as test:
+        identifier = uuid.uuid4().hex
+        test.controller.command(identifier, "start", 0)
+        await test.controller.charging.settle()
+        assert len(starts(test.rig)) == 1 and test.session.journal.active() is None
+        await until(lambda: test.controller.requests.intent().mode == "paused")
+        await until(lambda: test.rig.bench.firmware.effective_limit() == 0)
+        if test.controller.pause_task is not None:
+            await test.controller.pause_task
+        assert test.controller.requests.receipt(identifier)["state"] != "completed"
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls)
+        assert test.session.journal.active() is None and test.rig.bench.firmware.current == 0
+        assert len(starts(test.rig)) == 1
+
+
+# Intent: repeated request identifiers retain their existing receipt while an obsolete new request cannot start again.
+# Why: lost replies and stale dashboards must not replay a regular Start or manufacture a second session.
+async def test_regular_start_duplicate_and_stale_revision_do_not_repeat_rpc(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        identifier = uuid.uuid4().hex
+        accepted = test.controller.command(identifier, "start", 0)
+        assert test.controller.command(identifier, "start", 0) == accepted
+        await test.controller.charging.settle()
+        local = await zero_power_session(test)
+        await healthy(test.controller)
+        completed = test.controller.requests.receipt(identifier)
+        assert test.controller.command(identifier, "start", 0) == completed
+        before = copy.deepcopy(test.rig.bench.device_calls)
+        with pytest.raises(RecoveryRequiredError):
+            test.controller.command(uuid.uuid4().hex, "start", 0)
+        with pytest.raises(SecurityError):
+            test.controller.command(identifier, "pause", 0)
+        assert test.rig.bench.device_calls == before and len(starts(test.rig)) == 1
+        test.controller.command(uuid.uuid4().hex, "pause", test.controller.requests.intent().revision)
+        assert (await actual_stop(test, local))["local_hold_verified"]
+
+
+# Intent: newer Pause defeats a regular Start before its worker, while queued, and during real native send validation.
+# Why: resuming a persistent pause must not override a Stop that arrived during its asynchronous handover.
+@pytest.mark.parametrize("boundary", ["immediate", "owned_task", "native_send"])
+async def test_newer_pause_preempts_regular_start(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        test.controller.command(uuid.uuid4().hex, "pause", 0)
+        await healthy(test.controller)
+        revision = test.controller.requests.intent().revision
+        entered, proceed = asyncio.Event(), asyncio.Event()
+        if boundary == "owned_task":
+            actual = test.session.gateway.controls._start
+
+            # Only scheduling is delayed; the actual owned operation still validates every real send.
+            async def delayed_start(tag: str, **fields: Any) -> Any:
+                entered.set()
+                await proceed.wait()
+                return await actual(tag, **fields)
+
+            monkeypatch.setattr(test.session.gateway.controls, "_start", delayed_start)
+        elif boundary == "native_send":
+            actual_validate = test.session.gateway.charger.validate_send
+            assert actual_validate is not None
+
+            # Preserve independent native HTTP evidence while delaying the final Start send boundary.
+            async def delayed_validate(action: str, payload: dict[str, Any]) -> GateDecision | None:
+                if action == "RemoteStartTransaction":
+                    entered.set()
+                    await proceed.wait()
+                return await actual_validate(action, payload)
+
+            monkeypatch.setattr(test.session.gateway.charger, "validate_send", delayed_validate)
+        identifier = uuid.uuid4().hex
+        test.controller.command(identifier, "start", revision)
+        try:
+            if boundary != "immediate":
+                await asyncio.wait_for(entered.wait(), 3)
+            test.controller.command(uuid.uuid4().hex, "pause", revision)
+            limits = len(test.rig.bench.received_limits)
+            proceed.set()
+            await test.controller.charging.settle()
+            await until(lambda: test.rig.bench.firmware.effective_limit() == 0)
+            if test.controller.pause_task is not None:
+                await test.controller.pause_task
+            assert test.controller.requests.intent().mode == "paused"
+            assert test.controller.requests.receipt(identifier)["state"] != "completed"
+            assert not starts(test.rig)
+            assert all(value == 0 for value in test.rig.bench.received_limits[limits:])
+            if boundary == "native_send":
+                assert not test.session.journal.get("control")["start_pending"]
+                assert test.session.journal.get("local_start_receipt")["stage"] == "unsent"
+                assert test.controller.requests.intent().mode == "paused"
+                assert (await healthy(test.controller))["local_hold_verified"]
+                returning = uuid.uuid4().hex
+                test.controller.command(returning, "app_control", test.controller.requests.intent().revision)
+                assert (await healthy(test.controller))["owner_control_enabled"]
+                assert test.controller.requests.receipt(returning)["state"] == "completed" and not starts(test.rig)
+        finally:
+            proceed.set()
+
+
+# Intent: spontaneous car/session closure completes normal charging while retaining app/schedule authority.
+# Why: the normal Start path must not install a persistent pause merely because a car finishes charging.
+async def test_natural_session_stop_keeps_app_control_without_forced_pause(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        test.controller.command(uuid.uuid4().hex, "start", 0)
+        await test.controller.charging.settle()
+        local = await positive_flow(test)
+        await healthy(test.controller)
+        intent = test.controller.requests.intent()
+        calls = len(test.rig.bench.device_calls)
+        await natural_stop(test, local)
+        status = await healthy(test.controller)
+        assert test.controller.requests.intent() == intent and intent.mode == "app"
+        assert status["owner_control_enabled"] and status["station_ceiling_a"] == 6
+        assert status["power_w"] == 0 and not status["charging_session_open"]
+        assert test.controller.charging.state()["state"] == "completed"
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls[calls:])
+        assert len(starts(test.rig)) == 1
+
+
+# Intent: a local session can stop and a new app session can start between polls without inheriting local attribution.
+# Why: a fresh nonzero meter alone cannot extend an old normal Start record over another genuine transaction.
+async def test_between_poll_app_session_is_not_attributed_to_completed_local_start(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        test.controller.command(uuid.uuid4().hex, "start", 0)
+        await test.controller.charging.settle()
+        previous = await positive_flow(test)
+        await healthy(test.controller)
+        assert test.controller.charging.state()["local_transaction"] == previous
+        assert test.controller.charging.state()["state"] == "running"
+        intent = test.controller.requests.intent()
+
+        # Both real lifecycles occur before the next service tick observes native state.
+        await natural_stop(test, previous)
+        await owner_start(test)
+        answer = await test.rig.bench.call(
+            test.charger,
+            "new-app-session-between-polls",
+            "StartTransaction",
+            START | {"idTag": "CLOUD_OWNER", "meterStart": 1100},
+        )
+        current = answer[2]["transactionId"]
+        assert answer[2]["idTagInfo"]["status"] == "Accepted" and current != previous
+        await until(
+            lambda: test.session.journal.vendor_id(current) is not None and test.session.journal.next_delivery() is None
+        )
+        test.rig.peer.paused, test.rig.peer.permission_enabled = False, True
+        test.rig.bench.cp, test.rig.bench.connection = "C", "Charging"
+        test.rig.bench.firmware.fire_plan(9)
+
+        status = await healthy(test.controller)
+        assert status["power_w"] == 1440 and status["charging_session_open"]
+        assert status["local_charge"] == {"state": "completed", "charging": False}
+        assert test.controller.charging.state()["local_transaction"] == previous
+        assert test.controller.requests.intent() == intent and intent.mode == "app"
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls)
+        assert len(starts(test.rig)) == 2 and test.session.journal.active() == current
+
+        test.controller.command(uuid.uuid4().hex, "pause", intent.revision)
+        assert (await actual_stop(test, current))["local_hold_verified"]
+
+
+# Intent: a genuine local Start and Stop before the first poll completes without installing a later timeout pause.
+# Why: actual accepted lifecycle facts remain authoritative even when no poll observed the short session open.
+async def test_complete_local_lifecycle_before_first_poll_retires_startup_without_pause(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.6) as test:
+        identifier = uuid.uuid4().hex
+        test.controller.command(identifier, "start", 0)
+        await test.controller.charging.settle()
+        local = await positive_flow(test)
+        assert test.controller.charging.state()["local_transaction"] == local
+        await natural_stop(test, local)
+        assert test.controller.requests.receipt(identifier)["state"] == "accepted"
+
+        # This is the first supervisor poll after either actual StartTransaction or actual StopTransaction.
+        status = await healthy(test.controller)
+        assert status["local_charge"] == {"state": "completed", "charging": False}
+        assert status["desired_control"] == "app" and status["power_w"] == 0
+        receipt = test.controller.requests.receipt(identifier)
+        assert receipt["state"] == "completed" and receipt["result"]["local_session_verified"]
+        assert receipt["result"]["charging"] is False
+        assert test.controller.charging.lease is None
+
+        await asyncio.sleep(0.75)
+        assert test.controller.requests.intent().mode == "app"
+        assert test.rig.bench.firmware.effective_limit() == 6
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls)
+        assert len(starts(test.rig)) == 1 and test.session.journal.active() is None
+
+
+# Intent: a complete local lifecycle followed by a legitimate app or same-tag timer session never rebinds the old Start.
+# Why: source changes and tag reuse between polls cannot make an expired local request own or stop a later session.
+@pytest.mark.parametrize("source", ["cloud", "native-timer"])
+async def test_complete_lifecycle_then_external_start_before_first_poll_keeps_new_session(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04) as test:
+        identifier = uuid.uuid4().hex
+        test.controller.command(identifier, "start", 0)
+        await test.controller.charging.settle()
+        previous = await positive_flow(test)
+        assert test.controller.charging.state()["local_transaction"] == previous
+        await natural_stop(test, previous)
+        intent = test.controller.requests.intent()
+
+        # No service tick has yet observed either lifecycle of the original local session.
+        tag = "CLOUD_OWNER" if source == "cloud" else "NATIVE_TIMER"
+        if source == "cloud":
+            await owner_start(test)
+        else:
+            authorize = await test.rig.bench.call(
+                test.charger, "subsequent-native-timer-authorize", "Authorize", {"idTag": tag}
+            )
+            assert authorize[2]["idTagInfo"]["status"] == "Accepted"
+        reply = await test.rig.bench.call(
+            test.charger,
+            "subsequent-session-before-first-poll",
+            "StartTransaction",
+            START | {"idTag": tag, "meterStart": 1100},
+        )
+        current = reply[2]["transactionId"]
+        assert reply[2]["idTagInfo"]["status"] == "Accepted" and current != previous
+        await until(
+            lambda: test.session.journal.vendor_id(current) is not None and test.session.journal.next_delivery() is None
+        )
+        assert test.controller.charging.state()["local_transaction"] == previous
+        test.rig.peer.paused, test.rig.peer.permission_enabled = False, True
+        test.rig.bench.cp, test.rig.bench.connection = "C", "Charging"
+        test.rig.bench.firmware.fire_plan(9)
+
+        status = await healthy(test.controller)
+        assert status["power_w"] == 1440 and status["charging_session_open"]
+        assert status["local_charge"] == {"state": "completed", "charging": False}
+        receipt = test.controller.requests.receipt(identifier)
+        assert receipt["state"] == "completed" and receipt["result"]["local_session_verified"]
+        assert receipt["result"]["charging"] is False
+        assert test.controller.requests.intent() == intent and intent.mode == "app"
+        assert test.controller.charging.lease is None
+        await asyncio.sleep(0.1)
+        assert test.rig.bench.firmware.current == 6 and test.session.journal.active() == current
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls)
+        assert len(starts(test.rig)) == (2 if source == "cloud" else 1)
+
+        test.controller.command(uuid.uuid4().hex, "pause", intent.revision)
+        assert (await actual_stop(test, current))["local_hold_verified"]
+
+
+# Intent: the timer itself notices an actual closed local lifecycle when no supervisor poll ever observed it.
+# Why: expiry must retire a completed request instead of installing a persistent pause after the car already stopped.
+async def test_closed_lifecycle_retired_by_timer_without_any_poll_or_pause(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch, duration=0.04, startup=0.8) as test:
+        identifier = uuid.uuid4().hex
+        test.controller.command(identifier, "start", 0)
+        await test.controller.charging.settle()
+        local = await positive_flow(test)
+        await natural_stop(test, local)
+        intent = test.controller.requests.intent()
+        assert test.controller.requests.receipt(identifier)["state"] == "accepted"
+
+        # The independent startup timer must complete this request without any call to controller.tick().
+        await until(lambda: test.controller.charging.lease is None)
+        receipt = test.controller.requests.receipt(identifier)
+        assert receipt["state"] == "completed" and receipt["result"]["local_session_verified"]
+        assert test.controller.charging.normal_summary() == {"state": "completed", "charging": False}
+        assert test.controller.requests.intent() == intent and intent.mode == "app"
+        assert test.rig.bench.firmware.effective_limit() == 6
+        assert test.controller.pause_task is None and not test.session.journal.get("control")["inhibit"]
+        assert not any(frame[2] == "RemoteStopTransaction" for frame in test.rig.bench.device_calls)
+        assert len(starts(test.rig)) == 1
+
+
+# Intent: replacing an established normal charge retains a later accepted Pause or creates an internal hold.
+# Why: restart must stop only the known session, without replaying Start or requiring the owner to Pause again.
+@pytest.mark.parametrize("newer_pause", [False, True])
+async def test_crash_during_regular_charge_recovers_to_pause_without_replay(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    newer_pause: bool,
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        identifier = uuid.uuid4().hex
+        test.controller.command(identifier, "start", 0)
+        await test.controller.charging.settle()
+        local = await positive_flow(test)
+        await healthy(test.controller)
+        if newer_pause:
+            pause = uuid.uuid4().hex
+            # Pause is allowed when the client has an older displayed revision.
+            assert test.controller.requests.intent().revision > 0
+            test.controller.command(pause, "pause", 0)
+            task = test.controller.pause_task
+            assert task is not None
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            intent = test.controller.requests.intent()
+            claim = test.session.journal.get("managed_owner_pause")
+            assert claim["revision"] == intent.revision
+        mark = len(test.rig.bench.device_calls)
+        await test.controller.charging.close()
+        await crash(test.session)
+        replacement = managed_session(test.rig)
+        await replacement.start()
+        recovered = ManagedController(replacement)
+        try:
+            assert recovered.requests.intent().mode == "paused"
+            if newer_pause:
+                assert recovered.requests.intent() == intent
+                assert replacement.journal.get("managed_owner_pause") == claim
+                assert replacement.journal.get("control")["ticket"] == claim["ticket"]
+                assert recovered.requests.pending_pause()
+                assert recovered.requests.receipt(pause)["state"] == "accepted"
+            assert recovered.charging.normal_summary()["charging"] is False
+            async with test.rig.charger(replacement) as charger:
+                await introduced(test.rig, replacement, charger, "normal-start-replacement")
+                recovered_test = ChargeRig(test.rig, replacement, recovered, charger)
+                stopped = await actual_stop(recovered_test, local)
+                stop_targets = [
+                    frame[3]["transactionId"]
+                    for frame in test.rig.bench.device_calls[mark:]
+                    if frame[2] == "RemoteStopTransaction"
+                ]
+                assert stop_targets and set(stop_targets) == {local}
+                assert stopped["local_hold_verified"] and stopped["power_w"] == 0
+                assert stopped["local_charge"]["charging"] is False
+                if newer_pause:
+                    assert recovered.requests.receipt(pause)["state"] == "completed"
+                    assert recovered.requests.intent() == intent
+                assert len(starts(test.rig)) == 1 and test.rig.bench.firmware.effective_limit() == 0
+                assert recovered.requests.intent().mode == "paused" and recovered.charging.lease is None
+        finally:
+            await recovered.charging.close()
+            if recovered.pause_task is not None:
+                await asyncio.gather(recovered.pause_task, return_exceptions=True)
+            await replacement.close()
+
+
+# Intent: retained terminal history permits normal Start while preserving its later explicit Pause.
+# Why: completed UUID evidence must not impose a lifetime command budget or make a running charge unpausable.
+@pytest.mark.parametrize("count", [4094, 4095])
+async def test_normal_start_and_pause_remain_available_after_terminal_history(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    count: int,
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        journal = test.session.journal
+        with journal.atomic():
+            journal.db.executemany(
+                "INSERT INTO managed_requests VALUES(?,'pause',0,'completed','{}')",
+                [(format(index, "032x"),) for index in range(1, count + 1)],
+            )
+        identifier = uuid.uuid4().hex
+        test.controller.command(identifier, "start", 0)
+        await test.controller.charging.settle()
+        local = await positive_flow(test)
+        await healthy(test.controller)
+        assert journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] == count + 1
+        test.controller.command(uuid.uuid4().hex, "pause", test.controller.requests.intent().revision)
+        assert (await actual_stop(test, local))["local_hold_verified"]
+        assert journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] == count + 2
+
+
+# Intent: the authenticated normal Start protocol rejects caller-selected current, tag or duration before acceptance.
+# Why: exposing a regular button must not expose a general charger RPC or override the fixed six-ampere policy.
+@pytest.mark.parametrize("extra", [{"current_a": 32}, {"id_tag": "UNAPPROVED"}, {"duration_seconds": 99999}])
+async def test_normal_start_api_rejects_arbitrary_parameters_without_effects(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: dict[str, Any],
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as test:
+        port = unused_tcp_port_factory()
+        published = {**await healthy(test.controller), "running": True, "certificate_remaining_seconds": 86400}
+        api = ManagementServer(
+            ManagementSettings(port, tmp_path / "unused-secret", TOKEN), test.controller, lambda: published
+        )
+        await api.start()
+        try:
+            async with connect(
+                f"ws://127.0.0.1:{port}/management",
+                additional_headers={"Authorization": "Bearer " + TOKEN},
+                subprotocols=["ics-proxy.v1"],
+            ) as socket:
+                before = copy.deepcopy(test.rig.bench.device_calls)
+                result = await call(socket, "start", revision=0, **extra)
+                assert result == {"ok": False, "error": "invalid_request"}
+                assert test.rig.bench.device_calls == before and not starts(test.rig)
+                assert test.session.journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] == 0
+        finally:
+            await api.close()
+
+
+# Intent: Return is rejected while already in app mode and remains an explicit valid transition from verified pause.
+# Why: normal Start is a separate action; redundant Return must not become another release or Start route.
+async def test_return_requires_verified_paused_mode(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        before = copy.deepcopy(test.rig.bench.device_calls)
+        with pytest.raises(RecoveryRequiredError):
+            test.controller.command(uuid.uuid4().hex, "app_control", 0)
+        assert test.rig.bench.device_calls == before
+        test.controller.command(uuid.uuid4().hex, "pause", 0)
+        assert (await healthy(test.controller))["local_hold_verified"]
+        revision = test.controller.requests.intent().revision
+        request = uuid.uuid4().hex
+        test.controller.command(request, "app_control", revision)
+        status = await healthy(test.controller)
+        assert status["desired_control"] == "app" and status["station_ceiling_a"] == 6
+        assert test.controller.requests.receipt(request)["state"] == "completed"
+        assert not starts(test.rig)

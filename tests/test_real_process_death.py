@@ -1,0 +1,918 @@
+# Modified for the standalone iCS proxy repository.
+"""A real managed-service process dies at actual SQL boundaries while independent physical peers survive."""
+
+import asyncio
+import copy
+import json
+import os
+import signal
+import sqlite3
+import uuid
+from contextlib import closing
+
+import pytest
+
+from ics_proxy_core import commands
+from tests.cloud_start_helpers import StartReplyBench
+from tests.managed_rig import starts
+from tests.model_tls_support import model_tls as model_tls
+from tests.model_tls_support import tls_for_case
+from tests.native_peer_failures import InterruptedNativePeer
+from tests.process_helpers import process_rig
+from tests.prototype_rig import START
+from tests.recovery_barriers import require_zero_held
+from tests.runtime_rig import until
+from tests.test_cloud_ack_storage import HeldReply, SqlFault, StorageBench
+from tests_model.catalog import input_digest
+from tests_model.deep_cases import process_current_candidates, process_overlap_candidates, process_start_candidates
+from tests_model.test_current_sequences import BoundaryPeer
+
+
+# Intent: a saved definite forwarded Start reply survives an actual process cut and permits the next scheduled charge.
+# Why: a cut before the reply commits has a different, genuinely unknown outcome and must retain a protective hold.
+@pytest.mark.recovery_replay
+@pytest.mark.parametrize("cut", ["before-forwarded-reply-commit", "after-forwarded-reply-commit"])
+async def test_process_cut_at_forwarded_start_reply(tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, cut):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        ports(),
+        ports(),
+        monkeypatch,
+        16,
+        native_peer=InterruptedNativePeer,
+        timing="fast-poll",
+    ) as child:
+        bench = child.rig.bench
+        answer = bench.firmware.answer
+
+        # Keep the real simulated charger link and return a definite rejection for the app command.
+        def reject(action, payload):
+            return {"status": "Rejected"} if action == "RemoteStartTransaction" else answer(action, payload)
+
+        # Inspect only the exact original command's committed records through an independent read-only connection.
+        def recorded(identifier):
+            path = child.rig.prepared.config.journal
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                return db.execute(
+                    "SELECT state,wire_result FROM vendor_command_scope JOIN mutations ON mutation=token "
+                    "WHERE request=?",
+                    (identifier,),
+                ).fetchone()
+
+        monkeypatch.setattr(bench.firmware, "answer", reject)
+        await child.start()
+        await child.status()
+        intent = child.durable()["metadata"]["managed_control_intent"]
+        identifier = uuid.uuid4().hex
+        await child.arm(cut, identifier)
+        caller = asyncio.create_task(bench.cloud_call(identifier, "RemoteStartTransaction", {"idTag": "APP_OWNER"}))
+        try:
+            gate = await child.gate(cut, identifier)
+            saved = cut.startswith("after")
+            assert gate["transaction_open"] is not saved
+            assert recorded(identifier) == ("pending", "Rejected" if saved else "dispatched")
+            await child.kill()
+        finally:
+            caller.cancel()
+            await asyncio.gather(caller, return_exceptions=True)
+
+        await child.start()
+        assert child.durable()["metadata"]["managed_control_intent"] == intent
+        assert recorded(identifier) == (("confirmed", "Rejected") if saved else ("uncertain", "dispatched"))
+        assert len(starts(child.rig)) == 1
+        if saved:
+            assert (await child.status())["requested_current_a"] == 16
+            assert await child.scheduled_sessions(16, True)
+        else:
+            status = await child.status(
+                lambda value: (
+                    value.get("charger_connected") is True and value.get("operator_reconciliation_required") is True
+                )
+            )
+            assert status["vendor_write_uncertain"] == 1 and not status["can_start"]
+            assert bench.firmware.effective_limit() == 0
+        assert len(starts(child.rig)) == 1
+
+
+# Intent: the saved exact owner reply recovers local Start when its older receipt update never happened.
+# Why: a real rejection survives process death without any automatic Start or change to the newer hold.
+@pytest.mark.recovery_replay
+async def test_process_recovers_saved_owner_start_reply(tmp_path, model_tls, monkeypatch, unused_tcp_port_factory):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path, tls_for_case(tmp_path, model_tls), ports(), ports(), monkeypatch, 16, timing="fast-poll"
+    ) as child:
+        bench = child.rig.bench
+        answer = bench.firmware.answer
+
+        # The independent charger issues a real rejection on the original wire request.
+        def reject(action, payload):
+            return {"status": "Rejected"} if action == "RemoteStartTransaction" else answer(action, payload)
+
+        monkeypatch.setattr(bench.firmware, "answer", reject)
+        await child.start()
+        state = await child.status()
+        pause = uuid.uuid4().hex
+        response = await child.request("pause", id=pause, revision=state["control_revision"])
+        assert response["ok"]
+        await child.completed_control(pause)
+        state = await child.status(lambda value: value.get("local_hold_verified") is True)
+        identifier = uuid.uuid4().hex
+        cut = "after-owner-start-reply-write"
+        await child.arm(cut, identifier)
+        request = asyncio.create_task(child.request("start", id=identifier, revision=state["control_revision"]))
+        try:
+            gate = await child.gate(cut, identifier)
+            assert not gate["transaction_open"]
+            held = child.durable()["metadata"]
+            assert held["local_start_receipt"]["stage"] == "issued" and len(starts(child.rig)) == 1
+            await child.kill()
+        finally:
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+
+        await child.start()
+        recovered = child.durable()["metadata"]
+        assert recovered["local_start_receipt"]["stage"] == "rejected"
+        assert recovered["managed_control_intent"] == held["managed_control_intent"]
+        status = await child.status(lambda value: value.get("local_hold_verified") is True)
+        assert status["requested_current_a"] == 16 and bench.firmware.effective_limit() == 0
+        assert len(starts(child.rig)) == 1
+
+
+# Intent: a profile answer saved before local resource settlement survives process death without retransmission.
+# Why: the actual reply and its originally translated resource are durable even when local publication is interrupted.
+@pytest.mark.recovery_replay
+async def test_process_finishes_saved_profile_acknowledgement(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory
+):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path, tls_for_case(tmp_path, model_tls), ports(), ports(), monkeypatch, 16, timing="fast-poll"
+    ) as child:
+        bench = child.rig.bench
+        await child.start()
+        await child.status()
+        identifier, boundary = uuid.uuid4().hex, "after-forwarded-reply-commit"
+        profile = commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 16, 111, stack_level=2)
+        await child.arm(boundary, identifier)
+        caller = asyncio.create_task(bench.cloud_call(identifier, "SetChargingProfile", profile))
+
+        # Read the exact command and physical resource through an independent read-only SQLite connection.
+        def saved():
+            path = child.rig.prepared.config.journal
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                return db.execute(
+                    "SELECT m.state,v.wire_result,v.wire_request,v.profile,r.state FROM vendor_command_scope v "
+                    "JOIN mutations m ON v.mutation=m.token JOIN trial_resources r ON r.key='profile:'||v.profile "
+                    "WHERE v.request=?",
+                    (identifier,),
+                ).fetchone()
+
+        try:
+            await child.gate(boundary, identifier)
+            state, actual, wire, local, resource = saved()
+            assert (state, actual, resource) == ("pending", "Accepted", "pending")
+            assert local in bench.firmware.profiles
+            await child.kill()
+        finally:
+            caller.cancel()
+            await asyncio.gather(caller, return_exceptions=True)
+
+        await child.start()
+        assert saved() == ("confirmed", "Accepted", wire, local, "confirmed")
+        assert (await child.status())["requested_current_a"] == 16
+        assert sum(frame[1] == wire for frame in bench.device_calls) == 1
+
+
+# Intent: a saved forwarded Stop acknowledgement survives replacement with its original session still open.
+# Why: the charger must report actual closure and the proxy must retain the original start and stop records.
+@pytest.mark.recovery_replay
+async def test_process_saved_forwarded_stop_waits_for_closure(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory
+):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path, tls_for_case(tmp_path, model_tls), ports(), ports(), monkeypatch, 16, timing="fast-poll"
+    ) as child:
+        bench = child.rig.bench
+        await child.start()
+        await child.status()
+        intent = child.durable()["metadata"]["managed_control_intent"]
+        start = START | {"idTag": "NATIVE_TIMER"}
+        answer = await bench.call(child.socket, uuid.uuid4().hex, "StartTransaction", start)
+        assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted"
+        local = answer[2]["transactionId"]
+        vendor = (await child.delivered(local))["vendor"]
+
+        identifier = uuid.uuid4().hex
+        cut = "after-forwarded-reply-commit"
+        await child.arm(cut, identifier)
+        caller = asyncio.create_task(bench.cloud_call(identifier, "RemoteStopTransaction", {"transactionId": vendor}))
+
+        # Observe only the exact forwarded command's committed state, independently of the service process.
+        def recorded():
+            path = child.rig.prepared.config.journal
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                return db.execute(
+                    "SELECT state,wire_result,wire_request,local FROM vendor_command_scope "
+                    "JOIN mutations ON mutation=token WHERE request=?",
+                    (identifier,),
+                ).fetchall()
+
+        try:
+            await child.gate(cut, identifier)
+            [(state, result, wire, target)] = recorded()
+            assert (state, result, target) == ("pending", "Accepted", local)
+            assert bench.firmware.active == local
+            await child.kill()
+        finally:
+            caller.cancel()
+            await asyncio.gather(caller, return_exceptions=True)
+
+        await child.start()
+        assert recorded() == [("confirmed", "Accepted", wire, local)]
+        durable = child.durable()
+        assert durable["metadata"]["managed_control_intent"] == intent
+        assert durable["transactions"][0]["stop"] is None
+        stop = {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"}
+        answer = await bench.call(child.socket, uuid.uuid4().hex, "StopTransaction", stop)
+        assert answer[0] == 3
+        transaction = await child.delivered(local, closed=True)
+        assert transaction["vendor"] == vendor
+        assert json.loads(transaction["start"]) == start
+        assert json.loads(transaction["stop"]) == stop
+        assert sum(frame[1] == wire for frame in bench.device_calls) == 1
+
+
+# Intent: a saved cloud acknowledgement and the original Pause survive real process death after SQLite refuses it.
+# Why: report, physical closure and cloud delivery must converge without replaying the accepted charger Stop.
+@pytest.mark.recovery_replay
+@pytest.mark.parametrize("native_first", [False, True])
+async def test_process_resumes_exact_pause_after_stop_ack_write_fails(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, native_first
+):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        ports(),
+        ports(),
+        monkeypatch,
+        bench_type=StorageBench,
+        timing="fast-poll",
+    ) as child:
+        rig, bench = child.rig, child.rig.bench
+        await child.start()
+        await child.status()
+        start = START | {"idTag": "NATIVE_TIMER"}
+        answer = await bench.call(child.socket, uuid.uuid4().hex, "StartTransaction", start)
+        assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted"
+        local = answer[2]["transactionId"]
+        original = await child.delivered(local)
+        rig.peer.plan_session = (local, 9)
+        rig.peer.paused, rig.peer.permission_enabled = False, True
+        bench.cp, bench.connection = "C", "Charging"
+        bench.firmware.fire_plan(9)
+        charging = await child.status(lambda status: (status.get("power_w") or 0) > 0)
+
+        mark = len(bench.device_calls)
+        identifier = uuid.uuid4().hex
+        assert (await child.request("pause", id=identifier, revision=charging["control_revision"]))["ok"]
+        path = rig.prepared.config.journal
+
+        # Read only committed replies, independently of the service that attempted to publish them.
+        def receipt_row(sql, arg):
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                return db.execute(sql, (arg,)).fetchone()
+
+        await until(
+            lambda: (
+                receipt_row(
+                    "SELECT reply FROM owner_command_wires WHERE request=? AND action='RemoteStopTransaction'",
+                    identifier,
+                )
+                == ("Accepted",)
+            )
+        )
+        require_zero_held(rig, mark)
+        native, open_session = rig.peer.native, rig.peer.native("SESSION")
+        cloud = HeldReply("StopTransaction", asyncio.Event(), asyncio.Event())
+        bench.held_reply = cloud
+        stop = {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"}
+        with monkeypatch.context() as patch:
+            if not native_first:
+                patch.setattr(rig.peer, "native", lambda key: open_session if key == "SESSION" else native(key))
+            else:
+                seen_closed = asyncio.Event()
+
+                # Witness the child's genuine native read before the charger sends its lifecycle report.
+                def observe_closed(key):
+                    if key == "SESSION" and bench.firmware.active is None:
+                        seen_closed.set()
+                    return native(key)
+
+                patch.setattr(rig.peer, "native", observe_closed)
+                bench.firmware.active = None
+                bench.cp, bench.connection = "B", "Plug"
+            rig.peer.permission_enabled = False
+            try:
+                if native_first:
+                    await asyncio.wait_for(seen_closed.wait(), 5)
+                    assert receipt_row("SELECT stop FROM transactions WHERE local=?", local) == (None,)
+                assert (await bench.call(child.socket, uuid.uuid4().hex, "StopTransaction", stop))[0] == 3
+                await asyncio.wait_for(cloud.arrived.wait(), 5)
+                fault = SqlFault("delete", cloud.token)
+                with closing(sqlite3.connect(path)) as db, db:
+                    fault.install(db)
+                cloud.release.set()
+                await child.status(
+                    lambda status: status.get("diagnostics", {}).get("protocol", {}).get("delivery_cause") == "storage"
+                )
+                assert receipt_row("SELECT state FROM outbox WHERE token=?", cloud.token) == ("inflight",)
+                saved = receipt_row("SELECT answer FROM delivery_replies WHERE token=?", cloud.token)
+                assert saved is not None and json.loads(saved[0]) == cloud.answer
+                require_zero_held(rig, mark)
+                await child.kill()
+                with closing(sqlite3.connect(path)) as db, db:
+                    fault.remove(db)
+                await child.start()
+                closed = await child.delivered(local, closed=True)
+                assert closed["vendor"] == original["vendor"] and closed["start"] == original["start"]
+                assert json.loads(closed["stop"]) == stop
+                if not native_first:
+                    receipt = (await child.request("receipt", request_id=identifier))["result"]
+                    assert receipt["state"] != "completed"
+                    assert not (await child.status(lambda status: status.get("boot_verified")))["local_hold_verified"]
+                require_zero_held(rig, mark)
+            finally:
+                cloud.release.set()
+
+        paused = await child.status(lambda status: status.get("local_hold_verified") is True)
+        assert (await child.completed_control(identifier))["result"]["pause_verified"]
+        require_zero_held(rig, mark)
+        returned = await child.request("app_control", revision=paused["control_revision"])
+        assert returned["ok"]
+        await child.completed_control(returned["result"]["id"])
+        assert (await child.status())["station_ceiling_a"] == 6
+        assert [frame[3] for frame in bench.device_calls[mark:] if frame[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
+        assert sum(frame[1] == cloud.token for frame in bench.lifecycle_wires) == 1
+        assert len(child.kills) == 1 and child.kills[0]["pid"] != child.process.pid
+
+
+# Intent: automatic recovery after real process death retires its exact abandoned choice before later selections.
+# Why: a restored physical ceiling alone can conceal an orphan uncertain request that later blocks debt recovery.
+@pytest.mark.parametrize("case", process_overlap_candidates(), ids=lambda case: case.identifier)
+async def test_process_sigkill_automatic_current_overlap(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, record_property, case
+):
+    events = []
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        unused_tcp_port_factory(),
+        unused_tcp_port_factory(),
+        monkeypatch,
+        case.initial,
+        native_peer=BoundaryPeer,
+        timing="fast-poll",
+    ) as child:
+        await child.start()
+        ready = await child.status()
+        peer, bench = child.rig.peer, child.rig.bench
+        plans, configuration = copy.deepcopy(bench.firmware.plans), copy.deepcopy(peer.configuration)
+        seen_target = False
+
+        # Only the independent device observes the real applied profile/composite before arming its next HTTP read.
+        async def after_device(action, payload):
+            nonlocal seen_target
+            if action == "SetChargingProfile":
+                profile = payload["csChargingProfiles"]
+                if profile["chargingProfileId"] == 7001:
+                    seen_target |= profile["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == case.target
+            if action == "GetCompositeSchedule" and seen_target and not peer.entered.is_set():
+                peer.arm = True
+
+        bench.before_reply = after_device if case.boundary == "native-after" else None
+        peer.arm = case.boundary == "native-before"
+        identifier, revision = uuid.uuid4().hex, ready["control_revision"]
+        assert (await child.request("set_current", id=identifier, revision=revision, current_a=case.target))["ok"]
+        events.append("current-pending")
+        await asyncio.wait_for(peer.entered.wait(), 5)
+        assert json.loads(peer.request)["action"] == "getConfig"
+        assert bench.firmware.effective_limit() == (case.target if seen_target else case.initial)
+        assert seen_target is (case.boundary == "native-after")
+        bench.before_reply = None
+        events.append("held-native")
+        local = max(row["transactionId"] for row in bench.history) + 1
+        bench.firmware.active = local
+        bench.firmware.fire_plan(9)
+        bench.cp, bench.connection = ("C", "Charging") if case.demand else ("B", "Plug")
+        peer.paused, peer.permission_enabled = False, case.demand
+        bench.firmware.requested_current = 32 if case.demand else 0
+        peer.plan_session = (local, 9)
+        answer = await bench.call(child.socket, uuid.uuid4().hex, "StartTransaction", START | {"idTag": "NATIVE_TIMER"})
+        assert answer[0] == 3 and answer[2]["transactionId"] == local
+        events.append("original-start")
+        mapped = await child.delivered(local)
+        cloud_start = next(frame for frame in reversed(bench.calls) if frame[0] == 2 and frame[2] == "StartTransaction")
+        cloud_reply = next(frame for frame in bench.sent_vendor_replies if frame[1] == cloud_start[1])
+        assert mapped["vendor"] == cloud_reply[2]["transactionId"]
+        snapshot = child.durable()
+        assert snapshot["metadata"]["managed_current_change"]["state"] == "pending"
+        assert next(row for row in snapshot["requests"] if row["id"] == identifier)["state"] == "accepted"
+        events.append("cloud-mapped")
+        await child.kill()
+        events.append("sigkill")
+        peer.release.set()
+        first_restart_call = len(bench.device_calls)
+        await child.start()
+        events.append("restart")
+        await child.status(
+            lambda value: (
+                value.get("owner_control_enabled") is True
+                and value.get("station_ceiling_a") == case.initial
+                and bench.firmware.effective_limit() == case.initial
+            )
+        )
+        profiles = [
+            frame[3]["csChargingProfiles"]
+            for frame in bench.device_calls[first_restart_call:]
+            if frame[2] == "SetChargingProfile"
+        ]
+        limits = [profile["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] for profile in profiles]
+        assert limits and limits[0] == 0 and set(limits) <= {0, case.initial}
+        assert child.durable()["metadata"]["managed_control_intent"] == {"mode": "app", "revision": revision + 1}
+        events.append("automatic-restore")
+        receipt = (await child.request("receipt", request_id=identifier))["result"]
+        assert receipt["state"] == "failed"
+        assert receipt["result"] == {
+            "classification": "superseded_by_verified_overlap_recovery",
+            "current_a": case.initial,
+        }
+        assert child.durable()["metadata"]["managed_current_change"]["state"] == "cancelled"
+        events.append("retired-receipt")
+        await child.native_outage(case.initial, case.demand)
+        events.append("original-outage")
+        assert (
+            await bench.call(
+                child.socket,
+                uuid.uuid4().hex,
+                "StopTransaction",
+                {
+                    "transactionId": local,
+                    "meterStop": 1500,
+                    "timestamp": "2026-01-01T00:01:00Z",
+                },
+            )
+        )[0] == 3
+        peer.permission_enabled = False
+        await child.delivered(local, closed=True)
+        state = await child.status(lambda value: value.get("can_set_current") is True)
+        events.append("original-closed")
+        newer = uuid.uuid4().hex
+        assert (
+            await child.request("set_current", id=newer, revision=state["control_revision"], current_a=case.target)
+        )["ok"]
+        state = await child.status(
+            lambda value: value.get("requested_current_a") == case.target and value.get("can_set_current") is True
+        )
+        assert (await child.request("receipt", request_id=newer))["result"]["state"] == "completed"
+        assert bench.firmware.effective_limit() == case.target
+        events.append("new-selection")
+        before = copy.deepcopy(bench.device_calls)
+        assert (await child.request("set_current", id=identifier, revision=revision, current_a=case.target))[
+            "result"
+        ] == receipt
+        assert bench.device_calls == before
+        assert (await child.request("receipt", request_id=identifier))["result"] == receipt
+        assert not (await child.request("set_current", id=identifier, revision=revision, current_a=case.initial))["ok"]
+        assert bench.device_calls == before
+        after_replay = child.durable()["metadata"]
+        assert after_replay["managed_current_change"]["id"] == newer
+        assert after_replay["managed_control_intent"]["revision"] == state["control_revision"]
+        events.append("replay-old")
+        later = await child.ordinary_recovery(case.target, case.demand, start_minute=2)
+        assert len(later) == len(set(later)) == 2 and local not in later
+        assert not child.durable()["outbox"]
+        events.extend(case.events[-4:])
+        assert not [
+            frame for frame in bench.device_calls if frame[2] in ("RemoteStartTransaction", "RemoteStopTransaction")
+        ]
+        assert bench.firmware.plans == plans and peer.configuration == configuration
+        assert not [
+            row
+            for row in child.durable()["requests"]
+            if row["action"] != "pause" and row["state"] in ("accepted", "running", "uncertain")
+        ]
+        assert events == list(case.events) and len(child.kills) == 1
+    record_property("model_case", case.identifier)
+    record_property("model_family", "process_overlap")
+    record_property("model_input_sha256", input_digest("process_overlap", case))
+    record_property("completed_events", events)
+    record_property("suffix_complete", True)
+    for key in (
+        "independent_mapping",
+        "automatic_restore",
+        "receipt_retired_before_new_selection",
+        "later_selection_verified",
+        "peers_survived",
+    ):
+        record_property(key, True)
+    record_property("actual_sigkill", child.kills[0]["returncode"] == -9)
+
+
+# Intent: real SIGKILL at every pre-dispatch atomic boundary preserves no-send proof and fresh owner recovery.
+# Why: graceful runtime cancellation cannot establish what survives actual interpreter death and SQLite WAL recovery.
+@pytest.mark.parametrize(
+    "case",
+    process_start_candidates()[::6] if os.environ.get("MODEL_SMOKE") else process_start_candidates(),
+    ids=lambda case: case.identifier,
+)
+async def test_process_sigkill_before_start_dispatch(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, record_property, case
+):
+    phase, events, complete = case.phase, [], False
+    listener, management = unused_tcp_port_factory(), unused_tcp_port_factory()
+    assert listener != management
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        listener,
+        management,
+        monkeypatch,
+        case.selected,
+        native_peer=InterruptedNativePeer,
+        timing="fast-poll",
+    ) as child:
+        plans, config = copy.deepcopy(child.rig.bench.firmware.plans), copy.deepcopy(child.rig.peer.configuration)
+        await child.start()
+        ready = await child.status()
+        events.append("healthy")
+        identifier = uuid.uuid4().hex
+        await child.arm(phase, identifier)
+        events.append("armed")
+        request = asyncio.create_task(child.request("start", id=identifier, revision=ready["control_revision"]))
+        marker = await child.gate(phase, identifier)
+        events.append("sql-boundary")
+        durable = child.durable()["metadata"]
+        if phase in ("after-prepared-commit", "before-issued-commit"):
+            assert durable["managed_test_charge"]["start_attempted"] is True
+            assert durable["local_start_receipt"]["stage"] == "prepared"
+            assert marker["transaction_open"] is (phase == "before-issued-commit")
+        else:
+            assert durable["managed_test_charge"]["start_attempted"] is False
+            assert "local_start_receipt" not in durable
+        assert not starts(child.rig)
+        events.append("durable-read")
+        await child.kill()
+        events.append("sigkill")
+        await asyncio.gather(request, return_exceptions=True)
+        await child.start()
+        events.append("restart")
+        await child.status(lambda value: value.get("charger_connected") is True)
+        state = (await child.request("status"))["result"]
+        assert (await child.request("pause", revision=state["control_revision"]))["ok"]
+        paused = await child.status(lambda value: value.get("local_hold_verified") is True)
+        assert child.rig.bench.firmware.effective_limit() == 0
+        events.append("pause")
+        abandoned = (await child.request("receipt", request_id=identifier))["result"]
+        assert abandoned["state"] == "failed"
+        assert abandoned["result"] == {"classification": "start_not_accepted_at_verified_zero"}
+        events.append("retired")
+        assert (await child.request("app_control", revision=paused["control_revision"]))["ok"]
+        await child.status(
+            lambda value: value.get("owner_control_enabled") is True and value.get("station_ceiling_a") == case.selected
+        )
+        events.append("return")
+        await child.ordinary_recovery(case.selected, case.demand)
+        assert (await child.request("receipt", request_id=identifier))["result"] == abandoned
+        events.extend(case.events[-4:])
+        assert len(child.kills) == 1 and not starts(child.rig)
+        assert child.rig.bench.firmware.plans == plans and child.rig.peer.configuration == config
+        assert events == list(case.events)
+        complete = True
+    record_property("model_case", case.identifier)
+    record_property("model_family", "process_start")
+    record_property("model_input_sha256", input_digest("process_start", case))
+    record_property("completed_events", events)
+    record_property("suffix_complete", complete)
+    record_property("actual_sigkill", child.kills[0]["returncode"] == -9)
+    record_property("independent_durable_read", True)
+    record_property("peers_survived", True)
+
+
+# Intent: process death around real current-selection COMMIT retains exactly the last committed choice.
+# Why: an applied target ceiling is not proof of a completed owner selection, including while paused.
+@pytest.mark.parametrize(
+    "case",
+    process_current_candidates()[::6] if os.environ.get("MODEL_SMOKE") else process_current_candidates(),
+    ids=lambda case: case.identifier,
+)
+async def test_process_sigkill_current_selection(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, record_property, case
+):
+    events = []
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        unused_tcp_port_factory(),
+        unused_tcp_port_factory(),
+        monkeypatch,
+        case.initial,
+        native_peer=InterruptedNativePeer,
+        timing="fast-poll",
+    ) as child:
+        await child.start()
+        state = await child.status()
+        if case.intent == "paused":
+            assert (await child.request("pause", revision=state["control_revision"]))["ok"]
+            state = await child.status(lambda value: value.get("local_hold_verified") is True)
+        identifier = uuid.uuid4().hex
+        await child.arm(case.phase, identifier)
+        request = asyncio.create_task(
+            child.request("set_current", id=identifier, revision=state["control_revision"], current_a=case.target)
+        )
+        events.append("choose")
+        await child.gate(case.phase, identifier)
+        events.append("sql-boundary")
+        snapshot = child.durable()
+        change = snapshot["metadata"]["managed_current_change"]
+        assert change["id"] == identifier
+        committed = case.phase == "after-current-success-commit"
+        assert change["state"] == ("completed" if committed else "pending")
+        row = next(row for row in snapshot["requests"] if row["id"] == identifier)
+        assert row["state"] == ("completed" if committed else "accepted")
+        events.append("durable-read")
+        await child.kill()
+        events.append("sigkill")
+        await asyncio.gather(request, return_exceptions=True)
+        await child.start()
+        events.append("restart")
+        await child.ordinary_recovery(case.target if committed else case.initial, True)
+        receipt = (await child.request("receipt", request_id=identifier))["result"]
+        assert receipt["state"] == ("completed" if committed else "failed")
+        events.extend(case.events[-4:])
+        assert len(child.kills) == 1 and not starts(child.rig)
+        assert events == list(case.events)
+    record_property("model_case", case.identifier)
+    record_property("model_family", "process_current")
+    record_property("model_input_sha256", input_digest("process_current", case))
+    record_property("completed_events", events)
+    record_property("suffix_complete", True)
+    record_property("actual_sigkill", child.kills[0]["returncode"] == -9)
+    record_property("independent_durable_read", True)
+    record_property("peers_survived", True)
+
+
+# Intent: retain a committed owner Pause through one interruption and a second cut before receipt completion.
+# Why: an older current selection or a replacement hold can produce zero while losing the original request.
+@pytest.mark.recovery_replay
+@pytest.mark.parametrize("interrupt_recovery", [False, True], ids=["saved-pause", "interrupted-recovery"])
+async def test_process_sigkill_after_newer_pause_commit(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, interrupt_recovery
+):
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        unused_tcp_port_factory(),
+        unused_tcp_port_factory(),
+        monkeypatch,
+        native_peer=BoundaryPeer,
+        timing="fast-poll",
+    ) as child:
+        await child.start()
+        ready = await child.status()
+        assert (await child.request("pause", revision=ready["control_revision"]))["ok"]
+        paused = await child.status(lambda value: value.get("local_hold_verified") is True)
+        mark = len(child.rig.bench.device_calls)
+        peer = child.rig.peer
+        change, pause = uuid.uuid4().hex, uuid.uuid4().hex
+        request = None
+        try:
+            peer.arm = True
+            reply = await child.request("set_current", id=change, revision=paused["control_revision"], current_a=16)
+            assert reply["ok"]
+            await asyncio.wait_for(peer.entered.wait(), 5)
+            await child.arm("after-pause-request-commit", pause)
+            request = asyncio.create_task(child.request("pause", id=pause, revision=paused["control_revision"]))
+            gate = await child.gate("after-pause-request-commit", pause)
+            assert not gate["transaction_open"] and not request.done()
+            committed = child.durable()
+            stored = committed["metadata"]
+            intent, claim = stored["managed_control_intent"], stored["managed_owner_pause"]
+            assert intent == {"mode": "paused", "revision": paused["control_revision"] + 2}
+            assert claim == {"revision": intent["revision"], "ticket": stored["control"]["ticket"]}
+            assert stored["managed_current_change"]["id"] == change
+            assert stored["managed_current_change"]["state"] == "pending"
+            assert next(row for row in committed["requests"] if row["id"] == pause)["state"] == "accepted"
+            await child.kill()
+        finally:
+            peer.release.set()
+            if request is not None:
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+
+        phase = "before-pause-completion-sql"
+        await child.start(arm=(phase, pause) if interrupt_recovery else None)
+        recovered = child.durable()
+        assert recovered["metadata"]["managed_control_intent"] == intent, "restart lost the saved Pause revision"
+        assert recovered["metadata"]["managed_owner_pause"] == claim
+        if interrupt_recovery:
+            gate = await child.gate(phase, pause)
+            assert gate["transaction_open"]
+            pending = child.durable()
+            assert pending["metadata"]["managed_control_intent"] == intent
+            assert pending["metadata"]["control"]["ticket"] == claim["ticket"]
+            # The verified hold and its Pause receipt are still uncommitted at this cut.
+            assert pending["metadata"]["control"]["uncertain"] is True
+            assert pending["metadata"]["managed_current_change"]["state"] == "cancelled"
+            assert next(row for row in pending["requests"] if row["id"] == pause)["state"] == "accepted"
+            require_zero_held(child.rig, mark)
+            assert not starts(child.rig)
+            await child.kill()
+            await child.start()
+
+        pause_receipt = await child.completed_control(pause)
+        status = await child.status(lambda value: value.get("local_hold_verified") is True)
+        assert status["control_revision"] == intent["revision"] and status["requested_current_a"] == 6
+        recovered = child.durable()["metadata"]
+        assert recovered["managed_owner_pause"] == claim and recovered["control"]["ticket"] == claim["ticket"]
+        assert recovered["control"]["uncertain"] is False
+        change_receipt = (await child.request("receipt", request_id=change))["result"]
+        assert change_receipt["state"] == "failed"
+        assert [kill["generation"] for kill in child.kills] == ([1, 2] if interrupt_recovery else [1])
+        assert all(kill["returncode"] == -signal.SIGKILL for kill in child.kills)
+        assert len({kill["pid"] for kill in child.kills}) == len(child.kills)
+        assert not starts(child.rig)
+        require_zero_held(child.rig, mark)
+
+        returned = await child.request("app_control", revision=intent["revision"])
+        assert returned["ok"]
+        await child.completed_control(returned["result"]["id"])
+        await child.scheduled_sessions(6, True)
+        assert (await child.request("receipt", request_id=pause))["result"] == pause_receipt
+        assert (await child.request("receipt", request_id=change))["result"] == change_receipt
+        assert not starts(child.rig)
+
+
+# Intent: a real accepted one-shot command can report its actual lifecycle after a process dies before publication.
+# Why: durable acceptance and an exact later closed lifecycle must settle the original receipt without replaying Start.
+@pytest.mark.parametrize("phase", ["before-accepted-commit", "after-accepted-commit", "after-managed-success-commit"])
+@pytest.mark.parametrize("cloud_reply", ["Accepted", "Blocked"])
+async def test_process_accepted_start_late_lifecycle(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, phase, cloud_reply
+):
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        unused_tcp_port_factory(),
+        unused_tcp_port_factory(),
+        monkeypatch,
+        bench_type=StartReplyBench,
+        native_peer=InterruptedNativePeer,
+        timing="fast-poll",
+    ) as child:
+        await child.start()
+        ready = await child.status()
+        identifier = uuid.uuid4().hex
+        await child.arm(phase, identifier)
+        request = asyncio.create_task(child.request("start", id=identifier, revision=ready["control_revision"]))
+        await child.gate(phase, identifier)
+        before = child.durable()["metadata"]
+        assert before["local_start_receipt"]["stage"] == ("issued" if phase == "before-accepted-commit" else "accepted")
+        assert before["managed_test_charge"].get("local_transaction") is None
+        assert len(starts(child.rig)) == 1
+        tag = starts(child.rig)[0][3]["idTag"]
+        await child.kill()
+        await asyncio.gather(request, return_exceptions=True)
+        await child.start()
+        await child.status(lambda value: value.get("charger_connected") is True)
+        child.rig.bench.start_replies = [cloud_reply]
+        result = await child.rig.bench.call(child.socket, uuid.uuid4().hex, "StartTransaction", START | {"idTag": tag})
+        assert result[0] == 3 and result[2]["idTagInfo"]["status"] == "Accepted"
+        local = result[2]["transactionId"]
+        child.rig.peer.plan_session = (local, 987654)
+        child.rig.peer.permission_enabled = False
+        result = await child.rig.bench.call(
+            child.socket,
+            uuid.uuid4().hex,
+            "StopTransaction",
+            {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"},
+        )
+        assert result[0] == 3
+        await child.delivered(local, closed=True)
+        state = (await child.request("status"))["result"]
+        assert (await child.request("pause", revision=state["control_revision"]))["ok"]
+        await child.status(lambda value: value.get("local_hold_verified") is True)
+        receipt = (await child.request("receipt", request_id=identifier))["result"]
+        assert receipt["state"] == "completed", {"receipt": receipt, "metadata": child.durable()["metadata"]}
+        assert len(starts(child.rig)) == 1
+        await child.ordinary_recovery(6, True)
+
+
+# Intent: actual Return success and intent publish atomically around process death after real positive work.
+# Why: acceptance, a physical ceiling and a durable terminal receipt are separate facts during replacement.
+@pytest.mark.parametrize(
+    "phase", ["after-return-request-commit", "before-return-success-commit", "after-return-success-commit"]
+)
+@pytest.mark.parametrize("selected", [6, 16, 32])
+async def test_process_return_commit_preserves_honest_receipt(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, phase, selected
+):
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        unused_tcp_port_factory(),
+        unused_tcp_port_factory(),
+        monkeypatch,
+        selected,
+        native_peer=InterruptedNativePeer,
+        timing="production" if selected == 6 and phase == "before-return-success-commit" else "fast-poll",
+    ) as child:
+        await child.start()
+        state = await child.status()
+        assert (await child.request("pause", revision=state["control_revision"]))["ok"]
+        state = await child.status(lambda value: value.get("local_hold_verified") is True)
+        identifier = uuid.uuid4().hex
+        await child.arm(phase, identifier)
+        request = asyncio.create_task(child.request("app_control", id=identifier, revision=state["control_revision"]))
+        await child.gate(phase, identifier)
+        snapshot = child.durable()
+        row = next(row for row in snapshot["requests"] if row["id"] == identifier)
+        binding = json.loads(row["result"]).get("_return")
+        committed = phase == "after-return-success-commit"
+        assert (binding is None) == (phase == "after-return-request-commit")
+        if binding is not None:
+            journal = child.rig.prepared.config.journal
+            with closing(sqlite3.connect(journal.as_uri() + "?mode=ro", uri=True)) as reader:
+                wires = reader.execute(
+                    "SELECT boot FROM owner_command_wires WHERE request=? "
+                    "AND action='SetChargingProfile' AND limit_a>0",
+                    (identifier,),
+                ).fetchall()
+            assert wires == [(binding["boot"],)] and binding["ticket"] and binding["local"] is None
+        assert snapshot["metadata"]["managed_control_intent"]["mode"] == ("app" if committed else "paused")
+        assert row["state"] == (
+            "completed" if committed else "accepted" if phase == "after-return-request-commit" else "running"
+        )
+        assert child.rig.bench.firmware.effective_limit() == (0 if phase == "after-return-request-commit" else selected)
+        await child.kill()
+        await asyncio.gather(request, return_exceptions=True)
+        await child.start()
+        await child.status(lambda value: value.get("charger_connected") is True)
+        receipt = (await child.request("receipt", request_id=identifier))["result"]
+        assert receipt["state"] == ("completed" if committed else "uncertain")
+        recovered = next(row for row in child.durable()["requests"] if row["id"] == identifier)
+        assert json.loads(recovered["result"]).get("_return") == binding
+        assert "_return" not in receipt["result"]
+        await child.ordinary_recovery(selected, True)
+        receipt = (await child.request("receipt", request_id=identifier))["result"]
+        assert receipt["state"] == ("completed" if committed else "failed")
+        recovered = next(row for row in child.durable()["requests"] if row["id"] == identifier)
+        assert json.loads(recovered["result"]).get("_return") == binding
+        assert not starts(child.rig) and len(child.kills) == 1
+
+
+# Intent: an issued command stays quarantined when process death prevents durable evidence of its actual outcome.
+# Why: physical zero or a lost successful reply cannot prove an issued Start was unsent or permit automatic replay.
+@pytest.mark.parametrize("phase", ["after-issued-commit", "before-accepted-commit"])
+async def test_process_unknown_issued_start_retains_debt(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, phase
+):
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        unused_tcp_port_factory(),
+        unused_tcp_port_factory(),
+        monkeypatch,
+        native_peer=InterruptedNativePeer,
+        timing="fast-poll",
+    ) as child:
+        await child.start()
+        state = await child.status()
+        identifier = uuid.uuid4().hex
+        await child.arm(phase, identifier)
+        request = asyncio.create_task(child.request("start", id=identifier, revision=state["control_revision"]))
+        await child.gate(phase, identifier)
+        assert child.durable()["metadata"]["local_start_receipt"]["stage"] == "issued"
+        sent = len(starts(child.rig))
+        assert sent == int(phase == "before-accepted-commit")
+        await child.kill()
+        await asyncio.gather(request, return_exceptions=True)
+        await child.start()
+        await child.status(lambda value: value.get("charger_connected") is True)
+        state = (await child.request("status"))["result"]
+        assert (await child.request("pause", revision=state["control_revision"]))["ok"]
+        # Unknown issued debt intentionally prevents settled Pause; its restrictive physical command still runs.
+        await child.status(
+            lambda value: value.get("can_start") is False and child.rig.bench.firmware.effective_limit() == 0
+        )
+        assert (await child.request("receipt", request_id=identifier))["result"]["state"] == "uncertain"
+        recovered = child.durable()["metadata"]["local_start_receipt"]["stage"]
+        assert recovered == ("accepted" if phase == "before-accepted-commit" else "issued")
+        assert child.rig.bench.firmware.effective_limit() == 0 and len(starts(child.rig)) == sent

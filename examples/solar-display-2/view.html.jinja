@@ -1,0 +1,100 @@
+{# GeekMagic logical 240x240, displayed at 480x480.
+   Touch targets use physical pixels in controls.yaml.
+   Battery/cable values come from each car; charger watts/state are local ICS.
+   Start and Stop use the local iCS proxy. #}
+{% set tesla = states('sensor.vehicle_one_battery_percent') | float(none) %}
+{% set seat = states('sensor.vehicle_two_battery_percent') | float(none) %}
+{% set tesla = tesla if tesla is not none and 0 <= tesla <= 100 else none %}
+{% set seat = seat if seat is not none and 0 <= seat <= 100 else none %}
+{% set tesla_cable = states('binary_sensor.vehicle_one_charge_cable') %}
+{% set seat_cable = states('binary_sensor.vehicle_two_charge_cable') %}
+{# Historical values stay amber and carry their own OEM age; they are never live fallbacks. #}
+{% set seat_last_raw = state_attr('sensor.vehicle_two_last_battery_reading', 'last_reported_battery_percent') %}
+{% set seat_last = seat_last_raw | float(none) if seat_last_raw is not boolean else none %}
+{% set seat_last = seat_last if seat_last is not none and 0 <= seat_last <= 100 else none %}
+{% set seat_old = seat is none and seat_last is not none %}
+{% set seat = seat if seat is not none else seat_last %}
+{% set seat_last_cable = state_attr('sensor.vehicle_two_last_battery_reading', 'last_reported_cable_plugged_in') %}
+{% set seat_cable_old = seat_cable not in ['on','off'] and seat_last_cable is boolean %}
+{% set now_epoch = now.timestamp() if now else none %}
+{% macro history_age(raw) -%}
+  {%- set epoch = raw | float(none) if raw is not boolean else none -%}
+  {%- if epoch is not none and epoch > 0 and now_epoch is not none and epoch <= now_epoch -%}
+    {%- set minutes = ((now_epoch - epoch) / 60) | int -%}
+    {%- if minutes >= 1440 -%}{{ minutes // 1440 }}d {{ (minutes % 1440) // 60 }}h old
+    {%- elif minutes >= 60 -%}{{ minutes // 60 }}h {{ minutes % 60 }}m old
+    {%- else -%}{{ minutes }}m old{%- endif -%}
+  {%- else -%}age unknown{%- endif -%}
+{%- endmacro %}
+{% set charging = states('binary_sensor.ics_proxy_charging') %}
+{% set connected = states('binary_sensor.ics_proxy_vehicle_connected') %}
+{% set watts = states('sensor.ics_proxy_power') | float(none) %}
+{% set mode = states('sensor.ics_proxy_control_mode') %}
+{% set healthy = is_state('binary_sensor.ics_proxy_problem', 'off') %}
+{% set session = states('binary_sensor.ics_proxy_session_open') %}
+{% set request = states('input_select.general_display_2_ics_request') %}
+{% set request_available = request in ['idle', 'starting', 'stopping', 'starting_timeout', 'stopping_timeout'] %}
+{% set busy = state_attr('automation.general_display_2_ics_charger_buttons', 'current') | int(0) > 0 %}
+{% set start_revision = state_attr('binary_sensor.ics_proxy_session_open', 'control_revision') %}
+{% set start_ok = request_available and not busy and session == 'off' and start_revision is integer and 0 <= start_revision < 2**53 and state_attr('binary_sensor.ics_proxy_session_open', 'can_start') is sameas true %}
+{% set stop_target = state_attr('binary_sensor.ics_proxy_session_open', 'stop_target') %}
+{% set stop_ok = request_available and not busy and session == 'on' and stop_target is string and stop_target | length == 64 %}
+{% set ics_state = 'CHARGING' if charging == 'on' else 'CONNECTED' if charging == 'off' and connected == 'on' else 'UNPLUGGED' if charging == 'off' and connected == 'off' else 'STATE UNKNOWN' %}
+{% set accent = '#70e1b7' if charging == 'on' else '#9cb6d4' %}
+{% if busy %}
+  {% set hint = 'Waiting for charger confirmation' %}
+{% elif not request_available %}
+  {% set hint = 'Charger buttons unavailable' %}
+{% elif request == 'starting_timeout' and session != 'on' %}
+  {% set hint = 'Start not confirmed' %}
+{% elif request == 'stopping_timeout' and session != 'off' %}
+  {% set hint = 'Stop not confirmed' %}
+{% elif stop_ok %}
+  {% set hint = 'Open session · Stop available' %}
+{% elif start_ok %}
+  {% set hint = 'Ready to start' %}
+{% elif mode == 'App / schedule (cloud offline)' %}
+  {% set hint = 'Vendor connection unavailable' %}
+{% elif not healthy %}
+  {% set hint = 'Charger control needs attention' %}
+{% elif mode == 'Paused locally' %}
+  {% set hint = 'Paused locally · return control in HA' %}
+{% elif connected == 'off' %}
+  {% set hint = 'Plug in a car to start' %}
+{% else %}
+  {% set hint = 'Waiting for charger status' %}
+{% endif %}
+<div style="position:relative;width:240px;height:240px;background:#0b1119;color:#f4f7fb;font-family:Nunito,Arial,sans-serif;line-height:1.1;box-sizing:border-box">
+  {# The touchscreen reads these cells from the same PNG as the buttons. #}
+  {% set marker = 'd5192' ~ stop_target if stop_ok else 'd5191' ~ ('%014x' | format(start_revision)) if start_ok else '' %}
+  {% set levels = ['20', '60', 'a0', 'e0'] %}
+  {% for digit in marker %}
+    {% set value = digit | int(base=16) %}
+    <span style="position:absolute;left:{{ 10 + loop.index0 * 3 }}px;top:237px;width:3px;height:3px;background:#{{ levels[value // 4] }}{{ levels[value % 4] }}38"></span>
+  {% endfor %}
+  <div style="position:absolute;left:10px;top:8px;font-size:10px;font-weight:800;letter-spacing:.6px;color:#c2d1e1">CARS &amp; CHARGER</div>
+  <div style="position:absolute;right:10px;top:9px;font-size:9px;color:#91a8c1">{{ now.strftime('%H:%M') if now else '--:--' }}</div>
+  <div style="position:absolute;left:10px;top:28px;width:106px;height:86px;background:#172436;border-radius:10px">
+    <div style="position:absolute;left:8px;top:8px;font-size:10px;font-weight:800;color:#b0cbed">VEHICLE ONE</div>
+    <div style="position:absolute;left:8px;top:24px;font-size:32px;font-weight:800;color:#edf5ff;white-space:nowrap">{{ '%.0f' | format(tesla) if tesla is not none else '--' }}<span style="font-size:14px;color:#a0b7d3">%</span></div>
+    <div style="position:absolute;left:8px;top:60px;width:90px;height:3px;background:#293e55;border-radius:2px"><div style="width:{{ tesla if tesla is not none else 0 }}%;height:3px;background:#75bcff;border-radius:2px"></div></div>
+    <div style="position:absolute;left:8px;top:70px;font-size:8.4px;color:{{ '#70e1b7' if tesla_cable == 'on' else '#c1ccda' if tesla_cable == 'off' else '#ffc477' }}">Cable {{ 'plugged in' if tesla_cable == 'on' else 'unplugged' if tesla_cable == 'off' else 'unknown' }}</div>
+  </div>
+  <div style="position:absolute;left:124px;top:28px;width:106px;height:86px;background:#172436;border-radius:10px">
+    <div style="position:absolute;left:8px;top:8px;font-size:9.2px;font-weight:800;color:#b0cbed">VEHICLE TWO</div>
+    <div style="position:absolute;left:8px;top:24px;font-size:32px;font-weight:800;color:{{ '#ffc477' if seat_old else '#edf5ff' }};white-space:nowrap">{{ '%.0f' | format(seat) if seat is not none else '--' }}<span style="font-size:14px;color:{{ '#ffc477' if seat_old else '#a0b7d3' }}">%</span></div>
+    <div style="position:absolute;left:8px;top:60px;width:90px;font-size:6.7px;white-space:nowrap;color:{{ '#ffc477' if seat_old else '#91a8c1' }}">{{ 'Last battery · ' ~ history_age(state_attr('sensor.vehicle_two_last_battery_reading', 'battery_oem_reported_update_epoch')) if seat_old else 'Battery reading' if seat is not none else 'Battery unknown' }}</div>
+    <div style="position:absolute;left:8px;top:72px;width:90px;font-size:7.3px;white-space:nowrap;color:{{ '#ffc477' if seat_cable_old else '#70e1b7' if seat_cable == 'on' else '#c1ccda' if seat_cable == 'off' else '#ffc477' }}">{% if seat_cable_old %}{{ 'Plugged' if seat_last_cable else 'Unplugged' }} · {{ history_age(state_attr('sensor.vehicle_two_last_battery_reading', 'cable_oem_reported_update_epoch')) }}{% else %}Cable {{ 'plugged in' if seat_cable == 'on' else 'unplugged' if seat_cable == 'off' else 'unknown' }}{% endif %}</div>
+  </div>
+  <div style="position:absolute;left:10px;top:122px;width:220px;height:53px;background:#132c2b;border-radius:10px">
+    <div style="position:absolute;left:9px;top:8px;font-size:9px;font-weight:800;color:#b1d0ca">ICS CHARGER</div>
+    <div style="position:absolute;left:9px;top:24px;font-size:10px;font-weight:800;color:{{ accent }}">{{ ics_state }}</div>
+    <div style="position:absolute;left:9px;top:39px;font-size:7px;color:#8da9aa">{{ mode if mode not in ['unknown','unavailable'] else 'Control state unknown' }}</div>
+    <div style="position:absolute;right:9px;top:14px;font-size:{{ 24 if watts is not none and watts < 10000 else 20 }}px;font-weight:800;color:{{ accent }};white-space:nowrap">{{ '%.0f' | format(watts) if watts is not none and watts >= 0 else '--' }}<span style="font-size:10px;color:#a5c7bd"> W</span></div>
+  </div>
+  {# The touchscreen overlays the pending colour and label from live HA state. Keep them out of cached images. #}
+  <div style="position:absolute;left:10px;top:183px;width:106px;height:31px;display:flex;align-items:center;justify-content:center;background:{{ '#17654b' if start_ok else '#1c2b33' }};border:1px solid {{ '#48bc8e' if start_ok else '#30414c' }};box-sizing:border-box;border-radius:8px;font-size:12px;font-weight:800;color:{{ '#effff8' if start_ok else '#718490' }}">START ICS</div>
+  <div style="position:absolute;left:124px;top:183px;width:106px;height:31px;display:flex;align-items:center;justify-content:center;background:{{ '#6b2b35' if stop_ok else '#1c2b33' }};border:1px solid {{ '#e47787' if stop_ok else '#30414c' }};box-sizing:border-box;border-radius:8px;font-size:12px;font-weight:800;color:{{ '#fff2f4' if stop_ok else '#718490' }}">STOP ICS</div>
+  <div style="position:absolute;left:10px;top:218px;width:220px;text-align:center;font-size:7px;color:#91a8c1">{{ hint }}</div>
+  <div style="position:absolute;left:12px;top:229px;width:216px;text-align:center;font-size:7px;color:#6d849d">TAP HERE TO DIM / BRIGHTEN</div>
+</div>

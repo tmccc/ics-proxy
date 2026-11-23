@@ -1,0 +1,244 @@
+# Modified for the standalone iCS proxy repository.
+"""Real archive installation and rollback into an isolated configuration directory."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import io
+import json
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+import pytest
+
+from tools import ha_restart
+from tools.ha_container_deploy import install
+
+
+# Build only in-memory synthetic component files, with an exact independent digest inventory.
+def archive(files: dict[str, bytes]) -> tuple[bytes, dict[str, str]]:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as package:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            package.addfile(info, io.BytesIO(data))
+    return buffer.getvalue(), {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
+
+
+# Intent: initial install and replacement verify all bytes and retain an outside-component backup.
+# Why: the new HA client must never overwrite the older OCPP integration or leave an unverified copy deployed.
+def test_install_and_backup_are_domain_scoped(tmp_path: Path) -> None:
+    first = {"manifest.json": json.dumps({"domain": "ics_proxy"}).encode(), "__init__.py": b"VALUE = 1\n"}
+    data, expected = archive(first)
+    assert install(tmp_path, "ics_proxy", data, expected)["verified_files"] == 2
+    assert not (tmp_path / "custom_components/ocpp_hub").exists()
+    second = first | {"__init__.py": b"VALUE = 2\n"}
+    data, expected = archive(second)
+    assert install(tmp_path, "ics_proxy", data, expected)["backup_created"]
+    assert (tmp_path / "custom_components/ics_proxy/__init__.py").read_bytes() == second["__init__.py"]
+    assert len(list((tmp_path / ".ics_proxy-backup").glob("*.tar.gz"))) == 1
+
+
+# Intent: a replacement retains its own rollback archive alongside older backup names.
+# Why: older backup names can sort differently from their creation order.
+def test_mixed_backup_names_keep_new_rollback(tmp_path: Path, monkeypatch) -> None:
+    old = {"manifest.json": b'{"domain":"ics_proxy"}', "__init__.py": b"VALUE = 1\n"}
+    new = old | {"__init__.py": b"VALUE = 2\n"}
+    install(tmp_path, "ics_proxy", *archive(old))
+    backups = tmp_path / ".ics_proxy-backup"
+    for suffix in ("a", "b", "c"):
+        (backups / f"ics_proxy-20261122-100000-{suffix}.tar.gz").write_bytes(b"older archive")
+    monkeypatch.setattr("tools.ha_container_deploy.time.time_ns", lambda: 1795338000000000000)
+    assert install(tmp_path, "ics_proxy", *archive(new))["backup_created"]
+    saved = backups / "ics_proxy-1795338000000000000.tar.gz"
+    assert len(list(backups.glob("*.tar.gz"))) == 3
+    with tarfile.open(saved, "r:gz") as package:
+        previous = package.extractfile("ics_proxy/__init__.py")
+        assert previous is not None and previous.read() == old["__init__.py"]
+
+
+# Intent: the installed build stays exclusively owned through Core preflight and restart verification.
+# Why: two installs could otherwise make the first command verify a Core process that loaded the second build.
+def test_install_lock_covers_core_activation(tmp_path: Path) -> None:
+    old = {"manifest.json": b'{"domain":"ics_proxy"}', "__init__.py": b"VALUE = 1\n"}
+    new = old | {"__init__.py": b"VALUE = 2\n"}
+    install(tmp_path, "ics_proxy", *archive(old))
+    installed = tmp_path / "custom_components/ics_proxy/__init__.py"
+    lock_path = tmp_path / ".ics_proxy-backup/.install.lock"
+    observations = []
+
+    # A separate opener cannot acquire the same real lock at either restart boundary.
+    def observe() -> None:
+        with lock_path.open("a") as competitor, pytest.raises(BlockingIOError):
+            fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert not (lock_path.parent / ".install-lock").exists()
+        observations.append(installed.read_bytes())
+
+    # Capture the old process baseline before publication and its replacement afterward.
+    def prepare_restart():
+        observe()
+        return observe, observe
+
+    install(tmp_path, "ics_proxy", *archive(new), prepare_restart=prepare_restart)
+    assert observations == [old["__init__.py"], new["__init__.py"], new["__init__.py"]]
+
+
+# Intent: a rejected configuration restores staged files, while an uncertain restart keeps the candidate.
+# Why: the install can undo its own preflight publication only until Core may have read the new build.
+@pytest.mark.parametrize("replacing", [False, True])
+@pytest.mark.parametrize("failure", ["configuration", "restart"])
+def test_failed_activation_respects_restart_boundary(tmp_path, monkeypatch, replacing, failure):
+    old = {"manifest.json": b'{"domain":"ics_proxy"}', "__init__.py": b"VALUE = 1\n"}
+    new = old | {"__init__.py": b"VALUE = 2\n"}
+    installed = tmp_path / "custom_components/ics_proxy/__init__.py"
+    if replacing:
+        install(tmp_path, "ics_proxy", *archive(old))
+    requests = []
+
+    # Observe the actual candidate bytes during the dry check and fail at only the selected Core boundary.
+    def request(self, path, *, post=False):
+        assert post
+        requests.append(path)
+        assert installed.read_bytes() == new["__init__.py"]
+        if path == "/config/core/check_config":
+            return {"result": "invalid" if failure == "configuration" else "valid"}
+        raise ha_restart.ResponseError("The restart request was rejected.")
+
+    monkeypatch.setattr(ha_restart.HomeAssistantAPI, "request", request)
+    monkeypatch.setattr(ha_restart, "container_lifetime", lambda *args: (10, "same"))
+
+    # Bind the real activation callback to the fake Core.
+    def prepare():
+        return ha_restart.prepare_container_restart(8123, "fixture")
+
+    with pytest.raises(SystemExit):
+        install(tmp_path, "ics_proxy", *archive(new), prepare_restart=prepare)
+    if failure == "configuration":
+        assert requests == ["/config/core/check_config"]
+        if replacing:
+            assert installed.read_bytes() == old["__init__.py"]
+        else:
+            assert not installed.exists()
+    else:
+        assert requests == ["/config/core/check_config", "/services/homeassistant/restart"]
+        assert installed.read_bytes() == new["__init__.py"]
+
+
+# Intent: unsafe names, incorrect hashes and syntax errors fail before an installed component is touched.
+# Why: a malformed transfer cannot become a partially imported HA integration.
+@pytest.mark.parametrize("failure", ["path", "hash", "syntax", "domain"])
+def test_archive_validation_precedes_all_disk_mutation(tmp_path: Path, failure: str) -> None:
+    files = {"manifest.json": b'{"domain":"ics_proxy"}', "__init__.py": b"VALUE = 1\n"}
+    if failure == "path":
+        files["../escape"] = b"bad"
+    if failure == "syntax":
+        files["__init__.py"] = b"def invalid(:\n"
+    if failure == "domain":
+        files["manifest.json"] = b'{"domain":"other"}'
+    data, expected = archive(files)
+    if failure == "hash":
+        expected["__init__.py"] = "0" * 64
+    with pytest.raises((ValueError, SyntaxError)):
+        install(tmp_path, "ics_proxy", data, expected)
+    assert list(tmp_path.iterdir()) == []
+
+
+# Intent: a staging write failure leaves the byte-for-byte previous copy installed.
+# Why: permission or disk errors must leave the existing HA integration recoverable.
+def test_partial_write_failure_restores_previous_component(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    old = {"manifest.json": b'{"domain":"ics_proxy"}', "__init__.py": b"VALUE = 1\n"}
+    data, expected = archive(old)
+    install(tmp_path, "ics_proxy", data, expected)
+    actual = Path.write_bytes
+    failed = False
+
+    # Fail one disk write after actual archive parsing.
+    def write(path: Path, data: bytes) -> int:
+        nonlocal failed
+        if path.name == "__init__.py" and not failed:
+            failed = True
+            raise OSError("synthetic publication failure")
+        return actual(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", write)
+    data, expected = archive(old | {"__init__.py": b"VALUE = 2\n"})
+    with pytest.raises(OSError):
+        install(tmp_path, "ics_proxy", data, expected)
+    assert (tmp_path / "custom_components/ics_proxy/__init__.py").read_bytes() == old["__init__.py"]
+
+
+# Intent: abrupt process death during staging leaves the entire previous component available.
+# Why: a lost installer process cannot run Python's cleanup or restore an incomplete replacement.
+def test_interrupted_staging_keeps_the_old_live_component(tmp_path: Path) -> None:
+    old = {"manifest.json": b'{"domain":"ics_proxy"}', "__init__.py": b"VALUE = 1\n"}
+    data, expected = archive(old)
+    install(tmp_path, "ics_proxy", data, expected)
+    data, expected = archive(old | {"__init__.py": b"VALUE = 2\n"})
+    code = """
+import json
+import os
+import sys
+from pathlib import Path
+from tools.ha_container_deploy import install
+
+write_bytes = Path.write_bytes
+
+# End the installer without letting any context manager run.
+def interrupted_write(path, body):
+    write_bytes(path, body)
+    os._exit(91)
+
+Path.write_bytes = interrupted_write
+install(Path(sys.argv[1]), "ics_proxy", sys.stdin.buffer.read(), json.loads(sys.argv[2]))
+"""
+    execution = subprocess.run(
+        [sys.executable, "-B", "-c", code, str(tmp_path), json.dumps(expected)],
+        input=data,
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        timeout=10,
+    )
+    assert execution.returncode == 91, execution.stderr
+    target = tmp_path / "custom_components/ics_proxy"
+    assert {path.name: path.read_bytes() for path in target.iterdir()} == old
+
+
+# Intent: iCS can retry an interrupted Docker install after the previous process exits.
+# Why: a leftover directory from an older Docker installer does not represent a live iCS installer.
+def test_ics_can_retry_after_installer_dies_holding_its_lock(tmp_path: Path) -> None:
+    old = {"manifest.json": b'{"domain":"ics_proxy"}', "__init__.py": b"VALUE = 1\n"}
+    new = old | {"__init__.py": b"VALUE = 2\n"}
+    install(tmp_path, "ics_proxy", *archive(old))
+    data, expected = archive(new)
+    code = """
+import json
+import os
+import sys
+from pathlib import Path
+from tools.ha_container_deploy import install
+
+config = Path(sys.argv[1])
+
+def interrupted_restart():
+    os._exit(92)
+
+install(config, "ics_proxy", sys.stdin.buffer.read(), json.loads(sys.argv[2]), prepare_restart=interrupted_restart)
+"""
+    execution = subprocess.run(
+        [sys.executable, "-B", "-c", code, str(tmp_path), json.dumps(expected)],
+        input=data,
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        timeout=10,
+    )
+    assert execution.returncode == 92, execution.stderr
+    target = tmp_path / "custom_components/ics_proxy/__init__.py"
+    assert target.read_bytes() == old["__init__.py"]
+    # Older Docker installers may have left a directory beside their process lock.
+    (tmp_path / ".ics_proxy-backup/.install-lock").mkdir()
+    install(tmp_path, "ics_proxy", data, expected)
+    assert target.read_bytes() == new["__init__.py"]

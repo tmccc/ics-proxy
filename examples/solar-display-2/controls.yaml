@@ -1,0 +1,121 @@
+# Installed as one HA automation through /api/config/automation/config/.
+# Physical 480x480 pixels; must match view.html.jinja.
+# Only this device's single Cars & Charger view may route these touch areas.
+# Additional buttons can use the same coordinate event without reflashing.
+id: general_display_2_ics_touch
+alias: General Display 2 · ICS charger buttons
+description: Start or stop the ICS charger session from the second touchscreen.
+mode: single
+max_exceeded: silent
+triggers:
+  - trigger: event
+    id: touch
+    event_type: esphome.general_display_touch
+    event_data:
+      display: general_display_2
+      device_id: "replace-with-esphome-device-id"
+  - trigger: time_pattern
+    id: clear_feedback
+    seconds: "/5"
+variables:
+  touch_data: "{{ trigger.event.data if trigger.id == 'touch' else {} }}"
+  touch_x: "{{ touch_data.get('x', '') | int(-1) }}"
+  touch_y: "{{ touch_data.get('y', '') | int(-1) }}"
+  canvas_age: "{{ touch_data.get('canvas_age_seconds', '') | float(-1) }}"
+  frame_control: "{{ touch_data.get('frame_control', '') }}"
+  start_revision: >-
+    {{ frame_control[6:] | int(-1, 16)
+       if frame_control is string and frame_control.startswith('start:') and frame_control | length == 20 else -1 }}
+conditions:
+  - condition: or
+    conditions:
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: clear_feedback
+          - condition: template
+            value_template: >-
+              {% set feedback = states.input_select.general_display_2_ics_request %}
+              {{ feedback.state in ['starting_timeout', 'stopping_timeout']
+                 and as_timestamp(now()) - as_timestamp(feedback.last_changed) >= 20 }}
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: touch
+          - condition: template
+            value_template: >-
+              {{ 0 <= (canvas_age | float(-1)) < 45 and 366 <= touch_y < 428
+                 and (20 <= touch_x < 232 or 248 <= touch_x < 460) }}
+          - condition: state
+            entity_id: sensor.ics_display_screen_source
+            state: Home Assistant
+          - condition: template
+            value_template: >-
+              {% set image = 'image.ics_display_preview' %}
+              {% set rendered = as_timestamp(states(image), none) %}
+              {{ rendered is not none and 0 <= as_timestamp(now()) - rendered < 45
+                 and state_attr(image, 'assigned_views') == ['replace-with-editor-view-id']
+                 and state_attr(image, 'current_view_id') == 'replace-with-editor-view-id'
+                 and state_attr(image, 'rendered_view_id') == 'replace-with-editor-view-id'
+                 and state_attr(image, 'notification_active') == false }}
+          - condition: template
+            value_template: >-
+              {{ states('input_select.general_display_2_ics_request')
+                 in ['idle', 'starting', 'stopping', 'starting_timeout', 'stopping_timeout'] }}
+          - condition: or
+            conditions:
+              - condition: and
+                conditions:
+                  - condition: template
+                    value_template: >-
+                      {{ 20 <= touch_x < 232 and start_revision >= 0
+                         and start_revision == state_attr('binary_sensor.ics_proxy_session_open', 'control_revision') }}
+                  - condition: state
+                    entity_id: binary_sensor.ics_proxy_session_open
+                    state: 'off'
+                  - condition: template
+                    value_template: "{{ state_attr('binary_sensor.ics_proxy_session_open', 'can_start') is sameas true }}"
+              - condition: and
+                conditions:
+                  - condition: template
+                    value_template: "{{ 248 <= touch_x < 460 }}"
+                  - condition: state
+                    entity_id: binary_sensor.ics_proxy_session_open
+                    state: 'on'
+                  - condition: template
+                    value_template: >-
+                      {{ frame_control is string and frame_control.startswith('stop:') and frame_control | length == 69
+                         and frame_control[5:] == state_attr('binary_sensor.ics_proxy_session_open', 'stop_target') }}
+actions:
+  - if:
+      - condition: trigger
+        id: clear_feedback
+    then:
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.general_display_2_ics_request
+        data:
+          option: idle
+      - stop: Clear expired touchscreen feedback
+  - variables:
+      starting: "{{ 20 <= touch_x < 232 }}"
+      pending_request: "{{ 'starting' if starting else 'stopping' }}"
+      stop_target: "{{ frame_control[5:] if not starting else none }}"
+      proxy_result: {}
+  - action: input_select.select_option
+    target:
+      entity_id: input_select.general_display_2_ics_request
+    data:
+      option: "{{ pending_request }}"
+  # Only this action's exact proxy receipt can clear the pending state successfully.
+  - action: ics_proxy.session_command
+    continue_on_error: true
+    data: "{{ {'action': 'start', 'revision': start_revision} if starting else {'action': 'stop_session', 'target': stop_target} }}"
+    response_variable: proxy_result
+  - action: input_select.select_option
+    target:
+      entity_id: input_select.general_display_2_ics_request
+    data:
+      option: >-
+        {{ 'idle' if proxy_result is mapping and proxy_result.get('confirmed') is sameas true
+           else pending_request ~ '_timeout' }}

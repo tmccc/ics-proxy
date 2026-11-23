@@ -1,0 +1,208 @@
+# Modified for the standalone iCS proxy repository.
+"""Independent native inventory and device effects for the commissioning bench."""
+
+from __future__ import annotations
+
+import copy
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from ics_proxy_core import commands
+from ics_proxy_core.engine.gateway import decode
+from ics_proxy_core.engine.policy import Policy
+from ics_proxy_core.engine.store import encoded, fingerprint
+from ics_proxy_core.engine.trial_allocation import initialize_allocation, observe_history
+from ics_proxy_core.engine.trial_config import TrialConfig
+from ics_proxy_core.engine.trial_evidence import Evidence, Resource, native_profile_projection, profile_projection
+from ics_proxy_core.engine.trial_resources import Baseline, ResourceBook
+from ics_proxy_core.engine.trial_session import save_private
+from ics_proxy_core.frames import build_call_result
+from tests.prototype_rig import Rig
+
+
+# Model native tenths-of-an-ampere fields independently from the proxy's requested OCPP payload.
+def native_profile(profile: dict[str, Any], connector: int) -> dict[str, Any]:
+    return {
+        "chargingProfileId": profile["chargingProfileId"],
+        "connnectroId": connector,
+        "stackLevel": profile["stackLevel"],
+        "purpose": profile["chargingProfilePurpose"],
+        "periodKind": profile["chargingProfileKind"],
+        "unit": "A",
+        "periods": [
+            {
+                "startPeriod": 0,
+                "endPeriod": 2147483646,
+                "limit": profile["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] * 10,
+                "numberPhases": 1,
+            }
+        ],
+        "transactionId": profile.get("transactionId", -1),
+        "validFrom": 0,
+        "validTo": 2147483646,
+        "duration": 2147483646,
+        "startSchedule": (
+            int(datetime.fromisoformat(profile["chargingSchedule"]["startSchedule"].replace("Z", "+00:00")).timestamp())
+            if profile["chargingProfileKind"] == "Absolute"
+            else 0
+        ),
+    }
+
+
+class TrialRig(Rig):
+    """The actual gateway writes to an independent fake device and reads an independent complete inventory."""
+
+    # Seed genuine original resources before taking a baseline; the new journal owns none of them.
+    def __init__(self, path: Path, original_profile: bool = False, original_purpose: str = "TxProfile") -> None:
+        super().__init__(path, Policy(max_current_a=6), attach=False)
+        original = commands.set_charging_profile(
+            1, original_purpose, 32, 42, stack_level=1, transaction_id=77 if original_purpose == "TxProfile" else None
+        )
+        if original_profile:
+            self.firmware.answer("SetChargingProfile", original)
+        self.firmware.plans[9] = {"planId": 9, "limitCurrent": 32}
+        self.connectors = {42: 1}
+        self.cp, self.connection = "A", "Unplug"
+        self.native_open = False
+        self.age = 0
+        self.configuration = "original"
+        self.online = True
+        self.drop_clear = False
+        self.ack_without_clear = False
+        self.clear_order: list[int] = []
+        self.baseline = Baseline.capture(self.store.identity, self.evidence())
+        self.book = ResourceBook(self.store, self.baseline)
+        initialize_allocation(
+            self.store,
+            observe_history([], self.store.identity, "HARDWARE001", time.time()),
+            self.store.identity,
+            "HARDWARE001",
+        )
+        self.book.activate(self.evidence())
+        self.gateway.charger.before_send = self.book.before_send
+        self.gateway.charger.after_result = self.book.after_result
+        self.gateway.attach_charger(self.charger_send)
+
+    # Load a profile and its historical receipt as an older journal, without bypassing the new write gate at runtime.
+    def seed_legacy_profile(self, payload: dict[str, Any]) -> None:
+        canonical = profile_projection(payload)
+        self.firmware.answer("SetChargingProfile", payload)
+        self.connectors[canonical["id"]] = payload["connectorId"]
+        self.store.db.execute(
+            "INSERT INTO trial_resources VALUES(?,?,?,'confirmed',NULL)",
+            ("profile:" + str(canonical["id"]), encoded(canonical), encoded(canonical)),
+        )
+
+    # Translate only the fake device's own stored profiles, rather than sharing the proxy's receipt table.
+    def evidence(self) -> Evidence:
+        resources = []
+        for identifier, profile in self.firmware.profiles.items():
+            connector = self.connectors.get(
+                identifier, 0 if profile["chargingProfilePurpose"] == "ChargePointMaxProfile" else 1
+            )
+            body = native_profile(profile, connector)
+            resources.append(
+                Resource(
+                    "profile",
+                    identifier,
+                    body,
+                    native_profile_projection(body, connector, body["purpose"], time.time()),
+                )
+            )
+        resources += [
+            Resource("plan", key, copy.deepcopy(body), {"unsupported": True})
+            for key, body in self.firmware.plans.items()
+        ]
+        return Evidence(
+            fingerprint(self.store.identity),
+            time.time() - self.age,
+            self.cp,
+            self.connection,
+            0,
+            0,
+            self.native_open,
+            fingerprint(self.configuration),
+            tuple(resources),
+            self.online,
+        )
+
+    # A read callback is asynchronous just like the real independent LAN observer.
+    async def observe(self) -> Evidence:
+        return self.evidence()
+
+    # Freeze the cloud side without closing the charger receive path.
+    async def quiesce(self) -> None:
+        self.gateway.detach_vendor(self.gateway._vendor_epoch)
+
+    # Execute only peer-side effects and allow a lost cleanup ACK after the physical deletion really happened.
+    async def charger_send(self, raw: str) -> None:
+        frame = decode(raw)
+        self.charger_frames.append(frame)
+        if frame[0] != 2:
+            return
+        action, payload = frame[2:]
+        if action == "ClearChargingProfile":
+            self.clear_order.append(payload["id"])
+            answer = {"status": "Accepted"}
+            if not self.ack_without_clear:
+                answer = self.firmware.answer(action, payload)
+            if self.drop_clear:
+                return
+        else:
+            if action == "SetChargingProfile":
+                self.connectors[payload["csChargingProfiles"]["chargingProfileId"]] = payload["connectorId"]
+            answer = self.firmware.answer(action, payload)
+        await self.gateway.receive("charger", build_call_result(frame[1], answer))
+
+
+# Quiescing an already isolated fake cloud requires no real socket or environment operation.
+async def no_cloud() -> None:
+    return None
+
+
+# Build one complete private synthetic configuration; its separate Basic credentials never refer to the household.
+def config_files(directory: Path, listener_port: int, vendor_port: int) -> tuple[TrialConfig, Path]:
+    directory.chmod(0o700)
+    (directory / "certificate.pem").chmod(0o644)
+    (directory / "key.pem").chmod(0o600)
+    for name, username, password in (
+        ("incoming.json", "OFFLINE001", "INCOMING_TEST_SECRET"),
+        ("upstream.json", "OFFLINE001", "UPSTREAM_TEST_SECRET"),
+        ("native.json", "admin", "NATIVE_TEST_SECRET"),
+    ):
+        save_private(directory / name, {"username": username, "password": password})
+    evidence = Evidence(
+        fingerprint("OFFLINE001"), time.time(), "A", "Unplug", 0, 0, False, fingerprint("original"), (), True
+    )
+    save_private(directory / "baseline.json", Baseline.capture("OFFLINE001", evidence).value())
+    value = {
+        "identity": "OFFLINE001",
+        "hardware_identity": "HARDWARE001",
+        "listener_host": "127.0.0.1",
+        "listener_port": listener_port,
+        "listener_name": "127.0.0.1",
+        "charger_ip": "127.0.0.1",
+        "charger_path": "/charger/OFFLINE001",
+        "vendor_url": f"wss://127.0.0.1:{vendor_port}/ocpp/OFFLINE001",
+        "incoming_auth": "basic",
+        "upstream_auth": "basic",
+        "station_profile_kind": "Relative",
+        "station_stack_level": 1,
+        "station_profile_start": None,
+        "incoming_secret": str(directory / "incoming.json"),
+        "upstream_secret": str(directory / "upstream.json"),
+        "native_secret": str(directory / "native.json"),
+        "certificate": str(directory / "certificate.pem"),
+        "private_key": str(directory / "key.pem"),
+        "ca_file": str(directory / "certificate.pem"),
+        "journal": str(directory / "state.db"),
+        "baseline": str(directory / "baseline.json"),
+        "evidence": str(directory / "evidence.json"),
+        "max_current_a": 6,
+        "local_tags": ["LOCAL_TEST"],
+    }
+    path = directory / "trial.json"
+    save_private(path, value)
+    return TrialConfig.load(path), path

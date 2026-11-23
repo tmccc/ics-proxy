@@ -1,0 +1,550 @@
+# Modified for the standalone iCS proxy repository.
+"""Real native HTTP and OCPP TLS tests for deliberate holds, explicit return and restart intent."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import ssl
+import uuid
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from ics_proxy_core.constants import HUB_PROFILE_ID
+from ics_proxy_core.engine.managed import ManagedController
+from ics_proxy_core.engine.security import SecurityError
+from ics_proxy_core.engine.store import RecoveryRequiredError
+from ics_proxy_core.engine.trial_evidence import profile_projection
+from tests.charge_rig import owner_rig
+from tests.current_rig import adjustable, commissioned
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+from tests.tls_support import tls as tls
+
+
+# Give each intentional user operation an independent bounded opaque identifier.
+def identifier() -> str:
+    return uuid.uuid4().hex
+
+
+# Add only runtime envelope fields supplied by the service, rather than fabricating native proof.
+def envelope(status: dict[str, Any]) -> dict[str, Any]:
+    return {**status, "running": True, "certificate_remaining_seconds": 86400}
+
+
+# Intent: a newer Pause revokes each older command at the actual positive profile send boundary.
+# Why: even a successful native validation cannot authorise a positive send after the command loses ownership.
+@pytest.mark.parametrize("command", ["start", "app_control", "set_current"], ids=["start", "return", "current"])
+@pytest.mark.parametrize("validated", [False, True], ids=["pause-before-proof", "pause-after-proof"])
+async def test_pause_revokes_pending_positive_profile(tmp_path, tls, unused_tcp_port, monkeypatch, command, validated):
+    selecting = command == "set_current"
+    rig_factory = adjustable if selecting else owner_rig
+    async with rig_factory(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        c, bench = test.controller, test.rig.bench
+        if not selecting:
+            c.command(identifier(), "pause", c.requests.intent().revision)
+            assert (await healthy(c))["local_hold_verified"]
+
+        peer = test.session.gateway.charger
+        validate = peer.validate_send
+        assert validate is not None
+        reached, resume = asyncio.Event(), asyncio.Event()
+        proposed: list[int | float] = []
+
+        # Hold the older write on either side of its real native validation, before the charger has received it.
+        async def hold_positive(action, payload):
+            if action != "SetChargingProfile" or not (limit := profile_projection(payload)["limit"]):
+                return await validate(action, payload)
+            result = await validate(action, payload) if validated else None
+            if validated:
+                assert callable(result)
+            proposed.append(limit)
+            reached.set()
+            await resume.wait()
+            return result if validated else await validate(action, payload)
+
+        monkeypatch.setattr(peer, "validate_send", hold_positive)
+        request, revision = identifier(), c.requests.intent().revision
+        mark = len(bench.received_limits)
+        assert c.command(request, command, revision, current_a=16 if selecting else None)["state"] == "accepted"
+        returning = asyncio.create_task(c.return_requested(request, revision)) if command == "app_control" else None
+        try:
+            await asyncio.wait_for(reached.wait(), 3)
+            assert proposed == [16 if selecting else 6]
+            assert all(limit == 0 for limit in bench.received_limits[mark:])
+            pause = identifier()
+            assert c.command(pause, "pause", c.requests.intent().revision)["state"] == "accepted"
+            winning_intent = c.requests.intent()
+            assert winning_intent.mode == "paused" and winning_intent.revision > revision
+            resume.set()
+
+            if returning is not None:
+                await asyncio.wait_for(asyncio.shield(returning), 5)
+            await c.charging.settle()
+            await c.current.settle()
+            status = await healthy(c)
+            assert status["local_hold_verified"]
+            assert status["station_ceiling_a"] == bench.firmware.effective_limit() == 0
+            assert c.requests.receipt(pause)["state"] == "completed" and c.requests.intent() == winning_intent
+            assert c.requests.receipt(request)["state"] == "failed" and c.current.selected() == 6
+            assert all(limit == 0 for limit in bench.received_limits[mark:]) and not starts(test.rig)
+        finally:
+            resume.set()
+            if returning is not None:
+                await asyncio.gather(returning, return_exceptions=True)
+
+
+# Intent: Start and Return recheck zero and the owned station profile at their actual positive send.
+# Why: a newer independent native reading can revoke the preflight before the charger receives that write.
+@pytest.mark.parametrize("command", ["start", "app_control"], ids=["start", "return"])
+@pytest.mark.parametrize("drift", ["output", "profile"])
+async def test_positive_send_checks_fresh_zero_and_station(tmp_path, tls, unused_tcp_port, monkeypatch, command, drift):
+    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 6) as b:
+        controller, bench = b.controller, b.rig.bench
+        controller.command(identifier(), "pause", controller.requests.intent().revision)
+        assert (await healthy(controller))["local_hold_verified"]
+        peer = b.session.gateway.charger
+        validate = peer.validate_send
+        assert validate is not None
+        attempts = []
+        actual_native = b.rig.peer.native
+
+        # Change only the independent native sample seen in the real final validation call.
+        async def changed_at_send(action, payload):
+            if action != "SetChargingProfile" or profile_projection(payload)["limit"] == 0:
+                return await validate(action, payload)
+            attempts.append(action)
+            profile = bench.firmware.profiles[HUB_PROFILE_ID]
+
+            # A plugged, closed session can still report an unexpected connector limit.
+            def unexpected_output(key):
+                value = actual_native(key)
+                if key == "CONNECTOR":
+                    value[0]["outLimit"] = 160
+                return value
+
+            with monkeypatch.context() as patch:
+                if drift == "output":
+                    patch.setattr(b.rig.peer, "native", unexpected_output)
+                else:
+                    patch.setitem(profile, "stackLevel", profile["stackLevel"] + 1)
+                return await validate(action, payload)
+
+        monkeypatch.setattr(peer, "validate_send", changed_at_send)
+        request, revision = identifier(), controller.requests.intent().revision
+        mark = len(bench.received_limits)
+        assert controller.command(request, command, revision)["state"] == "accepted"
+        async with asyncio.timeout(5):
+            if command == "app_control":
+                await controller.return_requested(request, revision)
+            else:
+                await controller.charging.settle()
+        assert attempts == ["SetChargingProfile"]
+        assert all(limit == 0 for limit in bench.received_limits[mark:])
+        assert controller.requests.intent().mode == "paused" and not starts(b.rig)
+
+
+# Intent: deliberate Stop becomes a healthy actual0 hold, with explicit return6 and no Start or history change.
+# Why: supervisor ownership must distinguish an operator pause from an unintended loss of shared control.
+async def test_pause_and_explicit_return_keep_the_existing_native_safety_boundary(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ics_proxy_core.engine.managed_view import health_snapshot
+
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
+        session = managed_session(rig)
+        await session.start()
+        controller = ManagedController(session)
+        rig.route_to_trial()
+        async with rig.charger(session) as charger:
+            await introduced(rig, session, charger, "operator-boot")
+            await healthy(controller)
+            history = copy.deepcopy(rig.bench.history)
+            pause_id = identifier()
+            response = controller.command(pause_id, "pause", 0)
+            assert response["state"] == "accepted"
+            assert controller.requests.intent().mode == "paused"
+            status = await healthy(controller)
+            assert status["local_hold_verified"] and status["station_ceiling_a"] == 0
+            assert not status["owner_control_enabled"] and health_snapshot(envelope(status))["healthy"]
+            assert controller.requests.receipt(pause_id)["state"] == "completed"
+            count = len(rig.bench.received_limits)
+            assert controller.command(pause_id, "pause", 0)["state"] == "completed"
+            await healthy(controller)
+            assert len(rig.bench.received_limits) == count
+            return_id = identifier()
+            controller.command(return_id, "app_control", status["control_revision"])
+            status = await healthy(controller)
+            assert status["desired_control"] == "app" and status["owner_control_enabled"]
+            assert rig.bench.firmware.effective_limit() == 6
+            assert controller.requests.receipt(return_id)["state"] == "completed"
+            assert not starts(rig) and rig.bench.history == history
+
+
+# Intent: a paused choice and its actual zero persist through replacement until a new explicit return is made.
+# Why: process recovery is not permission to resume a charging schedule which the user deliberately inhibited.
+async def test_restart_remembers_requested_pause_without_automatic_release(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
+        first = managed_session(rig)
+        await first.start()
+        controller = ManagedController(first)
+        rig.route_to_trial()
+        async with rig.charger(first) as charger:
+            await introduced(rig, first, charger, "pause-first-boot")
+            await healthy(controller)
+            controller.command(identifier(), "pause", 0)
+            await healthy(controller)
+            await first.close()
+        replacement = managed_session(rig)
+        await replacement.start()
+        recovered = ManagedController(replacement)
+        before = len(rig.bench.received_limits)
+        async with rig.charger(replacement) as charger:
+            await introduced(rig, replacement, charger, "pause-replacement-boot")
+            status = await healthy(recovered)
+            assert status["desired_control"] == "paused" and status["local_hold_verified"]
+            assert rig.bench.received_limits[before:] and set(rig.bench.received_limits[before:]) == {0}
+            assert not starts(rig) and replacement.journal.get("managed_control_fault") is None
+
+
+# Intent: stale return commands and reused identifiers cannot clear a newer Pause or become another operation.
+# Why: an HA request based on an older dashboard revision must not undo a later user's Stop.
+async def test_stale_return_and_conflicting_identifier_are_rejected_before_writes(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
+        session = managed_session(rig)
+        await session.start()
+        controller = ManagedController(session)
+        rig.route_to_trial()
+        async with rig.charger(session) as charger:
+            await introduced(rig, session, charger, "stale-boot")
+            await healthy(controller)
+            request = identifier()
+            controller.command(request, "pause", 0)
+            await healthy(controller)
+            with pytest.raises(SecurityError):
+                controller.command(request, "app_control", 0)
+            with pytest.raises(RecoveryRequiredError):
+                controller.command(identifier(), "app_control", 0)
+            assert rig.bench.firmware.effective_limit() == 0 and not starts(rig)
+
+
+# Intent: a pending return from a lost process is retained as uncertain and never reissued automatically.
+# Why: a confirmed paused intent must remain authoritative when a positive command's outcome is unresolved.
+async def test_accepted_return_is_not_retried_after_process_replacement(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
+        first = managed_session(rig)
+        await first.start()
+        controller = ManagedController(first)
+        rig.route_to_trial()
+        async with rig.charger(first) as charger:
+            await introduced(rig, first, charger, "lost-return-boot")
+            await healthy(controller)
+            controller.command(identifier(), "pause", 0)
+            status = await healthy(controller)
+            request = identifier()
+            controller.command(request, "app_control", status["control_revision"])
+            await first.close()
+        replacement = managed_session(rig)
+        await replacement.start()
+        recovered = ManagedController(replacement)
+        assert recovered.requests.receipt(request)["state"] == "uncertain"
+        async with rig.charger(replacement) as charger:
+            await introduced(rig, replacement, charger, "lost-return-replacement")
+            assert (await healthy(recovered))["desired_control"] == "paused"
+            assert rig.bench.firmware.effective_limit() == 0 and not starts(rig)
+
+
+# Intent: a same-intent restrictive waiter cannot interrupt an owned Return's zero rollback.
+# Why: an unsent release leaves a retryable hold, and a sent positive profile must be zeroed before yielding.
+@pytest.mark.parametrize("boundary", ["positive-set", "composite"])
+async def test_same_intent_zero_waiter_allows_return_rollback(tmp_path, tls, unused_tcp_port, monkeypatch, boundary):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, g, rig = b.controller, b.session.gateway, b.rig
+        await healthy(c)
+        c.command(identifier(), "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        intent = c.requests.intent()
+        request = identifier()
+        c.command(request, "app_control", intent.revision)
+        initial = len(rig.bench.received_limits)
+        validate = g.charger.validate_send
+        assert validate is not None
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+        attempts = []
+
+        # Hold the real outgoing validation before its Set or its post-acceptance composite.
+        async def delay(action, payload):
+            attempt = g.controls.release_attempt
+            if (
+                attempt is not None
+                and not attempts
+                and (
+                    boundary == "positive-set"
+                    and action == "SetChargingProfile"
+                    and profile_projection(payload)["limit"] > 0
+                    or boundary == "composite"
+                    and action == "GetCompositeSchedule"
+                    and attempt.positive_may_have_dispatched
+                )
+            ):
+                attempts.append(attempt)
+                blocked.set()
+                await release.wait()
+            return await validate(action, payload)
+
+        monkeypatch.setattr(g.charger, "validate_send", delay)
+        poll = asyncio.create_task(c.tick())
+        try:
+            await asyncio.wait_for(blocked.wait(), 4)
+            assert c.requests.intent() == intent
+            if boundary == "composite":
+                assert rig.bench.firmware.effective_limit() == c.current.selected()
+            else:
+                assert rig.bench.firmware.effective_limit() == 0
+            assert g.controls.desired() == 0
+            zero_waiter = asyncio.create_task(g.controls.ensure_ceiling())
+            try:
+                await asyncio.wait_for(asyncio.gather(poll, zero_waiter), 5)
+            finally:
+                zero_waiter.cancel()
+                await asyncio.gather(zero_waiter, return_exceptions=True)
+        finally:
+            release.set()
+            await asyncio.gather(poll, return_exceptions=True)
+
+        attempt = attempts[0]
+        assert attempt.finished and not attempt.cleanup_failed and attempt.zero_confirmed
+        expected = "failed" if boundary == "positive-set" else "uncertain"
+        assert c.requests.intent() == intent and c.requests.receipt(request)["state"] == expected
+        assert rig.bench.firmware.effective_limit() == 0
+        received = rig.bench.received_limits[initial:]
+        if boundary == "positive-set":
+            assert not attempt.positive_may_have_dispatched and set(received) == {0}
+            assert not b.session.journal.fault.latched()
+            assert (await healthy(c))["local_hold_verified"]
+        else:
+            assert attempt.positive_may_have_dispatched and received[:2] == [c.current.selected(), 0]
+
+
+# Intent: Pause arriving while Return awaits a real native read invalidates the positive release before send.
+# Why: a newer Stop must preempt prior work rather than wait for it to restore app authority first.
+@pytest.mark.parametrize("boundary", ["native", "owned_task"])
+async def test_newer_pause_preempts_return_during_native_validation(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
+        session = managed_session(rig)
+        await session.start()
+        controller = ManagedController(session)
+        rig.route_to_trial()
+        async with rig.charger(session) as charger:
+            await introduced(rig, session, charger, "preempt-boot")
+            await healthy(controller)
+            controller.command(identifier(), "pause", 0)
+            status = await healthy(controller)
+            request = identifier()
+            controller.command(request, "app_control", status["control_revision"])
+            entered, proceed = asyncio.Event(), asyncio.Event()
+            actual = controller.native.observe
+
+            # Delay the independent peer observation, preserving every actual native evidence and RPC check.
+            async def delayed() -> Any:
+                entered.set()
+                await proceed.wait()
+                return await actual()
+
+            if boundary == "native":
+                monkeypatch.setattr(controller.native, "observe", delayed)
+            else:
+                original_release = session.gateway.controls._release
+
+                # Delay only scheduling, then execute the real owned release including its pre-claim guard.
+                async def delayed_release(*args, **kwargs):
+                    entered.set()
+                    await proceed.wait()
+                    return await original_release(*args, **kwargs)
+
+                monkeypatch.setattr(session.gateway.controls, "_release", delayed_release)
+            actual_claim = session.gateway.controls._claim
+            claims = []
+
+            # Observe the actual claim ordering, retaining every real persistence and control effect.
+            def claim(inhibit, stopping=False):
+                claims.append(stopping)
+                return actual_claim(inhibit, stopping)
+
+            monkeypatch.setattr(session.gateway.controls, "_claim", claim)
+            count = len(rig.bench.received_limits)
+            task = asyncio.create_task(controller.tick())
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                claims.clear()
+                controller.command(identifier(), "pause", status["control_revision"])
+                proceed.set()
+                await task
+                await healthy(controller)
+                assert all(limit == 0 for limit in rig.bench.received_limits[count:])
+                assert controller.requests.intent().mode == "paused"
+                assert controller.requests.receipt(request)["state"] == "failed"
+                assert not starts(rig) and session.journal.get("managed_control_fault") is None
+                assert claims and all(claims)
+            finally:
+                proceed.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+
+# Intent: a crash after durable Pause but before its worker runs recovers to actual0 without any positive release.
+# Why: intent durability must cover the interval in which the old physical ceiling can still be6.
+async def test_crash_immediately_after_pause_acceptance_reconciles_to_zero(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.handover_helpers import crash
+
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
+        first = managed_session(rig)
+        await first.start()
+        controller = ManagedController(first)
+        rig.route_to_trial()
+        async with rig.charger(first) as charger:
+            await introduced(rig, first, charger, "crash-pause-first")
+            await healthy(controller)
+            request = identifier()
+            controller.command(request, "pause", 0)
+            assert controller.pause_task is not None
+            controller.pause_task.cancel()
+            await asyncio.gather(controller.pause_task, return_exceptions=True)
+            assert rig.bench.firmware.effective_limit() == 6
+            await crash(first)
+        replacement = managed_session(rig)
+        await replacement.start()
+        recovered = ManagedController(replacement)
+        before = len(rig.bench.received_limits)
+        async with rig.charger(replacement) as charger:
+            await introduced(rig, replacement, charger, "crash-pause-replacement")
+            status = await healthy(recovered)
+            assert status["local_hold_verified"] and status["desired_control"] == "paused"
+            assert all(limit == 0 for limit in rig.bench.received_limits[before:])
+            assert recovered.requests.receipt(request)["state"] == "completed" and not starts(rig)
+
+
+# Intent: Stop Accepted alone cannot complete Pause; actual closure/zero still works when vendor delivery is offline.
+# Why: a command ACK is not proof of power or lifecycle closure, and stopping must not depend on the cloud.
+async def test_pause_requires_actual_closure_and_works_with_cloud_offline(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.prototype_rig import START
+    from tests.runtime_rig import until
+
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
+        session = managed_session(rig)
+        await session.start()
+        controller = ManagedController(session)
+        rig.route_to_trial()
+        async with rig.charger(session) as charger:
+            await introduced(rig, session, charger, "offline-pause-boot")
+            await healthy(controller)
+            reply = await rig.bench.call(
+                charger, "native-start-for-stop", "StartTransaction", START | {"idTag": "NATIVE_TIMER"}
+            )
+            local = reply[2]["transactionId"]
+            await until(
+                lambda: session.journal.vendor_id(local) is not None and session.journal.next_delivery() is None
+            )
+            rig.peer.paused, rig.peer.permission_enabled = False, True
+            rig.bench.cp, rig.bench.connection = "C", "Charging"
+            rig.bench.firmware.fire_plan(9)
+            assert (await healthy(controller))["power_w"] == 1440
+            await session.runtime.stop_vendor()
+            request = identifier()
+            controller.command(request, "pause", 0)
+            await until(lambda: any(f[2] == "RemoteStopTransaction" for f in rig.bench.device_calls))
+            assert controller.requests.receipt(request)["state"] == "accepted"
+            assert session.journal.active() == local
+            await rig.bench.call(
+                charger,
+                "actual-stop",
+                "StopTransaction",
+                {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100},
+            )
+            rig.peer.permission_enabled = False
+            rig.bench.cp, rig.bench.connection = "B", "Plug"
+            async with asyncio.timeout(5):
+                while controller.requests.receipt(request)["state"] != "completed":
+                    status = await controller.tick()
+                    await asyncio.sleep(0.02)
+            assert status["local_hold_verified"] and not status["cloud_connected"]
+            assert session.journal.next_delivery() is not None
+            assert rig.bench.firmware.effective_limit() == 0 and not starts(rig)
+
+
+# Intent: an explicit Pause lowers the commissioned charger before waiting on even the first native response.
+# Why: a stalled read can outlast a deadline and zero current alone cannot complete the owner's Pause receipt.
+async def test_pause_restricts_station_while_native_observation_is_stalled(tmp_path, tls, unused_tcp_port, monkeypatch):
+    from ics_proxy_core.engine.managed_view import refresh_for_read
+
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
+        session = managed_session(rig)
+        await session.start()
+        controller = ManagedController(session)
+        rig.route_to_trial()
+        async with rig.charger(session) as charger:
+            await introduced(rig, session, charger, "pause-telemetry-stall")
+            published = envelope(await healthy(controller))
+            observe = controller.native.observe
+            entered, resume = asyncio.Event(), asyncio.Event()
+
+            # Keep the socket-based station connection live while its separate observation is in progress.
+            async def delayed():
+                entered.set()
+                await resume.wait()
+                return await observe()
+
+            monkeypatch.setattr(controller.native, "observe", delayed)
+            request = identifier()
+            controller.command(request, "pause", controller.requests.intent().revision)
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                assert rig.bench.firmware.effective_limit() == 0
+                with_old_sample = refresh_for_read(controller, published)
+                assert with_old_sample["station_ceiling_a"] is None
+                assert with_old_sample["requested_current_a"] == 6 and with_old_sample["native_age_seconds"] < 15
+                assert controller.requests.receipt(request)["state"] == "accepted"
+                assert not any(frame[2] == "RemoteStopTransaction" for frame in rig.bench.device_calls)
+            finally:
+                resume.set()
+                await controller.pause_task
+            paused = refresh_for_read(controller, envelope(await healthy(controller)))
+            assert paused["local_hold_verified"] and paused["station_ceiling_a"] == 0
+            assert controller.requests.receipt(request)["state"] == "completed" and not starts(rig)
