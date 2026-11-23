@@ -92,6 +92,7 @@ class ManagedController:
         self._pause_generation = 0
         self.latest_native: HandoverEvidence | None = None
         self.latest_native_lifecycle: tuple[int, int | None] | None = None
+        self.latest_native_scope: ControlScope | None = None
         self.status_authority: AuthorityStamp | None = None
         self.status_latest_closed: int | None = None
         self.status_vendor_epoch: int | None = None
@@ -691,6 +692,7 @@ class ManagedController:
         g = self.session.gateway
         if authority != self.native.authority() or sequence != self.native.last_resolved_read:
             raise AuditSupersededError("native supervision crossed a newer authority or observation")
+        connection = current_control_scope(g)
         verified_pause = False
         if (self.requests.intent().mode == "app") and (self.released_epoch != g._charger_epoch):
             raise RecoveryRequiredError("managed release awaits fresh app-control restoration")
@@ -706,6 +708,7 @@ class ManagedController:
         self.history_omission_only = True
         self.native_unavailable = 0
         self.latest_native_lifecycle = self.session.journal.lifecycle_position()
+        self.latest_native_scope = connection
         self.latest_native = native
         if intent_changed:
             return PollStatus("pausing", intent=observed_intent)

@@ -26,7 +26,10 @@ PROXY_INPUTS = (
     "tools/trial_proxy.py",
     "requirements-offline.txt",
     "requirements-trial.txt",
+    "packaging/ics-proxy.service.example",
 )
+DISCOVERY_SEED = 19
+DISCOVERY_CASES = 20
 
 
 @dataclass(frozen=True)
@@ -105,8 +108,81 @@ def runtime_identity(python: str, source: Path) -> dict:
     )
 
 
-# Confirm the one expected test ran successfully, and that discovery actually ran all twenty histories.
-def evidence(check: Check, attempt: Path) -> dict[str, str]:
+# Regenerate the search orders from the frozen candidate using the same interpreter as the search.
+def discovery_orders(python: str, source: Path) -> list[list[str]]:
+    code = (
+        "import json, runpy, sys; "
+        "select = runpy.run_path('tests_discovery/schedules.py')['selected_orders']; "
+        "print(json.dumps(select(int(sys.argv[1]), int(sys.argv[2]))))"
+    )
+    orders = json.loads(
+        subprocess.check_output(
+            [python, "-I", "-B", "-c", code, str(DISCOVERY_SEED), str(DISCOVERY_CASES)],
+            cwd=source,
+            env=clean_env(),
+            timeout=20,
+        )
+    )
+    if (
+        not isinstance(orders, list)
+        or len(orders) != DISCOVERY_CASES
+        or not all(isinstance(order, list) and all(isinstance(event, str) for event in order) for order in orders)
+        or len({tuple(order) for order in orders}) != DISCOVERY_CASES
+    ):
+        raise ValueError("recovery search did not generate all distinct expected histories")
+    return orders
+
+
+# A passed history must record each boundary and both closure and subsequent charge evidence.
+def verified_observations(order: list[str], observations: object) -> bool:
+    events = ["prefix", *order, "settle_lifecycle", "later_charge"]
+    if (
+        not isinstance(observations, list)
+        or not all(isinstance(row, dict) for row in observations)
+        or [row.get("event") for row in observations] != events
+    ):
+        return False
+    revision = observations[0].get("expected_pause_revision")
+    if type(revision) is not int or revision < 0:
+        return False
+    pause, reply_seen = "original", False
+    for event, row in zip(events, observations, strict=True):
+        if event in ("pause", "newer_pause"):
+            revision += 1
+            pause = event
+        reply_seen = reply_seen or event == "reply"
+        later_charge = event == "later_charge"
+        settled = event in ("settle_lifecycle", "later_charge")
+        pause_state = "completed" if settled or pause == "original" else "accepted"
+        receipts = row.get("receipts")
+        intent = row.get("intent")
+        if (
+            type(row.get("expected_pause_revision")) is not int
+            or row["expected_pause_revision"] != revision
+            or not isinstance(intent, dict)
+            or type(intent.get("revision")) is not int
+            or intent != {"mode": "app" if later_charge else "paused", "revision": revision + int(later_charge)}
+            or row.get("old_reply_seen") is not reply_seen
+            or row.get("old_start_stage") != ("accepted" if reply_seen else "issued")
+            or type(row.get("start_commands_seen")) is not int
+            or row["start_commands_seen"] != 1
+            or not isinstance(receipts, dict)
+            or receipts.get("original") != "completed"
+            or receipts.get(pause) != pause_state
+        ):
+            return False
+        if settled:
+            if receipts.get("start") != "completed":
+                return False
+        elif receipts.get("start") not in ("accepted", "running", "failed", "uncertain"):
+            return False
+        if later_charge and receipts.get("final") != "completed":
+            return False
+    return True
+
+
+# Confirm the expected pytest case and independently audit discovery's recorded histories.
+def evidence(check: Check, attempt: Path, orders: list[list[str]] | None) -> dict[str, str]:
     xml = attempt / "pytest.xml"
     cases = ElementTree.parse(xml).findall(".//testcase")
     if (
@@ -120,13 +196,26 @@ def evidence(check: Check, attempt: Path) -> dict[str, str]:
         path = attempt / "discovery" / "summary.json"
         summary = json.loads(path.read_text())
         if (
-            summary["status"] != "passed"
-            or summary["seed"] != 19
-            or summary["planned"] != 20
-            or len(summary["runs"]) != 20
-            or any(row["purpose"] != "search" or row["status"] != "passed" for row in summary["runs"])
+            orders is None
+            or not isinstance(summary, dict)
+            or type(summary.get("schema_version")) is not int
+            or summary.get("schema_version") != 1
+            or summary.get("status") != "passed"
+            or summary.get("seed") != DISCOVERY_SEED
+            or summary.get("planned") != DISCOVERY_CASES
+            or not isinstance(runs := summary.get("runs"), list)
+            or len(runs) != len(orders)
+            or not all(
+                isinstance(run, dict)
+                and run.get("purpose") == "search"
+                and run.get("status") == "passed"
+                and run.get("events") == order
+                and verified_observations(order, run.get("observations"))
+                for order, run in zip(orders, runs, strict=True)
+            )
+            or summary.get("observed_events") != sorted({row["event"] for run in runs for row in run["observations"]})
         ):
-            raise ValueError("recovery search did not finish all twenty histories")
+            raise ValueError("recovery search evidence does not match every expected history and observation")
         artifacts.append(path)
     return {str(path.relative_to(attempt)): hashlib.sha256(path.read_bytes()).hexdigest() for path in artifacts}
 
@@ -145,7 +234,11 @@ def run_check(check: Check, python: str, source: Path, attempt: Path, previous: 
         "--junitxml=" + str(attempt / "pytest.xml"),
     ]
     if check == DISCOVERY:
-        command += ["--discovery-output=" + str(attempt / "discovery"), "--discovery-seed=19", "--discovery-cases=20"]
+        command += [
+            "--discovery-output=" + str(attempt / "discovery"),
+            f"--discovery-seed={DISCOVERY_SEED}",
+            f"--discovery-cases={DISCOVERY_CASES}",
+        ]
     else:
         assert previous is not None
         env["OCPP_WEEK_COMMISSIONING_ROOT"] = str(previous)
@@ -171,14 +264,14 @@ def run_check(check: Check, python: str, source: Path, attempt: Path, previous: 
 
 
 # A matching successful run can be reused only while its required test evidence still verifies.
-def passed_attempt(check: Check, directory: Path, inputs: dict) -> Path | None:
+def passed_attempt(check: Check, directory: Path, inputs: dict, orders: list[list[str]] | None) -> Path | None:
     try:
         receipt = json.loads((directory / "passed.json").read_text())
         name = receipt["attempt"]
         if receipt["inputs"] != inputs or not re.fullmatch(r"attempt-[a-z0-9_]+", name):
             return None
         attempt = directory / name
-        return attempt if receipt["evidence"] == evidence(check, attempt) else None
+        return attempt if receipt["evidence"] == evidence(check, attempt, orders) else None
     except OSError, ValueError, TypeError, KeyError, ElementTree.ParseError:
         return None
 
@@ -196,6 +289,7 @@ def ensure_check(
     import fcntl
 
     runtime = runtime_identity(python, source)
+    orders = discovery_orders(python, source) if check == DISCOVERY else None
     if check == WEEK:
         pins = (
             "requirements-ha-proxy.txt",
@@ -221,13 +315,13 @@ def ensure_check(
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "run.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if attempt := passed_attempt(check, directory, inputs):
+        if attempt := passed_attempt(check, directory, inputs, orders):
             print(f"{check.name}: reused passing results at {attempt}", flush=True)
             return
         attempt = Path(tempfile.mkdtemp(dir=directory, prefix="attempt-"))
         print(f"{check.name}: running on {inputs['commit']} (log: {attempt / 'test.log'})", flush=True)
         run_check(check, python, source, attempt, installed[1] if installed is not None else None)
-        receipt = {"inputs": inputs, "attempt": attempt.name, "evidence": evidence(check, attempt)}
+        receipt = {"inputs": inputs, "attempt": attempt.name, "evidence": evidence(check, attempt, orders)}
         pending = directory / "passed.new"
         pending.write_text(json.dumps(receipt, indent=2) + "\n")
         pending.replace(directory / "passed.json")

@@ -1,14 +1,17 @@
 # Release and rollback
 
 The development and hosted checks are useful for review. A live update also needs complete qualification tied
-to the exact clean commit. The tools derive test collection from frozen source and verify every recorded
-execution. Keep the raw evidence and executor configuration outside the repository.
+to the exact clean commit. Full validation freezes the candidate before running static checks, then audits the
+recorded worker executions against that same source. Keep the raw evidence and executor configuration outside
+the repository.
 
 There are three complete worker suites: `engine-model`, `ha-proxy` (Home Assistant 2026.11), and
 `ha-proxy-2026.10`. Use `tools/parallel_qualify.py --help` for the required worker image, interpreter, output and
 environment options. Use `tools/validate.py --help` to check a complete qualification bundle and its trusted
-collection executors. The release target `ics-client` includes recovery discovery. A changed standalone
-`ics-proxy` release also checks the pinned runtime and rehearses an installation week against the installed build.
+collection executors. Both release targets include recovery discovery. The verifier uses the candidate's seeded
+event orders and checks the recorded observations for each history. `ics-proxy` also checks the standalone
+runtime pins. A change to the standalone service, its dependency pins, or its packaged systemd unit triggers an
+installation week against the installed build.
 
 A previously installed commit from the upstream layout may be present only in the original checkout.
 For a cross-repository rehearsal, import that exact verified commit into your local checkout with
@@ -32,7 +35,15 @@ verification. This tool installs the Home Assistant client. The standalone servi
 ## Update the proxy
 
 Use a clean qualified source, a private state backup, and an authorized idle window. Rehearse journal initialization
-and release checks on a copy before replacing the service. Stop and restart with the configured service manager.
+and release checks on a copy before replacing the service.
+
+The installation week starts the Python service directly. For a systemd deployment, stage the adapted
+[service unit](../packaging/ics-proxy.service.example) as an `ics-proxy.service` file and verify it with
+`systemd-analyze verify /path/to/staged/ics-proxy.service` on the target host. Check the unit's execution paths,
+service account, writable state directory, watchdog and stop timeout. Run its `managed_proxy.py check` invocation
+against the staged source and corresponding private configuration as the configured service account.
+
+Stop and restart with the configured service manager in the authorized window.
 Confirm the installed source fingerprint, current setting, state, vendor availability and preserved charging records.
 
 The rollback checker accepts only exact historical build and journal pairs with rehearsed compatibility. It refuses

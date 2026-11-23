@@ -3,6 +3,8 @@
 ## Unreleased
 
 - Fixed a timing issue that could prevent Pause from recording and stopping a session the charger reported late.
+- Rechecked current charger evidence before sending a session-only Stop and preserved pending Pause through history repair.
+- Kept Home Assistant’s management requests on the configured loopback connection by rejecting redirects.
 - Extracted the active iCS engine, Home Assistant client, tests, deployment tools and documentation into a standalone repository.
 - Preserved one proxy owner for charging actions and retained the existing control and journal formats.
 - Kept queued charger reports for normal delivery during verified history repair, retried temporary native read failures,

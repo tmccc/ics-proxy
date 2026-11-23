@@ -2,8 +2,8 @@
 
 Copy `custom_components/ics_proxy` into the Home Assistant configuration directory, or use the
 [verified Docker installer](release-process.md) for a qualified source commit. Restart Home Assistant,
-then add **iCS local proxy** in Devices & services. Enter the management host, port and token for the already
-running proxy.
+then add **iCS local proxy** in Devices & services. Enter the management port and token for the already
+running proxy. The client connects to `127.0.0.1`.
 
 The proxy binds the management WebSocket to loopback. In a container setup, use a topology in which the
 Home Assistant client can reach that listener, such as the same host network. Keep the token private and

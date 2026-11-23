@@ -438,17 +438,27 @@ class ManagedCharging:
             return
         if self.scoped_normal_stop() and c.requests.intent().mode == "app":
             await self.hold_expired()
-        if c.requests.intent().mode == "paused" and (not g.controls.ready or g.controls.desired() != 0):
+        intent = c.requests.intent()
+        if intent.mode == "paused" and (not g.controls.ready or g.controls.desired() != 0):
             operations = set(g.controls._operations)
             if c.pause_task is not None and not c.pause_task.done():
                 operations.add(c.pause_task)
-            if operations:
-                await asyncio.wait(operations, timeout=min(1.0, g.charger.timeout))
-            if c.requests.intent().mode == "app":
+            # Let the already-owned Set and composite verification finish without waiting for session closure.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 2 * g.charger.timeout
+            while operations and c.requests.intent() == intent and not self.can_record_owner(tag):
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                _, operations = await asyncio.wait(
+                    operations, timeout=min(remaining, 0.05), return_when=asyncio.FIRST_COMPLETED
+                )
+            current = c.requests.intent()
+            if current.mode == "app":
                 if _reclassified:
                     raise UnavailableError("Start report authority changed again during its control handoff")
                 return await self.prepare_owner_report(payload, _reclassified=True)
-            if not self.can_record_owner(tag):
+            if current != intent or not self.can_record_owner(tag):
                 raise UnavailableError("the acknowledged owner report awaits verified Pause zero")
 
     # Ask the owner whether an already-issued Start may report under the existing hold.

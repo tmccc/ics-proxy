@@ -680,6 +680,16 @@ class NativeBoundedHandover:
             return None
         return latest[2]
 
+    # An ordinary Stop needs current verified open evidence. A protective Stop can use separate proof.
+    def session_stop_verified(self, local: int) -> bool:
+        sample = self._current_stop_sample(local)
+        return (
+            sample is not None
+            and sample.physical.transaction_open
+            and sample.physical.observed_at == self.last_verified_at
+            and 0 <= time.time() - self.last_verified_at <= 15
+        )
+
     # Refresh independent evidence before reusing an earlier Stop. A missing proof permits a guarded physical Stop.
     async def refresh_stop_zero(self, local: int) -> None:
         try:

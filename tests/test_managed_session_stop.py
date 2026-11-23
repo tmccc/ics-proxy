@@ -13,12 +13,14 @@ from ics_proxy_core.engine.gateway import decode
 from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
 from ics_proxy_core.engine.managed_session_stop import ManagedSessionStop
 from ics_proxy_core.engine.managed_view import refresh_for_read
+from ics_proxy_core.engine.security import SecurityError
+from ics_proxy_core.engine.store import RecoveryRequiredError
 from ics_proxy_core.frames import build_call_error, build_call_result
 from tests.charge_rig import owner_rig, positive_flow
 from tests.current_rig import adjustable, locally_ready, select
 from tests.managed_rig import healthy
 from tests.management_peer import TOKEN, call
-from tests.prototype_rig import START
+from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.test_managed_boot_supersession import delay_reply
 from tests.test_managed_normal_start import natural_stop, zero_power_session
@@ -78,6 +80,80 @@ async def test_management_start_then_session_stop_at_zero_watts(tmp_path, tls, u
                 assert [(frame[2], frame[3]) for frame in sent] == [("RemoteStopTransaction", {"transactionId": local})]
         finally:
             await api.close()
+
+
+# Intent: a new native refusal withdraws an ordinary Stop target at admission and after a wire wait.
+# Why: an unchanged transaction ID cannot substitute for current verified charger evidence.
+@pytest.mark.parametrize("queued", [False, True], ids=["before-admission", "at-dispatch"])
+async def test_session_stop_rechecks_native_verification(tmp_path, tls, unused_tcp_port, monkeypatch, queued):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        local = await positive_flow(t, "daily")
+        published = dict(await healthy(c), running=True, certificate_remaining_seconds=86400)
+        view = refresh_for_read(c, published)
+        target, revision = view["stop_target"], view["control_revision"]
+        assert target is not None
+        request = uuid.uuid4().hex
+
+        with monkeypatch.context() as configuration:
+            # Change only the independent charger reading, leaving the current Boot and ledger session intact.
+            async def withdraw_verification():
+                configuration.setitem(t.rig.peer.configuration, "maxOutCurrent0", "31")
+                with pytest.raises(SecurityError):
+                    await c.native.read()
+                assert c.native.last_verified_at == 0
+                assert refresh_for_read(c, published)["stop_target"] is None
+
+            if queued:
+                gate = t.session.gateway.charger.gate
+                async with gate.enter(10):
+                    assert c.command(request, "stop_session", revision, target=target)["state"] == "accepted"
+                    await asyncio.wait_for(gate.restrictive_waiting.wait(), 3)
+                    await withdraw_verification()
+                assert c.session_stop.worker is not None
+                await asyncio.wait_for(c.session_stop.worker, 3)
+                assert not j.outcomes.session_stop_dispatched(local)
+            else:
+                await withdraw_verification()
+                with pytest.raises(RecoveryRequiredError, match="current verified session"):
+                    c.command(request, "stop_session", revision, target=target)
+                assert c.requests.receipt(request)["state"] == "not_found"
+            assert not bench.remote_stop.is_set()
+
+        # A later valid auxiliary read of the same open session restores its current native proof.
+        observed_at = c.latest_native.physical.observed_at
+        await c.native.read()
+        assert c.native.last_verified_at > observed_at
+        assert c.command(uuid.uuid4().hex, "stop_session", revision, target=target)["state"] == "accepted"
+        await until(lambda: j.outcomes.accepted_stop(local))
+        await natural_stop(t, local)
+
+
+# Intent: an identical Boot on the same connection withdraws the previous session's Stop target.
+# Why: a newer auxiliary read may verify the session, but only supervision can publish a target for that Boot.
+async def test_session_stop_target_awaits_current_boot_supervision(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        local = await positive_flow(t, "daily")
+        await healthy(c)
+        previous = c.session_stop.target()
+        assert previous is not None
+
+        answer = await bench.call(t.charger, "same-socket-boot-before-stop", "BootNotification", BOOT)
+        assert answer[0] == 3
+        await c.native.read()
+        assert c.native.session_stop_verified(local)
+        assert c.session_stop.target() is None
+
+        await healthy(c)
+        target = c.session_stop.target()
+        assert target is not None and target != previous
+        revision = c.requests.intent().revision
+        with pytest.raises(RecoveryRequiredError, match="current verified session"):
+            c.command(uuid.uuid4().hex, "stop_session", revision, target=previous)
+        assert c.command(uuid.uuid4().hex, "stop_session", revision, target=target)["state"] == "accepted"
+        await until(lambda: j.outcomes.accepted_stop(local))
+        await natural_stop(t, local)
 
 
 # Intent: local and vendor Stop both reuse one physical Stop with a positive station ceiling.

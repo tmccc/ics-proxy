@@ -19,7 +19,7 @@ import pytest
 
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_current import capability_value
-from ics_proxy_core.engine.managed_intent import ManagedRequests
+from ics_proxy_core.engine.managed_intent import OWNER_PAUSE, ManagedRequests
 from ics_proxy_core.engine.native_faults import NativeContentError, diagnostic_type
 from ics_proxy_core.engine.native_history import audit_history, history_policy
 from ics_proxy_core.engine.native_history_recovery import acknowledge_history_policy
@@ -82,6 +82,7 @@ async def missing_history(
     paused: bool = False,
     mixed: bool = False,
     closing_stop: str | None = None,
+    pause_after_fault: str | None = None,
 ) -> AsyncIterator[HistoryFault]:
     async with managed_bench(directory, contexts, port) as rig:
         rig.bench.history = closed_records()
@@ -128,6 +129,10 @@ async def missing_history(
                 "native bounded handover must preserve every original history record"
             )
             assert rig.bench.firmware.effective_limit() == 0
+            if pause_after_fault is not None:
+                controller.command(pause_after_fault, "pause", controller.requests.intent().revision)
+                await controller.pause_task
+                assert controller.requests.receipt(pause_after_fault)["state"] == "accepted"
             with pytest.raises(RecoveryRequiredError, match="active owner"):
                 Journal(first.journal.path, first.journal.identity)
             path, identity = first.journal.path, first.journal.identity
@@ -138,6 +143,45 @@ async def missing_history(
             yield fault
         finally:
             fault.journal.close()
+
+
+# Intent: a Pause accepted during history loss stays owned by the proxy during offline acknowledgement.
+# Why: history recovery must clear the fault for the normal owner to confirm Pause after restarting at zero.
+@pytest.mark.parametrize("same_pause", [True, False], ids=["exact-pause", "unrelated-receipt"])
+async def test_history_acknowledgement_retains_pending_pause(
+    tmp_path, tls, unused_tcp_port, monkeypatch, same_pause
+) -> None:
+    request = uuid.uuid4().hex
+    async with missing_history(tmp_path, tls, unused_tcp_port, monkeypatch, pause_after_fault=request) as fault:
+        rig, journal = fault.rig, fault.journal
+        intent = journal.get("managed_control_intent")
+        before = journal.outcomes.owner(request)
+        assert before is not None and before.state == "accepted"
+        native = await rig.prepared.observer.observe_handover()
+        calls = list(rig.bench.device_calls)
+        if not same_pause:
+            journal.put(OWNER_PAUSE, {**journal.get(OWNER_PAUSE), "ticket": uuid.uuid4().hex})
+            damaged = database(journal)
+            with pytest.raises(RecoveryRequiredError, match="settled journal"):
+                acknowledge_history_policy(journal, fault.book, rig.spec, native)
+            assert database(journal) == damaged and rig.bench.device_calls == calls
+            return
+        assert acknowledge_history_policy(journal, fault.book, rig.spec, native)["fault_cleared"] is True
+        assert journal.get("managed_control_intent") == intent and journal.outcomes.owner(request) == before
+        assert rig.bench.device_calls == calls and rig.bench.firmware.effective_limit() == 0
+        journal.close()
+        replacement = managed_session(rig)
+        try:
+            await replacement.start()
+            controller = ManagedController(replacement)
+            async with rig.charger(replacement) as charger:
+                await introduced(rig, replacement, charger, "history-paused-replacement")
+                assert (await healthy(controller))["local_hold_verified"] is True
+                assert controller.requests.receipt(request)["state"] == "completed"
+                assert controller.requests.intent().mode == "paused" and rig.bench.firmware.effective_limit() == 0
+                await replacement.close()
+        finally:
+            await replacement.close()
 
 
 # Intent: an offline operator acknowledges precisely the missing bodies while keeping allocations, intent and zero.

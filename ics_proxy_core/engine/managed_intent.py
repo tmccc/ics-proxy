@@ -303,6 +303,18 @@ class PauseRequest:
     hold: str
 
 
+def decode_pause_request(identifier: str, result: dict[str, Any]) -> PauseRequest | None:
+    saved = result.get("_pause")
+    if saved is None:
+        return None  # Compatibility receipts predate the request-to-hold binding.
+    if not isinstance(saved, dict):
+        raise SecurityError("saved Pause command binding is malformed")
+    revision, local, hold = saved.get("revision"), saved.get("local"), saved.get("hold")
+    if type(revision) is not int or (local is not None and type(local) is not int) or not isinstance(hold, str):
+        raise SecurityError("saved Pause command binding is malformed")
+    return PauseRequest(identifier, revision, local, hold)
+
+
 @dataclass(frozen=True)
 class ReturnSettlement:
     """The exact Return's receipt decision can be retried without repeating its physical work."""
@@ -484,12 +496,7 @@ class ManagedRequests:
             "SELECT id,result FROM managed_requests WHERE action='pause' AND state IN ('accepted','uncertain') "
             "ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
-        if row is None or (saved := json.loads(row["result"]).get("_pause")) is None:
-            return None  # Compatibility receipts predate the request-to-hold binding.
-        revision, local, hold = saved.get("revision"), saved.get("local"), saved.get("hold")
-        if type(revision) is not int or (local is not None and type(local) is not int) or not isinstance(hold, str):
-            raise SecurityError("saved Pause command binding is malformed")
-        return PauseRequest(row["id"], revision, local, hold)
+        return decode_pause_request(row["id"], json.loads(row["result"])) if row is not None else None
 
     # The wire owner records the exact known session under the current Pause in its hold transaction.
     def bind_pause_stop(

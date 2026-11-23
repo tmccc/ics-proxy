@@ -10,9 +10,10 @@ Leave the charger on its original setup while preparing and inspecting the evide
 3. Keep the listener TLS key, authentication files, native credentials, native bounded specification, baseline,
    and management token outside the checkout. Install them for the service account with restrictive permissions.
    Keep the writable journal and evidence in a private state directory.
-4. Capture and verify the original native baseline, then prepare the native bounded specification for this charger.
-   The specification binds hardware identity, original settings, plan and history evidence, the exact charger Boot,
-   and the proposed listener route. Use `tools/trial_proxy.py capture-bounded-baseline --help` for the local interface.
+4. Run `python -B tools/trial_proxy.py capture-bounded-baseline --config /etc/ics-proxy/proxy.json` with the charger
+   on its original route and at independently verified closed zero. The read-only capture saves the baseline and
+   the original charger configuration to the configured baseline path and its `.original-config.json` companion.
+   Prepare the native bounded specification from those files and the installation's private commissioning evidence.
 5. Run the offline preflight against those files before the route is changed:
 
 ```bash
@@ -20,6 +21,22 @@ python -B tools/managed_proxy.py check --config /etc/ics-proxy/proxy.json \
   --native-bounded-spec /etc/ics-proxy/native-spec.json \
   --management-config /etc/ics-proxy/management.json
 ```
+
+The native specification is a JSON object with six fields.
+
+| Field | Value |
+| --- | --- |
+| `hardware_identity` | The native `bPSN`, matching the configured hardware identity |
+| `original_configuration` | The complete JSON object from the saved original charger configuration |
+| `trial_route` | The four proposed native route fields, `sDomain`, `sPort`, `sURL`, and `allowSelfSign`, as strings. Use the configured listener name and port. Adding the charger identity to `sURL` must produce the configured charger path. |
+| `saved_schedule_digest` | The fingerprint of the complete native `SETPLAN` response from the commissioning evidence |
+| `capability_digest` | The independently established capability digest from the private commissioning record. The service separately verifies current capabilities before applying the station profile. |
+| `boot_digest` | The fingerprint of the complete observed OCPP `BootNotification` payload for this charger |
+
+The saved schedule and Boot fingerprints use [the same deterministic JSON encoding and SHA-256 function as the
+proxy](../ics_proxy_core/engine/store.py#L40). Use the validated private evidence from the selected charger.
+The baseline capture supplies the original configuration. The native schedule, commissioning capability digest,
+and OCPP Boot evidence must be obtained separately before commissioning.
 
 The installation guides start with commissioning at a restricted current. The independent evidence must confirm
 the actual profile, journal and saved resources before authorizing normal operation. The separate

@@ -5,12 +5,52 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from aiohttp import web
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.setup import async_setup_component
 
 from tests_ha_proxy.test_client import TOKEN, setup
 from tests_ha_proxy.test_client import peer as peer
 from tests_ha_proxy.test_setup_outage_notice import _async_get_or_create_notifications, retry
+
+
+# An HTTP redirect must fail in both setup and control before the new endpoint sees a handshake.
+@pytest.mark.parametrize("different_port", [False, True], ids=["different-path", "different-port"])
+async def test_management_never_follows_websocket_redirects(actual_hass, aiohttp_server, different_port):
+    from custom_components.ics_proxy.api import ProxyClient, ProxyError, UnknownCommandOutcomeError
+
+    initial, redirected = [], []
+
+    async def destination(request):
+        redirected.append(request.path)
+        return web.Response(status=400)
+
+    async def redirect(request):
+        initial.append(request.headers.get("Authorization") == "Bearer " + TOKEN)
+        return web.Response(status=307, headers={"Location": target})
+
+    source = web.Application()
+    source.router.add_get("/management", redirect)
+    if different_port:
+        other = web.Application()
+        other.router.add_get("/other", destination)
+        listener = await aiohttp_server(other)
+        target = str(listener.make_url("/other"))
+    else:
+        source.router.add_get("/other", destination)
+        target = "/other"
+    listener = await aiohttp_server(source)
+
+    result = await actual_hass.config_entries.flow.async_init(
+        "ics_proxy", context={"source": "import"}, data={"port": listener.port, "token": TOKEN}
+    )
+    assert result["type"] == "form" and result["errors"]["base"] == "cannot_connect"
+    client = ProxyClient(async_get_clientsession(actual_hass), listener.port, TOKEN)
+    with pytest.raises(ProxyError) as failure:
+        await client.command("pause", 0)
+    assert not isinstance(failure.value, UnknownCommandOutcomeError)
+    assert initial == [True, True] and redirected == []
 
 
 # Intent: the very first coordinator status or a genuine reload starts an outage even when no good coordinator exists.

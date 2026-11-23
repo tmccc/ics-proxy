@@ -12,7 +12,15 @@ from .control_state import ControlState
 from .events import OBSERVATION_ACTIONS, validate_observation
 from .managed_current import managed_current_ceiling
 from .managed_debt_recovery import vendor_history_recovery_scope
-from .managed_intent import ControlIntent, unfinished_owner_requests, verified_pause_after, write_intent
+from .managed_intent import (
+    ControlIntent,
+    decode_intent,
+    decode_pause_request,
+    read_pause_claim,
+    unfinished_owner_requests,
+    verified_pause_after,
+    write_intent,
+)
 from .managed_native_repair import retire_history_omission_revocations
 from .managed_recovery_zero import require_paused_owned_zero
 from .managed_session_stop import CLOSED_REQUESTS, STOP_COMPLETION_FIELDS, STOP_SESSION
@@ -105,6 +113,23 @@ def _unrelated_history_requests(journal: Journal, allow_closed_stop_receipts: bo
 # Project already verified closure inside the caller's history transaction.
 def _complete_history_stops(journal: Journal) -> None:
     journal.db.execute(f"UPDATE managed_requests SET {STOP_COMPLETION_FIELDS} WHERE {CLOSED_REQUESTS}", (STOP_SESSION,))
+
+
+# History repair can retain the current Pause receipt for its owner to finish once normal audits resume.
+def _history_pause_is_only_pending_request(journal: Journal) -> bool:
+    rows = unfinished_owner_requests(journal, include_pause=True)
+    if not rows:
+        return True
+    if len(rows) != 1 or rows[0]["action"] != "pause" or rows[0]["state"] not in ("accepted", "uncertain"):
+        return False
+    pause = decode_pause_request(rows[0]["id"], json.loads(rows[0]["result"]))
+    intent = decode_intent(journal.get("managed_control_intent"))
+    return (
+        pause is not None
+        and pause.revision == intent.revision
+        and read_pause_claim(journal).owns(intent, pause.hold)
+        and journal.outcomes.stop_report_closed(pause.local)
+    )
 
 
 # An unsuccessful timed test keeps its original uncertain reply after its effect has been physically stopped.
@@ -347,7 +372,7 @@ def _reconcile(
             # The exact Stop report and fresh local zero may already agree while the history fault blocks polling.
             if journal.db.execute("SELECT 1 FROM sqlite_master WHERE name='managed_requests'").fetchone():
                 _complete_history_stops(journal)
-                if unfinished_owner_requests(journal, include_pause=True):
+                if not _history_pause_is_only_pending_request(journal):
                     raise RecoveryRequiredError(
                         "history reconciliation requires the matching native fault and a settled journal"
                     )

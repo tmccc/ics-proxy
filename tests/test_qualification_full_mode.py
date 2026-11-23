@@ -185,8 +185,9 @@ def test_full_validator_requires_complete_full_mode(tmp_path, monkeypatch, mode,
     executor_path.write_text("{}")
 
     # This is a structural validator unit: run the real auditor in-process with explicitly synthetic runtime records.
-    def audited_step(name, command, results):
+    def audited_step(name, command, results, *, cwd):
         assert command[-2:] == ["--collection-executors", str(executor_path)]
+        assert cwd == Path(command[2]).parent.parent and cwd != candidate
         import contextlib
         import io
 
@@ -198,7 +199,7 @@ def test_full_validator_requires_complete_full_mode(tmp_path, monkeypatch, mode,
 
     monkeypatch.setattr(validate, "run_step", audited_step)
     results = {}
-    validate.run_full_qualification(bundle, sys.executable, results, executor_path)
+    validate.run_full_qualification(bundle, sys.executable, results, executor_path, include_static=False)
     assert int(not all(results.values())) == expected
 
 

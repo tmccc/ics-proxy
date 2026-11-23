@@ -68,6 +68,16 @@ class ReceiptMismatchError(ProxyError):
     """The response cannot confirm the original request or its actual successor."""
 
 
+async def _reject_redirect(
+    request: aiohttp.ClientRequest, handler: aiohttp.ClientHandlerType
+) -> aiohttp.ClientResponse:
+    response = await handler(request)
+    if 300 <= response.status < 400:
+        response.close()
+        raise aiohttp.ClientError("The local management endpoint redirected the WebSocket handshake")
+    return response
+
+
 class ProxyClient:
     """Home Assistant shares the host network with the proxy; every connection is literal loopback only."""
 
@@ -87,8 +97,17 @@ class ProxyClient:
         identifier = fields.pop("id", uuid.uuid4().hex)
         sending = False
         try:
-            async with asyncio.timeout(10):
-                async with self.session.ws_connect(
+            connector = self.session.connector
+            if connector is None or connector.closed:
+                raise aiohttp.ClientConnectionError("The local management client is closed")
+            # aiohttp applies redirects inside ws_connect. Scope the guard to this exchange and borrow HA's connector.
+            async with (
+                asyncio.timeout(10),
+                aiohttp.ClientSession(
+                    connector=connector, connector_owner=False, middlewares=(_reject_redirect,)
+                ) as session,
+            ):
+                async with session.ws_connect(
                     f"http://127.0.0.1:{self.port}/management",
                     headers={"Authorization": "Bearer " + self.token},
                     protocols=["ics-proxy.v1"],

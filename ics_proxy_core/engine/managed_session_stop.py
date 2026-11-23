@@ -63,10 +63,12 @@ class ManagedSessionStop:
             or not j.phase.read().active
             or local is None
             or connection is None
+            or c.latest_native_scope != connection
             or native is None
             or not native.physical.transaction_open
             or native.physical.native_transaction_id != local
             or not 0 <= time.time() - native.physical.observed_at <= 15
+            or not c.native.session_stop_verified(local)
         ):
             return None
         scope, generation = connection

@@ -18,7 +18,51 @@ from tests.managed_rig import healthy, introduced, managed_session, pending_clou
 from tests.native_schedule_support import ZONE, timer_bench
 from tests.prototype_rig import START
 from tests.runtime_rig import until
+from tests.test_managed_boot_supersession import delay_reply
 from tests.tls_support import tls as tls
+
+
+# Intent: a genuine Start may reach the proxy while the existing Pause zero verification is still on the wire.
+# Why: the proxy needs the report to identify the session, even when the charger confirms the zero hold slowly.
+async def test_held_cloud_start_waits_for_pause_zero_ack(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        c, journal, gateway = b.c, b.session.journal, b.session.gateway
+        await b.acknowledge_older_owner_start()
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        await c.tick()
+        gateway.charger.timeout = 5
+        send, held, entered = delay_reply(monkeypatch, b.rig, b.sock, "SetChargingProfile")
+        pause = uuid.uuid4().hex
+        c.command(pause, "pause", c.requests.intent().revision)
+        await asyncio.wait_for(entered.wait(), 3)
+        assert b.device.effective_limit() == 0 and not gateway.controls.ready
+        b.device.active = 987654
+        b.rig.peer.plan_session = (987654, 987655)
+        body = START | {
+            "idTag": "CLOUD_OWNER",
+            "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
+        }
+        report = asyncio.create_task(b.rig.bench.call(b.sock, "late-start", "StartTransaction", body))
+        try:
+            # Keep the actual Set reply away for longer than the former one-second admission wait.
+            await asyncio.sleep(1.25)
+            assert not report.done()
+        finally:
+            await send(held[0])
+        answer = await report
+        assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted", answer
+        local = answer[2]["transactionId"]
+        b.rig.peer.plan_session = (local, 987655)
+        assert journal.active() == local and b.device.effective_limit() == 0
+        await c.pause_task
+        async with asyncio.timeout(4):
+            while not b.stops():
+                await c.tick()
+                await asyncio.sleep(0.02)
+        assert b.stops() == [local] and b.device.effective_limit() == 0
+        await b.close_transaction(local)
+        assert (await healthy(c))["local_hold_verified"]
+        assert c.requests.receipt(pause)["state"] == "completed"
 
 
 # Reach the existing ordinary native-outage hold through actual failed loopback HTTP reads.

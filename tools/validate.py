@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Modified for the standalone iCS proxy repository.
-"""Run static checks and re-audit complete20-worker qualification, or run an explicit targeted test selection.
+"""Run static checks and re-audit complete 20-worker qualification, or run an explicit targeted test selection.
 
     python tools/validate.py --qualification-report /absolute/path/bundle.json
     python tools/validate.py --quick    # skip pytest
@@ -85,27 +85,44 @@ def pytest_succeeded(completed: subprocess.CompletedProcess[str], known: list[st
 
 # Run one named step and report pass or fail without aborting the remaining steps.
 # A single run should list every problem, not only the first.
-def run_step(name: str, command: list[str], results: dict[str, bool]) -> subprocess.CompletedProcess[str]:
+def run_step(
+    name: str,
+    command: list[str],
+    results: dict[str, bool],
+    *,
+    cwd: Path | None = None,
+    cache_dir: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     print(f"\n== {name}")
     env = dict(os.environ)
-    if env.get("TMPDIR"):
+    tmp = cache_dir or (Path(env["TMPDIR"]) if env.get("TMPDIR") else None)
+    if tmp is not None:
         for variable, child in (
             ("MYPY_CACHE_DIR", "mypy"),
             ("RUFF_CACHE_DIR", "ruff"),
             ("PYTHONPYCACHEPREFIX", "compiled"),
         ):
-            env.setdefault(variable, str(Path(env["TMPDIR"]) / child))
-    completed = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, env=env)
+            if cache_dir is not None:
+                env[variable] = str(tmp / child)
+            else:
+                env.setdefault(variable, str(tmp / child))
+    completed = subprocess.run(command, cwd=cwd or ROOT, text=True, capture_output=True, env=env)
     output = (completed.stdout + completed.stderr).strip()
     print(output[-2500:] if output else "(no output)")
     results[name] = completed.returncode == 0
     return completed
 
 
-# Run the YAML syntax check CI applies to every *.yml/*.yaml file in the repository.
-# A broken fixture or workflow should fail locally, not in CI.
-def check_yaml(python: str, results: dict[str, bool]) -> None:
-    code = (
+# For a release, source checks read the frozen candidate and Git checks address its immutable commit.
+def run_static_checks(
+    python: str,
+    results: dict[str, bool],
+    *,
+    source: Path | None = None,
+    commit: str | None = None,
+    cache_dir: Path | None = None,
+) -> None:
+    yaml_check = (
         "import pathlib,yaml,sys\n"
         "bad=[]\n"
         "for pat in ('*.yml','*.yaml'):\n"
@@ -115,7 +132,19 @@ def check_yaml(python: str, results: dict[str, bool]) -> None:
         "        except Exception as e: bad.append(f'{p}: {str(e)[:80]}')\n"
         "print('\\n'.join(bad)); sys.exit(1 if bad else 0)\n"
     )
-    run_step("yaml", [python, "-c", code], results)
+    for name, args in (
+        ("ruff check", ["-m", "ruff", "check", "."]),
+        ("ruff format", ["-m", "ruff", "format", "--check", *FORMAT_TARGETS]),
+        ("mypy --strict", ["-m", "mypy", "--strict", "--follow-imports=skip", *MYPY_TARGETS]),
+        ("version", ["tools/version.py", "check"]),
+        ("translations (hassfest rules)", ["tools/check_translations.py"]),
+        ("yaml", ["-c", yaml_check]),
+        ("compileall", ["-m", "compileall", "-q", "-f", *FORMAT_TARGETS]),
+    ):
+        run_step(name, [python, *args], results, cwd=source, cache_dir=cache_dir)
+    if commit is None:
+        run_step("git diff --check", ["git", "diff", "--check", "HEAD"], results)
+    run_step("committed whitespace", ["git", "show", "--check", "--format=", commit or "HEAD"], results)
 
 
 # Check all three raw qualification phases against the exact clean source.
@@ -130,10 +159,10 @@ def audit_qualification(path, source, metadata, python, results, collection_exec
         raise ValueError("qualification bundle does not cover this exact source and every required suite")
     engine_packages = {}
     for suite in sorted(required):
-        batch = Path(bundle["phases"][suite])
+        batch = Path(bundle["phases"][suite]).resolve()
         config = json.loads((batch / "config.json").read_text())
         if config.get("suite") != suite or config.get("workers") != 20 or config.get("mode") != "full":
-            raise ValueError("qualification phase requires its entire suite in full mode with20 workers")
+            raise ValueError("qualification phase requires its entire suite in full mode with 20 workers")
         completed = run_step(
             f"qualification ({suite})",
             [
@@ -145,9 +174,10 @@ def audit_qualification(path, source, metadata, python, results, collection_exec
                 metadata["commit"],
                 "--expected-source-digest",
                 metadata["source_digest"],
-                *(["--collection-executors", str(collection_executors)] if collection_executors else []),
+                *(["--collection-executors", str(collection_executors.resolve())] if collection_executors else []),
             ],
             results,
+            cwd=source,
         )
         audited = json.loads(completed.stdout)
         if (
@@ -175,6 +205,7 @@ def run_full_qualification(
     *,
     validated_snapshot: Path | None = None,
     deployment: Deployment | None = None,
+    include_static: bool = True,
 ) -> None:
     if path is None:
         print("Full qualification requires --qualification-report from tools/parallel_qualify.py (20 workers).")
@@ -183,10 +214,14 @@ def run_full_qualification(
     with tempfile.TemporaryDirectory(prefix="ocpp-release-") as tmp:
         scratch = Path(tmp)
         try:
+            if validated_snapshot is not None and not include_static:
+                raise ValueError("a deployment snapshot requires static checks")
             target = deployment.target if deployment is not None else "qualification-only"
             ics_release = target in ("ics-proxy", "ics-client")
-            source = (validated_snapshot or scratch).resolve() / "source" if ics_release or validated_snapshot else None
+            source = (validated_snapshot or scratch).resolve() / "source"
             metadata = freeze(ROOT, source)
+            if include_static:
+                run_static_checks(python, results, source=source, commit=metadata["commit"], cache_dir=scratch)
             week = target == "ics-proxy" and ics_predeployment.changed_proxy(
                 ROOT, metadata["commit"], deployment.installed
             )
@@ -194,7 +229,7 @@ def run_full_qualification(
                 raise ValueError(
                     "provide --ics-ha-python from a pinned Home Assistant runtime for the installation week"
                 )
-            engine_packages = audit_qualification(path, source or ROOT, metadata, python, results, collection_executors)
+            engine_packages = audit_qualification(path, source, metadata, python, results, collection_executors)
             if target == "ics-proxy":
                 ics_predeployment.require_standalone_pins(source, engine_packages)
             if ics_release and all(results.values()):
@@ -265,16 +300,8 @@ def main() -> int:
     python = venv_python()
     results: dict[str, bool] = {}
 
-    if not args.tests_only:
-        run_step("ruff check", [python, "-m", "ruff", "check", "."], results)
-        run_step("ruff format", [python, "-m", "ruff", "format", "--check", *FORMAT_TARGETS], results)
-        run_step("mypy --strict", [python, "-m", "mypy", "--strict", "--follow-imports=skip", *MYPY_TARGETS], results)
-        run_step("version", [python, "tools/version.py", "check"], results)
-        run_step("translations (hassfest rules)", [python, "tools/check_translations.py"], results)
-        check_yaml(python, results)
-        run_step("compileall", [python, "-m", "compileall", "-q", "-f", *FORMAT_TARGETS], results)
-        run_step("git diff --check", ["git", "diff", "--check", "HEAD"], results)
-        run_step("committed whitespace", ["git", "show", "--check", "--format=", "HEAD"], results)
+    if not args.tests_only and (args.quick or args.expression):
+        run_static_checks(python, results)
 
     if not args.quick and args.expression:
         command = [python, "-m", "pytest", "-q", "-rf", "-p", "no:cacheprovider", "tests/", "-k", args.expression]
@@ -295,6 +322,7 @@ def main() -> int:
             validated_snapshot=args.validated_snapshot,
             collection_executors=args.collection_executors,
             deployment=Deployment(args.deployment_target, args.installed_proxy_commit, args.ics_ha_python),
+            include_static=not args.tests_only,
         )
 
     print("\nSummary")
