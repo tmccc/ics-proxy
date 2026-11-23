@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
 
-from tools.version import canonical
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tools.version import canonical  # noqa: E402
 
 
 # Match the requested version rather than relying on the position of an Unreleased heading.

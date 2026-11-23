@@ -624,14 +624,15 @@ class ManagedController:
                 try:
                     await self.ordinary.hold("native_observation_unavailable")
                 except SecurityError as failure:
-                    self.fault("native_authority_or_preservation_failed")
-                    self.record_optional_native_failure(
-                        {
+                    self.fault(
+                        "native_authority_or_preservation_failed",
+                        diagnostic={
                             "type": diagnostic_type(failure),
                             "detail": str(failure)[:1024],
                             "at_epoch": time.time(),
-                        }
+                        },
                     )
+                    return PollStatus("attention", j.fault.classification())
                 except DeniedError, UnavailableError, RecoveryRequiredError:
                     pass  # The admitted zero remains the only retry; no positive authority was created.
             return PollStatus("degraded", "native_observation_unavailable")

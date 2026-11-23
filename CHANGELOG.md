@@ -5,6 +5,7 @@
 - Fixed a timing issue that could prevent Pause from recording and stopping a session the charger reported late.
 - Rechecked current charger evidence before sending a session-only Stop and preserved pending Pause through history repair.
 - Preserved Stop confirmation through a temporary receipt write failure and supported retrying the first listener bind.
+- Resolved known Start rejections under a verified Pause and recorded whether shutdown reached the Stop send boundary.
 - Kept Home Assistant’s management requests on loopback and preserved Start and Stop after a failed unload.
 - Extracted the active iCS engine, Home Assistant client, tests, deployment tools and documentation into a standalone repository.
 - Preserved one proxy owner for charging actions and retained the existing control and journal formats.

@@ -57,6 +57,12 @@ class ObservedConnection(sqlite3.Connection):
         if Gate.phase == "none" or Gate.fired:
             return
         operation = sql.strip().upper()
+        if Gate.phase == "after-shutdown-stop-claim":
+            if operation == "COMMIT" and not before:
+                attempt = self.metadata("trial_shutdown_attempt")
+                if attempt.get("state") == "pending" and str(attempt.get("local")) == Gate.identifier:
+                    Gate.freeze(self, "after-shutdown-stop-claim")
+            return
         if Gate.phase == "after-owner-start-reply-write":
             if (
                 not before

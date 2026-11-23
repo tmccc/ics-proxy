@@ -247,6 +247,110 @@ async def test_process_saved_forwarded_stop_waits_for_closure(
         assert sum(frame[1] == wire for frame in bench.device_calls) == 1
 
 
+# Intent: only a shutdown Stop proved unissued can be followed by another Stop after process death.
+# Why: an older claim or an actual dispatch without a saved reply can still own the same physical session.
+@pytest.mark.recovery_replay
+@pytest.mark.parametrize("evidence", ["unissued", "legacy", "sent"])
+async def test_process_cut_during_shutdown_stop(tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, evidence):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path, tls_for_case(tmp_path, model_tls), ports(), ports(), monkeypatch, timing="fast-poll"
+    ) as child:
+        rig, bench = child.rig, child.rig.bench
+        await child.start()
+        await child.status()
+        start = START | {"idTag": "NATIVE_TIMER"}
+        answer = await bench.call(child.socket, uuid.uuid4().hex, "StartTransaction", start)
+        assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted"
+        local = answer[2]["transactionId"]
+        rig.peer.plan_session = (local, 9)
+        rig.peer.permission_enabled = False
+        bench.cp, bench.connection = "B", "Plug"
+        await child.delivered(local)
+        await child.status(lambda status: status["healthy"] and status["charging_session_open"])
+        assert bench.firmware.active == local and bench.firmware.current == 0
+        journal_path = rig.prepared.config.journal
+        phase = "after-shutdown-stop-claim"
+
+        # Distinguish actual requests reaching the independent charger from saved or lost wire evidence.
+        def stop_frames():
+            return [frame for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"]
+
+        if evidence == "sent":
+            with closing(sqlite3.connect(journal_path, isolation_level=None)) as db:
+                db.execute(
+                    "CREATE TRIGGER refuse_shutdown_wire_log BEFORE INSERT ON owner_command_wires "
+                    "WHEN NEW.action='RemoteStopTransaction' AND NEW.ticket=("
+                    "SELECT json_extract(value,'$.ticket') FROM meta WHERE key='trial_shutdown_attempt') "
+                    "BEGIN SELECT RAISE(ABORT, 'optional shutdown wire log unavailable'); END"
+                )
+
+            # The charger sees the actual Stop while the process dies without its reply.
+            async def hold_reply(action, _payload):
+                if action == "RemoteStopTransaction":
+                    await asyncio.Event().wait()
+
+            bench.before_reply = hold_reply
+        else:
+            await child.arm(phase, str(local))
+        child.process.terminate()
+        if evidence == "sent":
+            await asyncio.wait_for(bench.remote_stop.wait(), 5)
+        else:
+            gate = await child.gate(phase, str(local))
+            assert not gate["transaction_open"]
+        attempt = child.durable()["metadata"]["trial_shutdown_attempt"]
+        assert attempt["local"] == local and attempt["state"] == "pending" and not attempt["prior_pending_stop"]
+        if evidence == "sent":
+            [sent] = stop_frames()
+            assert sent[3] == {"transactionId": local} and attempt["stop_wire"] == sent[1]
+            with closing(sqlite3.connect(journal_path.as_uri() + "?mode=ro", uri=True)) as db:
+                assert db.execute("SELECT 1 FROM owner_command_wires WHERE wire=?", (sent[1],)).fetchone() is None
+        else:
+            assert not stop_frames()
+        await child.kill()
+        bench.before_reply = None
+
+        with closing(sqlite3.connect(journal_path, isolation_level=None)) as db:
+            if evidence == "legacy":
+                db.execute("UPDATE meta SET value=json_remove(value,'$.stop_wire') WHERE key='trial_shutdown_attempt'")
+            elif evidence == "sent":
+                db.execute("DROP TRIGGER refuse_shutdown_wire_log")
+        if evidence == "sent":
+            # A newer shutdown with no send must carry the original possible dispatch for this same open session.
+            await child.start()
+            await child.status(lambda status: status.get("boot_verified") is True)
+            await child.arm(phase, str(local))
+            child.process.terminate()
+            await child.gate(phase, str(local))
+            next_attempt = child.durable()["metadata"]["trial_shutdown_attempt"]
+            assert next_attempt["stop_wire"] is None and next_attempt["prior_pending_stop"] is True
+            await child.kill()
+        await child.start()
+        state = await child.status(lambda status: status.get("boot_verified") is True)
+        receipt = uuid.uuid4().hex
+        response = await child.request("pause", id=receipt, revision=state["control_revision"])
+        assert response["ok"]
+        if evidence == "unissued":
+            await asyncio.wait_for(bench.remote_stop.wait(), 5)
+            assert [frame[3] for frame in stop_frames()] == [{"transactionId": local}]
+        else:
+            await child.status(
+                lambda status: (
+                    status.get("desired_control") == "paused"
+                    and status["checked_at"] > state["checked_at"]
+                    and bench.firmware.effective_limit() == 0
+                )
+            )
+            assert len(stop_frames()) == (1 if evidence == "sent" else 0)
+            assert (await child.request("receipt", request_id=receipt))["result"]["state"] != "completed"
+
+        stop = {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"}
+        assert (await bench.call(child.socket, uuid.uuid4().hex, "StopTransaction", stop))[0] == 3
+        await child.delivered(local, closed=True)
+        await child.completed_control(receipt)
+
+
 # Intent: a saved cloud acknowledgement and the original Pause survive real process death after SQLite refuses it.
 # Why: report, physical closure and cloud delivery must converge without replaying the accepted charger Stop.
 @pytest.mark.recovery_replay

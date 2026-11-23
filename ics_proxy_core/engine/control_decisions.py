@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     from .managed_records import TerminalCurrent
     from .native_bounded_handover import NativeBoundedHandover
     from .recovery_coordinator import RecoveryCoordinator
+    from .start_settlement import StartRequest
     from .trial_handover_evidence import HandoverEvidence
 
 
@@ -2424,21 +2425,35 @@ class ControlDecisions:
             return "control_operation_pending"
         return None
 
-    # Independently verify the newer owner's closed zero before clearing a superseded Start's pending flag.
+    # Independently verify the current hold's closed zero before clearing a rejected Start's pending flag.
     def settle_rejected_start_at_pause(
         self, c: ManagedController, native: HandoverEvidence, intent: ControlIntent, connection: ControlScope | None
     ) -> None:
         g, j = c.session.gateway, c.session.journal
 
-        # Check only the exact newer Pause and its current hold in the Start settlement transaction.
-        def require_hold(control: dict[str, Any]) -> None:
+        # The internal Pause can retain its intent revision on replacement. Its ticket still supersedes the Start.
+        def require_hold(control: dict[str, Any], request: StartRequest) -> None:
             pause, ownership = c.requests.pause_request(), c.requests.pause_ownership()
+            explicit = (
+                pause is not None
+                and request.revision < intent.revision
+                and pause.revision == intent.revision
+                and ownership.owns_ticket(pause.hold)
+            )
+            internal = j.get("managed_internal_pause")
+            owns_internal_hold = (
+                pause is None
+                and intent.mode == "paused"
+                and isinstance(internal, dict)
+                and internal.get("source") == "test"
+                and internal.get("id") == request.identifier
+                and internal.get("revision") == intent.revision
+                and internal.get("ticket") == control.get("ticket")
+            )
             if (
                 c.stopping
                 or ownership.intent != intent
-                or pause is None
-                or pause.revision != intent.revision
-                or not ownership.owns_ticket(pause.hold)
+                or not (explicit or owns_internal_hold)
                 or not control_scope_matches(g, connection)
                 or c.native.introduction_pending
                 or c.native.audited_epoch != g._charger_epoch
@@ -2451,7 +2466,7 @@ class ControlDecisions:
                 or g.controls._operations
                 or not c.native.commissioned_binding_matches(native)
             ):
-                raise RecoveryRequiredError("rejected Start settlement awaits its current owner Pause")
+                raise RecoveryRequiredError("rejected Start settlement awaits its current Pause hold")
             c.native.require(native, closed=True)
             key = f"profile:{HUB_PROFILE_ID}"
             station = [resource for resource in native.physical.resources if resource.key == key]

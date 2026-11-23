@@ -53,6 +53,27 @@ def test_real_validator_rejects_unexecuted_pytest(tmp_path, monkeypatch, usage):
     assert validate.main() == 1
 
 
+# Intent: a known assertion failure cannot hide a real fixture error in targeted validation.
+# Why: pytest's reporting options must include errors in the same summary used for the compatibility baseline.
+def test_real_validator_retains_fixture_error_next_to_known_failure(tmp_path, monkeypatch, capsys):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_subject.py").write_text(
+        "import pytest\n"
+        "@pytest.fixture\n"
+        "def broken():\n    raise RuntimeError('fixture broke')\n"
+        "def test_known():\n    assert False\n"
+        "def test_setup_error(broken):\n    pass\n"
+    )
+    monkeypatch.setattr(validate, "ROOT", tmp_path)
+    monkeypatch.setattr(validate, "venv_python", lambda: sys.executable)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(validate, "load_baseline", lambda: ["tests/test_subject.py::test_known"])
+    monkeypatch.setattr(sys, "argv", ["validate", "--tests-only", "-k", "test"])
+    assert validate.main() == 1
+    assert "ERROR tests/test_subject.py::test_setup_error" in capsys.readouterr().out
+
+
 # Prepare one genuinely exercised pure module under the task's pytest scratch directory.
 def mutation_project(path, body):
     target = path / "subject.py"

@@ -50,18 +50,25 @@ def test_invalid_release_notes_fail(text: str, tag: str) -> None:
         extract(text, tag)
 
 
-# Intent: exercise the exact stdlib-only module command used by the release job, including its failure exit.
-# Why: a green pure helper does not prove that the workflow can write the right file or stop on a bad tag.
-def test_release_job_command(tmp_path: Path) -> None:
+# Intent: both supported invocations write the tagged notes and fail on an unknown tag.
+# Why: a direct script invocation must resolve its repository imports independently of the working directory.
+@pytest.mark.parametrize("direct", [False, True], ids=["module", "script"])
+def test_release_notes_command(tmp_path: Path, direct: bool) -> None:
     changelog, output = tmp_path / "CHANGELOG.md", tmp_path / "notes.md"
     changelog.write_text(CHANGELOG)
-    command = [sys.executable, "-B", "-m", "tools.release_notes"]
+    invocation = [str(ROOT / "tools/release_notes.py")] if direct else ["-m", "tools.release_notes"]
+    command = [sys.executable, "-E", "-B", *invocation]
+    working_directory = tmp_path if direct else ROOT
     result = subprocess.run(
-        [*command, "v1.9.0", "--changelog", str(changelog), "--output", str(output)], cwd=ROOT, capture_output=True
+        [*command, "v1.9.0", "--changelog", str(changelog), "--output", str(output)],
+        cwd=working_directory,
+        capture_output=True,
     )
     assert result.returncode == 0 and output.read_text() == "- Older changes.\n"
     output.unlink()
     result = subprocess.run(
-        [*command, "v9.0.0", "--changelog", str(changelog), "--output", str(output)], cwd=ROOT, capture_output=True
+        [*command, "v9.0.0", "--changelog", str(changelog), "--output", str(output)],
+        cwd=working_directory,
+        capture_output=True,
     )
     assert result.returncode != 0 and not output.exists()

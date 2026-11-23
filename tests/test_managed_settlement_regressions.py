@@ -425,6 +425,89 @@ async def test_explicit_rejected_start_settles_its_current_ticket(
             assert c.requests.receipt(returning)["state"] == "completed" and len(starts(b.rig)) == 1
 
 
+# Intent: the internal hold after expiry or shutdown can settle its own real rejected Start at verified zero.
+# Why: the later hold has a different ticket, and replacement can retain an already paused intent revision.
+@pytest.mark.parametrize("supersession", ["deadline", "replacement-app", "replacement-paused"])
+async def test_rejected_start_settles_under_its_internal_hold(
+    tmp_path, tls, unused_tcp_port, monkeypatch, supersession
+):
+    restarting = supersession != "deadline"
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, startup=60 if restarting else 1) as b:
+        controller, journal = b.controller, b.session.journal
+        if supersession == "replacement-paused":
+            controller.command(uuid.uuid4().hex, "pause", controller.requests.intent().revision)
+            assert (await healthy(controller))["local_hold_verified"]
+        revision = controller.requests.intent().revision
+        answer = b.rig.bench.firmware.answer
+
+        def reject_start(action, payload):
+            return {"status": "Rejected"} if action == "RemoteStartTransaction" else answer(action, payload)
+
+        on_wire, release_reply = asyncio.Event(), asyncio.Event()
+
+        async def delay_rejection(action, payload):
+            if action == "RemoteStartTransaction":
+                on_wire.set()
+                await release_reply.wait()
+
+        monkeypatch.setattr(b.rig.bench.firmware, "answer", reject_start)
+        b.rig.bench.before_reply = delay_rejection
+        identifier = uuid.uuid4().hex
+        controller.command(identifier, "start", revision)
+        try:
+            await asyncio.wait_for(on_wire.wait(), 3)
+            issued = journal.starts.receipt()
+            assert issued["stage"] == "issued" and journal.get("control")["start_pending"] is True
+            if restarting:
+                controller.request_stop()
+            await until(lambda: journal.get("control")["ticket"] != issued["ticket"])
+        finally:
+            release_reply.set()
+        await controller.charging.settle()
+        b.rig.bench.before_reply = None
+        assert journal.starts.receipt()["stage"] == "rejected" and journal.get("control")["start_pending"] is True
+
+        async def settle(c):
+            j = c.session.journal
+            intent = c.requests.intent()
+            assert intent.mode == "paused" and c.requests.pause_request() is None
+            assert intent.revision == revision + int(supersession != "replacement-paused")
+            hold = j.get("managed_internal_pause")
+            assert hold["source"] == "test" and hold["id"] == identifier
+            assert hold["ticket"] == j.get("control")["ticket"] and hold["ticket"] != issued["ticket"]
+            if not restarting:
+                # The real rejection and zero are insufficient if the durable hold belongs to another request.
+                j.put("managed_internal_pause", {**hold, "id": uuid.uuid4().hex})
+                assert (await c.tick())["state"] == "reconciling"
+                assert j.get("control")["start_pending"] is True
+                j.put("managed_internal_pause", hold)
+            assert (await settled_without_another_command(c))["local_hold_verified"]
+            assert j.starts.receipt()["settled_ticket"] == hold["ticket"]
+            assert j.get("control")["start_pending"] is False and j.active() is None
+            assert b.rig.bench.firmware.effective_limit() == 0
+            assert not any(frame[2] == "RemoteStopTransaction" for frame in b.rig.bench.device_calls)
+            returning = uuid.uuid4().hex
+            c.command(returning, "app_control", intent.revision)
+            assert (await healthy(c))["owner_control_enabled"]
+            assert c.requests.receipt(returning)["state"] == "completed" and len(starts(b.rig)) == 1
+
+        if not restarting:
+            await settle(controller)
+            return
+        await controller.charging.close()
+        await crash(b.session)
+        replacement = managed_session(b.rig)
+        try:
+            await replacement.start()
+            recovered = ManagedController(replacement)
+            async with b.rig.charger(replacement) as charger:
+                await introduced(b.rig, replacement, charger, "rejected-start-replacement")
+                await settle(recovered)
+                await replacement.close()
+        finally:
+            await replacement.close()
+
+
 # Intent: an exact terminal candidate is revoked if its durable target or request changes during real native I/O.
 # Why: metadata cleanup cannot apply a proof to a request whose separate argument binding has been replaced.
 @pytest.mark.parametrize("change", ["target", "request", "new_pause"])

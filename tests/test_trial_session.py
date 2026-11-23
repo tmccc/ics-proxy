@@ -206,6 +206,35 @@ async def test_managed_shutdown_stops_late_transaction_for_already_issued_owner_
         assert b.session.final_status["shutdown_attempt_uncertain"] is False
 
 
+# Intent: the actual shutdown sender requires the original Stop's dispatch proof to commit first.
+# Why: if a refusal left the journal proving that no Stop was sent, a later process could send that Stop again.
+async def test_shutdown_keeps_stop_unissued_if_dispatch_proof_fails(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        await healthy(b.controller)
+        j, g, bench = b.session.journal, b.session.gateway, b.rig.bench
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_shutdown_stop_dispatch BEFORE INSERT ON meta "
+            "WHEN NEW.key='trial_shutdown_attempt' AND json_type(NEW.value,'$.stop_wire')='text' "
+            "BEGIN SELECT RAISE(ABORT, 'shutdown dispatch proof unavailable'); END"
+        )
+        b.controller.request_stop()
+        try:
+            attempt = uuid.uuid4().hex
+            with pytest.raises(sqlite3.IntegrityError, match="shutdown dispatch proof unavailable"):
+                await g.controls.decisions.stop_for_shutdown(g, b.controller.native, attempt, local)
+            shutdown = j.get("trial_shutdown_attempt")
+            assert shutdown["id"] == attempt and shutdown["local"] == local and shutdown["stop_wire"] is None
+            assert j.active() == local and not j.db.in_transaction
+            assert not bench.remote_stop.is_set() and bench.firmware.effective_limit() == 0
+        finally:
+            j.db.execute("DROP TRIGGER refuse_shutdown_stop_dispatch")
+        stop = {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100}
+        assert (await bench.call(b.charger, uuid.uuid4().hex, "StopTransaction", stop))[0] == 3
+        b.rig.peer.permission_enabled = False
+        bench.cp, bench.connection = "B", "Plug"
+
+
 # Intent: confirm shutdown from an actual Stop report and independent zero after a lost RPC reply.
 # Why: a missing reply leaves the command ambiguous, but the later physical evidence can settle the outcome.
 async def test_shutdown_verifies_real_closure_when_only_the_stop_reply_is_lost(

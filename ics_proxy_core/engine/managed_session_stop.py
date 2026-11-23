@@ -145,9 +145,26 @@ class ManagedSessionStop:
                 c.commands.decide(partial(self._fail, scope.identifier, "stop_rejected"))
         except StopAlreadyHandledError:
             pass  # The original session's real closure can also satisfy this waiting request.
-        except DeniedError, RecoveryRequiredError, SecurityError, UnavailableError, TimeoutError, sqlite3.Error:
-            # The original request stays readable. Supervision retires an unresolved live wait at its deadline.
-            pass
+        except DeniedError, RecoveryRequiredError, SecurityError, UnavailableError, TimeoutError:
+            try:
+                c.commands.decide(lambda: self._fail_unsent(scope))
+            except sqlite3.Error:
+                if j.db.in_transaction:
+                    raise
+        except sqlite3.Error:
+            pass  # Preserve the receipt for expiry if the original store operation failed.
+
+    # A pre-dispatch refusal is final only while the original receipt proves no send and no join.
+    def _fail_unsent(self, scope: SessionStop) -> None:
+        self._update_receipts(
+            "state='failed',result=json_set(result,'$.classification','stop_not_sent')",
+            (),
+            "id=? AND action=? AND revision=? AND state='accepted' "
+            "AND json_type(result,'$._session_stop.dispatched')='false' "
+            "AND json_type(result,'$._session_stop.joined') IS NULL",
+            (scope.identifier, STOP_SESSION, scope.intent.revision),
+            retry_after_rollback=True,
+        )
 
     # A known rejection permits another deliberate attempt without forgetting the original wire result.
     def _fail(self, identifier: str, reason: str) -> None:

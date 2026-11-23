@@ -115,6 +115,8 @@ async def test_session_stop_rechecks_native_verification(tmp_path, tls, unused_t
                 assert c.session_stop.worker is not None
                 await asyncio.wait_for(c.session_stop.worker, 3)
                 assert not j.outcomes.session_stop_dispatched(local)
+                receipt = c.requests.receipt(request)
+                assert receipt["state"] == "failed" and receipt["result"]["classification"] == "stop_not_sent"
             else:
                 await withdraw_verification()
                 with pytest.raises(RecoveryRequiredError, match="current verified session"):

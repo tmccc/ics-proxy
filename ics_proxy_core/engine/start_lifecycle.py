@@ -652,8 +652,10 @@ class StartLifecycle:
             return
         self.pending_reply = None
 
-    # A newer Pause can settle an exact, unbound device rejection after verifying its own closed zero.
-    def settle_rejected_pause(self, revision: int, require_hold: Callable[[dict[str, Any]], None]) -> None:
+    # A superseding Pause can settle an exact unbound rejection after verifying its own closed zero.
+    def settle_rejected_pause(
+        self, revision: int, require_hold: Callable[[dict[str, Any], StartRequest], None]
+    ) -> None:
         j = self.journal
         control = j.get("control", {})
         if control.get("start_pending") is not True:
@@ -671,7 +673,7 @@ class StartLifecycle:
             or record.published is not False
             or record.reported_local is not None
             or request.state not in ("accepted", "running", "uncertain")
-            or request.revision >= revision
+            or request.revision > revision
             or receipt.request_id != request.identifier
             or receipt.stage != "rejected"
             or receipt.local is not None
@@ -683,7 +685,7 @@ class StartLifecycle:
         ):
             return
         with j.atomic():
-            require_hold(control)
+            require_hold(control, request)
             j.put(
                 "local_start_receipt",
                 {**json.loads(receipt.body), "settled_ticket": ticket, "pause_revision": revision},

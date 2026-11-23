@@ -220,7 +220,6 @@ class CommandOutcomes:
         self._owner_sessions: dict[str, int] = {}
         self._read_binding_pending = False
         self._shutdown_ticket: str | None = None
-        self._shutdown_stop_dispatched = False
         self.delivery_reply: DeliveryReply | None = None
 
     # Sample delivery certainty from the original report and actual reply, independently of the pump's last error.
@@ -351,8 +350,8 @@ class CommandOutcomes:
 
     # Keep the exact evidence in memory before trying the independent storage write.
     def record_owner_wire(self, wire: OwnerWire) -> None:
-        if wire.action == "RemoteStopTransaction" and wire.ticket == self._shutdown_ticket:
-            self._shutdown_stop_dispatched = True
+        if wire.action == "RemoteStopTransaction" and wire.ticket == self._shutdown_ticket and wire.reply is None:
+            self._mark_shutdown_stop(wire)
         self._owner_writes[wire.wire] = wire
         if len(self._owner_writes) > self.journal.capacity:
             self._owner_writes.pop(next(iter(self._owner_writes)))
@@ -519,15 +518,32 @@ class CommandOutcomes:
                 "boot": boot,
                 "state": "pending",
                 "prior_pending_stop": self.awaits_stop_report(local),
+                "stop_wire": None,
             },
         )
-        self._shutdown_ticket, self._shutdown_stop_dispatched = ticket, False
+        self._shutdown_ticket = ticket
 
-    # Only the original live executor can attest that it retired without dispatching its tracked Stop.
+    # The sender may run only after the exact possible Stop dispatch has committed, even if wire logging fails.
+    def _mark_shutdown_stop(self, wire: OwnerWire) -> None:
+        j = self.journal
+        latest = j.get("trial_shutdown_attempt", {})
+        if (
+            j.db.in_transaction
+            or latest.get("ticket") != wire.ticket
+            or latest.get("local") != wire.local
+            or latest.get("boot") != wire.boot
+            or latest.get("state") != "pending"
+            or "stop_wire" not in latest
+            or latest["stop_wire"] is not None
+        ):
+            raise RecoveryRequiredError("shutdown Stop dispatch requires its original committed claim")
+        j.put("trial_shutdown_attempt", {**latest, "stop_wire": wire.wire})
+
+    # Preserve the historical unsent field for older readers when this attempt can prove the Stop never dispatched.
     def record_shutdown_stop(self, attempt: str, state: str) -> None:
         latest = self.journal.get("trial_shutdown_attempt", {})
         if latest.get("id") == attempt:
-            unsent = latest.get("ticket") == self._shutdown_ticket and not self._shutdown_stop_dispatched
+            unsent = "stop_wire" in latest and latest["stop_wire"] is None
             self.journal.put("trial_shutdown_attempt", {**latest, "state": state, "unsent": unsent})
 
     # A possibly sent shutdown Stop also retains zero until the exact charger report resolves it.
@@ -601,15 +617,20 @@ class CommandOutcomes:
             return False
         if shutdown.get("prior_pending_stop"):
             return True
-        if shutdown.get("unsent") or ticket == self._shutdown_ticket and not self._shutdown_stop_dispatched:
+        if shutdown.get("unsent"):
             return False
         stops = [
             wire
             for wire in self.owner_wires("ticket", ticket)
             if wire.local == local and wire.action == "RemoteStopTransaction"
         ]
-        # A temporary write failure can leave the durable claim without a saved dispatch row.
-        return not stops or any(wire.reply != "Rejected" for wire in stops)
+        if any(wire.reply != "Rejected" for wire in stops):
+            return True
+        # An absent wire row is only conclusive for a new claim that still proves its Stop was never issued.
+        if "stop_wire" not in shutdown:
+            return not stops
+        marked = shutdown["stop_wire"]
+        return marked is not None and not any(wire.wire == marked for wire in stops)
 
     # Read one original mutation. Historical unrelated rows cannot lend it a reply or local session.
     def vendor(self, mutation: object) -> VendorCommand | None:

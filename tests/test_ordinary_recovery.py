@@ -13,14 +13,15 @@ import pytest
 
 from ics_proxy_core.engine.connection_scope import current_scope
 from ics_proxy_core.engine.managed import ManagedController
+from ics_proxy_core.engine.managed_release_recovery import release_evidence
 from ics_proxy_core.engine.rpc import UnavailableError
-from ics_proxy_core.engine.store import encoded
+from ics_proxy_core.engine.store import encoded, fingerprint
 from tests.charge_rig import owner_start, positive_flow
 from tests.current_rig import selected_ready
 from tests.handover_helpers import crash
 from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.native_peer_failures import InterruptedNativePeer
-from tests.prototype_rig import START
+from tests.prototype_rig import BOOT, START
 from tests.recovery_barriers import require_zero_held, returned_to_app
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
@@ -654,6 +655,42 @@ async def test_ordinary_http_outage_retries_zero_and_recovers(
             assert status["current_a"] == current
             await close_session(b.rig, b.session, b.charger, local)
             await healthy(b.controller)
+
+
+# Intent: a changed Boot while a genuine native outage's zero waits for the charger gate is a strict refusal.
+# Why: the exact refusal must publish with its fault instead of appearing as another transient outage.
+async def test_new_boot_during_ordinary_zero_latches_exact_strict_evidence(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 6, native_peer=InterruptedNativePeer) as b:
+        c, g, j = b.controller, b.session.gateway, b.session.journal
+        b.rig.peer.unavailable = True
+        first_boot = g.boot_observation
+        new_boot = BOOT | {"firmwareVersion": "UNCOMMISSIONED"}
+        mark = len(b.rig.bench.device_calls)
+        poll = None
+        try:
+            for _ in range(2):
+                assert (await c.tick())["fault"] == "native_observation_unavailable"
+            async with g.charger.gate.enter(0):
+                poll = asyncio.create_task(c.tick())
+                await until(lambda: c.ordinary.active() and g.controls.desired() == 0)
+                assert not poll.done()
+                assert (await b.rig.bench.call(b.charger, "changed-boot", "BootNotification", new_boot))[0] == 3
+                assert g.boot_observation != first_boot and j.get("boot") == new_boot
+            status = await poll
+            failure, fault = j.get("managed_native_failure"), j.fault.read()
+            assert fault["classification"] == "native_authority_or_preservation_failed"
+            assert status["state"] == "attention" and status["fault"] == fault["classification"]
+            assert failure["type"] == "SecurityError" and "persistence was not proved" in failure["detail"]
+            assert failure["at_epoch"] <= fault["at_epoch"]
+            assert fault["native_failure_digest"] == fingerprint(failure)
+            assert release_evidence(c, fault) is None
+            assert not b.rig.bench.device_calls[mark:]
+        finally:
+            if poll is not None and not poll.done():
+                poll.cancel()
+                await asyncio.gather(poll, return_exceptions=True)
+            b.rig.peer.unavailable = False
+            await b.rig.bench.call(b.charger, "restore-boot", "BootNotification", BOOT)
 
 
 class SlowOrTruncatedPeer(InterruptedNativePeer):

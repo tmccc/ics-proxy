@@ -326,7 +326,7 @@ def main() -> int:
         run_static_checks(python, results)
 
     if not args.quick and args.expression:
-        command = [python, "-m", "pytest", "-q", "-rf", "-p", "no:cacheprovider", "tests/", "-k", args.expression]
+        command = [python, "-m", "pytest", "-q", "-rfE", "-p", "no:cacheprovider", "tests/", "-k", args.expression]
         completed = run_step("pytest", command, results)
         failures = parse_failures(completed.stdout + completed.stderr)
         baseline = load_baseline() if sys.platform == "win32" else []
