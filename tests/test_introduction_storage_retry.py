@@ -44,7 +44,8 @@ def current_probe(runtime, epoch):
     return None
 
 
-# Why: a failed claim must not leave the first authenticated Boot waiting for another connection.
+# Intent: retry a failed initial journal claim on the same authenticated Boot.
+# Why: the first commissioning attempt should recover after storage becomes readable again.
 async def test_first_introduction_claim_read_recovers_on_same_boot(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
@@ -56,6 +57,7 @@ async def test_first_introduction_claim_read_recovers_on_same_boot(tmp_path, tls
         claim = recovery.begin_introduction
         attempts, refusals = [], []
 
+        # Refuse the real claim's metadata read through SQLite's authorization hook.
         def authorizer(action, table, column, database, trigger):
             if action == sqlite3.SQLITE_READ and table == "meta":
                 refusals.append(column)

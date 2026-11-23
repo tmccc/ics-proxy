@@ -68,6 +68,7 @@ class ReceiptMismatchError(ProxyError):
     """The response cannot confirm the original request or its actual successor."""
 
 
+# Reject redirects before aiohttp can send a second handshake to a different path or port.
 async def _reject_redirect(
     request: aiohttp.ClientRequest, handler: aiohttp.ClientHandlerType
 ) -> aiohttp.ClientResponse:
@@ -171,9 +172,16 @@ class ProxyClient:
                     energy if type(energy) in (int, float) and 0 <= energy <= 1e9 else None
                 )
             elif result["charger_latest_completion_known"]:
-                result["last_session_energy_kwh"] = next(
-                    (row["energy_kwh"] for row in result["charger_sessions"] if row["stopped_at"] is not None), None
+                latest = max(
+                    (
+                        (stopped, row["energy_kwh"])
+                        for row in result["charger_sessions"]
+                        if (stopped := _history_time(row["stopped_at"])) is not None
+                    ),
+                    key=lambda item: item[0],
+                    default=None,
                 )
+                result["last_session_energy_kwh"] = latest[1] if latest is not None else None
         return result
 
     # Retry only temporary read failures within the command caller's existing deadline.

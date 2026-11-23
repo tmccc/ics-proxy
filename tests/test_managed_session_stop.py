@@ -32,6 +32,8 @@ from tests.tls_support import tls as tls
 from tools import managed_proxy
 
 
+# Intent: time an outstanding Stop using actual elapsed time across clock corrections.
+# Why: a clock correction could end the client's wait too early or keep it pending too long.
 @pytest.mark.parametrize("wall_step", [-30, 30])
 async def test_live_stop_confirmation_uses_elapsed_time(tmp_path, tls, unused_tcp_port, monkeypatch, wall_step):
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:

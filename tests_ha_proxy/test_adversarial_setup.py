@@ -15,17 +15,20 @@ from tests_ha_proxy.test_client import peer as peer
 from tests_ha_proxy.test_setup_outage_notice import _async_get_or_create_notifications, retry
 
 
-# An HTTP redirect must fail in both setup and control before the new endpoint sees a handshake.
+# Intent: both setup and control stop at a redirect from the configured management listener.
+# Why: each WebSocket handshake must use the exact configured path and port.
 @pytest.mark.parametrize("different_port", [False, True], ids=["different-path", "different-port"])
 async def test_management_never_follows_websocket_redirects(actual_hass, aiohttp_server, different_port):
     from custom_components.ics_proxy.api import ProxyClient, ProxyError, UnknownCommandOutcomeError
 
     initial, redirected = [], []
 
+    # Record any handshake that reaches the redirected destination.
     async def destination(request):
         redirected.append(request.path)
         return web.Response(status=400)
 
+    # Check that authentication reached the original listener before sending the redirect.
     async def redirect(request):
         initial.append(request.headers.get("Authorization") == "Bearer " + TOKEN)
         return web.Response(status=307, headers={"Location": target})

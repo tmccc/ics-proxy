@@ -294,7 +294,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--quick", action="store_true", help="skip pytest")
-    mode.add_argument("--tests-only", action="store_true", help="run only pytest")
+    mode.add_argument(
+        "--tests-only",
+        action="store_true",
+        help="skip static checks for a qualification audit or a targeted -k run",
+    )
     parser.add_argument("-k", dest="expression", default="", help="engine pytest -k expression; not full qualification")
     parser.add_argument("--qualification-report", type=Path, default=os.environ.get("OCPP_QUALIFICATION_REPORT"))
     parser.add_argument(

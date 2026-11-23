@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from ics_proxy_core.engine.managed_view import summarize_charger_history
 from ics_proxy_core.engine.native_history import NativeHistoryArchive, latest_completion_available
 from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import ConflictError, Journal
@@ -51,8 +52,31 @@ def test_latest_archive_uses_known_closure_order(history_journal: Journal) -> No
     archive = NativeHistoryArchive(history_journal)
     archive.observe([], [older, latest], allow_missing=True)
     archive.observe([], [latest], allow_missing=True)
-    assert latest_completion_available(history_journal, {1002: 1000}, 1002)
-    assert not latest_completion_available(history_journal, {1001: 2001}, 1001)
+    assert latest_completion_available(history_journal, {1002: latest["stopTime"]}, 1002)
+    assert not latest_completion_available(history_journal, {1001: older["stopTime"]}, 1001)
+
+
+# Intent: identify the latest native completion even when starts and stops have different orders.
+# Why: a clock correction can preserve either session's own chronology while reversing the order of their starts.
+def test_latest_native_completion_uses_stop_time_without_a_managed_close(history_journal: Journal) -> None:
+    stopped_last = row(1001) | {"startTime": 1000, "stopTime": 1250, "meterStop": 12000}
+    started_last = row(1002) | {"startTime": 1100, "stopTime": 1200, "meterStop": 7000}
+    originals = [stopped_last, started_last]
+    archive = NativeHistoryArchive(history_journal)
+    archive.observe(originals, originals, allow_missing=True)
+
+    history = summarize_charger_history(tuple(originals))
+    assert history.complete and history.latest_completion_known and history.last_energy == 7.0
+    assert history.sessions[0]["energy_kwh"] == 2.0
+
+    for visible, expected in ((started_last, False), (stopped_last, True)):
+        assert archive.observe(originals, [visible], allow_missing=True)["missing_records"] == 1
+        current = summarize_charger_history((visible,))
+        assert current.latest_completion_known
+        assert latest_completion_available(history_journal, current.completed) is expected
+
+    damaged = summarize_charger_history((stopped_last | {"meterStop": None}, started_last))
+    assert not damaged.latest_completion_known
 
 
 # Intent: any number of absent original records is archived and reported without rewriting original admission data.

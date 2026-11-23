@@ -48,6 +48,8 @@ def test_cached_health_ages_certificate_validity():
     assert not current["healthy"] and "certificate_validity_insufficient" in current["health_blockers"]
 
 
+# Intent: publish the certificate warning alongside any existing fault or shutdown state.
+# Why: the expiry warning must leave the primary charger fault or lifecycle state visible.
 @pytest.mark.parametrize(
     ("state", "fault", "expected"),
     [

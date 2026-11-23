@@ -71,6 +71,7 @@ def changed_proxy(repo: Path, candidate: str, installed: str | None) -> bool:
     return bool(git(repo, "diff", "--name-only", installed, candidate, "--", *PROXY_INPUTS).strip())
 
 
+# Compare distribution names using the same normalization for committed pins and installed metadata.
 def normalized_package_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name.strip().lower())
 

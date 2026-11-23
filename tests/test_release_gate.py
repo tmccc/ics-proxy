@@ -21,6 +21,7 @@ def _run(name: str, status: str = "completed", conclusion: str | None = "success
 
 
 # Intent: the hosted gate follows the actual aggregate job whose prerequisites cover both matrices.
+# Why: the aggregate job is the result that combines static, engine, and Home Assistant checks.
 def test_gate_uses_the_workflows_aggregate_check() -> None:
     workflow = Path(__file__).resolve().parents[1] / ".github/workflows/checks.yml"
     jobs = yaml.safe_load(workflow.read_text())["jobs"]
@@ -38,12 +39,14 @@ def test_evaluate_waits_fails_or_passes() -> None:
 
 
 # Intent: the hosted checker polls the exact commit and ignores other providers and other commits.
+# Why: a similarly named check on another commit or provider cannot establish approval for this release.
 def test_check_run_fetch_is_bound_to_actions_and_full_commit(monkeypatch) -> None:
     sha = "a" * 40
     other_commit = {**_run("checks"), "head_sha": "b" * 40, "app": {"slug": "github-actions"}}
     other_provider = {**_run("checks"), "head_sha": sha, "app": {"slug": "other-service"}}
     right = {**_run("checks"), "head_sha": sha, "app": {"slug": "github-actions"}}
 
+    # Verify the query and its time budget, then return both eligible and unrelated results.
     def fetch(command, **kwargs):
         assert command[:3] == ["gh", "api", f"repos/example/ics-proxy/commits/{sha}/check-runs?filter=all"]
         assert 0 < kwargs["timeout"] <= 5
@@ -57,10 +60,12 @@ def test_check_run_fetch_is_bound_to_actions_and_full_commit(monkeypatch) -> Non
     assert error.value.code == 2
 
 
-# Why: even a successful response cannot approve a release once the caller's deadline has expired.
+# Intent: refuse a successful hosted response that arrives after the deadline.
+# Why: a late result cannot establish that the release passed within the caller's requested wait.
 def test_gate_does_not_accept_a_late_result() -> None:
     now = 10.0
 
+    # Advance past the deadline before returning a successful check.
     def fetch(remaining):
         nonlocal now
         assert remaining == 1
@@ -70,14 +75,17 @@ def test_gate_does_not_accept_a_late_result() -> None:
     assert gate.wait_for_gate(fetch, 1, clock=lambda: now) == (False, "timeout: waiting for checks")
 
 
-# Why: sleeping until the next normal poll must not postpone an earlier timeout or start another request.
+# Intent: cap both polling sleep and each request budget at the remaining time.
+# Why: a scheduled poll after the deadline can delay or incorrectly approve a release.
 def test_gate_sleeps_only_until_the_deadline() -> None:
     now, budgets, sleeps = 10.0, [], []
 
+    # Leave the check pending and record the time budget for each poll.
     def fetch(remaining):
         budgets.append(remaining)
         return []
 
+    # Advance the deterministic clock by the requested polling interval.
     def sleep(seconds):
         nonlocal now
         sleeps.append(seconds)
@@ -90,8 +98,10 @@ def test_gate_sleeps_only_until_the_deadline() -> None:
     assert budgets == [5, 2] and sleeps == [3, 2]
 
 
-# Why: a hung hosted request must finish as a classified timeout without fetching again.
+# Intent: report an expired hosted subprocess through the release CLI's normal failure output.
+# Why: a hung request should terminate the polling attempt at its deadline.
 def test_gate_reports_subprocess_timeout(monkeypatch, capsys) -> None:
+    # Model the subprocess reaching its remaining time budget.
     def fetch(command, *, timeout, **kwargs):
         assert 0 < timeout <= 1
         raise gate.subprocess.TimeoutExpired(command, timeout)

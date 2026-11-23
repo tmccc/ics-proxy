@@ -166,12 +166,12 @@ def session_history(journal: Journal) -> list[dict[str, Any]]:
 
 @dataclass(frozen=True)
 class ChargerHistorySummary:
-    """Redacted history and the valid completed sessions used to identify the latest one."""
+    """Redacted history, valid Stop times by transaction, and the last session's energy."""
 
     sessions: list[dict[str, Any]]
     complete: bool
     completed: dict[int, int]
-    energy: dict[int, float]
+    last_energy: float | None
     latest_completion_known: bool
 
 
@@ -182,7 +182,7 @@ def summarize_charger_history(
     summaries: list[dict[str, Any]] = []
     completed: dict[int, int] = {}
     energy: dict[int, float] = {}
-    newest_unreadable_start = 0.0
+    newest_unreadable = 0.0
     unreadable_recent = False
     latest_time = time.time() + 30
     for record in records:
@@ -193,24 +193,27 @@ def summarize_charger_history(
         start = raw_start if type(raw_start) is int else 0
         first, last = record.get("meterStart"), record.get("meterStop", 0)
         start_valid = 0 < start <= latest_time
+        stop_valid = type(stop) is int and 0 <= stop <= latest_time
         if (
             not start_valid
+            or not stop_valid
             or type(identifier) is not int
-            or type(stop) is not int
             or type(first) is not int
             or type(last) is not int
-            or not 0 <= stop <= latest_time
             or not 0 <= first <= 10**12
             or not 0 <= last <= 10**12
             or stop != 0
             and (stop < start or last < first)
         ):
-            newest_unreadable_start = max(newest_unreadable_start, start if start_valid else math.inf)
+            # A row with a reversed clock can still threaten the latest completion through its newer Start time.
+            newest_unreadable = max(
+                newest_unreadable, start if start_valid else math.inf, stop if stop_valid else math.inf
+            )
             if latest_closed is not None and (type(identifier) is not int or identifier >= latest_closed):
                 unreadable_recent = True
             continue
         if stop:
-            completed[identifier] = start
+            completed[identifier] = stop
             energy[identifier] = (last - first) / 1000
         summaries.append(
             {
@@ -219,16 +222,19 @@ def summarize_charger_history(
                 "energy_kwh": energy[identifier] if stop else None,
             }
         )
-    complete = newest_unreadable_start == 0
+    complete = newest_unreadable == 0
     if latest_closed is None:
-        latest_known = complete or max(completed.values(), default=0) > newest_unreadable_start
+        latest_id = max(completed, key=completed.__getitem__, default=None)
+        latest_known = complete or latest_id is not None and completed[latest_id] > newest_unreadable
     else:
+        # The journal can receive the Stop before native history includes that same assigned ID.
+        latest_id = latest_closed
         latest_known = not unreadable_recent and max(completed, default=None) == latest_closed
     return ChargerHistorySummary(
         sorted(summaries, key=lambda r: r["started_at"], reverse=True)[:20],
         complete,
         completed,
-        energy,
+        energy.get(latest_id) if latest_id is not None else None,
         latest_known,
     )
 
@@ -345,11 +351,6 @@ def observed_status(
         and history.latest_completion_known
         and (not check_archive or latest_completion_available(j, history.completed, closed))
     )
-    # A delivered Stop can reach the journal before the charger includes that same assigned ID in its history.
-    if closed is None:
-        last_energy = next((row["energy_kwh"] for row in history.sessions if row["stopped_at"] is not None), None)
-    else:
-        last_energy = history.energy.get(closed)
     try:
         can_set_current = c.current.available(native)
         test_start_ready = c.charging.available(native)
@@ -392,7 +393,7 @@ def observed_status(
         "charger_sessions": history.sessions,
         "charger_history_complete": history.complete and latest_known,
         "charger_latest_completion_known": latest_known,
-        "last_session_energy_kwh": last_energy if latest_known else None,
+        "last_session_energy_kwh": history.last_energy if latest_known else None,
         "preservation_failed": bool(j.get("trial_preservation_fault") or j.get("trial_inventory_fault")),
     }
 

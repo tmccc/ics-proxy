@@ -384,6 +384,7 @@ def test_coverage_cli_reads_the_validated_evidence(tmp_path, monkeypatch, relati
         written[config["suite"]] = path
         return subprocess.CompletedProcess(command, 0, json.dumps(audit))
 
+    # Run the real audit's path resolution in the validator's selected working directory.
     def run_validator(command, *, cwd, check):
         assert command[:3] == [sys.executable, "-B", str(source / "tools/validate.py")]
         assert command[3:6] == ["--deployment-target", "qualification-only", "--tests-only"]

@@ -407,6 +407,7 @@ async def test_expired_session_stop_sample_stays_expired_after_wall_rebase(
         intent = c.requests.intent()
         request = uuid.uuid4().hex
 
+        # Let both clocks age, then correct only the wall clock.
         def rebase() -> None:
             nonlocal elapsed
             elapsed += 16
@@ -435,6 +436,7 @@ async def test_expired_session_stop_sample_stays_expired_after_wall_rebase(
 
         observe = c.native.observe
 
+        # Let the sample's elapsed lifetime pass before returning the real reading.
         async def slow_observation():
             nonlocal elapsed
             sample = await observe()
@@ -465,7 +467,8 @@ async def test_expired_session_stop_sample_stays_expired_after_wall_rebase(
         assert c.requests.receipt(request)["state"] == "completed"
 
 
-# A clock correction cannot restore expired measurements or admit new work from those measurements.
+# Intent: withdraw expired readings and positive requests across a wall-clock correction.
+# Why: a recently displayed idle reading can outlive its verification window.
 @pytest.mark.parametrize("action", ["start", "set_current"])
 async def test_expired_idle_sample_cannot_restore_live_authority(tmp_path, tls, unused_tcp_port, monkeypatch, action):
     async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
@@ -498,6 +501,8 @@ async def test_expired_idle_sample_cannot_restore_live_authority(tmp_path, tls, 
         assert view["healthy"] and view["can_start"] and view["can_set_current"]
 
 
+# Intent: retire the previous periodic sample when the same socket reports a new Boot.
+# Why: an auxiliary native audit cannot restore the earlier Boot's displayed or admitted authority.
 async def test_periodic_idle_sample_is_scoped_to_its_boot(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
         c = rig.controller
@@ -515,6 +520,8 @@ async def test_periodic_idle_sample_is_scoped_to_its_boot(tmp_path, tls, unused_
         assert c.current_native_sample() is c.latest_native and c.latest_native is not previous
 
 
+# Intent: keep old daily schedule evidence expired across a wall-clock correction.
+# Why: continuing the daily at the previous limit requires fresh evidence for that exact session.
 async def test_daily_evidence_stays_expired_after_wall_rebase(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with timer_bench(tmp_path, tls, unused_tcp_port) as rig:
         c = rig.c

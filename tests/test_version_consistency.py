@@ -13,6 +13,7 @@ from tools import version
 ROOT = Path(__file__).resolve().parents[1]
 
 
+# Give version checks an isolated changelog that each test can populate with its release notes.
 @pytest.fixture
 def changelog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "CHANGELOG.md"
@@ -42,6 +43,7 @@ def test_release_tag_must_match_the_checked_out_version(monkeypatch: pytest.Monk
 
 
 # Intent: pending notes allow development checks and prevent tagging the otherwise matching release.
+# Why: a release should put published changes under its version heading before tagging the source.
 @pytest.mark.parametrize(
     ("unreleased", "release_allowed"),
     [

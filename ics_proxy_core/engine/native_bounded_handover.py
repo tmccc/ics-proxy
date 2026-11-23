@@ -141,6 +141,7 @@ class NativeBoundedHandover:
     def authority(self, *, include_observed_digests: bool = True) -> str:
         return fingerprint(self._authority_state(include_observed_digests=include_observed_digests))
 
+    # Capture the connection, control and journal facts that can supersede an in-flight audit.
     def _authority_state(self, *, include_observed_digests: bool) -> dict[str, Any]:
         gateway, journal = self.gateway, self.gateway.journal
         # A report checks the latest observed digest against its sample at commit. Its ownership uses the receipt.

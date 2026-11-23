@@ -61,6 +61,7 @@ def test_proxy_change_detection_includes_standalone_dependency_pins(releases):
 
 
 # Intent: the interpreter that runs the installation week has every candidate standalone pin before it can pass.
+# Why: the old build's pins and a matching Home Assistant version cannot verify the candidate runtime by themselves.
 @pytest.mark.parametrize(
     ("ha_version", "websockets_version", "extra_version", "passes"),
     [
@@ -87,6 +88,7 @@ def test_installation_week_requires_candidate_standalone_pins(
     monkeypatch.setattr(checks, "runtime_identity", lambda python, source: {"packages": packages})
     attempts = []
 
+    # Retain one synthetic passing test report only when the candidate's pins admit the interpreter.
     def run(check, python, source, attempt, installed):
         assert installed == previous
         attempts.append(attempt)
@@ -108,12 +110,14 @@ def test_installation_week_requires_candidate_standalone_pins(
 
 
 # Intent: the unit shipped to standalone operators counts as a proxy release input.
+# Why: a unit-only change can affect how the daemon starts or shuts down in an installation.
 def test_proxy_change_detection_includes_packaged_unit(releases):
     repo, _, _, installed = releases
     candidate = commit(repo, "packaging/ics-proxy.service.example", "[Service]\nTimeoutStopSec=45\n")
     assert checks.changed_proxy(repo, candidate, installed) is True
 
 
+# Intent: include an initializer-only change in release rehearsal and in the startup fingerprint.
 # Why: importing the service helpers executes their package initializer on every startup.
 def test_proxy_release_and_fingerprint_include_tools_initializer(releases):
     repo, _, _, _ = releases
@@ -129,6 +133,7 @@ def test_proxy_release_and_fingerprint_include_tools_initializer(releases):
 
 
 # Intent: every static command and the full audit retain the original candidate if HEAD moves during the run.
+# Why: a published qualification receipt must describe the same source that passed its checks.
 @pytest.mark.parametrize("candidate_passes", [True, False])
 def test_release_checks_the_frozen_candidate_after_checkout_changes(tmp_path, monkeypatch, releases, candidate_passes):
     repo, installed, _, candidate = releases
@@ -138,6 +143,7 @@ def test_release_checks_the_frozen_candidate_after_checkout_changes(tmp_path, mo
     checked_sources = []
     commands = []
 
+    # Move the checkout on the first check and verify which source each subsequent check sees.
     def step(name, command, results, *, cwd=None, cache_dir=None):
         if not commands:
             subprocess.run(["git", "checkout", "--detach", "-q", installed], cwd=repo, check=True)
@@ -152,6 +158,7 @@ def test_release_checks_the_frozen_candidate_after_checkout_changes(tmp_path, mo
             checked_sources.append(cwd)
         results[name] = candidate_passes or name != "ruff check"
 
+    # Confirm the audit still receives the candidate while the checkout contains the installed build.
     def audit(path, source, metadata, python, results, executors):
         assert source == checked_sources[0]
         assert metadata["commit"] == candidate
@@ -181,11 +188,13 @@ def test_release_checks_the_frozen_candidate_after_checkout_changes(tmp_path, mo
 
 
 # Intent: a full tests-only audit can pass independently, and the CLI refuses a publication request in this mode.
+# Why: an evidence audit can verify the recorded suites, while publication also requires static validation.
 def test_tests_only_audits_frozen_source_without_publishing(tmp_path, monkeypatch, releases):
     repo, _, _, candidate = releases
     monkeypatch.setattr(validate, "ROOT", repo)
     audits = []
 
+    # Record which frozen source the tests-only path audits.
     def audit(path, source, metadata, python, results, executors):
         assert source != repo
         assert metadata["commit"] == candidate
@@ -193,6 +202,7 @@ def test_tests_only_audits_frozen_source_without_publishing(tmp_path, monkeypatc
         audits.append(metadata["commit"])
         results["three suites"] = True
 
+    # Detect any unexpected static check in the tests-only path.
     def unexpected_static(*args, **kwargs):
         pytest.fail("tests-only mode ran static checks")
 
@@ -277,6 +287,7 @@ def test_release_snapshot_waits_for_required_checks(
 
 
 # Intent: an unsuccessful release leaves the requested output available for retry with the same exact candidate.
+# Why: a failed or repeated attempt must preserve any files the operator already kept in the destination.
 def test_failed_validation_can_retry_the_same_snapshot_directory(tmp_path, monkeypatch, releases):
     repo, _, _, candidate = releases
     monkeypatch.setattr(validate, "ROOT", repo)
@@ -284,6 +295,7 @@ def test_failed_validation_can_retry_the_same_snapshot_directory(tmp_path, monke
     monkeypatch.setattr(checks, "ensure_check", lambda *args, **kwargs: None)
     fail = True
 
+    # Refuse the first qualification and accept later attempts for the same frozen commit.
     def audit(path, source, metadata, python, results, executors):
         assert metadata["commit"] == candidate
         if fail:
@@ -296,6 +308,7 @@ def test_failed_validation_can_retry_the_same_snapshot_directory(tmp_path, monke
     unrelated = snapshot / "notes.txt"
     unrelated.write_text("operator notes\n")
 
+    # Run each attempt with fresh results and the same publication destination.
     def run():
         results = {}
         validate.run_full_qualification(
@@ -320,6 +333,7 @@ def test_failed_validation_can_retry_the_same_snapshot_directory(tmp_path, monke
 
 
 # Intent: publication can roll back its staged source when an older or concurrent receipt owns the output name.
+# Why: a source snapshot and its receipt must remain paired when another publication already owns the receipt path.
 def test_snapshot_publication_preserves_a_preexisting_receipt(tmp_path):
     source = tmp_path / "staging/source"
     source.mkdir(parents=True)
@@ -378,6 +392,7 @@ def discovery_summary(orders):
 
 
 # Intent: require evidence for each exact history even when a cache agrees with a changed artifact's hash.
+# Why: a matching hash alone only identifies the cached bytes. The audit also checks the observations they contain.
 @pytest.mark.parametrize("damage", ["placeholder", "duplicate", "missing_observation", "incomplete_return"])
 def test_reusing_and_rechecking_discovery_results(tmp_path, monkeypatch, damage):
     attempts = []

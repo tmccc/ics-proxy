@@ -221,6 +221,7 @@ async def test_session_action_can_start_then_stop_at_zero_watts(
     if failed_unload:
         coordinator = entry.runtime_data
 
+        # Fail before platform cleanup so the original coordinator remains available to the service.
         async def refuse_unload(*args, **kwargs):
             raise HomeAssistantError("synthetic platform unload failure")
 
@@ -600,7 +601,8 @@ async def test_bad_token_cannot_configure_or_issue_controls(actual_hass, peer):
     assert peer["commands"] == []
 
 
-# The example proxy settings should connect using the prefilled port in the actual HA configuration form.
+# Intent: the actual HA configuration form defaults to the packaged management port.
+# Why: an installation using the example settings should connect with the port already in the form.
 async def test_management_example_matches_configuration_form(actual_hass):
     example = Path(__file__).resolve().parents[1] / "packaging/management.json.example"
     result = await actual_hass.config_entries.flow.async_init("ics_proxy", context={"source": "user"})

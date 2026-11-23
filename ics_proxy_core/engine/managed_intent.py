@@ -303,6 +303,7 @@ class PauseRequest:
     hold: str
 
 
+# Recover the exact hold and session from newer Pause receipts while preserving unbound legacy receipts.
 def decode_pause_request(identifier: str, result: dict[str, Any]) -> PauseRequest | None:
     saved = result.get("_pause")
     if saved is None:

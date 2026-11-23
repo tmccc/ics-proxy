@@ -94,6 +94,30 @@ async def test_invalid_nested_history_preserves_siblings(actual_hass, peer):
     assert actual_hass.states.get(sensor_id).state == "0.0"
 
 
+# Intent: rank fallback history by completion in UTC and prefer the proxy's explicit value when it arrives.
+# Why: an older status response can omit the scalar while still carrying the latest completed charge.
+async def test_history_energy_fallback_uses_completion_time(actual_hass, peer):
+    peer["state"]["charger_sessions"] = [
+        {
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "stopped_at": "2026-01-01T02:00:00+00:00",
+            "energy_kwh": 2.0,
+        },
+        {
+            "started_at": "2025-12-31T23:00:00+00:00",
+            "stopped_at": "2026-01-01T00:30:00-02:00",
+            "energy_kwh": 7.0,
+        },
+    ]
+    entry = await setup(actual_hass, peer)
+    sensor = "sensor.ics_proxy_last_session_energy"
+    assert actual_hass.states.get(sensor).state == "7.0"
+
+    peer["state"]["last_session_energy_kwh"] = 2.0
+    await entry.runtime_data.async_refresh()
+    assert actual_hass.states.get(sensor).state == "2.0"
+
+
 # Intent: even a direct enormous-integer current request gets a safe validation error before any management command.
 # Why: HA's normal service coercion is not the numeric boundary's only callable path.
 async def test_huge_integer_current_is_safely_rejected(actual_hass, peer):

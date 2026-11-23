@@ -59,6 +59,7 @@ def _rejected_attempts(owner: str, vendor: str) -> str:
     )
 
 
+# An exact closure only settles a waiting receipt if the recorded Stop decision still permits it.
 def _closed_requests(rejected: str) -> str:
     return (
         f"action=? AND state IN ('accepted','running','uncertain') AND NOT {rejected} AND EXISTS ("

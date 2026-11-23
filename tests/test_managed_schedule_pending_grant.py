@@ -50,6 +50,8 @@ async def test_held_cloud_start_waits_for_pause_zero_ack(tmp_path, tls, unused_t
         assert reports is not None
         prepare = reports.prepare_hold
 
+        # Intent: signal when the real Start report enters hold preparation.
+        # Why: the test can supersede Pause at a known point while the report still runs the original checks.
         async def observe_report(payload):
             reporting.set()
             await prepare(payload)
@@ -97,6 +99,8 @@ async def test_held_cloud_start_waits_for_pause_composite_retry(tmp_path, tls, u
         send_or_hold_set = b.sock.send
         composites = 0
 
+        # Intent: give the first composite a future start and delay the retry reply within its own deadline.
+        # Why: the held Start must survive both stages of real ceiling verification.
         async def delay_composite(raw):
             nonlocal composites
             answer = decode(raw)

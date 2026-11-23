@@ -198,7 +198,7 @@ def latest_completion_available(journal: Journal, completed: dict[int, int], clo
             if not isinstance(record, dict) or type(stop := record.get("stopTime")) is not int:
                 return False
             start = record.get("startTime")
-            if stop > 0 and (closed is not None or type(start) is not int or not 0 < start < latest):
+            if stop > 0 and (closed is not None or type(start) is not int or not 0 < start < latest or stop >= latest):
                 return False
     except sqlite3.Error, ValueError:
         # A failed display check must not interrupt charger supervision or present a plausible older value.

@@ -440,11 +440,15 @@ async def test_rejected_start_settles_under_its_internal_hold(
         revision = controller.requests.intent().revision
         answer = b.rig.bench.firmware.answer
 
+        # Intent: make the peer reject only the Start command.
+        # Why: the proxy must still establish its hold using ordinary profile and composite replies.
         def reject_start(action, payload):
             return {"status": "Rejected"} if action == "RemoteStartTransaction" else answer(action, payload)
 
         on_wire, release_reply = asyncio.Event(), asyncio.Event()
 
+        # Intent: hold the Start rejection until the deadline or shutdown has claimed a new ticket.
+        # Why: the test needs the actual wire reply to arrive after the original Start loses authority.
         async def delay_rejection(action, payload):
             if action == "RemoteStartTransaction":
                 on_wire.set()
@@ -467,6 +471,8 @@ async def test_rejected_start_settles_under_its_internal_hold(
         b.rig.bench.before_reply = None
         assert journal.starts.receipt()["stage"] == "rejected" and journal.get("control")["start_pending"] is True
 
+        # Intent: check that the correlated internal hold settles the rejection at verified zero.
+        # Why: both live and replacement supervision must clear the original pending Start before Return.
         async def settle(c):
             j = c.session.journal
             intent = c.requests.intent()

@@ -11,7 +11,8 @@ import yaml
 from tools import run_hosted_ha as hosted
 
 
-# An accidental matrix or requirements swap must leave a clear incompatibility.
+# Intent: bind each hosted matrix row to the matching Home Assistant requirement and CLI version argument.
+# Why: each test suite is expected to exercise a specific supported Home Assistant version.
 def test_hosted_matrix_binds_both_home_assistant_pins():
     root = Path(__file__).resolve().parents[1]
     job = yaml.safe_load((root / ".github/workflows/checks.yml").read_text())["jobs"]["ha-layer"]
@@ -26,7 +27,8 @@ def test_hosted_matrix_binds_both_home_assistant_pins():
     assert any(version_argument in step.get("run", "") for step in job["steps"])
 
 
-# The same explicit pin must enter both child processes and survive the execution audit.
+# Intent: require the declared Home Assistant version during collection, execution, and audit.
+# Why: results collected or executed under a different version cannot qualify the selected suite.
 @pytest.mark.parametrize("mismatch", [None, "collection", "execution", "suite", "installed"])
 def test_hosted_runner_requires_the_same_home_assistant_in_both_phases(tmp_path, monkeypatch, mismatch):
     pin = "2026.11.0"
@@ -48,6 +50,7 @@ def test_hosted_runner_requires_the_same_home_assistant_in_both_phases(tmp_path,
     runtime = {"python": "3.14", "python_sha256": "a" * 64, "packages": {"homeassistant": pin}}
     swapped = runtime | {"packages": {"homeassistant": "2026.10.4"}}
 
+    # Record each phase's environment and synthesize version evidence for the chosen mismatch.
     def run(command, *, cwd, env):
         assert json.loads(env["QUALIFICATION_EXPECTED_PACKAGES"]) == {"homeassistant": pin}
         stage = Path(command[2]).stem
