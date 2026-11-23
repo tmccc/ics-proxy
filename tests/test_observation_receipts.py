@@ -150,13 +150,13 @@ async def test_distinct_status_identity_and_counter_reuse(tmp_path, tls, timed):
         assert states == ["Available", "Preparing", "Available", "Charging"]
 
 
-# Intent: cache eviction never loses a pending publication, and already received meter retries do not revive liveness.
-# Why: finite retention must not create false live-session evidence or consume the reserved closure slot.
+# Intent: a fresh row after an older row marks the session live on the first publication of a batched report.
+# Why: meter retries and finite receipt retention must preserve genuine liveness and the reserved closure slot.
 async def test_pending_receipt_pin_and_meter_retry_liveness(tmp_path, tls):
     async with ObservationTLS(tmp_path / "state.db", tls, capacity=2) as peer:
         local = (await peer.call("start", "StartTransaction", START))[2]["transactionId"]
         action, payload = observation_payload("meter-transaction", local)
-        payload["meterValue"][0]["timestamp"] = datetime.now(UTC).isoformat()
+        payload["meterValue"].append(payload["meterValue"][0] | {"timestamp": datetime.now(UTC).isoformat()})
         assert (await peer.call("meter", action, payload))[0] == 3
         assert peer.j.db.execute("SELECT live FROM transactions WHERE local=?", (local,)).fetchone()[0] == 1
         peer.j.db.execute("UPDATE transactions SET live=0 WHERE local=?", (local,))

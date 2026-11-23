@@ -724,14 +724,15 @@ class Gateway:
                 if published and action == "StatusNotification":
                     self.journal.put("last_status", payload)
                 elif published and action == "MeterValues" and type(payload.get("transactionId")) is int:
-                    rows = payload.get("meterValue", [])
-                    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-                        observed = timestamp(rows[0].get("timestamp"))
-                        if abs((datetime.now(UTC) - observed).total_seconds()) < 60:
-                            self.journal.db.execute(
-                                "UPDATE transactions SET live=1 WHERE local=? AND stop IS NULL",
-                                (payload["transactionId"],),
-                            )
+                    # A validated batch can contain a current sample after buffered history.
+                    now = datetime.now(UTC)
+                    if any(
+                        abs((now - timestamp(row["timestamp"])).total_seconds()) < 60 for row in payload["meterValue"]
+                    ):
+                        self.journal.db.execute(
+                            "UPDATE transactions SET live=1 WHERE local=? AND stop IS NULL",
+                            (payload["transactionId"],),
+                        )
             return {}
         raise DeniedError("unsupported charger request")
 

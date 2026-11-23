@@ -20,6 +20,7 @@
 - Used Stop time to identify the latest completed charge in native history and older Home Assistant status responses.
 - Required Home Assistant to confirm the proxy is running and to verify a local hold explicitly before showing it.
 - Preserved the shutdown grace period for test workers and reported hard failures even when the last worker exits.
+- Recorded current meter activity when a charger report contains a fresh sample after older samples.
 - Resolved known Start rejections under a verified Pause and recorded whether shutdown reached the Stop send boundary.
 - Kept Home Assistant’s management requests on loopback and preserved Start and Stop after a failed unload.
 - Extracted the active iCS engine, Home Assistant client, tests, deployment tools and documentation into a standalone repository.
