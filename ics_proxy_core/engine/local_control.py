@@ -16,6 +16,7 @@ from typing import Any
 from .. import commands
 from ..constants import HUB_PROFILE_ID
 from ..frames import Frame
+from .command_outcomes import transaction_reply_status
 from .command_processor import CommandPriority, CommandProcessor
 from .composite import ExcessiveCompositeError, FutureScheduleError, verify_composite
 from .connection_scope import CloudAttemptScope
@@ -799,7 +800,6 @@ class LocalControl:
         )
         boot = self.boot()
         restoring_zero = False
-        saved_reply: bool | None = None
 
         # Positive permission may be revoked; the same exact ticket and Boot still permit its restrictive rollback.
         def check() -> None:
@@ -823,13 +823,14 @@ class LocalControl:
 
         # Receipt recording precedes fallible resource/result publication and never claims observed charging.
         def received(action: str, frame: Frame) -> None:
-            nonlocal saved_reply
             if action != "RemoteStartTransaction":
                 return
             if attempt is not None:
                 attempt.answer = frame
+            status = transaction_reply_status(frame)
             try:
-                saved_reply = self.journal.starts.record_reply(ticket, frame)
+                if status is not None:
+                    self.journal.starts.record_reply_status(ticket, status, request_id=request_id)
             except sqlite3.Error:
                 if self.journal.db.in_transaction:
                     raise
@@ -837,9 +838,9 @@ class LocalControl:
                 return
             if frame[0] == 4:
                 reply: ObservedReply = "call_error"
-            elif frame[2] == {"status": "Accepted"}:
+            elif status == "Accepted":
                 reply = "accepted"
-            elif frame[2] == {"status": "Rejected"}:
+            elif status == "Rejected":
                 reply = "rejected"
             else:
                 reply = "other"
@@ -870,7 +871,10 @@ class LocalControl:
                 def settle(answer: Frame) -> None:
                     if attempt is not None:
                         attempt.answer = answer
-                    accepted = self.journal.starts.record_reply(ticket, answer) if saved_reply is None else saved_reply
+                    status = transaction_reply_status(answer)
+                    accepted = status is not None and self.journal.starts.record_reply_status(
+                        ticket, status, request_id=request_id
+                    )
                     context = (
                         None
                         if scope is None or handoff is None

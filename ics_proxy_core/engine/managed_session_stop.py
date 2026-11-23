@@ -18,66 +18,20 @@ from .native_http import NativeTransportUnavailableError
 from .policy import DeniedError
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
+from .stop_settlement import (
+    SAVED_STOP_REJECTIONS,
+    STOP_COMPLETION_FIELDS,
+    STOP_SESSION,
+    StopRejections,
+    stop_rejections,
+)
 from .store import JournalStartBusy, RecoveryRequiredError, encoded, fingerprint
 
 if TYPE_CHECKING:
     from .managed import ManagedController
-    from .store import Journal
     from .trial_handover_evidence import HandoverEvidence
 
-STOP_SESSION = "stop_session"
 CONFIRMATION_SECONDS = 20
-STOP_COMPLETION_FIELDS = "state='completed',result=json_set(result,'$.session_stopped',json('true'))"
-_OWNER_REJECTIONS = (
-    "SELECT request,local FROM owner_command_wires WHERE action='RemoteStopTransaction' AND reply='Rejected'"
-)
-_VENDOR_STOP_SCOPE = (
-    "SELECT v.mutation,v.local FROM vendor_command_scope v JOIN mutations m ON m.token=v.mutation "
-    "WHERE m.origin='vendor' AND m.action='RemoteStopTransaction'"
-)
-_VENDOR_REJECTIONS = f"{_VENDOR_STOP_SCOPE} AND v.wire_result='Rejected'"
-_BUFFERED_REJECTIONS = (
-    f"WITH owner_rejections(request,local) AS ({_OWNER_REJECTIONS} UNION ALL "
-    "SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?)), "
-    f"vendor_rejections(mutation,local) AS ({_VENDOR_REJECTIONS} UNION ALL {_VENDOR_STOP_SCOPE} "
-    "AND EXISTS (SELECT 1 FROM json_each(?) WHERE json_extract(value,'$[0]')=v.mutation "
-    "AND json_extract(value,'$[1]')=v.wire_request)) "
-)
-
-
-# One direct refusal suffices. A joined request needs a refusal from every attempt it actually joined.
-def _rejected_attempts(owner: str, vendor: str) -> str:
-    local = "json_extract(managed_requests.result,'$._session_stop.local')"
-    return (
-        f"(EXISTS (SELECT 1 FROM {owner} w WHERE w.request=managed_requests.id AND w.local={local}) OR "
-        "COALESCE(json_array_length(result,'$._session_stop.local_attempts') "
-        "+ json_array_length(result,'$._session_stop.vendor_attempts'),0) > 0 "
-        "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.local_attempts') a "
-        f"WHERE NOT EXISTS (SELECT 1 FROM {owner} w WHERE w.request=a.value AND w.local={local})) "
-        "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.vendor_attempts') a "
-        f"WHERE NOT EXISTS (SELECT 1 FROM {vendor} v WHERE v.mutation=a.value AND v.local={local})))"
-    )
-
-
-# An exact closure only settles a waiting receipt if the recorded Stop decision still permits it.
-def _closed_requests(rejected: str) -> str:
-    return (
-        f"action=? AND state IN ('accepted','running','uncertain') AND NOT {rejected} AND EXISTS ("
-        "SELECT 1 FROM transactions WHERE local=json_extract(managed_requests.result,'$._session_stop.local') "
-        "AND stop IS NOT NULL)"
-    )
-
-
-_SAVED_REJECTED_ATTEMPTS = _rejected_attempts(f"({_OWNER_REJECTIONS})", f"({_VENDOR_REJECTIONS})")
-_LIVE_REJECTED_ATTEMPTS = _rejected_attempts("owner_rejections", "vendor_rejections")
-CLOSED_REQUESTS = _closed_requests(_SAVED_REJECTED_ATTEMPTS)
-_LIVE_CLOSED_REQUESTS = _closed_requests(_LIVE_REJECTED_ATTEMPTS)
-
-
-# Offline and ordinary live checks use only persisted rows. Add exact buffered evidence only when present.
-def _buffered_rejection_binding(journal: Journal) -> tuple[str, ...]:
-    owner, vendor = journal.outcomes.buffered_stop_rejections()
-    return (encoded(owner), encoded(vendor)) if owner or vendor else ()
 
 
 @dataclass(frozen=True)
@@ -198,9 +152,8 @@ class ManagedSessionStop:
             async with g.charger.sequence(
                 0, guard, on_dispatch=dispatch, owner_scope=wire_scope, late_reply_action="RemoteStopTransaction"
             ) as call:
-                answer = await call("RemoteStopTransaction", remote_stop_transaction(scope.local))
-            if answer[0] == 3 and answer[2] == {"status": "Rejected"}:
-                c.commands.decide(partial(self._fail, scope.identifier, "stop_rejected"))
+                await call("RemoteStopTransaction", remote_stop_transaction(scope.local))
+            c.commands.decide(lambda: self._publish_rejections(stop_rejections(j)))
         except StopAlreadyHandledError:
             pass  # The original session's real closure can also satisfy this waiting request.
         except DeniedError, RecoveryRequiredError, SecurityError, UnavailableError, TimeoutError:
@@ -224,45 +177,39 @@ class ManagedSessionStop:
             retry_after_rollback=True,
         )
 
-    # A known rejection permits another deliberate attempt without forgetting the original wire result.
-    def _fail(self, identifier: str, reason: str) -> None:
-        self.controller.session.journal.db.execute(
-            "UPDATE managed_requests SET state='failed',result=json_set(result,'$.classification',?) "
-            "WHERE id=? AND state IN ('accepted','running')",
-            (reason, identifier),
+    # Use the same rejection evidence for replies that arrive immediately, late, or before a restart.
+    def _publish_rejections(self, rejections: StopRejections) -> None:
+        self._update_receipts(
+            "state='failed',result=json_set(result,'$.classification','stop_rejected')",
+            (),
+            f"action=? AND state IN ('running','uncertain') AND {rejections.receipts}",
+            (STOP_SESSION,),
+            rejections=rejections,
+            retry_after_rollback=True,
         )
 
     # Retire the client wait without resending or erasing a Stop that might still take effect.
     def expire(self, *, replaced: bool = False) -> None:
-        buffered = _buffered_rejection_binding(self.controller.session.journal)
-        rejected = _LIVE_REJECTED_ATTEMPTS if buffered else _SAVED_REJECTED_ATTEMPTS
-        self._update_receipts(
-            "state='failed',result=json_set(result,'$.classification','stop_rejected')",
-            (),
-            f"action=? AND state IN ('running','uncertain') AND {rejected}",
-            (STOP_SESSION,),
-            buffered=buffered,
-            retry_after_rollback=not replaced,
-        )
+        rejections = stop_rejections(self.controller.session.journal)
+        self._publish_rejections(rejections)
         # The same rejection evidence also excludes a receipt from closure while its failure write awaits retry.
         self._update_receipts(
             "state=CASE WHEN json_extract(result,'$._session_stop.dispatched') "
             "OR json_extract(result,'$._session_stop.joined') "
             "THEN 'uncertain' ELSE 'failed' END,result=json_set(result,'$.classification',?)",
             ("process_replaced" if replaced else "stop_not_confirmed",),
-            f"action=? AND state IN ('accepted','running') AND NOT {rejected} "
+            f"action=? AND state IN ('accepted','running') AND NOT {rejections.receipts} "
             "AND (? OR COALESCE(json_extract(result,'$._session_stop.confirmation_deadline')<=?, "
             "json_extract(result,'$.accepted_at')<=?))",
             (STOP_SESSION, replaced, time.monotonic(), time.time() - CONFIRMATION_SECONDS),
-            buffered=buffered,
+            rejections=rejections,
             retry_after_rollback=not replaced,
         )
 
     # Skip receipt writes and optional native probes when none of the exact eligible rows exists.
-    def _has_receipts(self, where: str, binding: tuple[Any, ...], buffered: tuple[str, ...]) -> bool:
-        prefix = _BUFFERED_REJECTIONS if buffered else ""
+    def _has_receipts(self, where: str, binding: tuple[Any, ...], rejections: StopRejections) -> bool:
         row = self.controller.session.journal.db.execute(
-            f"{prefix}SELECT 1 FROM managed_requests WHERE {where} LIMIT 1", buffered + binding
+            f"{rejections.prefix}SELECT 1 FROM managed_requests WHERE {where} LIMIT 1", rejections.bindings + binding
         ).fetchone()
         return row is not None
 
@@ -274,19 +221,19 @@ class ManagedSessionStop:
         where: str,
         binding: tuple[Any, ...],
         *,
-        buffered: tuple[str, ...] = (),
+        rejections: StopRejections = SAVED_STOP_REJECTIONS,
         retry_after_rollback: bool = False,
     ) -> None:
         j = self.controller.session.journal
-        if not self._has_receipts(where, binding, buffered):
+        if not self._has_receipts(where, binding, rejections):
             return
-        prefix = _BUFFERED_REJECTIONS if buffered else ""
         transaction_started = False
         try:
             with j.atomic(retry_busy=True):
                 transaction_started = True
                 j.db.execute(
-                    f"{prefix}UPDATE managed_requests SET {assignments} WHERE {where}", buffered + values + binding
+                    f"{rejections.prefix}UPDATE managed_requests SET {assignments} WHERE {where}",
+                    rejections.bindings + values + binding,
                 )
         except JournalStartBusy:
             return  # The existing receipt is still accurate because the write never began.
@@ -307,13 +254,13 @@ class ManagedSessionStop:
             and (native.physical.power_w != 0 or any(value != 0 for value in native.currents_a + native.powers_w))
         ):
             return
-        buffered = _buffered_rejection_binding(j)
+        rejections = stop_rejections(j)
         self._update_receipts(
             STOP_COMPLETION_FIELDS,
             (),
-            _LIVE_CLOSED_REQUESTS if buffered else CLOSED_REQUESTS,
+            rejections.closed_receipts,
             (STOP_SESSION,),
-            buffered=buffered,
+            rejections=rejections,
             retry_after_rollback=True,
         )
 
@@ -322,8 +269,8 @@ class ManagedSessionStop:
         c, j = self.controller, self.controller.session.journal
         if c.stopping:
             return
-        buffered = _buffered_rejection_binding(j)
-        if not self._has_receipts(_LIVE_CLOSED_REQUESTS if buffered else CLOSED_REQUESTS, (STOP_SESSION,), buffered):
+        rejections = stop_rejections(j)
+        if not self._has_receipts(rejections.closed_receipts, (STOP_SESSION,), rejections):
             return
         try:
             native = await c.native.read(stop_only=True)

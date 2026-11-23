@@ -108,6 +108,8 @@ class Journal:
             self.current_change = CurrentChangeJournal(self)
             self.fault = ManagedFaultJournal(self)
             self._initialize(path, identity)
+            self.outcomes.recover_transaction_replies()
+            self._recover_deliveries()
             self.outcomes.recover_owner_start()
             cleanup.pop_all()
 
@@ -189,6 +191,10 @@ class Journal:
                 "UPDATE mutations SET state='uncertain' WHERE state='pending' AND token IN "
                 "(SELECT mutation FROM vendor_command_scope WHERE wire_result='dispatched')"
             )
+
+    # Recover independent delivery faults after an exact forwarded reply can retire its own timeout.
+    def _recover_deliveries(self) -> None:
+        with self.atomic():
             # An upstream Start may have been accepted before its response was lost.
             self.db.execute(
                 "UPDATE outbox SET state='ambiguous' WHERE state='inflight' AND action='StartTransaction' "
@@ -199,16 +205,19 @@ class Journal:
                 "AND NOT EXISTS(SELECT 1 FROM delivery_replies r WHERE r.token=outbox.token)"
             )
             self.db.execute("UPDATE transactions SET live=0")
-            head = self.next_delivery()
-            if head is not None and head.action == "StartTransaction" and head.state == "ambiguous":
-                # The same exact proof normalization is used after a live timeout and an interrupted process.
-                from .managed_start_delivery import supersede_unknown_start_retry
+            self._recover_delivery_fault()
 
-                supersede_unknown_start_retry(self, head, restarting=True)
-            elif head is not None and head.action == "StopTransaction" and head.state == "rejected":
-                from .managed_stop_delivery import latch_rejected_stop
+    # Keep the lifecycle delivery's own recovery proof when an independent forwarded outcome settles.
+    def _recover_delivery_fault(self) -> None:
+        head = self.next_delivery()
+        if head is not None and head.action == "StartTransaction" and head.state == "ambiguous":
+            from .managed_start_delivery import supersede_unknown_start_retry
 
-                latch_rejected_stop(self, head)
+            supersede_unknown_start_retry(self, head, restarting=True)
+        elif head is not None and head.action == "StopTransaction" and head.state == "rejected":
+            from .managed_stop_delivery import latch_rejected_stop
+
+            latch_rejected_stop(self, head)
 
     # Undo only fresh profile aliases retired before dispatch and before any resource was recorded.
     def _retire_prepared_profile_aliases(self) -> None:
@@ -702,6 +711,8 @@ class Journal:
         ):
             self.phase.restrict(self.control.read().values)
             self.fault.clear()
+            if evidence_key == "forwarded_timeout":
+                self._recover_delivery_fault()
 
     # The exclusive caller must already own one transaction for a compound independently attested resolution.
     def acknowledge_in_transaction(

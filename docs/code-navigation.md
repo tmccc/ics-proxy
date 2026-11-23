@@ -32,6 +32,11 @@ flowchart LR
   local executor use that same owner for the final send. Wire I/O can wait outside the short decision turn.
 - Follow the same request through the journal and the physical observation. An accepted wire reply can precede
   the real Start or closing report. Home Assistant and the display keep the exact request and session identity.
+- Use the same exact reply evidence during normal operation and recovery. The request, possible dispatch,
+  definite charger reply, and verified physical outcome are separate facts. A refused reply write can leave an
+  independent checkpoint for that attempt. Retrying publication uses that evidence without sending the command again.
+  Session Stop uses the [shared rejection and closure query](../ics_proxy_core/engine/stop_settlement.py)
+  when deciding whether to send, updating a receipt, or repairing native history.
 - Compare the session Stop and Pause paths. A session Stop closes the exact session while retaining app or schedule
   mode. An uncertain ordinary Stop is tied to its original attempt. A protective Pause can hold at zero and stop the
   exact session under the shared controller.

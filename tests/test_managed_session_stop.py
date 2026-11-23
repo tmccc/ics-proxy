@@ -6,18 +6,21 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from contextlib import closing
 from types import SimpleNamespace
 
 import pytest
 from websockets.asyncio.client import connect
 
 from ics_proxy_core.engine import managed_session_stop
+from ics_proxy_core.engine.command_outcomes import OwnerWire
 from ics_proxy_core.engine.gateway import decode
 from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
+from ics_proxy_core.engine.managed_intent import ManagedRequests, insert_request
 from ics_proxy_core.engine.managed_session_stop import ManagedSessionStop
 from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.security import SecurityError
-from ics_proxy_core.engine.store import RecoveryRequiredError
+from ics_proxy_core.engine.store import Journal, RecoveryRequiredError
 from ics_proxy_core.frames import build_call_error, build_call_result
 from tests.charge_rig import owner_rig, positive_flow, report_actual_stop
 from tests.current_rig import adjustable, locally_ready, select
@@ -568,6 +571,62 @@ async def test_buffered_late_stop_rejection_fences_receipts(tmp_path, tls, unuse
         assert [frame[3]["transactionId"] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == (
             expected_stops
         )
+
+
+# Intent: retain an exact Stop rejection across process replacement and a refused receipt write.
+# Why: physical closure must not complete the rejected request while the original wire record awaits storage.
+@pytest.mark.parametrize("source", ["owner", "vendor"])
+def test_exact_stop_rejection_fences_receipt_after_replacement(tmp_path, source):
+    path = tmp_path / "stop-journal.sqlite"
+    with closing(Journal(path, "synthetic-charger")) as journal:
+        requests = ManagedRequests(journal)
+        stop = ManagedSessionStop(SimpleNamespace(session=SimpleNamespace(journal=journal)))
+        journal.put("managed_mode", {"mode": "app_schedule"})
+        local = journal.start("start-report", START)["transactionId"]
+        answer = [3, "stop-wire", {"status": "Rejected"}]
+        if source == "owner":
+            binding = {"local": local, "dispatched": True}
+            wire = OwnerWire("stop-wire", "stop-request", "stop-request", "boot", "RemoteStopTransaction", local, None)
+            journal.outcomes.record_owner_wire(wire)
+            refusal = "BEFORE INSERT ON owner_command_wires WHEN NEW.reply='Rejected'"
+        else:
+            action = "RemoteStopTransaction"
+            token = journal.mutation_intent("vendor", action, {"transactionId": 42})
+            journal.bind_vendor_command(
+                token, request="vendor-stop", vendor_epoch=1, boot="boot", wire="stop-wire", local=local, profile=None
+            )
+            journal.record_vendor_result(token, "dispatched")
+            binding = {"local": local, "joined": True, "local_attempts": [], "vendor_attempts": [token]}
+            refusal = "BEFORE UPDATE OF wire_result ON vendor_command_scope WHEN NEW.wire_result='Rejected'"
+        insert_request(journal, "stop-request", "stop_session", 0, {"_session_stop": binding}, state="running")
+        journal.db.execute(
+            f"CREATE TEMP TRIGGER refuse_primary_reply {refusal} BEGIN SELECT RAISE(ABORT, 'reply unavailable'); END"
+        )
+        journal.db.execute(
+            "CREATE TRIGGER refuse_stop_receipt BEFORE UPDATE ON managed_requests WHEN NEW.state='failed' "
+            "BEGIN SELECT RAISE(ABORT, 'receipt unavailable'); END"
+        )
+        if source == "owner":
+            journal.outcomes.record_owner_reply(wire, answer)
+            assert not journal.outcomes.session_stop_dispatched(local)
+        else:
+            reply = journal.outcomes.capture(token, action, "stop-wire", answer)
+            assert reply is not None and not journal.outcomes.publish(reply)
+            assert not journal.outcomes.unanswered_vendor_stop(local)
+        journal.stop("stop-report", {"transactionId": local, "meterStop": 1200, "timestamp": "2026-01-01T00:01:00Z"})
+        stop.expire()
+        assert requests.receipt("stop-request")["state"] == "running"
+
+    with closing(Journal(path, "synthetic-charger")) as journal:
+        requests = ManagedRequests(journal)
+        stop = ManagedSessionStop(SimpleNamespace(session=SimpleNamespace(journal=journal)))
+        assert requests.receipt("stop-request")["state"] == "running"
+        journal.db.execute("DROP TRIGGER refuse_stop_receipt")
+        stop.expire()
+        receipt = requests.receipt("stop-request")
+        assert receipt["state"] == "failed"
+        assert receipt["result"]["classification"] == "stop_rejected"
+        assert journal.outcomes.session(local).closed
 
 
 # Intent: the service retries publication of the same closed Stop receipt after SQLite rolls back its write.

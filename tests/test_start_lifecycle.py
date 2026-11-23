@@ -159,11 +159,72 @@ def test_late_accepted_preserves_new_pause_and_unpublished_state(closed_owner):
     j.starts.record(start_ticket, "issued")
     paused = {**j.get("control"), "ticket": pause_ticket, "inhibit": True, "owner": "local"}
     j.put("control", paused)
-    j.starts.record(start_ticket, "accepted")
+    assert j.starts.record_reply_status(start_ticket, "Accepted", request_id=newcomer.identifier)
     record = j.starts.normal()
     assert record is not None and record.receipt.stage == "accepted" and record.published is False
     assert record.pending and j.get("control") == paused
     assert newcomer.revision == 7 and j.starts.lease is newcomer
+
+
+# Intent: a definitive reply settles its exact issued Start once and cannot revive a retired receipt.
+# Why: prepared, different and already reconciled receipts cannot grant authority from a late Accepted.
+def test_start_reply_settles_only_its_exact_issued_receipt(closed_owner):
+    j, owner, _ = closed_owner
+    ticket = uuid.uuid4().hex
+    j.starts.prepare(ticket, fingerprint("app_owner"), owner.identifier)
+    prepared = j.starts.receipt()
+    assert not j.starts.record_reply_status(ticket, "Accepted", request_id=owner.identifier)
+    assert j.starts.receipt() == prepared
+
+    j.starts.record(ticket, "issued")
+    issued = j.starts.receipt()
+    assert not j.starts.record_reply_status(ticket, "Accepted", request_id=uuid.uuid4().hex)
+    assert not j.starts.record_reply_status(uuid.uuid4().hex, "Accepted", request_id=owner.identifier)
+    assert j.starts.receipt() == issued
+
+    assert j.starts.record_reply_status(ticket, "Accepted", request_id=owner.identifier)
+    accepted = j.starts.receipt()
+    assert accepted["stage"] == "accepted"
+    assert j.starts.record_reply_status(ticket, "Accepted", request_id=owner.identifier)
+    assert not j.starts.record_reply_status(ticket, "Rejected", request_id=owner.identifier)
+    assert j.starts.receipt() == accepted
+
+    reconciled = {**accepted, "stage": "reconciled"}
+    j.put("local_start_receipt", reconciled)
+    assert not j.starts.record_reply_status(ticket, "Accepted", request_id=owner.identifier)
+    assert j.starts.receipt() == reconciled
+    j.db.execute("DELETE FROM meta WHERE key='local_start_receipt'")
+    assert not j.starts.record_reply_status(ticket, "Accepted", request_id=owner.identifier)
+    assert j.get("local_start_receipt") is None
+
+
+# Intent: retry the same exact reply after an unavailable preimage read or a rolled-back write.
+# Why: the failed storage operation cannot be interpreted as either a definite reply or an unsent Start.
+@pytest.mark.parametrize("boundary", ["read", "commit"])
+def test_start_reply_retries_original_settlement_after_storage_fault(closed_owner, boundary):
+    j, owner, _ = closed_owner
+    ticket = uuid.uuid4().hex
+    j.starts.prepare(ticket, fingerprint("app_owner"), owner.identifier)
+    j.starts.record(ticket, "issued")
+
+    # Refuse only the selected SQLite read or commit so the same reply can be retried.
+    def refuse(code, first, _second, _database, _trigger):
+        fault = (
+            code == sqlite3.SQLITE_READ and first == "meta"
+            if boundary == "read"
+            else code == sqlite3.SQLITE_TRANSACTION and first == "COMMIT"
+        )
+        return sqlite3.SQLITE_DENY if fault else sqlite3.SQLITE_OK
+
+    j.db.set_authorizer(refuse)
+    try:
+        with pytest.raises(sqlite3.Error):
+            j.starts.record_reply_status(ticket, "Accepted", request_id=owner.identifier)
+    finally:
+        j.db.set_authorizer(None)
+    assert not j.db.in_transaction and j.starts.receipt()["stage"] == "issued"
+    j.starts.publish_pending_reply()
+    assert j.starts.receipt()["stage"] == "accepted"
 
 
 # Intent: local closure may finish one request while retaining its exact independent cloud delivery obligations.
@@ -278,11 +339,13 @@ def test_missing_publication_does_not_satisfy_strict_denial(closed_owner):
 def test_rejected_after_new_claim_preserves_pending(closed_owner):
     j, _, _ = closed_owner
     start_ticket, pause_ticket = uuid.uuid4().hex, uuid.uuid4().hex
+    identifier = uuid.uuid4().hex
     with j.atomic():
-        j.starts.prepare(start_ticket, fingerprint("app_owner"), uuid.uuid4().hex)
+        j.starts.prepare(start_ticket, fingerprint("app_owner"), identifier)
+    j.starts.record(start_ticket, "issued")
     paused = {"ticket": pause_ticket, "inhibit": True, "start_pending": True}
     j.put("control", paused)
-    j.starts.record(start_ticket, "rejected")
+    j.starts.record_reply_status(start_ticket, "Rejected", request_id=identifier)
     assert j.get("control") == paused and j.get("local_start_receipt")["stage"] == "rejected"
 
 

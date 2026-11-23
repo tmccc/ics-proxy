@@ -6,6 +6,8 @@ import asyncio
 import copy
 import json
 import time
+import uuid
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,13 @@ from aiohttp import ClientConnectionError, ClientWebSocketResponse, WSMsgType, w
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.setup import async_setup_component
+
+from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
+from tests.charge_rig import owner_rig, positive_flow
+from tests.managed_rig import healthy
+from tests.runtime_rig import until
+from tests.test_managed_normal_start import natural_stop
+from tests.tls_support import tls as tls
 
 TOKEN = "a" * 64  # Synthetic loopback-only test credential.
 
@@ -260,6 +269,103 @@ async def test_session_action_can_start_then_stop_at_zero_watts(
     assert peer["commands"].count("start") == peer["commands"].count("stop_session") == 1
     assert hass.states.get(session).state == "off"
     assert hass.states.get("sensor.ics_proxy_control_mode").state == "App / schedule"
+
+
+# Intent: Home Assistant and the vendor can request Stop in either order for one genuine scheduled session.
+# Why: the shared physical acknowledgement cannot finish the Home Assistant request before verified closure.
+@pytest.mark.parametrize("first", ["local", "vendor"])
+async def test_session_stop_shares_the_vendor_wire_in_either_order(
+    actual_hass, tmp_path, tls, unused_tcp_port_factory, monkeypatch, first
+):
+    async with (
+        owner_rig(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as test,
+        AsyncExitStack() as cleanup,
+    ):
+        controller, journal, bench = test.controller, test.session.journal, test.rig.bench
+        local = await positive_flow(test, "daily")
+        vendor = journal.vendor_id(local)
+        assert vendor is not None
+        published = await healthy(controller)
+        port = unused_tcp_port_factory()
+
+        # Add only the service envelope to actual controller publications.
+        def status():
+            return dict(published, running=True, certificate_remaining_seconds=86400)
+
+        api = ManagementServer(ManagementSettings(port, tmp_path / "unused-secret", TOKEN), controller, status)
+        await api.start()
+        cleanup.push_async_callback(api.close)
+        hass = actual_hass
+        coordinator = (await setup(hass, {"port": port})).runtime_data
+        session = "binary_sensor.ics_proxy_session_open"
+        mode = "sensor.ics_proxy_control_mode"
+        active = hass.states.get(session)
+        assert active.state == "on" and hass.states.get(mode).state == "App / schedule"
+        target, revision = active.attributes["stop_target"], active.attributes["control_revision"]
+        assert isinstance(target, str)
+
+        # Issue the vendor request with its independently assigned transaction number.
+        async def vendor_stop():
+            identifier = uuid.uuid4().hex
+            answer = await bench.cloud_call(identifier, "RemoteStopTransaction", {"transactionId": vendor})
+            assert answer == [3, identifier, {"status": "Accepted"}]
+
+        if first == "vendor":
+            await vendor_stop()
+        request = asyncio.create_task(
+            hass.services.async_call(
+                "ics_proxy",
+                "session_command",
+                {"action": "stop_session", "target": target},
+                blocking=True,
+                return_response=True,
+            )
+        )
+        try:
+            await until(lambda: controller.session_stop.worker is not None and controller.session_stop.worker.done())
+            assert journal.outcomes.accepted_stop(local)
+            if first == "local":
+                await vendor_stop()
+            [(identifier,)] = journal.db.execute("SELECT id FROM managed_requests WHERE action='stop_session'")
+            binding = journal.outcomes.owner(identifier).result["_session_stop"]
+            assert binding["local"] == local
+            assert bool(binding.get("dispatched")) == (first == "local")
+            assert bool(binding.get("joined")) == (first == "vendor")
+            assert (await coordinator.client.request("receipt", request_id=identifier))["state"] == "running"
+            await coordinator.async_refresh()
+            assert hass.states.get(session).state == "on" and not request.done()
+            assert journal.active() == local and bench.firmware.active == local
+            open_observed_at = controller.latest_native.physical.observed_at
+
+            await natural_stop(test, local)
+            # A separately observed native transaction can outlast the Stop report.
+            bench.firmware.active = local
+            published = await controller.tick()
+            assert published["state"] != "attention"
+            assert journal.outcomes.session(local).closed and journal.vendor_id(local) == vendor
+            assert (await coordinator.client.request("receipt", request_id=identifier))["state"] == "running"
+            assert not request.done()
+
+            bench.firmware.active = None
+            published = await healthy(controller)
+            physical = controller.latest_native.physical
+            assert physical.observed_at > open_observed_at and physical.transaction_open is False
+            assert await asyncio.wait_for(request, 3) == {"confirmed": True}
+            receipt = await coordinator.client.request("receipt", request_id=identifier)
+            assert (receipt["id"], receipt["action"], receipt["state"]) == (identifier, "stop_session", "completed")
+            assert (receipt["target"], receipt["revision"]) == (target, revision)
+            assert receipt["result"]["session_stopped"] is True
+            closed = hass.states.get(session)
+            assert closed.state == "off" and closed.attributes["stop_target"] is None
+            assert closed.attributes["control_revision"] == revision
+            assert hass.states.get(mode).state == "App / schedule" and bench.firmware.effective_limit() == 6
+            assert [call[3] for call in bench.device_calls if call[2] == "RemoteStopTransaction"] == [
+                {"transactionId": local}
+            ]
+        finally:
+            if not request.done():
+                request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
 
 
 # Intent: a recorded Pause reports unknown confirmation on a slow receipt while a fast receipt completes normally.

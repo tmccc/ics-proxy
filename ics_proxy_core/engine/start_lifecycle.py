@@ -10,7 +10,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from ..frames import Frame
 from .managed_intent import ControlIntent, insert_request
 from .policy import DeniedError
 from .security import SecurityError
@@ -49,7 +48,7 @@ class StartLifecycle:
     def __init__(self, journal: Journal) -> None:
         self.journal = journal
         self.lease: ChargeLease | None = None
-        self.pending_reply: tuple[str, str] | None = None
+        self.pending_reply: tuple[str, str | None, str] | None = None
 
     # Preserve the established fallback for journals written before a separate wire receipt existed.
     def receipt(self) -> dict[str, Any]:
@@ -606,51 +605,53 @@ class StartLifecycle:
             {"ticket": ticket, "digest": digest, "stage": "prepared", "local": None, "request_id": request_id},
         )
 
-    # A recorded wire stage is keyed to the original effect, so a newer Pause cannot erase its real reply.
-    def record(self, ticket: str, stage: str) -> None:
+    # Issue once and settle only the original issued Start, independently of any newer Pause.
+    def record(self, ticket: str, stage: str, *, request_id: str | None = None) -> bool:
         j = self.journal
         receipt = j.get("local_start_receipt", {})
-        if receipt.get("ticket") != ticket:
-            return
+        exact_ticket = receipt.get("ticket") == ticket
+        previous: object = receipt.get("stage")
+        if stage == "issued":
+            if not exact_ticket or previous != "prepared":
+                raise RecoveryRequiredError("Start dispatch requires its original prepared receipt")
+        else:
+            if not exact_ticket or ("request_id" in receipt and receipt["request_id"] != request_id):
+                return False
+            if previous != "issued":
+                return previous == stage
         with j.atomic():
             control = j.get("control", {})
             settled = stage == "rejected" and receipt.get("local") is None and control.get("ticket") == ticket
             j.put("local_start_receipt", {**receipt, "stage": stage, **({"settled_ticket": ticket} if settled else {})})
             if settled:
                 j.control.project(control, start_pending=False)
-
-    # Store only a definite reply, independently of permission to publish an accepted Start.
-    def record_reply(self, ticket: str, answer: Frame) -> bool:
-        if answer[0] != 3 or answer[2] not in ({"status": "Accepted"}, {"status": "Rejected"}):
-            return False
-        return self.record_reply_status(ticket, answer[2]["status"])
+        return True
 
     # Live and saved wire replies settle through the same Start receipt transition.
-    def record_reply_status(self, ticket: str, status: str) -> bool:
+    def record_reply_status(self, ticket: str, status: str, *, request_id: str | None = None) -> bool:
         if status not in ("Accepted", "Rejected"):
             return False
         stage = "accepted" if status == "Accepted" else "rejected"
+        pending = ticket, request_id, status
         try:
-            self.record(ticket, stage)
+            recorded = self.record(ticket, stage, request_id=request_id)
         except sqlite3.Error:
-            self.pending_reply = ticket, stage
+            self.pending_reply = pending
             raise
-        return stage == "accepted"
+        if self.pending_reply == pending:
+            self.pending_reply = None
+        return recorded and stage == "accepted"
 
     # Retry the original write without holding up Pause or reopening the Start's authority.
     def publish_pending_reply(self) -> None:
         if self.pending_reply is None:
             return
-        ticket, stage = self.pending_reply
+        ticket, request_id, status = self.pending_reply
         try:
-            wire = self.receipt()
-            if wire.get("ticket") == ticket and wire.get("stage") == "issued":
-                self.record(ticket, stage)
+            self.record_reply_status(ticket, status, request_id=request_id)
         except sqlite3.Error:
             if self.journal.db.in_transaction:
                 raise
-            return
-        self.pending_reply = None
 
     # A superseding Pause can settle an exact unbound rejection after verifying its own closed zero.
     def settle_rejected_pause(

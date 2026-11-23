@@ -24,7 +24,7 @@ from .managed_release_recovery import (
     release_evidence,
     release_pause_ack,
 )
-from .managed_session_stop import STOP_SESSION, ManagedSessionStop
+from .managed_session_stop import ManagedSessionStop
 from .managed_settlement import (
     charge_test_candidate,
 )
@@ -48,6 +48,7 @@ from .recovery_contracts import AuthorityStamp, GateDecision, Pending, Prerequis
 from .recovery_coordinator import RecoveryCoordinator
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
+from .stop_settlement import STOP_SESSION
 from .store import JournalStartBusy, RecoveryRequiredError
 from .supervision import ControlProof, HealthVerdict, Observation, PollStatus, assess
 from .trial_handover_evidence import HandoverEvidence

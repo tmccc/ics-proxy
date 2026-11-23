@@ -47,6 +47,8 @@ class Gate:
 class ObservedConnection(sqlite3.Connection):
     """All actual SQL runs unchanged; before-statement and post-return observations never invent stored facts."""
 
+    shutdown_claim: str | None = None
+
     # Read only this actual connection's current private metadata without recursively entering the observation hook.
     def metadata(self, key):
         row = super().execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -58,10 +60,24 @@ class ObservedConnection(sqlite3.Connection):
             return
         operation = sql.strip().upper()
         if Gate.phase == "after-shutdown-stop-claim":
-            if operation == "COMMIT" and not before:
+            if before:
+                return
+            # Track the claim written by this transaction. An older pending claim can survive in the journal.
+            if operation.startswith("INSERT OR REPLACE INTO META") and parameters[:1] == ("trial_shutdown_attempt",):
                 attempt = self.metadata("trial_shutdown_attempt")
-                if attempt.get("state") == "pending" and str(attempt.get("local")) == Gate.identifier:
+                if (
+                    self.in_transaction
+                    and attempt.get("state") == "pending"
+                    and str(attempt.get("local")) == Gate.identifier
+                ):
+                    self.shutdown_claim = attempt["id"]
+            elif operation == "COMMIT" and self.shutdown_claim is not None:
+                attempt = self.metadata("trial_shutdown_attempt")
+                if attempt.get("id") == self.shutdown_claim:
                     Gate.freeze(self, "after-shutdown-stop-claim")
+                self.shutdown_claim = None
+            elif operation == "ROLLBACK":
+                self.shutdown_claim = None
             return
         if Gate.phase == "after-owner-start-reply-write":
             if (

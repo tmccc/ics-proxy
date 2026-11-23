@@ -2,10 +2,12 @@
 """Real SQLite transaction, storage exhaustion and writer contention failures retain durable recovery semantics."""
 
 import sqlite3
+from contextlib import closing
 
 import pytest
 
 from ics_proxy_core.engine.store import Journal
+from tests.prototype_rig import START
 
 
 # Intent: SQLite's automatic rollback on storage exhaustion preserves the original error and every prior fact.
@@ -77,3 +79,152 @@ def test_actual_writer_busy_does_not_change_journal(tmp_path):
     finally:
         other.close()
         j.close()
+
+
+# Intent: settle a definite owner Start rejection from exact evidence after both normal writes fail.
+# Why: live polling and process replacement must recover the same reply without inferring a session.
+@pytest.mark.parametrize("replace_process", [False, True], ids=["live", "replacement"])
+def test_owner_start_rejection_survives_refused_reply_writes(tmp_path, replace_process):
+    path = tmp_path / "owner-start.db"
+    request, ticket, boot, wire_id = "start-request", "start-ticket", "start-boot", "start-wire"
+
+    # Check both the Start projection and its underlying wire witness.
+    def check(recovered):
+        receipt = recovered.starts.receipt()
+        assert (receipt["stage"], receipt["ticket"], receipt["request_id"]) == ("rejected", ticket, request)
+        (record,) = recovered.outcomes.owner_wires("request", request)
+        assert (record.wire, record.ticket, record.boot, record.reply) == (wire_id, ticket, boot, "Rejected")
+        assert record.local is None and recovered.active() is None
+
+    with closing(Journal(path, "synthetic")) as j:
+        j.starts.prepare(ticket, "tag-digest", request)
+        j.starts.record(ticket, "issued")
+        scope = j.outcomes.owner_scope(request, ticket, boot)
+        wire = scope.sent(wire_id, "RemoteStartTransaction", {"idTag": "LOCAL_TEST"})
+        assert wire is not None
+        j.db.executescript("""
+            CREATE TEMP TRIGGER refuse_owner_start_reply BEFORE INSERT ON owner_command_wires
+            WHEN NEW.action='RemoteStartTransaction' AND NEW.reply='Rejected'
+            BEGIN SELECT RAISE(ABORT, 'owner Start reply storage unavailable'); END;
+            CREATE TEMP TRIGGER refuse_owner_start_projection BEFORE INSERT ON meta
+            WHEN NEW.key='local_start_receipt' AND json_extract(NEW.value,'$.stage')='rejected'
+            BEGIN SELECT RAISE(ABORT, 'owner Start projection storage unavailable'); END;
+        """)
+        frame = [3, wire_id, {"status": "Rejected"}]
+        scope.received(wire, frame)
+        with pytest.raises(sqlite3.IntegrityError, match="owner Start projection storage unavailable"):
+            j.starts.record_reply_status(ticket, "Rejected", request_id=request)
+        assert j.starts.receipt()["stage"] == "issued"
+        assert j.db.execute("SELECT reply FROM owner_command_wires WHERE wire=?", (wire_id,)).fetchone()[0] is None
+        assert not j.db.in_transaction
+        if not replace_process:
+            # Isolate the shared wire replay from the direct live callback's retry path.
+            j.starts.pending_reply = None
+            j.db.execute("DROP TRIGGER refuse_owner_start_reply")
+            j.db.execute("DROP TRIGGER refuse_owner_start_projection")
+            j.outcomes.retry_owner_writes()
+            check(j)
+            return
+
+    with closing(Journal(path, "synthetic")) as recovered:
+        check(recovered)
+
+
+# Intent: a definite forwarded Stop rejection survives replacement when normal result storage failed.
+# Why: after reopening, its outcome can finish recording later without claiming physical closure.
+def test_forwarded_stop_rejection_survives_refused_reply_write(tmp_path):
+    path = tmp_path / "forwarded-stop.db"
+    request, wire_id = "stop-request", "stop-wire"
+    with closing(Journal(path, "synthetic")) as j:
+        local = j.start("charger-start", START)["transactionId"]
+        delivery = j.next_delivery()
+        assert delivery is not None
+        j.mark_sent(delivery)
+        j.acknowledge(delivery, {"transactionId": 9001, "idTagInfo": {"status": "Accepted"}})
+        assert j.local_id(9001) == local
+        with j.atomic():
+            mutation = j.mutation_intent("vendor", "RemoteStopTransaction", {"transactionId": 9001})
+            j.bind_vendor_command(
+                mutation, request=request, vendor_epoch=1, boot="stop-boot", wire=wire_id, local=local, profile=None
+            )
+            j.record_vendor_result(mutation, "dispatched")
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_forwarded_stop_reply BEFORE UPDATE OF wire_result ON vendor_command_scope "
+            "WHEN NEW.wire_result='Rejected' BEGIN SELECT RAISE(ABORT, 'forwarded Stop reply storage unavailable'); END"
+        )
+        answer = j.outcomes.capture(mutation, "RemoteStopTransaction", wire_id, [3, wire_id, {"status": "Rejected"}])
+        assert answer is not None
+        j.outcomes.publish(answer)
+        command = j.outcomes.vendor(mutation)
+        assert command is not None and (command.status, command.wire_result) == ("Rejected", "dispatched")
+        assert not j.db.in_transaction
+        j.db.execute(
+            "CREATE TRIGGER refuse_forwarded_stop_settlement BEFORE UPDATE OF state ON mutations "
+            "WHEN NEW.action='RemoteStopTransaction' AND NEW.state='confirmed' "
+            "BEGIN SELECT RAISE(ABORT, 'forwarded Stop settlement storage unavailable'); END"
+        )
+
+    with closing(Journal(path, "synthetic")) as recovered:
+        command = recovered.outcomes.vendor(mutation)
+        assert command is not None and command.saving_reply and command.status == "Rejected"
+        assert not recovered.db.in_transaction
+        recovered.db.execute("DROP TRIGGER refuse_forwarded_stop_settlement")
+        recovered.outcomes.retry()
+        command = recovered.outcomes.vendor(mutation)
+        assert command is not None and command.settled
+        assert (command.action, command.wire, command.status) == ("RemoteStopTransaction", wire_id, "Rejected")
+        assert command.session is not None and (command.session.local, command.session.closed) == (local, False)
+        assert recovered.active() == local and not recovered.outcomes.unanswered_vendor_stop(local)
+
+
+# Intent: recover a definite forwarded reply and retain the independent ambiguous Start report after replacement.
+# Why: clearing an exact command timeout must still leave the next unresolved lifecycle delivery protected.
+@pytest.mark.parametrize("retry_after_startup", [False, True], ids=["startup", "live-retry"])
+def test_forwarded_reply_recovery_preserves_ambiguous_start_delivery(tmp_path, retry_after_startup):
+    path = tmp_path / "forwarded-start.db"
+    action, wire = "RemoteStartTransaction", "start-wire"
+    with closing(Journal(path, "synthetic")) as journal:
+        journal.start("start-report", START)
+        delivery = journal.next_delivery()
+        assert delivery is not None
+        journal.mark_sent(delivery)
+        journal.put("managed_mode", {"mode": "app_schedule"})
+        journal.phase.block()
+        with journal.atomic():
+            mutation = journal.mutation_intent("vendor", action, {"idTag": START["idTag"]})
+            journal.bind_vendor_command(
+                mutation,
+                request="start-request",
+                vendor_epoch=1,
+                boot="start-boot",
+                wire=wire,
+                local=None,
+                profile=None,
+            )
+            journal.record_vendor_result(mutation, "dispatched")
+            journal.fault.replace(
+                {"classification": "owner_control_or_delivery_uncertain", "forwarded_timeout": mutation}
+            )
+        temporary = "" if retry_after_startup else "TEMP "
+        journal.db.execute(
+            f"CREATE {temporary}TRIGGER refuse_forwarded_start_settlement BEFORE UPDATE OF state ON mutations "
+            "WHEN NEW.state='confirmed' BEGIN SELECT RAISE(ABORT, 'forwarded Start settlement unavailable'); END"
+        )
+        reply = journal.outcomes.capture(mutation, action, wire, [3, wire, {"status": "Accepted"}])
+        assert reply is not None and not journal.outcomes.publish(reply)
+
+    with closing(Journal(path, "synthetic")) as recovered:
+        head = recovered.next_delivery()
+        assert head is not None and head.state == "ambiguous" and head.token == delivery.token
+        if retry_after_startup:
+            command = recovered.outcomes.vendor(mutation)
+            assert command is not None and command.saving_reply and command.status == "Accepted"
+            assert recovered.fault.read({}).get("forwarded_timeout") == mutation
+            recovered.db.execute("DROP TRIGGER refuse_forwarded_start_settlement")
+            recovered.outcomes.retry()
+        command = recovered.outcomes.vendor(mutation)
+        assert command is not None and command.settled and command.status == "Accepted"
+        assert recovered.fault.read({}) == {
+            "classification": "owner_control_or_delivery_uncertain",
+            "delivery_token": delivery.token,
+        }

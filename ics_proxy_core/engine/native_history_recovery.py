@@ -23,7 +23,6 @@ from .managed_intent import (
 )
 from .managed_native_repair import retire_history_omission_revocations
 from .managed_recovery_zero import require_paused_owned_zero
-from .managed_session_stop import CLOSED_REQUESTS, STOP_COMPLETION_FIELDS, STOP_SESSION
 from .native_bounded import NativeBoundedSpec
 from .native_history import (
     ORIGINAL_HISTORY_OMISSION,
@@ -36,6 +35,7 @@ from .native_history import (
     inspect_history,
 )
 from .native_start_attempts import split_attempts
+from .stop_settlement import STOP_COMPLETION_FIELDS, STOP_SESSION, StopRejections, stop_rejections
 from .store import Journal, RecoveryRequiredError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 from .trial_resources import ResourceBook
@@ -99,20 +99,25 @@ def history_recovery_idle(
 
 # The original closed Stop may await evidence, while unrelated unfinished work still blocks a repair.
 def _unrelated_history_requests(journal: Journal, allow_closed_stop_receipts: bool) -> bool:
-    closed = (
-        {
+    closed: set[str] = set()
+    if allow_closed_stop_receipts:
+        rejections = stop_rejections(journal)
+        closed = {
             row[0]
-            for row in journal.db.execute(f"SELECT id FROM managed_requests WHERE {CLOSED_REQUESTS}", (STOP_SESSION,))
+            for row in journal.db.execute(
+                f"{rejections.prefix}SELECT id FROM managed_requests WHERE {rejections.closed_receipts}",
+                (*rejections.bindings, STOP_SESSION),
+            )
         }
-        if allow_closed_stop_receipts
-        else set()
-    )
     return any(row["id"] not in closed for row in unfinished_owner_requests(journal, include_pause=True))
 
 
 # Project already verified closure inside the caller's history transaction.
-def _complete_history_stops(journal: Journal) -> None:
-    journal.db.execute(f"UPDATE managed_requests SET {STOP_COMPLETION_FIELDS} WHERE {CLOSED_REQUESTS}", (STOP_SESSION,))
+def _complete_history_stops(journal: Journal, rejections: StopRejections) -> None:
+    journal.db.execute(
+        f"{rejections.prefix}UPDATE managed_requests SET {STOP_COMPLETION_FIELDS} WHERE {rejections.closed_receipts}",
+        (*rejections.bindings, STOP_SESSION),
+    )
 
 
 # History repair can retain the current Pause receipt for its owner to finish once normal audits resume.
@@ -182,15 +187,17 @@ def acknowledge_history_policy(
         )
         with journal.atomic():
             revocations = retire_history_omission_revocations(journal, fault)
+            rejections = stop_rejections(journal)
             closed_stops = (
                 journal.db.execute("SELECT 1 FROM sqlite_master WHERE name='managed_requests'").fetchone()
                 and journal.db.execute(
-                    f"SELECT 1 FROM managed_requests WHERE {CLOSED_REQUESTS} LIMIT 1", (STOP_SESSION,)
+                    f"{rejections.prefix}SELECT 1 FROM managed_requests WHERE {rejections.closed_receipts} LIMIT 1",
+                    (*rejections.bindings, STOP_SESSION),
                 ).fetchone()
             )
             if closed_stops:
                 require_paused_owned_zero(journal, book, spec, native)
-                _complete_history_stops(journal)
+                _complete_history_stops(journal, rejections)
             scope = vendor_history_recovery_scope(journal, spec, retiring_history_fault=retire_fault)
             if scope is not None:
                 if revocations:
@@ -371,7 +378,7 @@ def _reconcile(
         else:
             # The exact Stop report and fresh local zero may already agree while the history fault blocks polling.
             if journal.db.execute("SELECT 1 FROM sqlite_master WHERE name='managed_requests'").fetchone():
-                _complete_history_stops(journal)
+                _complete_history_stops(journal, stop_rejections(journal))
                 if not _history_pause_is_only_pending_request(journal):
                     raise RecoveryRequiredError(
                         "history reconciliation requires the matching native fault and a settled journal"

@@ -27,6 +27,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-offline.txt
 
+      - name: Check engine control settlement
+        run: TMPDIR="$RUNNER_TEMP" python -B tools/check_control_settlement.py engine
+
       - name: Version check
         run: python tools/version.py check
 
@@ -90,6 +93,9 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r "${{ matrix.requirements }}"
+
+      - name: Check Home Assistant control settlement
+        run: TMPDIR="$RUNNER_TEMP" python -B tools/check_control_settlement.py ha
 
       - name: Test the Home Assistant layer
         run: >-

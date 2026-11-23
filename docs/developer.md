@@ -31,6 +31,21 @@ Run the same command in an environment built from `requirements-ha-proxy-2026.10
 Core version. Keep pytest selection explicit. The full engine and model suites cover substantially more than
 the two test files used by the engine runner’s default smoke command.
 
+## Required settlement checks
+
+Run these focused checks before review. Use the engine environment for the first command and run the second
+in each supported Home Assistant environment.
+
+```bash
+python -B tools/check_control_settlement.py engine
+python -B tools/check_control_settlement.py ha
+```
+
+The hosted checks run this selection before the full engine and Home Assistant suites. It covers both local
+and vendor-app Stop orders, lost and late replies, failed journal writes, closure before and after the charger
+report, process replacement, clock adjustments, and a new charger Boot. The Home Assistant cases check what
+the session control shows while the result is pending and after the exact session closes.
+
 ## Public replay files
 
 The four replay files contain the same sanitized protocol frames already made public in the upstream project.
