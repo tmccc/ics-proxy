@@ -333,7 +333,7 @@ class TrialSession:
                 return
             self._station_inventory = (
                 sum(resource.kind == "profile" for resource in native.physical.resources),
-                any(resource.key == "profile:7001" for resource in native.physical.resources),
+                any(resource.key == f"profile:{HUB_PROFILE_ID}" for resource in native.physical.resources),
             )
         except (SecurityError, RecoveryRequiredError) as error:
             if self.journal.get("managed_mode"):

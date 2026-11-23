@@ -6,6 +6,7 @@ import asyncio
 import copy
 import json
 import time
+from pathlib import Path
 
 import pytest
 from aiohttp import ClientConnectionError, ClientWebSocketResponse, WSMsgType, web
@@ -207,10 +208,26 @@ async def setup(hass, peer):
 
 # Intent: one HA action waits for the correct receipt, updates the session view and enables an immediate Stop.
 # Why: an open session can draw 0 W, and a result for another target must never clear this request as confirmed.
-@pytest.mark.parametrize("wrong_receipt", [False, True])
-async def test_session_action_can_start_then_stop_at_zero_watts(actual_hass, peer, wrong_receipt):
+@pytest.mark.parametrize(
+    ("wrong_receipt", "failed_unload"),
+    [(False, False), (True, False), (False, True)],
+    ids=["exact-receipt", "wrong-receipt", "failed-unload"],
+)
+async def test_session_action_can_start_then_stop_at_zero_watts(
+    actual_hass, peer, monkeypatch, wrong_receipt, failed_unload
+):
     hass = actual_hass
-    await setup(hass, peer)
+    entry = await setup(hass, peer)
+    if failed_unload:
+        coordinator = entry.runtime_data
+
+        async def refuse_unload(*args, **kwargs):
+            raise HomeAssistantError("synthetic platform unload failure")
+
+        with monkeypatch.context() as boundary:
+            boundary.setattr(hass.config_entries, "async_unload_platforms", refuse_unload)
+            assert not await hass.config_entries.async_unload(entry.entry_id)
+        assert entry.state is ConfigEntryState.FAILED_UNLOAD and entry.runtime_data is coordinator
     peer["pending_receipt"] = True
     session = "binary_sensor.ics_proxy_session_open"
     assert hass.states.get(session).state == "off"
@@ -581,6 +598,14 @@ async def test_bad_token_cannot_configure_or_issue_controls(actual_hass, peer):
     )
     assert result["type"] == "form" and result["errors"]["base"] == "cannot_connect"
     assert peer["commands"] == []
+
+
+# The example proxy settings should connect using the prefilled port in the actual HA configuration form.
+async def test_management_example_matches_configuration_form(actual_hass):
+    example = Path(__file__).resolve().parents[1] / "packaging/management.json.example"
+    result = await actual_hass.config_entries.flow.async_init("ics_proxy", context={"source": "user"})
+    assert result["type"] == "form"
+    assert result["data_schema"]({"token": TOKEN})["port"] == json.loads(example.read_text())["port"]
 
 
 # Intent: a nearly expired reading becomes unavailable on its deadline without waiting for another successful poll.

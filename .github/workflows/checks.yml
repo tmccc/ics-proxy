@@ -77,9 +77,11 @@ jobs:
           - suite: proxy-ha10
             collection_suite: ha-proxy-2026.10
             requirements: requirements-ha-proxy-2026.10.txt
+            expected_ha_version: "2026.10.4"
           - suite: proxy-ha11
             collection_suite: ha-proxy
             requirements: requirements-ha-proxy.txt
+            expected_ha_version: "2026.11.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
@@ -90,7 +92,9 @@ jobs:
         run: pip install -r "${{ matrix.requirements }}"
 
       - name: Test the Home Assistant layer
-        run: python tools/run_hosted_ha.py --suite "${{ matrix.collection_suite }}" --output "${RUNNER_TEMP}/ha"
+        run: >-
+          python tools/run_hosted_ha.py --suite "${{ matrix.collection_suite }}"
+          --expected-ha-version "${{ matrix.expected_ha_version }}" --output "${RUNNER_TEMP}/ha"
 
   engine:
     needs: static

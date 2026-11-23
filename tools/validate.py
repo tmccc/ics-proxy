@@ -196,6 +196,27 @@ def audit_qualification(path, source, metadata, python, results, collection_exec
     return engine_packages
 
 
+# Give the approved receipt its final name after the exact staged source is in place.
+def publish_snapshot(source: Path, destination: Path, metadata: dict) -> None:
+    pending = source.parent / "snapshot.json"
+    pending.write_text(json.dumps(metadata) + "\n")
+    installed = destination / "source"
+    receipt = destination / "snapshot.json"
+    installed.mkdir()
+    try:
+        if receipt.exists() or receipt.is_symlink():
+            raise FileExistsError("the destination already has a snapshot receipt")
+        source.replace(installed)
+        pending.replace(receipt)
+    except BaseException:
+        # Release only the output path this invocation reserved. An earlier snapshot is still intact.
+        if source.exists():
+            installed.rmdir()
+        else:
+            installed.rename(source)
+        raise
+
+
 # Finish the normal gate and the focused iCS checks before publishing a deployable snapshot.
 def run_full_qualification(
     path: Path | None,
@@ -211,14 +232,15 @@ def run_full_qualification(
         print("Full qualification requires --qualification-report from tools/parallel_qualify.py (20 workers).")
         results["full qualification"] = False
         return
-    with tempfile.TemporaryDirectory(prefix="ocpp-release-") as tmp:
-        scratch = Path(tmp)
-        try:
-            if validated_snapshot is not None and not include_static:
-                raise ValueError("a deployment snapshot requires static checks")
+    try:
+        if validated_snapshot is not None and not include_static:
+            raise ValueError("a deployment snapshot requires static checks")
+        destination = validated_snapshot.resolve() if validated_snapshot is not None else None
+        with tempfile.TemporaryDirectory(prefix="ocpp-release-", dir=destination) as tmp:
+            scratch = Path(tmp)
             target = deployment.target if deployment is not None else "qualification-only"
             ics_release = target in ("ics-proxy", "ics-client")
-            source = (validated_snapshot or scratch).resolve() / "source"
+            source = scratch / "source"
             metadata = freeze(ROOT, source)
             if include_static:
                 run_static_checks(python, results, source=source, commit=metadata["commit"], cache_dir=scratch)
@@ -248,18 +270,18 @@ def run_full_qualification(
                         installed=(deployment.installed, previous),
                     )
                     results["installation week"] = True
-            if validated_snapshot is not None and all(results.values()):
-                (validated_snapshot / "snapshot.json").write_text(json.dumps(metadata) + "\n")
-        except (
-            OSError,
-            ValueError,
-            KeyError,
-            RuntimeError,
-            ElementTree.ParseError,
-            subprocess.SubprocessError,
-        ) as error:
-            print(f"Full qualification is invalid: {type(error).__name__}: {error}")
-            results["full qualification"] = False
+            if destination is not None and all(results.values()):
+                publish_snapshot(source, destination, metadata)
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        RuntimeError,
+        ElementTree.ParseError,
+        subprocess.SubprocessError,
+    ) as error:
+        print(f"Full qualification is invalid: {type(error).__name__}: {error}")
+        results["full qualification"] = False
 
 
 # Orchestrate the CI-equivalent checks.

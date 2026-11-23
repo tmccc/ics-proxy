@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -70,18 +71,24 @@ def runtime_identity():
 
 # Capture counters within the worker's own namespace without exposing network endpoints.
 def namespace_counters():
+    network = Path("/proc/net")
     result = {
         "pid": os.getpid(),
         "network_namespace": os.readlink("/proc/self/ns/net"),
         "cpu_affinity": sorted(os.sched_getaffinity(0)),
+        "sockstat": (network / "sockstat").read_text().strip(),
+        "sockstat6": None,
     }
-    for name in ("sockstat", "sockstat6"):
-        result[name] = (Path("/proc/net") / name).read_text().strip()
+    # The worker still records isolation evidence when its kernel has no IPv6 counters.
+    with suppress(FileNotFoundError):
+        result["sockstat6"] = (network / "sockstat6").read_text().strip()
+    tcp_lines = (network / "tcp").read_text().splitlines()[1:]
+    with suppress(FileNotFoundError):
+        tcp_lines.extend((network / "tcp6").read_text().splitlines()[1:])
     states = {}
-    for name in ("tcp", "tcp6"):
-        for line in (Path("/proc/net") / name).read_text().splitlines()[1:]:
-            state = line.split()[3]
-            states[state] = states.get(state, 0) + 1
+    for line in tcp_lines:
+        state = line.split()[3]
+        states[state] = states.get(state, 0) + 1
     result["tcp_state_counts"] = states
     return result
 

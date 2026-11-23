@@ -83,7 +83,8 @@ def test_release_checks_the_frozen_candidate_after_checkout_changes(tmp_path, mo
         if command[0] == "git":
             assert command == ["git", "show", "--check", "--format=", candidate]
         else:
-            assert cwd == snapshot / "source"
+            assert cwd.name == "source" and cwd.parent.parent == snapshot
+            assert not (snapshot / "source").exists()
             assert (cwd / "tools/managed_proxy.py").read_text() == "# candidate\n"
             assert cache_dir != cwd and cache_dir is not None
             checked_sources.append(cwd)
@@ -112,6 +113,9 @@ def test_release_checks_the_frozen_candidate_after_checkout_changes(tmp_path, mo
     assert receipt.exists() is candidate_passes
     if candidate_passes:
         assert json.loads(receipt.read_text())["commit"] == candidate
+        assert (snapshot / "source/tools/managed_proxy.py").read_text() == "# candidate\n"
+    else:
+        assert list(snapshot.iterdir()) == []
 
 
 # Intent: a full tests-only audit can pass independently, and the CLI refuses a publication request in this mode.
@@ -183,7 +187,8 @@ def test_release_snapshot_waits_for_required_checks(
     # Capture the command boundary before the release process can mark a snapshot as approved.
     def invoke(check, source, output, metadata, python, *, installed=None):
         assert not (snapshot / "snapshot.json").exists()
-        assert source == snapshot / "source" and metadata["commit"] == candidate
+        assert not (snapshot / "source").exists()
+        assert source.name == "source" and source.parent.parent == snapshot and metadata["commit"] == candidate
         assert (source / "tools/managed_proxy.py").read_text() == "# candidate\n"
         if installed is not None:
             assert installed[0] == releases[1]
@@ -207,6 +212,65 @@ def test_release_snapshot_waits_for_required_checks(
     passed = not week_fails and pin_matches
     assert (snapshot / "snapshot.json").exists() is passed
     assert all(results.values()) is passed
+
+
+# Intent: an unsuccessful release leaves the requested output available for retry with the same exact candidate.
+def test_failed_validation_can_retry_the_same_snapshot_directory(tmp_path, monkeypatch, releases):
+    repo, _, _, candidate = releases
+    monkeypatch.setattr(validate, "ROOT", repo)
+    monkeypatch.setattr(validate, "run_static_checks", lambda *args, **kwargs: None)
+    monkeypatch.setattr(checks, "ensure_check", lambda *args, **kwargs: None)
+    fail = True
+
+    def audit(path, source, metadata, python, results, executors):
+        assert metadata["commit"] == candidate
+        if fail:
+            raise ValueError("synthetic failed audit")
+        results["three suites"] = True
+
+    monkeypatch.setattr(validate, "audit_qualification", audit)
+    snapshot = tmp_path / "target"
+    snapshot.mkdir()
+    unrelated = snapshot / "notes.txt"
+    unrelated.write_text("operator notes\n")
+
+    def run():
+        results = {}
+        validate.run_full_qualification(
+            tmp_path / "report.json",
+            sys.executable,
+            results,
+            validated_snapshot=snapshot,
+            deployment=validate.Deployment("ics-client", None, None),
+        )
+        return all(results.values())
+
+    assert not run()
+    assert list(snapshot.iterdir()) == [unrelated]
+    fail = False
+    assert run()
+    approved = (snapshot / "snapshot.json").read_bytes()
+    assert json.loads(approved)["commit"] == candidate
+    assert not run()
+    assert (snapshot / "snapshot.json").read_bytes() == approved
+    assert (snapshot / "source/tools/managed_proxy.py").read_text() == "# candidate\n"
+    assert unrelated.read_text() == "operator notes\n"
+
+
+# Intent: publication can roll back its staged source when an older or concurrent receipt owns the output name.
+def test_snapshot_publication_preserves_a_preexisting_receipt(tmp_path):
+    source = tmp_path / "staging/source"
+    source.mkdir(parents=True)
+    (source / "candidate").write_text("candidate\n")
+    destination = tmp_path / "validated"
+    destination.mkdir()
+    receipt = destination / "snapshot.json"
+    receipt.write_text("original receipt\n")
+    with pytest.raises(FileExistsError):
+        validate.publish_snapshot(source, destination, {"commit": "candidate"})
+    assert (source / "candidate").read_text() == "candidate\n"
+    assert list(destination.iterdir()) == [receipt]
+    assert receipt.read_text() == "original receipt\n"
 
 
 # Produce synthetic boundary observations with the same public evidence fields as the discovery simulator.

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
+from contextlib import suppress
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -316,15 +317,19 @@ def telemetry(workers):
             pressure[name] = (Path("/proc/pressure") / name).read_text().strip()
         except OSError:
             pressure[name] = None
-    sockets = {}
-    for name in ("sockstat", "sockstat6"):
-        sockets[name] = (Path("/proc/net") / name).read_text().strip()
+    network = Path("/proc/net")
+    sockets = {"sockstat": (network / "sockstat").read_text().strip(), "sockstat6": None}
+    # Kernels built without IPv6 omit these files but still provide IPv4 counters.
+    with suppress(FileNotFoundError):
+        sockets["sockstat6"] = (network / "sockstat6").read_text().strip()
+    tcp_lines = (network / "tcp").read_text().splitlines()[1:]
+    with suppress(FileNotFoundError):
+        tcp_lines.extend((network / "tcp6").read_text().splitlines()[1:])
     tcp_states = defaultdict(int)
-    for name in ("tcp", "tcp6"):
-        for line in (Path("/proc/net") / name).read_text().splitlines()[1:]:
-            fields = line.split()
-            if len(fields) > 3:
-                tcp_states[fields[3]] += 1
+    for line in tcp_lines:
+        fields = line.split()
+        if len(fields) > 3:
+            tcp_states[fields[3]] += 1
     row = {
         "epoch": time.time(),
         "load": os.getloadavg(),

@@ -12,15 +12,20 @@ from .coordinator import DOMAIN
 
 # A response belongs to this exact command. The client reads its receipt and never repeats the write.
 def register_session_service(hass: HomeAssistant) -> None:
-    # Only a loaded entry and an exact current target can send a session command.
+    # A failed unload can leave the current coordinator available to handle an exact session request.
     async def handle(call: ServiceCall) -> dict[str, bool]:
-        entry = next(
-            (entry for entry in hass.config_entries.async_entries(DOMAIN) if entry.state is ConfigEntryState.LOADED),
+        coordinator = next(
+            (
+                runtime
+                for entry in hass.config_entries.async_entries(DOMAIN)
+                if entry.disabled_by is None
+                and entry.state in (ConfigEntryState.LOADED, ConfigEntryState.FAILED_UNLOAD)
+                and (runtime := getattr(entry, "runtime_data", None)) is not None
+            ),
             None,
         )
-        if entry is None:
+        if coordinator is None:
             return {"confirmed": False}
-        coordinator = entry.runtime_data
         data = coordinator.data or {}
         action = call.data["action"]
         target = call.data.get("target")

@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from ..constants import HUB_PROFILE_ID
 from .native_faults import NativeContentError
 from .native_http import read_native
 from .policy import DeniedError, integer, number
@@ -53,7 +54,7 @@ def profile_projection(payload: dict[str, Any]) -> dict[str, Any]:
         kind not in ("Relative", "Absolute")
         or absolute
         and (
-            profile.get("chargingProfileId") != 7001
+            profile.get("chargingProfileId") != HUB_PROFILE_ID
             or profile.get("chargingProfilePurpose") != "ChargePointMaxProfile"
             or payload.get("connectorId") != 0
             or start is None
@@ -117,7 +118,7 @@ def native_profile_projection(profile: dict[str, Any], connector: int, purpose: 
             raw = profile["startSchedule"]
             start = anchor_epoch(raw) if isinstance(raw, str) else integer(raw, 1)
             if (
-                profile["chargingProfileId"] != 7001
+                profile["chargingProfileId"] != HUB_PROFILE_ID
                 or purpose != "ChargePointMaxProfile"
                 or connector != 0
                 or start >= now

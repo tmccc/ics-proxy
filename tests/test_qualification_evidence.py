@@ -6,12 +6,13 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from tests.qualification_test_helpers import synthetic_collection_row, synthetic_source_recollection
 from tools import audit_parallel_qualification as audit
-from tools import parallel_worker, qualification_collection
+from tools import parallel_worker, qualification_collection, qualification_evidence
 from tools.qualification_collection import runtime_digest
 from tools.qualification_snapshot import freeze
 
@@ -139,6 +140,49 @@ def test_worker_cleanup_distinguishes_inspection_failure(tmp_path, monkeypatch):
     errors = parallel_worker.cleanup_containers([{"container_name": "owned-test"}])
     assert errors == ["container ownership inspection failed"]
     assert json.loads((tmp_path / "container-cleanup.json").read_text())["errors"] == errors
+
+
+# Intent: optional IPv6 proc files can be absent in either the host or the worker namespace.
+# Why: neither telemetry writer may prevent qualification from recording the actual IPv4 and namespace evidence.
+@pytest.mark.parametrize("missing", [(), ("sockstat6",), ("tcp6",), ("sockstat6", "tcp6")])
+def test_qualification_records_available_network_evidence(tmp_path, monkeypatch, missing):
+    files = {
+        "sockstat": "sockets: used 4\n",
+        "sockstat6": "TCP6: inuse 1\n",
+        "tcp": "header\n0: local remote 0A\n1: local remote 01\n",
+        "tcp6": "header\n0: local remote 01\n",
+    }
+    read_text = Path.read_text
+
+    # Model only the kernel's network counter files without enumerating real host processes or endpoints.
+    def read_network_file(path, *args, **kwargs):
+        if path.parent != Path("/proc/net"):
+            return read_text(path, *args, **kwargs)
+        if path.name in missing:
+            raise FileNotFoundError(path)
+        return files[path.name]
+
+    monkeypatch.setattr(Path, "read_text", read_network_file)
+    monkeypatch.setattr(parallel_worker, "ROOT", tmp_path)
+    monkeypatch.setattr(parallel_worker, "processes", lambda: {})
+    parallel_worker.telemetry([])
+    host = json.loads((tmp_path / "telemetry.jsonl").read_text())
+
+    evidence_path = tmp_path / "worker.jsonl"
+    monkeypatch.setenv("SCENARIO_RESULTS", str(evidence_path))
+    monkeypatch.setattr(qualification_evidence, "SCRATCH_ROOTS", None)
+    runtime = {"python": "3.14.0", "python_sha256": "a" * 64, "packages": {}}
+    monkeypatch.setattr(qualification_evidence, "runtime_identity", lambda: runtime)
+    qualification_evidence.pytest_sessionstart(SimpleNamespace(config=SimpleNamespace(getoption=lambda _: False)))
+    worker = json.loads(evidence_path.read_text())
+
+    expected_sockets = {"sockstat": "sockets: used 4", "sockstat6": None if "sockstat6" in missing else "TCP6: inuse 1"}
+    expected_states = {"0A": 1, "01": 1 if "tcp6" in missing else 2}
+    assert host["socket_counters"] == {key: worker[key] for key in expected_sockets} == expected_sockets
+    assert host["tcp_state_counts"] == worker["tcp_state_counts"] == expected_states
+    assert worker["event"] == "worker_namespace" and worker["runtime"] == runtime
+    assert worker["network_namespace"] == os.readlink("/proc/self/ns/net")
+    assert worker["cpu_affinity"] == sorted(os.sched_getaffinity(0))
 
 
 # Write deterministic fixture artifacts without invoking Docker or generating fake production test results.

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 import tests.managed_rig as managed_helpers
 from ics_proxy_core.engine.gateway import decode
+from ics_proxy_core.engine.trial_evidence import profile_projection
 from tests.managed_rig import healthy, starts
 from tests.managed_scenario_helpers import close_in_order, next_daily, originals, select_current, settle
 from tests.native_schedule_support import timer_bench
@@ -17,13 +18,13 @@ from tests.tls_support import tls as tls
 
 
 class CompositeReplyPeer:
-    """Delay one real composite reply while continuing to receive unrelated TLS replies."""
+    """Delay the zero composite replies while continuing to receive unrelated TLS replies."""
 
     # Record actual incoming request tokens so only the intended independent verification can be held.
     def __init__(self, connection, bench):
         self.connection, self.bench = connection, bench
         self.actions = {}
-        self.delayed = None
+        self.delayed = []
 
     # Keep every unmodified websocket operation on the actual authenticated socket.
     def __getattr__(self, name):
@@ -41,7 +42,7 @@ class CompositeReplyPeer:
                 self.actions[frame[1]] = frame[2]
             yield raw
 
-    # Withhold only one actual zero composite response; the reader must still process the Start CALLERROR.
+    # Withhold zero composite responses so retries cannot prove a hold before the report is refused.
     async def send(self, raw):
         frame = decode(raw)
         if (
@@ -50,9 +51,8 @@ class CompositeReplyPeer:
             and self.actions.get(frame[1]) == "GetCompositeSchedule"
             and self.bench.firmware.effective_limit() == 0
         ):
-            self.bench.hold_zero = False
             self.bench.entered.set()
-            self.delayed = asyncio.create_task(self.reply_after_release(raw))
+            self.delayed.append(asyncio.create_task(self.reply_after_release(raw)))
             return
         await self.connection.send(raw)
 
@@ -71,15 +71,14 @@ class HeldZeroBench(managed_helpers.OwnerBench):
         self.hold_zero = False
         self.entered, self.release = asyncio.Event(), asyncio.Event()
 
-    # Own the delayed response until the actual device reader retires, including assertion failures.
+    # Own the delayed responses until the actual device reader retires, including assertion failures.
     async def read_charger(self, charger):
         peer = CompositeReplyPeer(charger, self)
         try:
             await super().read_charger(peer)
         finally:
             self.release.set()
-            if peer.delayed is not None:
-                await asyncio.gather(peer.delayed, return_exceptions=True)
+            await asyncio.gather(*peer.delayed, return_exceptions=True)
 
 
 # Intent: an unconfirmed real zero yields a retryable wire error without allocating the delayed lifecycle.
@@ -94,8 +93,8 @@ async def test_delayed_report_retries_after_zero_join_timeout(tmp_path, tls, unu
         tag = starts(b.rig)[0][3]["idTag"]
         reported = b.clock.now
         g, peer = b.session.gateway, b.rig.bench
-        # Give the actual RPC longer than the report's one-second join, so missing proof remains genuinely pending.
-        g.charger.timeout = 3
+        # Let the actual zero RPC expire before the charger's own report-response timeout.
+        g.charger.timeout = 0.75
         peer.hold_zero = True
         b.c.command(uuid.uuid4().hex, "pause", b.c.requests.intent().revision)
         try:
@@ -111,8 +110,15 @@ async def test_delayed_report_retries_after_zero_join_timeout(tmp_path, tls, unu
             assert refused[0] == 4 and refused[2] == "InternalError"
             assert b.session.journal.active() is None and b.device.active is None
             assert not g.controls.ready and not b.stops() and b.device.effective_limit() == 0
-            assert peer.device_calls[before:] == []
+            assert all(
+                frame[2] == "GetCompositeSchedule"
+                or frame[2] == "SetChargingProfile" and profile_projection(frame[3])["limit"] == 0
+                for frame in peer.device_calls[before:]
+            )
+            peer.hold_zero = False
             peer.release.set()
+            # The expired wire reply proves nothing. A later supervision turn must verify the hold again.
+            await b.c.tick()
             await until(lambda: g.controls.ready and g.controls.desired() == 0)
             accepted = await peer.call(b.sock, token, "StartTransaction", payload)
             assert accepted[0] == 3 and accepted[2]["idTagInfo"]["status"] == "Accepted"

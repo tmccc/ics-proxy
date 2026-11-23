@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Refuse a release unless hassfest and HACS validation passed on the tagged commit.
+"""Check the hosted result for an exact release commit.
 
-Used by the ``release`` job in ``.github/workflows/ci.yml``. Those two checks run in
-separate workflows, so a tag pushed early could publish a release whose hassfest run
-later failed (1.10.5). The gate polls the check runs of the exact commit and fails the
-job unless every required check finished with ``success``::
+The ``checks`` job in ``.github/workflows/checks.yml`` succeeds only once static,
+engine and both Home Assistant legs pass. This optional hosted check is separate
+from the source-bound qualification audit used by ``tools/validate.py``::
 
     python tools/release_gate.py <owner/repo> <sha> [--timeout 900]
 
-Needs ``gh`` and ``GH_TOKEN`` in the environment (provided by GitHub Actions).
+Use a full commit SHA and an authenticated ``gh`` session with access to the repository.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 
-REQUIRED_CHECKS: tuple[str, ...] = ("validate", "validate-hacs")
+REQUIRED_CHECKS: tuple[str, ...] = ("checks",)
 
 
 # Reduce the check runs of one commit to pass, fail or pending for the required checks.
@@ -28,8 +28,7 @@ REQUIRED_CHECKS: tuple[str, ...] = ("validate", "validate-hacs")
 def evaluate(check_runs: Sequence[Mapping[str, object]], required: Sequence[str] = REQUIRED_CHECKS) -> tuple[str, str]:
     """Return ``(state, detail)`` where state is ``pass``, ``fail`` or ``pending``."""
     by_name: dict[str, Mapping[str, object]] = {}
-    # A check can run more than once on a commit (a re-run, or a skip while the repository was private): the newest
-    # run, the one with the highest id, is the one that counts.
+    # A check can run more than once on a commit. The newest run owns the current outcome.
     for run in sorted(check_runs, key=lambda item: int(str(item.get("id") or 0))):
         by_name[str(run.get("name"))] = run
     pending: list[str] = []
@@ -49,31 +48,19 @@ def evaluate(check_runs: Sequence[Mapping[str, object]], required: Sequence[str]
 # The gate needs the real result for the tagged commit, not the state of a branch.
 def _fetch_check_runs(repo: str, sha: str) -> list[dict[str, object]]:
     out = subprocess.run(
-        ["gh", "api", f"repos/{repo}/commits/{sha}/check-runs", "--paginate", "--jq", ".check_runs[]"],
+        ["gh", "api", f"repos/{repo}/commits/{sha}/check-runs?filter=all", "--paginate", "--jq", ".check_runs[]"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout
-    return [json.loads(line) for line in out.splitlines() if line.strip()]
-
-
-# Choose the checks a release must pass: the HACS check only exists for public repositories.
-# The HACS action refuses a private repository, so waiting for it there would block every release forever.
-def required_checks(private: bool) -> tuple[str, ...]:
-    return tuple(name for name in REQUIRED_CHECKS if not (private and name == "validate-hacs"))
-
-
-# Ask GitHub whether the repository is private.
-# The required checks depend on it, and the gate must not guess.
-def _is_private(repo: str) -> bool:
-    out = subprocess.run(
-        ["gh", "api", f"repos/{repo}", "--jq", ".private"], check=True, capture_output=True, text=True
-    ).stdout
-    return out.strip() == "true"
+    runs = (json.loads(line) for line in out.splitlines() if line.strip())
+    return [
+        run for run in runs if run.get("head_sha") == sha and (run.get("app") or {}).get("slug") == "github-actions"
+    ]
 
 
 # Poll the check runs until the gate passes, fails or the timeout ends.
-# Hassfest and HACS run in other workflows and can finish after the tag push; sleep and clock are replaceable.
+# Hosted jobs can finish after the candidate commit is selected.
 def wait_for_gate(
     fetch: Callable[[], Sequence[Mapping[str, object]]],
     timeout: float,
@@ -95,15 +82,16 @@ def wait_for_gate(
 
 
 # Parse the arguments, run the gate and turn its result into the exit code.
-# The release job stops on a non-zero exit before it builds the zip.
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo")
     parser.add_argument("sha")
     parser.add_argument("--timeout", type=float, default=900.0)
     args = parser.parse_args(argv)
-    required = required_checks(_is_private(args.repo))
-    ok, detail = wait_for_gate(lambda: _fetch_check_runs(args.repo, args.sha), args.timeout, required=required)
+    sha = args.sha.lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+        parser.error("provide a full release commit SHA")
+    ok, detail = wait_for_gate(lambda: _fetch_check_runs(args.repo, sha), args.timeout)
     print(("RELEASE GATE OK: " if ok else "RELEASE GATE FAILED: ") + detail, file=sys.stderr if not ok else sys.stdout)
     return 0 if ok else 1
 

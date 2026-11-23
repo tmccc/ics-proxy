@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import yaml
+
 from tests.tool_loader import load_tool
 
 gate = load_tool("release_gate")
@@ -13,37 +20,48 @@ def _run(name: str, status: str = "completed", conclusion: str | None = "success
     return {"name": name, "status": status, "conclusion": conclusion}
 
 
-# Intent: a private repository is gated on hassfest alone, a public one also on HACS.
-# Why: the HACS action cannot run on a private repository, so requiring it there would block every release.
-def test_required_checks_depend_on_visibility() -> None:
-    assert gate.required_checks(private=True) == ("validate",)
-    assert gate.required_checks(private=False) == ("validate", "validate-hacs")
+# Intent: the hosted gate follows the actual aggregate job whose prerequisites cover both matrices.
+def test_gate_uses_the_workflows_aggregate_check() -> None:
+    workflow = Path(__file__).resolve().parents[1] / ".github/workflows/checks.yml"
+    jobs = yaml.safe_load(workflow.read_text())["jobs"]
+    assert set(jobs["checks"]["needs"]) == {"static", "engine", "ha-layer"}
+    assert gate.REQUIRED_CHECKS == (jobs["checks"].get("name", "checks"),)
 
 
 # Intent: a missing or unfinished required check waits, a finished failure fails at once, all green passes.
-# Why: hassfest can finish after the tag push, but a failed check must never be waited out.
+# Why: a missing aggregate check might still run; a completed failure must not pass.
 def test_evaluate_waits_fails_or_passes() -> None:
-    assert gate.evaluate([_run("validate")], ("validate",)) == ("pass", "all required checks succeeded")
-    assert gate.evaluate([], ("validate",))[0] == "pending"
-    assert gate.evaluate([_run("validate", status="in_progress", conclusion=None)], ("validate",))[0] == "pending"
-    assert gate.evaluate([_run("validate", conclusion="failure")], ("validate",))[0] == "fail"
+    assert gate.evaluate([_run("checks")]) == ("pass", "all required checks succeeded")
+    assert gate.evaluate([_run("validate"), _run("validate-hacs")])[0] == "pending"
+    assert gate.evaluate([_run("checks", status="in_progress", conclusion=None)])[0] == "pending"
+    assert gate.evaluate([_run("checks", conclusion="failure")])[0] == "fail"
 
 
-# Intent: the polling loop honours the required list it is given.
-# Why: with a private repository the missing HACS run must not keep the gate pending until the timeout.
-def test_wait_for_gate_uses_the_required_checks() -> None:
-    ok, _ = gate.wait_for_gate(lambda: [_run("validate")], timeout=1.0, required=gate.required_checks(private=True))
+# Intent: the hosted checker polls the exact commit and ignores other providers and other commits.
+def test_check_run_fetch_is_bound_to_actions_and_full_commit(monkeypatch) -> None:
+    sha = "a" * 40
+    other_commit = {**_run("checks"), "head_sha": "b" * 40, "app": {"slug": "github-actions"}}
+    other_provider = {**_run("checks"), "head_sha": sha, "app": {"slug": "other-service"}}
+    right = {**_run("checks"), "head_sha": sha, "app": {"slug": "github-actions"}}
 
-    assert ok
+    def fetch(command, **kwargs):
+        assert command[:3] == ["gh", "api", f"repos/example/ics-proxy/commits/{sha}/check-runs?filter=all"]
+        return SimpleNamespace(stdout="\n".join(json.dumps(row) for row in [other_commit, other_provider, right]))
+
+    monkeypatch.setattr(gate.subprocess, "run", fetch)
+    assert gate._fetch_check_runs("example/ics-proxy", sha) == [right]
+    assert gate.main(["example/ics-proxy", sha]) == 0
+    with pytest.raises(SystemExit) as error:
+        gate.main(["example/ics-proxy", "main"])
+    assert error.value.code == 2
 
 
 # Intent: when a check ran twice on a commit, the newest run decides, whatever order the API lists them in.
-# Why: the first public tag failed because a HACS run skipped while the repository was private was read instead of the
-# successful run made after it went public.
+# Why: an older successful run cannot grant approval while a newer rerun is pending or has failed.
 def test_the_newest_run_of_a_check_decides() -> None:
-    skipped = {**_run("validate-hacs", conclusion="skipped"), "id": 1}
-    passed = {**_run("validate-hacs"), "id": 2}
-    validate = {**_run("validate"), "id": 3}
-
-    assert gate.evaluate([passed, skipped, validate])[0] == "pass"
-    assert gate.evaluate([{**passed, "id": 0}, skipped, validate])[0] == "fail"
+    skipped = {**_run("checks", conclusion="skipped"), "id": 1}
+    passed = {**_run("checks"), "id": 2}
+    pending = {**_run("checks", status="queued", conclusion=None), "id": 3}
+    assert gate.evaluate([passed, skipped])[0] == "pass"
+    assert gate.evaluate([pending, passed, skipped])[0] == "pending"
+    assert gate.evaluate([{**skipped, "id": 4}, passed])[0] == "fail"
