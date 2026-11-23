@@ -13,7 +13,7 @@ from typing import Any, Literal
 from .managed_denial_faults import denial_source_fault
 from .managed_intent import RELEASE_PAUSE_ACK, retire_pause_ack, saved_pause_ack
 from .native_faults import NativeContentError
-from .native_history import ORIGINAL_HISTORY_OMISSION, ORIGINAL_HISTORY_REFUSAL, MissingOriginalHistoryError
+from .native_history import ORIGINAL_HISTORY_OMISSION, MissingOriginalHistoryError
 from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 
 AUDITS = "managed_native_repair_audits"
@@ -49,11 +49,16 @@ def retire_history_omission_revocations(journal: Journal, fault: dict[str, Any])
         if key not in rows:
             continue
         row = rows[key]
+        refusal = row.get("typed_refusal") if isinstance(row, dict) else None
         if (
             not isinstance(row, dict)
             or row.get("fault") != source
-            or row.get("typed_refusal")
-            != {"stage": "history", "detail": ORIGINAL_HISTORY_REFUSAL, "source": ORIGINAL_HISTORY_OMISSION}
+            or not isinstance(refusal, dict)
+            or refusal.keys() != {"stage", "detail", "source"}
+            or refusal["stage"] != "history"
+            or refusal["source"] != ORIGINAL_HISTORY_OMISSION
+            or not isinstance(refusal["detail"], str)
+            or not 0 < len(refusal["detail"]) <= 1024
         ):
             return {}
         retired[key] = row

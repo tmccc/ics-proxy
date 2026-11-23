@@ -22,7 +22,7 @@ from ics_proxy_core.engine.managed_current import capability_value
 from ics_proxy_core.engine.managed_intent import OWNER_PAUSE, ManagedRequests
 from ics_proxy_core.engine.native_faults import NativeContentError, diagnostic_type
 from ics_proxy_core.engine.native_history import audit_history, history_policy
-from ics_proxy_core.engine.native_history_recovery import acknowledge_history_policy
+from ics_proxy_core.engine.native_history_recovery import acknowledge_history_policy, matches_history_fault
 from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError, fingerprint
 from ics_proxy_core.engine.trial_resources import ResourceBook
@@ -48,6 +48,25 @@ class HistoryFault:
     book: ResourceBook
     original: list[dict[str, Any]]
     before: dict[str, Any]
+
+
+@pytest.mark.parametrize("source", ["original_history_omission", "startup_history_omission"])
+def test_history_fault_matches_the_bound_omission_code_after_rewording(source):
+    fault = {"classification": "native_authority_or_preservation_failed", "at_epoch": 2}
+    legacy = {
+        "type": "SecurityError",
+        "detail": "native bounded handover must preserve every original history record",
+        "at_epoch": 1,
+    }
+    failure = {**legacy, "source": source, "detail": "An original native history record is absent."}
+    bound = {**fault, "native_failure_digest": fingerprint(failure)}
+    assert matches_history_fault(fault, legacy)
+    assert matches_history_fault(bound, failure)
+    assert not matches_history_fault(bound, failure, attempts=True)
+    assert not matches_history_fault(bound, {**failure, "detail": "A different recorded diagnostic."})
+    unknown = {**legacy, "source": "other_native_history_failure"}
+    assert not matches_history_fault({**fault, "native_failure_digest": fingerprint(unknown)}, unknown)
+    assert not matches_history_fault(fault, unknown)
 
 
 # Read stable private database contents for an exact rollback comparison, without accepting new state.

@@ -1,8 +1,7 @@
-"""Separate fixed-endpoint commissioning transport; the offline adapters remain loopback-only."""
+"""Fixed-endpoint TLS transport for the managed service and commissioning tools."""
 
 from __future__ import annotations
 
-import hmac
 import ipaddress
 import ssl
 from collections.abc import Awaitable, Callable
@@ -15,12 +14,12 @@ from websockets.http11 import Request, Response
 
 from ..vendor_connection import FixedVendorConnect
 from .runtime import RuntimeSettings
-from .security import TRANSPORT_LOG, SecurityError, require_verified_tls
+from .security import TRANSPORT_LOG, SecurityError, authorization_matches, require_verified_tls
 from .trial_config import PreparedTLS, TrialConfig
 
 
 class TrialTransport:
-    """Dormant until an explicit trial start; no endpoint discovery or credential inference."""
+    """Use explicitly configured endpoints and credentials for each connection."""
 
     # Require already validated TLS and configuration; construction performs no DNS, bind or connection.
     def __init__(self, config: TrialConfig, tls: PreparedTLS, settings: RuntimeSettings | None = None) -> None:
@@ -42,12 +41,16 @@ class TrialTransport:
             source_matches = ipaddress.ip_address(peer) == ipaddress.ip_address(self.config.charger_ip)
         except ValueError:
             source_matches = False
-        credential_matches = (
-            not headers
-            if self.tls.incoming is None
-            else len(headers) == 1 and hmac.compare_digest(headers[0].encode(), self.tls.incoming.encode())
+        allowed = (
+            source_matches
+            and request.path == self.config.charger_path
+            and (
+                not headers
+                if self.tls.incoming is None
+                else len(headers) == 1 and authorization_matches(headers[0], self.tls.incoming)
+            )
         )
-        if not source_matches or request.path != self.config.charger_path or not credential_matches:
+        if not allowed:
             return connection.respond(HTTPStatus.UNAUTHORIZED, "trial admission refused\n")
         return None
 

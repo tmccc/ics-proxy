@@ -37,7 +37,7 @@ from .managed_intent import (
     request_pending,
     write_intent,
 )
-from .managed_records import CurrentFailure
+from .managed_records import CurrentFailure, CurrentFailureReason
 from .managed_release_wait import awaiting_known_stops, awaiting_observations
 from .managed_settlement import (
     charge_test_candidate,
@@ -686,7 +686,10 @@ class ControlDecisions:
             or change.identifier != selection.identifier
             or change.value.get("ticket") != selection.ticket
         ):
-            raise UnavailableError("current update was superseded by another control operation")
+            raise UnavailableError(
+                "current update was superseded by another control operation",
+                reason=CurrentFailureReason.CONTROL_SUPERSEDED,
+            )
 
     # A changed claim and its exact receipt bind inside the wire operation's transaction.
     def bind_current_selection(self, selection: CurrentSelection, ticket: str) -> None:

@@ -1,4 +1,4 @@
-"""Strict, authenticated TLS adapters restricted to the offline loopback test bench."""
+"""Shared TLS and authorization checks, with loopback adapters for offline tests."""
 
 from __future__ import annotations
 
@@ -27,6 +27,17 @@ class SecurityError(ValueError):
 
 class StaleEvidenceError(SecurityError):
     """An observation aged out before it could establish current authority."""
+
+
+_LOGGER = logging.getLogger(__name__)
+
+
+# Check the header's alphabet before constant-time comparison and log only the reason for a malformed header.
+def authorization_matches(credential: str, expected: str) -> bool:
+    if credential.isascii() and expected.isascii():
+        return hmac.compare_digest(credential, expected)
+    _LOGGER.warning("iCS refused an authorization header with a non-ASCII credential")
+    return False
 
 
 # The prototype never lets a synthetic credential reach a LAN or public endpoint.
@@ -85,9 +96,7 @@ class Admission:
         values = request.headers.get_all("Authorization")
         identity = urlsplit(request.path).path.rstrip("/").rsplit("/", 1)[-1]
         allowed = (
-            len(values) == 1
-            and identity == self.identity
-            and hmac.compare_digest(values[0].encode(), self.authorization.encode())
+            len(values) == 1 and identity == self.identity and authorization_matches(values[0], self.authorization)
         )
         if not allowed:
             return connection.respond(HTTPStatus.UNAUTHORIZED, "authentication required\n")

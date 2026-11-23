@@ -6,7 +6,7 @@ import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import TYPE_CHECKING, Any, cast, overload
 
 from .managed_intent import ControlIntent, decode_intent, finish_request, insert_request, request_pending
@@ -26,6 +26,14 @@ class CurrentFailure(Enum):
     KEEP_NEWER_CONTROL = "keep_newer_control"
     PROTECT_OPEN_SESSION = "protect_open_session"
     HOLD_IDLE = "hold_idle"
+
+
+class CurrentFailureReason(StrEnum):
+    """Durable causes for new current failure records."""
+
+    CONTROL_SUPERSEDED = "control_superseded"
+    NATIVE_AUDIT_SUPERSEDED = "native_audit_superseded"
+    OTHER = "other"
 
 
 @dataclass(frozen=True)
@@ -215,9 +223,12 @@ class CurrentChangeJournal:
     def failure(self, change: dict[str, Any]) -> dict[str, Any] | None:
         if "failure" not in change:
             legacy = self.journal.get("managed_current_failure")
-            return legacy if isinstance(legacy, dict) else None
+            return legacy if isinstance(legacy, dict) and "reason" not in legacy else None
         cause = change["failure"]
-        if not isinstance(cause, dict) or set(cause) != {"id", "revision", "current_a", "type", "detail"}:
+        fields = {"id", "revision", "current_a", "type", "detail"}
+        if not isinstance(cause, dict) or (cause.keys() != fields and cause.keys() != fields | {"reason"}):
+            return None
+        if "reason" in cause and cause["reason"] not in CurrentFailureReason:
             return None
         row = self.journal.db.execute(
             "SELECT r.action,r.revision,c.current_a FROM managed_requests r "

@@ -28,6 +28,10 @@ ReplyHandler = Callable[[str, Frame], bool | None]
 class UnavailableError(RuntimeError):
     """The peer did not give a confirmed outcome."""
 
+    def __init__(self, *args: object, reason: str | None = None) -> None:
+        super().__init__(*args)
+        self.reason = reason
+
 
 class ValidationPreemptedError(UnavailableError):
     """A genuinely queued restrictive operation retired validation before dispatch."""

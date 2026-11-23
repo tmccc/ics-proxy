@@ -28,6 +28,7 @@ from .local_control import local_start_receipt
 from .managed_current import managed_current_ceiling
 from .managed_intent import OWNER_PAUSE, decode_intent, decode_pause_claim
 from .managed_native_repair import NativeRepairAudits, RepairAttempt
+from .managed_records import CurrentFailureReason
 from .native_bounded import NativeBoundedSpec, NativeReadinessError, _require_ready, readiness_decision
 from .native_faults import MeasuredValues, NativeContentError, _NativeMeasurementError
 from .native_history import MissingOriginalHistoryError, audit_history, inspect_history
@@ -258,7 +259,10 @@ class NativeBoundedHandover:
                     raise sample
                 native = sample
                 if not current():
-                    raise AuditSupersededError("native bounded audit was superseded by local authority")
+                    raise AuditSupersededError(
+                        "native bounded audit was superseded by local authority",
+                        reason=CurrentFailureReason.NATIVE_AUDIT_SUPERSEDED,
+                    )
                 content_current = True
                 observed_route = self.initial_listener_route(native) if allow_original_route else route
                 measured = self._inspect(native, route=observed_route)

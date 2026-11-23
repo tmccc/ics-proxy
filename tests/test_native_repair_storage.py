@@ -16,9 +16,11 @@ from ics_proxy_core.engine.managed_native_repair import (
     NativeRepairAudits,
     repair_pending,
     repair_revoked,
+    retire_history_omission_revocations,
 )
 from ics_proxy_core.engine.managed_release_recovery import recoverable_fault
 from ics_proxy_core.engine.native_faults import NativeContentError
+from ics_proxy_core.engine.native_history import MissingOriginalHistoryError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError, fingerprint
 from tests.current_rig import release_bench
 from tests.managed_rig import healthy, starts
@@ -68,6 +70,25 @@ def contract_journal(path):
     for key, value in (("managed_control_fault", fault), ("managed_native_failure", diagnostic), (ACK, ack)):
         j.put(key, value)
     return j, fault, diagnostic, ack
+
+
+@pytest.mark.parametrize("omission", [True, False])
+def test_history_revocation_retirement_requires_typed_omission(tmp_path, omission):
+    journal, fault, _, _ = contract_journal(tmp_path / "revocation.db")
+    try:
+        audits = NativeRepairAudits(journal, lambda value: value == fault)
+        attempt = audits.begin("authority", 1, 1, "boot", 1)
+        error_type = MissingOriginalHistoryError if omission else NativeContentError
+        audits.finish(attempt, "strict", error_type("history", "An original native history record is absent."))
+        key = fingerprint(fault)
+        saved = journal.get(REVOCATIONS)
+        assert key in saved
+        with journal.atomic():
+            retired = retire_history_omission_revocations(journal, fault)
+        assert retired == (saved if omission else {})
+        assert repair_revoked(journal, fault) is not omission
+    finally:
+        journal.close()
 
 
 # Intent: BEGIN, statement and COMMIT failure cannot leave half a fence before an independent read.

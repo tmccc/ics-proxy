@@ -26,7 +26,6 @@ from .managed_recovery_zero import require_paused_owned_zero
 from .native_bounded import NativeBoundedSpec
 from .native_history import (
     ORIGINAL_HISTORY_OMISSION,
-    ORIGINAL_HISTORY_REFUSAL,
     STARTUP_HISTORY_OMISSION,
     MissingOriginalHistoryError,
     NativeHistoryArchive,
@@ -41,6 +40,10 @@ from .trial_handover_evidence import HandoverEvidence
 from .trial_resources import ResourceBook
 
 HISTORY_ACK = "native_history_policy_acknowledgement"
+
+# These texts identify records written before the failure digest and source were available.
+_LEGACY_HISTORY_REFUSAL = "native bounded handover must preserve every original history record"
+_LEGACY_START_ATTEMPT_REFUSAL = "complete connected-handover native evidence is required"
 
 
 # Leave deliverable observations and exact mapped Stops with the normal FIFO delivery owner.
@@ -173,7 +176,7 @@ def acknowledge_history_policy(
     journal: Journal, book: ResourceBook, spec: NativeBoundedSpec, native: HandoverEvidence
 ) -> dict[str, Any]:
     fault, failure = journal.fault.read({}), journal.get("managed_native_failure", {})
-    owns_fault = matches_history_fault(fault, failure, ORIGINAL_HISTORY_REFUSAL)
+    owns_fault = matches_history_fault(fault, failure)
     receipt = journal.get(HISTORY_ACK, {})
     if receipt.get("vendor_recovery") and journal.get("native_history_policy") is not None:
         require_paused_owned_zero(journal, book, spec, native)
@@ -261,20 +264,24 @@ def record_history_policy(
 
 
 # Identify the particular native refusal whose own latch the offline tool is allowed to retire.
-def matches_history_fault(fault: dict[str, Any], failure: dict[str, Any], detail: str) -> bool:
+def matches_history_fault(fault: dict[str, Any], failure: dict[str, Any], *, attempts: bool = False) -> bool:
+    detail = failure.get("detail")
     if "native_failure_digest" in fault:
         # The scheduled-attempt parser repair applies only to legacy faults. Require exact source for current faults.
-        if detail != ORIGINAL_HISTORY_REFUSAL or failure.get("source") not in (
+        if attempts or failure.get("source") not in (
             ORIGINAL_HISTORY_OMISSION,
             STARTUP_HISTORY_OMISSION,
         ):
             return False
         if fault["native_failure_digest"] != fingerprint(failure):
             return False
+    elif "source" in failure or detail != (_LEGACY_START_ATTEMPT_REFUSAL if attempts else _LEGACY_HISTORY_REFUSAL):
+        return False
     return (
         fault.get("classification") == "native_authority_or_preservation_failed"
         and failure.get("type") == "SecurityError"
-        and failure.get("detail") == detail
+        and isinstance(detail, str)
+        and 0 < len(detail) <= 1024
         and type(fault.get("at_epoch")) in (int, float)
         and type(failure.get("at_epoch")) in (int, float)
         and 0 <= fault["at_epoch"] - failure["at_epoch"] <= 2
@@ -294,7 +301,6 @@ def _reconcile(
 ) -> dict[str, Any]:
     fault, failure = journal.fault.read({}), journal.get("managed_native_failure", {})
     policy = history_policy(journal, spec.digest)
-    detail = "complete connected-handover native evidence is required" if attempts else ORIGINAL_HISTORY_REFUSAL
     binding = native.physical.configuration_digest
     if managed_current_ceiling(journal, spec) == 32:
         spec.require_managed(native, journal.identity, closed=True, allow_unplugged=True)
@@ -302,7 +308,7 @@ def _reconcile(
     else:
         spec.require(native, journal.identity, "trial", closed=True, allow_unplugged=True)
     if (
-        not matches_history_fault(fault, failure, detail)
+        not matches_history_fault(fault, failure, attempts=attempts)
         or not journal.phase.read().held
         or journal.get("native_bounded_handover", {}).get("stage") != "admitted"
         or journal.get("trial_preservation_fault")

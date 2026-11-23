@@ -1,4 +1,4 @@
-"""Durable acceptance, session correlation and cloud delivery for the offline prototype."""
+"""Durable acceptance, session correlation and cloud delivery for the iCS proxy."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ class Delivery:
 class Journal:
     """A private SQLite WAL journal; failures propagate before any successful charger reply."""
 
-    # Open one exclusive prototype owner and recover interrupted sends conservatively.
+    # Open the journal for its exclusive owner and recover interrupted sends conservatively.
     def __init__(
         self,
         path: Path,
