@@ -68,8 +68,13 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Health cannot outlive either the independent native reading or the service report which verified it.
     @property
     def fresh_healthy(self) -> bool:
+        data = self.data or {}
         ages = [self.age(key) for key in AGE_FIELDS]
-        return (self.data or {}).get("healthy") is True and all(a is not None and 0 <= a <= 15 for a in ages)
+        return (
+            data.get("running") is True
+            and data.get("healthy") is True
+            and all(a is not None and 0 <= a <= 15 for a in ages)
+        )
 
     # Explicit local health can retain safe native control during a manufacturer-cloud outage.
     @property
@@ -131,7 +136,12 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 detail += "Waiting for the charger to confirm the pause."
         else:
             detail = explanation(current, fresh=fresh, native_fresh=native_fresh)
-        self.notice.update(okay and not offline_pause, self.notice_generation, detail, immediate=offline_pause)
+        self.notice.update(
+            okay and fresh and native_fresh and not offline_pause,
+            self.notice_generation,
+            detail,
+            immediate=offline_pause,
+        )
 
     # API errors are classified before HA logs them; tokens and server payloads never appear in UpdateFailed.
     async def _async_update_data(self) -> dict[str, Any]:
@@ -153,10 +163,5 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ages = [value.get(key) for key in AGE_FIELDS]
         remaining = [15 - age for age in ages if usable_age(age)]
         self.schedule_expiry(remaining)
-        self.update_notification(
-            value.get("healthy") is True
-            and len(remaining) == 2
-            and all(remaining_age >= 0 for remaining_age in remaining),
-            value,
-        )
+        self.update_notification(value.get("healthy") is True, value)
         return value

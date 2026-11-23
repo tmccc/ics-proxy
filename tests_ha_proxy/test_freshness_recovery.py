@@ -62,6 +62,43 @@ async def test_healthy_proxy_pause_shows_notice_on_setup(actual_hass, peer):
     assert set(peer["commands"]) == {"status"}
 
 
+# Intent: health flags and fresh ages need a running service to restore controls or resolve an outage.
+# Why: stale readiness flags cannot prove recovery when the running evidence is missing, false or malformed.
+@pytest.mark.parametrize("running", [None, False, "true"], ids=["missing", "false", "string"])
+async def test_healthy_status_requires_running_service(actual_hass, peer, running):
+    peer["state"]["healthy"] = False
+    coordinator = (await setup(actual_hass, peer)).runtime_data
+    coordinator.problem_since -= 61
+    await coordinator.async_refresh()
+    notifications = _async_get_or_create_notifications(actual_hass)
+    assert coordinator.notification_id in notifications
+    since = coordinator.problem_since
+
+    peer["state"].update(healthy=True, can_return=True)
+    if running is None:
+        peer["state"].pop("running")
+    else:
+        peer["state"]["running"] = running
+    await coordinator.async_refresh()
+    assert not coordinator.fresh_healthy
+    assert actual_hass.states.get("binary_sensor.ics_proxy_problem").state == "on"
+    for action in ("start_test", "app_control"):
+        entity = f"button.ics_proxy_{action}"
+        assert actual_hass.states.get(entity).state == "unavailable"
+        await actual_hass.services.async_call("button", "press", {"entity_id": entity}, blocking=True)
+
+    coordinator.cancel_expiry()
+    coordinator.expire(None)
+    assert coordinator.problem_since == since and coordinator.notification_id in notifications
+
+    peer["state"].update(running=True, can_return=False)
+    await coordinator.async_refresh()
+    assert coordinator.fresh_healthy and coordinator.problem_since is None
+    assert coordinator.notification_id not in notifications
+    assert actual_hass.states.get("button.ics_proxy_start_test").state != "unavailable"
+    assert set(peer["commands"]) == {"status"}
+
+
 # Intent: expire native and service-only entities at their own boundaries while the next status is held.
 # Why: aging one half of a snapshot must not leave the other half visible indefinitely during a slow poll.
 async def test_app_connection_expires_after_native_reading_during_held_poll(actual_hass, peer, monkeypatch):

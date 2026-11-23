@@ -117,6 +117,126 @@ def test_preparation_consumes_the_worker_deadline(tmp_path, monkeypatch):
     assert len(cleanup) == 1 and cleanup[0]["container_name"].endswith("-collection")
 
 
+# Intent: preserve the post-SIGTERM grace and classify an unexpected exit even when the last worker exits.
+# Why: slow host observations must leave time for descendants to exit, and a crash needs an explicit result reason.
+@pytest.mark.parametrize("outcome", ["slow-telemetry", "last-worker-crash", "completed-test-failure"])
+def test_supervisor_grace_and_final_worker_outcomes(tmp_path, monkeypatch, outcome):
+    source = tmp_path / "source"
+    source.mkdir()
+    config = {
+        "mode": "full",
+        "scheduler": "pull-v1",
+        "workers": 2,
+        "timeout_seconds": 10,
+        "label": "unit",
+        "commit": "commit",
+        "source_digest": "digest",
+        "image": "unused",
+        "harness_hashes": {},
+        "runner": "tools/offline_ha_validate.py",
+        "runner_args": [],
+        "specs": ["tests_ha_proxy"],
+        "suite": "ha-proxy",
+        "expected_packages": {},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "snapshot.json").write_text(json.dumps({"commit": config["commit"]}))
+    clock = SimpleNamespace(seconds=0.0)
+    first, last = SimpleNamespace(returncode=0), SimpleNamespace(returncode=None)
+    first.poll = lambda: first.returncode
+    last.poll = lambda: last.returncode
+    launches = iter((first, last))
+    request = tmp_path / "1/request.json"
+    terms, kills = [], []
+    delayed = False
+
+    # Cross the qualification deadline during the first running-worker telemetry sample.
+    def telemetry(workers):
+        nonlocal delayed
+        if workers and outcome == "slow-telemetry" and not delayed:
+            delayed = True
+            clock.seconds += 10
+
+    # Deliver the unexpected exit between polls, or let a normal pytest failure consume its final grant.
+    def sleep(seconds):
+        clock.seconds += seconds
+        assert clock.seconds < 20
+        if outcome == "last-worker-crash":
+            last.returncode = 3
+        elif outcome == "completed-test-failure":
+            grant = json.loads(request.with_name("grant.json").read_text())
+            if grant["id"] is None:
+                last.returncode = 1
+            else:
+                request.write_text(json.dumps(grant["sequence"] + 1))
+
+    # Track the actual time of the signal, after time spent identifying the worker's process tree.
+    def terminate(process, signum):
+        assert process is last and signum == parallel_worker.signal.SIGTERM
+        clock.seconds += 2
+        terms.append(clock.seconds)
+        return {42: "owned"}
+
+    # Simulate hard termination without sending any real signal or launching a container.
+    def kill(identities):
+        assert identities == {42: "owned"}
+        kills.append(clock.seconds)
+        last.returncode = -9
+
+    # Feed the real supervisor a minimal collection and an independent failing audit.
+    def child(command, **kwargs):
+        if "--collect-only" in command:
+            (tmp_path / "collection/results.jsonl").write_text(
+                json.dumps({"event": "collection", "ids": ["tests_ha_proxy/test_sample.py::test_first"]}) + "\n"
+            )
+            return subprocess.CompletedProcess(command, 0)
+        assert command[2].endswith("/audit_parallel_qualification.py")
+        return subprocess.CompletedProcess(command, 1)
+
+    # Create a work request only for the worker that will finish its test and drain its grants.
+    def launch(*args, **kwargs):
+        process = next(launches)
+        if process is last and outcome == "completed-test-failure":
+            request.write_text("0\n")
+        return process
+
+    monkeypatch.syspath_prepend(source)
+    monkeypatch.setattr(
+        parallel_worker,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock.seconds, time=lambda: 300 + clock.seconds, sleep=sleep),
+    )
+    monkeypatch.setattr(parallel_worker, "signal", SimpleNamespace(signal=lambda *_: None, SIGTERM=15, SIGINT=2))
+    monkeypatch.setattr(parallel_worker, "ROOT", tmp_path)
+    monkeypatch.setattr(parallel_worker, "SOURCE", source)
+    monkeypatch.setattr(parallel_worker, "ABORT", None)
+    monkeypatch.setattr(parallel_worker, "snapshot_digest", lambda _: config["source_digest"])
+    monkeypatch.setattr(qualification_collection, "runtime_digest", lambda _: "runtime")
+    monkeypatch.setattr(parallel_worker, "container_command", lambda *_: ["docker"])
+    monkeypatch.setattr(parallel_worker, "telemetry", telemetry)
+    monkeypatch.setattr(parallel_worker.os, "sched_getaffinity", lambda _: set(range(6)))
+    monkeypatch.setattr(parallel_worker, "cleanup_containers", lambda _: [])
+    monkeypatch.setattr(parallel_worker, "stop_tree", terminate)
+    monkeypatch.setattr(parallel_worker, "kill_survivors", kill)
+    monkeypatch.setattr(
+        parallel_worker, "subprocess", SimpleNamespace(run=child, Popen=launch, STDOUT=subprocess.STDOUT)
+    )
+
+    assert parallel_worker.main() == 1
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert not result["complete"]
+    if outcome == "slow-telemetry":
+        assert result["abort_reason"] == "qualification_timeout"
+        assert len(terms) == len(kills) == 1 and kills[0] - terms[0] >= 3
+        assert result["groups"][-1]["rc"] == -9
+    else:
+        assert not terms and not kills
+        if outcome == "last-worker-crash":
+            assert result["abort_reason"] == "worker_1_exit_3" and result["groups"][-1]["rc"] == 3
+        else:
+            assert result["abort_reason"] is None and result["groups"][-1]["rc"] == 1
+
+
 # Run the real offline runner and queue plugin against a small local synthetic test source.
 def start_worker(source, directory, output):
     directory.mkdir()

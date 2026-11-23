@@ -569,9 +569,10 @@ def main():
         stopped = False
         pending_kills = {}
         stop_at = None
-        while any(item["process"].poll() is None for item in workers):
+        while True:
+            running = any(item["process"].poll() is None for item in workers)
             now = time.monotonic()
-            if now >= next_telemetry:
+            if running and now >= next_telemetry:
                 telemetry(workers)
                 next_telemetry = now + 5
             if time.monotonic() >= deadline:
@@ -585,6 +586,9 @@ def main():
             ]
             if failed and ABORT is None:
                 ABORT = "worker_" + str(failed[0]["index"]) + "_exit_" + str(failed[0]["process"].returncode)
+            # Classify the last worker's outcome before leaving the supervisor loop.
+            if not running:
+                break
             if not ABORT:
                 for item in workers:
                     if item["process"].poll() is None:
@@ -594,9 +598,9 @@ def main():
                 for item in workers:
                     if item["process"].poll() is None:
                         pending_kills.update(stop_tree(item["process"], signal.SIGTERM))
-                stop_at = now + 3
+                stop_at = time.monotonic() + 3
                 stopped = True
-            if stopped and pending_kills and now >= stop_at:
+            if stopped and pending_kills and time.monotonic() >= stop_at:
                 kill_survivors(pending_kills)
                 pending_kills.clear()
             time.sleep(0.05)

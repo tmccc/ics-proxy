@@ -59,10 +59,11 @@ class ProxyBinary(ProxyEntity, BinarySensorEntity):
         if self.key == "charging":
             power = data.get("power_w")
             return power > 10 if isinstance(power, (int, float)) else None
-        if self.key == "session_open":
-            value = data.get("charging_session_open")
+        key = "charging_session_open" if self.key == "session_open" else self.key
+        value = data.get(key)
+        if self.key in ("session_open", "local_hold_verified"):
             return value if type(value) is bool else None
-        return data.get(self.key)
+        return value
 
     # Publish the button capabilities from the same fresh proxy sample as the session state.
     @property

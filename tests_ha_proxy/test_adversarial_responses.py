@@ -94,6 +94,24 @@ async def test_invalid_nested_history_preserves_siblings(actual_hass, peer):
     assert actual_hass.states.get(sensor_id).state == "0.0"
 
 
+# Intent: a legacy paused status needs boolean evidence before either entity confirms the local hold.
+# Why: a truthy malformed field can otherwise report a verified Pause to a dashboard or automation.
+@pytest.mark.parametrize("bad_hold", [1, "false"])
+async def test_legacy_pause_requires_boolean_hold(actual_hass, peer, bad_hold):
+    peer["state"].update(desired_control="paused", local_hold_verified=bad_hold)
+    entry = await setup(actual_hass, peer)
+    mode = "sensor.ics_proxy_control_mode"
+    hold = "binary_sensor.ics_proxy_local_hold_verified"
+    assert actual_hass.states.get(mode).state == "Pause requested"
+    assert actual_hass.states.get(hold).state == "unknown"
+
+    peer["state"]["local_hold_verified"] = True
+    await entry.runtime_data.async_refresh()
+    assert actual_hass.states.get(mode).state == "Paused locally"
+    assert actual_hass.states.get(hold).state == "on"
+    assert set(peer["commands"]) == {"status"}
+
+
 # Intent: rank fallback history by completion in UTC and prefer the proxy's explicit value when it arrives.
 # Why: an older status response can omit the scalar while still carrying the latest completed charge.
 async def test_history_energy_fallback_uses_completion_time(actual_hass, peer):
