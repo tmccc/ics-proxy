@@ -162,18 +162,20 @@ def test_qualification_records_available_network_evidence(tmp_path, monkeypatch,
             raise FileNotFoundError(path)
         return files[path.name]
 
-    monkeypatch.setattr(Path, "read_text", read_network_file)
-    monkeypatch.setattr(parallel_worker, "ROOT", tmp_path)
-    monkeypatch.setattr(parallel_worker, "processes", lambda: {})
-    parallel_worker.telemetry([])
-    host = json.loads((tmp_path / "telemetry.jsonl").read_text())
-
     evidence_path = tmp_path / "worker.jsonl"
-    monkeypatch.setenv("SCENARIO_RESULTS", str(evidence_path))
-    monkeypatch.setattr(qualification_evidence, "SCRATCH_ROOTS", None)
     runtime = {"python": "3.14.0", "python_sha256": "a" * 64, "packages": {}}
-    monkeypatch.setattr(qualification_evidence, "runtime_identity", lambda: runtime)
-    qualification_evidence.pytest_sessionstart(SimpleNamespace(config=SimpleNamespace(getoption=lambda _: False)))
+    # Restore the real worker's destination before pytest reports this test's call phase.
+    with monkeypatch.context() as simulated:
+        simulated.setattr(Path, "read_text", read_network_file)
+        simulated.setattr(parallel_worker, "ROOT", tmp_path)
+        simulated.setattr(parallel_worker, "processes", lambda: {})
+        parallel_worker.telemetry([])
+        simulated.setenv("SCENARIO_RESULTS", str(evidence_path))
+        simulated.setattr(qualification_evidence, "SCRATCH_ROOTS", None)
+        simulated.setattr(qualification_evidence, "runtime_identity", lambda: runtime)
+        qualification_evidence.pytest_sessionstart(SimpleNamespace(config=SimpleNamespace(getoption=lambda _: False)))
+
+    host = json.loads((tmp_path / "telemetry.jsonl").read_text())
     worker = json.loads(evidence_path.read_text())
 
     expected_sockets = {"sockstat": "sockets: used 4", "sockstat6": None if "sockstat6" in missing else "TCP6: inuse 1"}
