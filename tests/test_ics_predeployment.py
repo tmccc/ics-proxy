@@ -11,6 +11,7 @@ import pytest
 
 from tools import ics_predeployment as checks
 from tools import validate
+from tools.managed_reporting import software
 
 
 # Commit a tiny source tree so the release gate must select real immutable candidate and predecessor bytes.
@@ -111,6 +112,20 @@ def test_proxy_change_detection_includes_packaged_unit(releases):
     repo, _, _, installed = releases
     candidate = commit(repo, "packaging/ics-proxy.service.example", "[Service]\nTimeoutStopSec=45\n")
     assert checks.changed_proxy(repo, candidate, installed) is True
+
+
+# Why: importing the service helpers executes their package initializer on every startup.
+def test_proxy_release_and_fingerprint_include_tools_initializer(releases):
+    repo, _, _, _ = releases
+    for name in ("managed_reporting.py", "managed_incident.py", "trial_proxy.py"):
+        commit(repo, f"tools/{name}", "# runtime helper\n")
+    installed = commit(repo, "tools/__init__.py", "PACKAGE_REVISION = 1\n")
+    before = software(repo)["proxy_source_sha256"]
+
+    candidate = commit(repo, "tools/__init__.py", "PACKAGE_REVISION = 2\n")
+    after = software(repo)["proxy_source_sha256"]
+    assert checks.changed_proxy(repo, candidate, installed)
+    assert before is not None and after is not None and before != after
 
 
 # Intent: every static command and the full audit retain the original candidate if HEAD moves during the run.

@@ -12,7 +12,7 @@ from typing import Any
 from ..constants import HUB_PROFILE_ID
 from .command_processor import CommandPriority
 from .composite import STATION_COMPOSITE_FAULT, ExcessiveCompositeError
-from .connection_scope import ControlScope, current_control_scope, current_scope
+from .connection_scope import ControlScope, control_scope_matches, current_control_scope, current_scope
 from .local_control import ControlSupersededError
 from .managed_charging import ManagedCharging
 from .managed_current import ManagedCurrentLimits
@@ -119,9 +119,13 @@ class ManagedController:
             session.journal, lambda fault: release_evidence(self, fault) is not None
         )
 
-    # A sample before a recorded Start or Stop cannot prove the current session, even after it closes.
+    # A periodic sample belongs to one Boot, control generation, and position in the charger lifecycle.
     def current_native_sample(self) -> HandoverEvidence | None:
-        if self.latest_native is not None and self.latest_native_lifecycle == self.session.journal.lifecycle_position():
+        if (
+            self.latest_native is not None
+            and control_scope_matches(self.session.gateway, self.latest_native_scope)
+            and self.latest_native_lifecycle == self.session.journal.lifecycle_position()
+        ):
             return self.latest_native
         return None
 

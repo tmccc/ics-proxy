@@ -46,14 +46,59 @@ def test_check_run_fetch_is_bound_to_actions_and_full_commit(monkeypatch) -> Non
 
     def fetch(command, **kwargs):
         assert command[:3] == ["gh", "api", f"repos/example/ics-proxy/commits/{sha}/check-runs?filter=all"]
+        assert 0 < kwargs["timeout"] <= 5
         return SimpleNamespace(stdout="\n".join(json.dumps(row) for row in [other_commit, other_provider, right]))
 
     monkeypatch.setattr(gate.subprocess, "run", fetch)
-    assert gate._fetch_check_runs("example/ics-proxy", sha) == [right]
-    assert gate.main(["example/ics-proxy", sha]) == 0
+    assert gate._fetch_check_runs("example/ics-proxy", sha, timeout=5) == [right]
+    assert gate.main(["example/ics-proxy", sha, "--timeout", "5"]) == 0
     with pytest.raises(SystemExit) as error:
         gate.main(["example/ics-proxy", "main"])
     assert error.value.code == 2
+
+
+# Why: even a successful response cannot approve a release once the caller's deadline has expired.
+def test_gate_does_not_accept_a_late_result() -> None:
+    now = 10.0
+
+    def fetch(remaining):
+        nonlocal now
+        assert remaining == 1
+        now += 2
+        return [_run("checks")]
+
+    assert gate.wait_for_gate(fetch, 1, clock=lambda: now) == (False, "timeout: waiting for checks")
+
+
+# Why: sleeping until the next normal poll must not postpone an earlier timeout or start another request.
+def test_gate_sleeps_only_until_the_deadline() -> None:
+    now, budgets, sleeps = 10.0, [], []
+
+    def fetch(remaining):
+        budgets.append(remaining)
+        return []
+
+    def sleep(seconds):
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    assert gate.wait_for_gate(fetch, 5, interval=3, sleep=sleep, clock=lambda: now) == (
+        False,
+        "timeout: waiting for checks",
+    )
+    assert budgets == [5, 2] and sleeps == [3, 2]
+
+
+# Why: a hung hosted request must finish as a classified timeout without fetching again.
+def test_gate_reports_subprocess_timeout(monkeypatch, capsys) -> None:
+    def fetch(command, *, timeout, **kwargs):
+        assert 0 < timeout <= 1
+        raise gate.subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr(gate.subprocess, "run", fetch)
+    assert gate.main(["example/ics-proxy", "a" * 40, "--timeout", "1"]) == 1
+    assert capsys.readouterr().err == "RELEASE GATE FAILED: timeout: waiting for checks\n"
 
 
 # Intent: when a check ran twice on a commit, the newest run decides, whatever order the API lists them in.

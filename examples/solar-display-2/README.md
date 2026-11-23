@@ -16,6 +16,7 @@ display, touch and brightness components, its fallback dashboard, and the render
 3. Adapt [esphome-canvas.yaml.example](esphome-canvas.yaml.example) to the board package and include
    [canvas_frame.h](canvas_frame.h). Keep the image URL and image-scoped authorization in local ESPHome secrets.
 4. Confirm that the automation entity ID used by the view and firmware matches the installed automation.
+   Enable the automation in Home Assistant for the charger buttons to become available.
 
 Start calls `ics_proxy.session_command` with `action: start` and the displayed revision. Stop calls it with
 `action: stop_session` and the displayed session target. The client returns confirmation for the exact request.

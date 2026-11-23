@@ -22,6 +22,7 @@ from tools.qualification_snapshot import git
 
 PROXY_INPUTS = (
     "ics_proxy_core",
+    "tools/__init__.py",
     "tools/managed_proxy.py",
     "tools/managed_reporting.py",
     "tools/managed_incident.py",

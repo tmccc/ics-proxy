@@ -18,9 +18,10 @@ from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
 from ics_proxy_core.engine.store import RecoveryRequiredError
 from tests.charge_rig import actual_stop, owner_start, positive_flow, ready, report_actual_stop
-from tests.current_rig import commissioned
+from tests.current_rig import adjustable, commissioned
 from tests.managed_rig import healthy, starts
-from tests.prototype_rig import START
+from tests.native_schedule_support import timer_bench
+from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 from tests.trial_peer import Bench
@@ -413,7 +414,7 @@ async def test_expired_session_stop_sample_stays_expired_after_wall_rebase(
             assert refresh_for_read(c, published)["stop_target"] is None
             clock.time = time.time
             view = refresh_for_read(c, published)
-            assert 0 <= view["native_age_seconds"] <= 15
+            assert view["native_age_seconds"] is None
             assert view["stop_target"] is None
 
         if queued:
@@ -462,3 +463,75 @@ async def test_expired_session_stop_sample_stays_expired_after_wall_rebase(
         assert c.requests.receipt(request)["state"] == "running"
         await healthy(c)
         assert c.requests.receipt(request)["state"] == "completed"
+
+
+# A clock correction cannot restore expired measurements or admit new work from those measurements.
+@pytest.mark.parametrize("action", ["start", "set_current"])
+async def test_expired_idle_sample_cannot_restore_live_authority(tmp_path, tls, unused_tcp_port, monkeypatch, action):
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+        c = rig.controller
+        elapsed = 0
+        clock = SimpleNamespace(time=time.time, monotonic=lambda: time.monotonic() + elapsed)
+        for module in (managed_view, native_bounded_handover, trial_handover_evidence):
+            monkeypatch.setattr(module, "time", clock)
+        published = dict(await healthy(c), running=True, certificate_remaining_seconds=86400)
+        view = refresh_for_read(c, published)
+        assert view["healthy"] and view["can_start"] and view["can_set_current"]
+        request = uuid.uuid4().hex
+        revision = c.requests.intent().revision
+        fields = {"current_a": 16} if action == "set_current" else {}
+
+        elapsed = 16
+        clock.time = lambda: time.time() + elapsed
+        assert not refresh_for_read(c, published)["healthy"]
+        clock.time = time.time
+        view = refresh_for_read(c, published)
+        assert view["power_w"] is None and view["charging_session_open"] is None
+        assert not view["healthy"] and not view["owner_control_enabled"]
+        assert not view["can_start"] and not view["can_set_current"]
+        with pytest.raises(RecoveryRequiredError, match="fresh idle authority"):
+            c.command(request, action, revision, **fields)
+        assert c.requests.receipt(request)["state"] == "not_found"
+
+        published = dict(await healthy(c), running=True, certificate_remaining_seconds=86400)
+        view = refresh_for_read(c, published)
+        assert view["healthy"] and view["can_start"] and view["can_set_current"]
+
+
+async def test_periodic_idle_sample_is_scoped_to_its_boot(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+        c = rig.controller
+        await healthy(c)
+        previous = c.current_native_sample()
+        assert previous is not None
+
+        reply = await rig.rig.bench.call(rig.charger, "new-boot-before-next-poll", "BootNotification", BOOT)
+        assert reply[0] == 3
+        await c.native.read()
+        assert c.native.last_verified_at != 0 and c.latest_native is previous
+        assert c.current_native_sample() is None
+
+        await healthy(c)
+        assert c.current_native_sample() is c.latest_native and c.latest_native is not previous
+
+
+async def test_daily_evidence_stays_expired_after_wall_rebase(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as rig:
+        c = rig.c
+        c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await rig.start_plan(9)
+        elapsed = 0
+        clock = SimpleNamespace(time=time.time, monotonic=lambda: time.monotonic() + elapsed)
+        for module in (native_bounded_handover, trial_handover_evidence):
+            monkeypatch.setattr(module, "time", clock)
+        await healthy(c)
+        assert c.charging.current_daily(local)
+
+        elapsed = 6
+        clock.time = lambda: time.time() + elapsed
+        assert not c.charging.current_daily(local)
+        clock.time = time.time
+        assert not c.charging.current_daily(local)
+        await c.native.read()
+        assert c.charging.current_daily(local)

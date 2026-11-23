@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -97,7 +96,7 @@ def current_refusal(current: ManagedCurrentLimits, native: HandoverEvidence | No
         return "managed_start_active"
     if not c.requests.has_capacity():
         return "request_capacity_exhausted"
-    if native is None or c.native.last_verified_at == 0 or not 0 <= time.time() - native.physical.observed_at <= 15:
+    if native is None or c.native.last_verified_at == 0 or not native.is_fresh(15):
         return "native_observation_stale"
     if native.physical.transaction_open:
         return "native_transaction_open"

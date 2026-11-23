@@ -1249,7 +1249,7 @@ class ControlDecisions:
         if not normal and not (c.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted"):
             return "timed_test_requires_cloud"
         if native is not None:
-            if c.native.last_verified_at == 0:
+            if c.native.last_verified_at == 0 or not native.is_fresh(15):
                 return "native_observation_stale"
             if native.physical.connection != "Plug":
                 return "vehicle_not_plugged_in"
@@ -1271,7 +1271,6 @@ class ControlDecisions:
         if (
             revision != c.requests.intent().revision
             or native is None
-            or not 0 <= time.time() - native.physical.observed_at <= 15
             or not charging.available(native, local=action in ("start", "start_test"), normal=action == "start")
         ):
             raise RecoveryRequiredError(

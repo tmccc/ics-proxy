@@ -429,6 +429,25 @@ class CommandOutcomes:
         else:
             self._save_owner_sessions()
 
+    # Receipt settlement must see a real refusal even if the exact wire reply still awaits storage.
+    def buffered_stop_rejections(self) -> tuple[list[tuple[str, int]], list[tuple[str, str]]]:
+        owner = [
+            (wire.request, wire.local)
+            for wire in self._owner_writes.values()
+            if wire.action == "RemoteStopTransaction"
+            and wire.reply == "Rejected"
+            and wire.request is not None
+            and wire.local is not None
+        ]
+        vendor = [
+            (reply.mutation, reply.wire)
+            for reply in self._pending.values()
+            if isinstance(reply, ForwardedReply)
+            and reply.action == "RemoteStopTransaction"
+            and reply.status == "Rejected"
+        ]
+        return owner, vendor
+
     # Recover an older Start stage only when a real reply names that exact issued Start.
     def recover_owner_start(self) -> None:
         self.retain_bound_owner_start()

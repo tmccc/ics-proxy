@@ -555,6 +555,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         and current.scope == observed.scope
         and (current == observed or pause_pending and observed.intent.mode == "app")
         and native is not None
+        and native.is_fresh(15)
         and c.native.last_verified_at != 0
         and pending_fault is None
         and not station_lost

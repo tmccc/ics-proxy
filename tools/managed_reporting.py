@@ -29,7 +29,9 @@ def software(root: Path) -> dict[str, Any]:
         names = sorted((root / "ics_proxy_core").rglob("*.py"))
         names += [
             root / "tools" / name
-            for name in ("managed_proxy.py", "managed_reporting.py", "managed_incident.py", "trial_proxy.py")
+            for name in (
+                "__init__.py", "managed_proxy.py", "managed_reporting.py", "managed_incident.py", "trial_proxy.py"
+            )
         ]
         digest = hashlib.sha256()
         for path in names:

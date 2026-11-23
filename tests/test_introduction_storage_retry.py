@@ -6,8 +6,9 @@ import uuid
 
 import pytest
 
+from ics_proxy_core.engine.managed import ManagedController
 from tests.current_rig import selected_ready
-from tests.managed_rig import healthy, starts
+from tests.managed_rig import healthy, managed_bench, managed_session, starts
 from tests.native_peer_failures import InterruptedNativePeer
 from tests.prototype_rig import BOOT
 from tests.runtime_rig import until
@@ -41,6 +42,51 @@ def current_probe(runtime, epoch):
             if frame.f_locals.get("self") is runtime and frame.f_locals.get("epoch") == epoch:
                 return task
     return None
+
+
+# Why: a failed claim must not leave the first authenticated Boot waiting for another connection.
+async def test_first_introduction_claim_read_recovers_on_same_boot(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
+        session = managed_session(rig)
+        await session.start()
+        controller = ManagedController(session)
+        rig.route_to_trial()
+        gateway, journal = session.gateway, session.journal
+        recovery = gateway.controls.decisions.recovery
+        claim = recovery.begin_introduction
+        attempts, refusals = [], []
+
+        def authorizer(action, table, column, database, trigger):
+            if action == sqlite3.SQLITE_READ and table == "meta":
+                refusals.append(column)
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        # Confine the real SQLite refusal to the first claim, leaving the Boot and the retry untouched.
+        def claim_with_first_read_refused(handover):
+            attempts.append(gateway._charger_epoch)
+            if len(attempts) != 1:
+                return claim(handover)
+            assert journal.get("trial_binding") is None and not rig.bench.device_calls
+            journal.db.set_authorizer(authorizer)
+            try:
+                return claim(handover)
+            finally:
+                journal.db.set_authorizer(None)
+
+        monkeypatch.setattr(recovery, "begin_introduction", claim_with_first_read_refused)
+        async with rig.charger(session) as charger:
+            assert (await rig.bench.call(charger, uuid.uuid4().hex, "BootNotification", BOOT))[0] == 3
+            await until(lambda: bool(refusals))
+            epoch, boot = gateway._charger_epoch, gateway.boot_observation
+            status = await healthy(controller)
+            assert status["owner_control_enabled"] and journal.get("trial_binding")
+            assert attempts == [epoch, epoch] and gateway._charger_epoch == epoch
+            assert gateway.boot_observation == boot and controller.native.introduced_epoch == epoch
+            assert not any(
+                call[2] in ("RemoteStartTransaction", "RemoteStopTransaction") for call in rig.bench.device_calls
+            )
+            await session.close()
 
 
 # Intent: two real initial-read refusals retry and complete the same paused connection without another Boot.

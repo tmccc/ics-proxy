@@ -193,8 +193,28 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         hass.states.async_set(SESSION, "on", {"stop_target": TARGET})
         fresh_session = template.async_render({"now": datetime.now(UTC)}, parse_result=False)
         assert "Open session" in fresh_session and "not confirmed" not in fresh_session
-        # A timed-out helper already present when automation starts can also expire.
+
+        # An unavailable touch automation cannot honor either rendered charger control.
         await hass.services.async_call("automation", "turn_off", {"entity_id": AUTOMATION}, blocking=True)
+        assert hass.states.get(AUTOMATION).state == "off"
+        tap(False)
+        await hass.async_block_till_done()
+        assert len(calls) == 3
+        for automation_state in ("off", "unavailable", None):
+            if automation_state == "unavailable":
+                hass.states.async_set(AUTOMATION, automation_state, {"current": 1})
+            elif automation_state is None:
+                hass.states.async_remove(AUTOMATION)
+            for session_state, attributes in (
+                ("on", {"stop_target": TARGET}),
+                ("off", {"can_start": True, "control_revision": REVISION}),
+            ):
+                hass.states.async_set(SESSION, session_state, attributes)
+                html = template.async_render({"now": datetime.now(UTC)}, parse_result=False)
+                assert "Charger buttons unavailable" in html
+                assert "width:3px;height:3px;background:#" not in html
+
+        # A timed-out helper already present when automation starts can also expire.
         await hass.services.async_call(
             "input_select", "select_option", {"entity_id": PENDING, "option": "stopping_timeout"}, blocking=True
         )
@@ -202,6 +222,7 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         assert hass.states.get(PENDING).state == "stopping_timeout"
         await hass.services.async_call("automation", "turn_on", {"entity_id": AUTOMATION}, blocking=True)
         await wait_for(lambda: settled("idle"))
+        assert "Ready to start" in template.async_render({"now": datetime.now(UTC)}, parse_result=False)
         assert len(calls) == 3
     finally:
         gate.set()

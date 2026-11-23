@@ -554,8 +554,8 @@ class NativeBoundedHandover:
         with self._introduction_work():
             gateway, journal = self.gateway, self.gateway.journal
             decisions = gateway.controls.decisions.recovery
-            claim = decisions.begin_introduction(self)
             try:
+                claim = decisions.begin_introduction(self)
                 native = await self.read(
                     closed=claim.first_zero,
                     owned=True,
@@ -571,8 +571,8 @@ class NativeBoundedHandover:
                 TimeoutError,
                 sqlite3.Error,
             ) as error:
-                # Retrying this initial observation cannot replay any Stop, ceiling change or lifecycle event.
-                raise IntroductionDeferredError("introduction awaits fresh native evidence") from error
+                # Retrying the claim or observation cannot replay a Stop, ceiling change or lifecycle event.
+                raise IntroductionDeferredError("introduction awaits its claim and fresh native evidence") from error
             read_sequence = self.last_resolved_read
 
             try:
@@ -699,7 +699,7 @@ class NativeBoundedHandover:
             sample is not None
             and sample.physical.transaction_open
             and sample.physical.observed_at == self.last_verified_at
-            and sample.fresh_for_stop(15)
+            and sample.is_fresh(15)
         )
 
     # Refresh independent evidence before reusing an earlier Stop. A missing proof permits a guarded physical Stop.
@@ -722,7 +722,7 @@ class NativeBoundedHandover:
             or sample.physical.observed_at != self.last_verified_at
             or not sample.physical.transaction_open
             or j.active() != local
-            or not sample.fresh_for_stop(5)
+            or not sample.is_fresh(5)
         ):
             return False
         try:
@@ -746,7 +746,7 @@ class NativeBoundedHandover:
         if (
             not native.physical.transaction_open
             or native.physical.native_transaction_id != j.active()
-            or not native.fresh_for_stop(5)
+            or not native.is_fresh(5)
         ):
             return False
         try:

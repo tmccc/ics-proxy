@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
@@ -46,12 +47,13 @@ def evaluate(check_runs: Sequence[Mapping[str, object]], required: Sequence[str]
 
 # Read all check runs of one commit through the `gh` CLI.
 # The gate needs the real result for the tagged commit, not the state of a branch.
-def _fetch_check_runs(repo: str, sha: str) -> list[dict[str, object]]:
+def _fetch_check_runs(repo: str, sha: str, *, timeout: float) -> list[dict[str, object]]:
     out = subprocess.run(
         ["gh", "api", f"repos/{repo}/commits/{sha}/check-runs?filter=all", "--paginate", "--jq", ".check_runs[]"],
         check=True,
         capture_output=True,
         text=True,
+        timeout=timeout,
     ).stdout
     runs = (json.loads(line) for line in out.splitlines() if line.strip())
     return [
@@ -62,7 +64,7 @@ def _fetch_check_runs(repo: str, sha: str) -> list[dict[str, object]]:
 # Poll the check runs until the gate passes, fails or the timeout ends.
 # Hosted jobs can finish after the candidate commit is selected.
 def wait_for_gate(
-    fetch: Callable[[], Sequence[Mapping[str, object]]],
+    fetch: Callable[[float], Sequence[Mapping[str, object]]],
     timeout: float,
     interval: float = 20.0,
     sleep: Callable[[float], None] = time.sleep,
@@ -70,15 +72,20 @@ def wait_for_gate(
     required: Sequence[str] = REQUIRED_CHECKS,
 ) -> tuple[bool, str]:
     deadline = clock() + timeout
-    while True:
-        state, detail = evaluate(fetch(), required)
-        if state == "pass":
-            return True, detail
-        if state == "fail":
-            return False, detail
-        if clock() >= deadline:
-            return False, f"timeout: {detail}"
-        sleep(interval)
+    detail = "waiting for " + ", ".join(required)
+    while (remaining := deadline - clock()) > 0:
+        try:
+            state, outcome = evaluate(fetch(remaining), required)
+        except subprocess.TimeoutExpired:
+            break
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        if state != "pending":
+            return state == "pass", outcome
+        detail = outcome
+        sleep(min(interval, remaining))
+    return False, f"timeout: {detail}"
 
 
 # Parse the arguments, run the gate and turn its result into the exit code.
@@ -91,7 +98,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     sha = args.sha.lower()
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
         parser.error("provide a full release commit SHA")
-    ok, detail = wait_for_gate(lambda: _fetch_check_runs(args.repo, sha), args.timeout)
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("provide a finite positive timeout")
+    ok, detail = wait_for_gate(lambda remaining: _fetch_check_runs(args.repo, sha, timeout=remaining), args.timeout)
     print(("RELEASE GATE OK: " if ok else "RELEASE GATE FAILED: ") + detail, file=sys.stderr if not ok else sys.stdout)
     return 0 if ok else 1
 

@@ -19,7 +19,7 @@ from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import RecoveryRequiredError
 from ics_proxy_core.frames import build_call_error, build_call_result
-from tests.charge_rig import owner_rig, positive_flow
+from tests.charge_rig import owner_rig, positive_flow, report_actual_stop
 from tests.current_rig import adjustable, locally_ready, select
 from tests.managed_rig import healthy
 from tests.management_peer import TOKEN, call
@@ -468,6 +468,104 @@ async def test_joined_session_stop_settles_from_late_rejection(tmp_path, tls, un
         result = c.requests.receipt(receipt)
         assert result["state"] == "failed" and result["result"]["classification"] == "stop_rejected"
         assert j.active() == local and c.requests.intent().mode == "app"
+
+
+# Intent: keep a real late Stop rejection authoritative while SQLite refuses that wire reply.
+# Why: expiry and a later independent closure must preserve the original and joined request outcomes.
+@pytest.mark.parametrize("first", ["local", "vendor"])
+async def test_buffered_late_stop_rejection_fences_receipts(tmp_path, tls, unused_tcp_port, monkeypatch, first):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await zero_power_session(t)
+        await healthy(c)
+        target, revision = c.session_stop.target(), c.requests.intent().revision
+        assert isinstance(target, str)
+        send, held, entered = delay_reply(monkeypatch, t.rig, t.charger, "RemoteStopTransaction")
+        monkeypatch.setattr(t.session.gateway.charger, "timeout", 0.2)
+        original, joined = uuid.uuid4().hex, uuid.uuid4().hex
+        expected_stops = [local]
+        if first == "local":
+            assert c.command(original, "stop_session", revision, target=target)["state"] == "accepted"
+            await asyncio.wait_for(entered.wait(), 3)
+            await asyncio.wait_for(c.session_stop.worker, 3)
+            affected = (original, joined)
+            reject_write = "BEFORE INSERT ON owner_command_wires WHEN NEW.reply='Rejected'"
+        else:
+            cloud = asyncio.create_task(
+                bench.cloud_call(original, "RemoteStopTransaction", {"transactionId": j.vendor_id(local)})
+            )
+            await asyncio.wait_for(entered.wait(), 3)
+            assert (await cloud)[0] == 4
+            (mutation,) = j.outcomes.vendor_stop_dispatches(local)
+            affected = (joined,)
+            reject_write = "BEFORE UPDATE OF wire_result ON vendor_command_scope WHEN NEW.wire_result='Rejected'"
+        assert c.command(joined, "stop_session", revision, target=target)["state"] == "accepted"
+        await asyncio.wait_for(c.session_stop.worker, 3)
+        assert all(c.requests.receipt(request)["state"] == "running" for request in affected)
+
+        refused = asyncio.Event()
+        j.db.create_function("note_stop_reply_refusal", 0, refused.set)
+        j.db.execute(
+            f"CREATE TEMP TRIGGER refuse_stop_reply {reject_write} "
+            "BEGIN SELECT note_stop_reply_refusal(); SELECT RAISE(ABORT, 'Stop reply unavailable'); END"
+        )
+        try:
+            await send(build_call_result(decode(held[0])[1], {"status": "Rejected"}))
+            await asyncio.wait_for(refused.wait(), 3)
+            assert not j.db.in_transaction
+            if first == "local":
+                (wire,) = j.outcomes.owner_wires("request", original)
+                assert wire.reply == "Rejected" and wire.local == local
+            else:
+                command = j.outcomes.vendor(mutation)
+                assert command.status == "Rejected" and command.wire_result == "dispatched"
+
+            j.db.execute(
+                "CREATE TEMP TRIGGER refuse_rejected_receipt BEFORE UPDATE ON managed_requests "
+                "WHEN NEW.action='stop_session' AND NEW.state='failed' "
+                "BEGIN SELECT RAISE(ABORT, 'Stop receipt unavailable'); END"
+            )
+            try:
+                await natural_stop(t, local)
+                c.session_stop.observed(await c.native.read(stop_only=True))
+                expired = time.monotonic() + managed_session_stop.CONFIRMATION_SECONDS + 1
+                with monkeypatch.context() as clock:
+                    clock.setattr(
+                        managed_session_stop, "time", SimpleNamespace(time=time.time, monotonic=lambda: expired)
+                    )
+                    c.session_stop.expire()
+                assert all(c.requests.receipt(request)["state"] == "running" for request in affected)
+            finally:
+                j.db.execute("DROP TRIGGER refuse_rejected_receipt")
+
+            c.session_stop.expire()
+            assert all(c.requests.receipt(request)["state"] == "failed" for request in affected)
+            if first == "local":
+                later = await positive_flow(t, "daily", call_id=uuid.uuid4().hex)
+                expected_stops.append(later)
+                await healthy(c)
+                later_target = c.session_stop.target()
+                assert later_target is not None and later_target != target
+                unrelated = uuid.uuid4().hex
+                assert c.command(unrelated, "stop_session", revision, target=later_target)["state"] == "accepted"
+                await until(lambda: j.outcomes.accepted_stop(later))
+                await report_actual_stop(t, later)
+                await healthy(c)
+                assert c.requests.receipt(unrelated)["state"] == "completed"
+        finally:
+            j.db.execute("DROP TRIGGER refuse_stop_reply")
+
+        await healthy(c)
+        for request in affected:
+            receipt = c.requests.receipt(request, include_binding=True)
+            assert receipt["state"] == "failed" and receipt["result"]["classification"] == "stop_rejected"
+            assert receipt["target"] == target and receipt["revision"] == revision
+        assert j.active() is None and c.requests.intent().mode == "app"
+        assert [frame[3]["transactionId"] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == (
+            expected_stops
+        )
 
 
 # Intent: the service retries publication of the same closed Stop receipt after SQLite rolls back its write.

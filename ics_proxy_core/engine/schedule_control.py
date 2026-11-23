@@ -215,7 +215,7 @@ class ScheduleControl:
             and boot == g.boot_observation
             and revision == g.controls._revision
             and c.native.last_verified_at == native.physical.observed_at
-            and 0 <= c.native.observation_age() <= 5
+            and native.is_fresh(5)
             and self.independent_daily(charging, native, local)
         )
 

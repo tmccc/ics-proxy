@@ -42,7 +42,7 @@ class HandoverEvidence:
     observed_monotonic: float | None = field(default=None, compare=False)
 
     # Keep the epoch check and bound the elapsed lifetime even if the system clock changes.
-    def fresh_for_stop(self, max_age: float) -> bool:
+    def is_fresh(self, max_age: float) -> bool:
         return (
             self.observed_monotonic is not None
             and 0 <= time.monotonic() - self.observed_monotonic <= max_age

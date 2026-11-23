@@ -12,6 +12,11 @@
 - Checked the standalone dependency pins during the installation rehearsal and documented the first charger handover.
 - Kept release tags from omitting pending changelog entries and spaced proxy restarts during temporary charger outages.
 - Linked coverage reports to the qualification files actually audited when the command runs from another directory.
+- Retired expired native readings and earlier Boot samples from live status and charger request admission.
+- Kept exact Stop rejections authoritative while their wire replies await storage.
+- Retried the first charger introduction after a temporary journal read failure.
+- Hid Solar Display 2 charger buttons while their Home Assistant automation is unavailable.
+- Included the service tools package in the installed source fingerprint and enforced the hosted release check deadline.
 - Resolved known Start rejections under a verified Pause and recorded whether shutdown reached the Stop send boundary.
 - Kept Home Assistant’s management requests on loopback and preserved Start and Stop after a failed unload.
 - Extracted the active iCS engine, Home Assistant client, tests, deployment tools and documentation into a standalone repository.

@@ -22,30 +22,61 @@ from .store import JournalStartBusy, RecoveryRequiredError, encoded, fingerprint
 
 if TYPE_CHECKING:
     from .managed import ManagedController
+    from .store import Journal
     from .trial_handover_evidence import HandoverEvidence
 
 STOP_SESSION = "stop_session"
 CONFIRMATION_SECONDS = 20
 STOP_COMPLETION_FIELDS = "state='completed',result=json_set(result,'$.session_stopped',json('true'))"
-REJECTED_ATTEMPTS = (
-    "(EXISTS (SELECT 1 FROM owner_command_wires WHERE request=managed_requests.id "
-    "AND action='RemoteStopTransaction' AND reply='Rejected') OR "
-    "COALESCE(json_array_length(result,'$._session_stop.local_attempts') "
-    "+ json_array_length(result,'$._session_stop.vendor_attempts'),0) > 0 "
-    "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.local_attempts') a "
-    "WHERE NOT EXISTS (SELECT 1 FROM owner_command_wires w WHERE w.request=a.value "
-    "AND w.local=json_extract(managed_requests.result,'$._session_stop.local') "
-    "AND w.action='RemoteStopTransaction' AND w.reply='Rejected')) "
-    "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.vendor_attempts') a "
-    "WHERE NOT EXISTS (SELECT 1 FROM vendor_command_scope v JOIN mutations m ON m.token=v.mutation "
-    "WHERE v.mutation=a.value AND v.local=json_extract(managed_requests.result,'$._session_stop.local') "
-    "AND m.origin='vendor' AND m.action='RemoteStopTransaction' AND v.wire_result='Rejected')))"
+_OWNER_REJECTIONS = (
+    "SELECT request,local FROM owner_command_wires WHERE action='RemoteStopTransaction' AND reply='Rejected'"
 )
-CLOSED_REQUESTS = (
-    f"action=? AND state IN ('accepted','running','uncertain') AND NOT {REJECTED_ATTEMPTS} AND EXISTS ("
-    "SELECT 1 FROM transactions WHERE local=json_extract(managed_requests.result,'$._session_stop.local') "
-    "AND stop IS NOT NULL)"
+_VENDOR_STOP_SCOPE = (
+    "SELECT v.mutation,v.local FROM vendor_command_scope v JOIN mutations m ON m.token=v.mutation "
+    "WHERE m.origin='vendor' AND m.action='RemoteStopTransaction'"
 )
+_VENDOR_REJECTIONS = f"{_VENDOR_STOP_SCOPE} AND v.wire_result='Rejected'"
+_BUFFERED_REJECTIONS = (
+    f"WITH owner_rejections(request,local) AS ({_OWNER_REJECTIONS} UNION ALL "
+    "SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?)), "
+    f"vendor_rejections(mutation,local) AS ({_VENDOR_REJECTIONS} UNION ALL {_VENDOR_STOP_SCOPE} "
+    "AND EXISTS (SELECT 1 FROM json_each(?) WHERE json_extract(value,'$[0]')=v.mutation "
+    "AND json_extract(value,'$[1]')=v.wire_request)) "
+)
+
+
+# One direct refusal suffices. A joined request needs a refusal from every attempt it actually joined.
+def _rejected_attempts(owner: str, vendor: str) -> str:
+    local = "json_extract(managed_requests.result,'$._session_stop.local')"
+    return (
+        f"(EXISTS (SELECT 1 FROM {owner} w WHERE w.request=managed_requests.id AND w.local={local}) OR "
+        "COALESCE(json_array_length(result,'$._session_stop.local_attempts') "
+        "+ json_array_length(result,'$._session_stop.vendor_attempts'),0) > 0 "
+        "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.local_attempts') a "
+        f"WHERE NOT EXISTS (SELECT 1 FROM {owner} w WHERE w.request=a.value AND w.local={local})) "
+        "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.vendor_attempts') a "
+        f"WHERE NOT EXISTS (SELECT 1 FROM {vendor} v WHERE v.mutation=a.value AND v.local={local})))"
+    )
+
+
+def _closed_requests(rejected: str) -> str:
+    return (
+        f"action=? AND state IN ('accepted','running','uncertain') AND NOT {rejected} AND EXISTS ("
+        "SELECT 1 FROM transactions WHERE local=json_extract(managed_requests.result,'$._session_stop.local') "
+        "AND stop IS NOT NULL)"
+    )
+
+
+_SAVED_REJECTED_ATTEMPTS = _rejected_attempts(f"({_OWNER_REJECTIONS})", f"({_VENDOR_REJECTIONS})")
+_LIVE_REJECTED_ATTEMPTS = _rejected_attempts("owner_rejections", "vendor_rejections")
+CLOSED_REQUESTS = _closed_requests(_SAVED_REJECTED_ATTEMPTS)
+_LIVE_CLOSED_REQUESTS = _closed_requests(_LIVE_REJECTED_ATTEMPTS)
+
+
+# Offline and ordinary live checks use only persisted rows. Add exact buffered evidence only when present.
+def _buffered_rejection_binding(journal: Journal) -> tuple[str, ...]:
+    owner, vendor = journal.outcomes.buffered_stop_rejections()
+    return (encoded(owner), encoded(vendor)) if owner or vendor else ()
 
 
 @dataclass(frozen=True)
@@ -77,11 +108,10 @@ class ManagedSessionStop:
             or not j.phase.read().active
             or local is None
             or connection is None
-            or c.latest_native_scope != connection
             or native is None
             or not native.physical.transaction_open
             or native.physical.native_transaction_id != local
-            or not native.fresh_for_stop(15)
+            or not native.is_fresh(15)
             or not c.native.session_stop_verified(local)
         ):
             return None
@@ -203,11 +233,14 @@ class ManagedSessionStop:
 
     # Retire the client wait without resending or erasing a Stop that might still take effect.
     def expire(self, *, replaced: bool = False) -> None:
+        buffered = _buffered_rejection_binding(self.controller.session.journal)
+        rejected = _LIVE_REJECTED_ATTEMPTS if buffered else _SAVED_REJECTED_ATTEMPTS
         self._update_receipts(
             "state='failed',result=json_set(result,'$.classification','stop_rejected')",
             (),
-            f"action=? AND state IN ('running','uncertain') AND {REJECTED_ATTEMPTS}",
+            f"action=? AND state IN ('running','uncertain') AND {rejected}",
             (STOP_SESSION,),
+            buffered=buffered,
             retry_after_rollback=not replaced,
         )
         # The same rejection evidence also excludes a receipt from closure while its failure write awaits retry.
@@ -216,12 +249,21 @@ class ManagedSessionStop:
             "OR json_extract(result,'$._session_stop.joined') "
             "THEN 'uncertain' ELSE 'failed' END,result=json_set(result,'$.classification',?)",
             ("process_replaced" if replaced else "stop_not_confirmed",),
-            f"action=? AND state IN ('accepted','running') AND NOT {REJECTED_ATTEMPTS} "
+            f"action=? AND state IN ('accepted','running') AND NOT {rejected} "
             "AND (? OR COALESCE(json_extract(result,'$._session_stop.confirmation_deadline')<=?, "
             "json_extract(result,'$.accepted_at')<=?))",
             (STOP_SESSION, replaced, time.monotonic(), time.time() - CONFIRMATION_SECONDS),
+            buffered=buffered,
             retry_after_rollback=not replaced,
         )
+
+    # Skip receipt writes and optional native probes when none of the exact eligible rows exists.
+    def _has_receipts(self, where: str, binding: tuple[Any, ...], buffered: tuple[str, ...]) -> bool:
+        prefix = _BUFFERED_REJECTIONS if buffered else ""
+        row = self.controller.session.journal.db.execute(
+            f"{prefix}SELECT 1 FROM managed_requests WHERE {where} LIMIT 1", buffered + binding
+        ).fetchone()
+        return row is not None
 
     # Only a real receipt transition needs a write lock. A busy begin can wait for the next poll.
     def _update_receipts(
@@ -231,16 +273,20 @@ class ManagedSessionStop:
         where: str,
         binding: tuple[Any, ...],
         *,
+        buffered: tuple[str, ...] = (),
         retry_after_rollback: bool = False,
     ) -> None:
         j = self.controller.session.journal
-        if j.db.execute(f"SELECT 1 FROM managed_requests WHERE {where} LIMIT 1", binding).fetchone() is None:
+        if not self._has_receipts(where, binding, buffered):
             return
+        prefix = _BUFFERED_REJECTIONS if buffered else ""
         transaction_started = False
         try:
             with j.atomic(retry_busy=True):
                 transaction_started = True
-                j.db.execute(f"UPDATE managed_requests SET {assignments} WHERE {where}", values + binding)
+                j.db.execute(
+                    f"{prefix}UPDATE managed_requests SET {assignments} WHERE {where}", buffered + values + binding
+                )
         except JournalStartBusy:
             return  # The existing receipt is still accurate because the write never began.
         except sqlite3.Error:
@@ -255,30 +301,28 @@ class ManagedSessionStop:
         if (
             native.physical.transaction_open != (active is not None)
             or native.physical.native_transaction_id != active
-            or not native.fresh_for_stop(5)
+            or not native.is_fresh(5)
             or active is None
             and (native.physical.power_w != 0 or any(value != 0 for value in native.currents_a + native.powers_w))
         ):
             return
+        buffered = _buffered_rejection_binding(j)
         self._update_receipts(
             STOP_COMPLETION_FIELDS,
             (),
-            CLOSED_REQUESTS,
+            _LIVE_CLOSED_REQUESTS if buffered else CLOSED_REQUESTS,
             (STOP_SESSION,),
+            buffered=buffered,
             retry_after_rollback=True,
         )
 
     # Cloud reconciliation must not erase an independently confirmed local closure.
     async def confirm_while_blocked(self) -> None:
         c, j = self.controller, self.controller.session.journal
-        if (
-            c.stopping
-            or j.db.execute(
-                f"SELECT 1 FROM managed_requests WHERE {CLOSED_REQUESTS} LIMIT 1",
-                (STOP_SESSION,),
-            ).fetchone()
-            is None
-        ):
+        if c.stopping:
+            return
+        buffered = _buffered_rejection_binding(j)
+        if not self._has_receipts(_LIVE_CLOSED_REQUESTS if buffered else CLOSED_REQUESTS, (STOP_SESSION,), buffered):
             return
         try:
             native = await c.native.read(stop_only=True)
