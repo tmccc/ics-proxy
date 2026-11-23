@@ -63,20 +63,50 @@ class CurrentCase:
         )
 
 
+_CURRENT_PROOF_VARIANTS = (
+    *product(("native-before", "native-after", "paused-native"), ("valid", "503", "eof", "bad-json")),
+    *product(("profile",), ("valid", "rejected", "call-error")),
+    *product(("composite",), ("valid", "rejected", "call-error", "bad-schedule")),
+)
+_CURRENT_EVENT_ORDERS = tuple(permutations(("resolve", "pause", "boot")))
+
+
 # Cover every directed representative current pair, each real proof boundary and every competing event order.
 def current_candidates():
-    variants = (
-        *product(("native-before", "native-after", "paused-native"), ("valid", "503", "eof", "bad-json")),
-        *product(("profile",), ("valid", "rejected", "call-error")),
-        *product(("composite",), ("valid", "rejected", "call-error", "bad-schedule")),
-    )
     return tuple(
         CurrentCase(initial, target, boundary, outcome, demand, order)
         for initial, target in permutations((6, 16, 32), 2)
-        for boundary, outcome in variants
+        for boundary, outcome in _CURRENT_PROOF_VARIANTS
         for demand in (False, True)
-        for order in permutations(("resolve", "pause", "boot"))
+        for order in _CURRENT_EVENT_ORDERS
     )
+
+
+# Alternate later demand across proof variants and event orders, then flip it for the reverse endpoint direction.
+def reviewed_current_resolution_cases():
+    reviewed = {
+        CurrentCase(initial, target, boundary, outcome, bool((pair_index + variant_index + order_index) % 2), order)
+        for pair_index, (initial, target) in enumerate(((6, 32), (32, 6)))
+        for variant_index, (boundary, outcome) in enumerate(_CURRENT_PROOF_VARIANTS)
+        for order_index, order in enumerate(_CURRENT_EVENT_ORDERS)
+    }
+
+    # Advance by two event orders per 16 A pair to cycle which event leads at each valid proof boundary.
+    sentinel_pairs = ((6, 16), (16, 6), (16, 32), (32, 16))
+    valid_boundaries = tuple(boundary for boundary, outcome in _CURRENT_PROOF_VARIANTS if outcome == "valid")
+    reviewed.update(
+        CurrentCase(
+            initial,
+            target,
+            boundary,
+            "valid",
+            bool((pair_index + boundary_index) % 2),
+            _CURRENT_EVENT_ORDERS[(2 * pair_index + boundary_index) % len(_CURRENT_EVENT_ORDERS)],
+        )
+        for pair_index, (initial, target) in enumerate(sentinel_pairs)
+        for boundary_index, boundary in enumerate(valid_boundaries)
+    )
+    return tuple(case for case in current_candidates() if case in reviewed)
 
 
 @dataclass(frozen=True)

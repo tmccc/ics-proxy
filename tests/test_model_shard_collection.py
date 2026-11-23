@@ -8,6 +8,8 @@ import sys
 import pytest
 
 from tests.qualification_test_helpers import synthetic_collection_row
+from tests_model.control_cases import reviewed_current_resolution_cases
+from tools.check_control_settlement import SUITES
 from tools.run_model_shard import ROOT, assigned_ids, collection_targets, hosted_collection, verify_execution
 
 
@@ -70,8 +72,8 @@ def test_model_ci_enrolls_external_families_without_ordinary_cases(tmp_path):
     assert len(flattened) == len(set(flattened)) and set(flattened) == declared
 
 
-# Intent: all hosted jobs share the exact complete engine plan, including both kinds of case in the process-death file.
-# Why: separate serial and model jobs used to execute registered out-of-root model cases twice.
+# Intent: both hosted selections partition a verified complete engine plan and retain out-of-root process cases.
+# Why: routine selection must defer only the declared current cases without hiding an incomplete collection.
 def test_hosted_engine_shards_partition_controlled_collection_once(tmp_path):
     plan = tmp_path / "collection.json"
     collected = subprocess.run(
@@ -114,6 +116,18 @@ def test_hosted_engine_shards_partition_controlled_collection_once(tmp_path):
     omitted = next(iter(models & process))
     with pytest.raises(RuntimeError, match="exact registered finite universe"):
         assigned_ids([case for case in ids if case != omitted], rows, 0, 20, full_engine=True)
+
+    current = {row["node_id"]: row["id"] for row in rows if row["family"] == "current_resolution"}
+    reviewed = {case.identifier for case in reviewed_current_resolution_cases()}
+    deferred = {node for node, case in current.items() if case not in reviewed}
+    assert len(current) == 1368 and len(deferred) == 1120
+    review_shards = [assigned_ids(ids, rows, index, 20, full_engine=True, review=True) for index in range(20)]
+    review_ids = [identifier for shard in review_shards for identifier in shard]
+    assert all(review_shards) and len(review_ids) == len(set(review_ids))
+    assert set(review_ids) == set(ids) - deferred
+    assert set(SUITES["engine"][1]) <= set(review_ids)
+    with pytest.raises(RuntimeError, match="exact registered finite universe"):
+        assigned_ids([case for case in ids if case != min(deferred)], rows, 0, 20, full_engine=True, review=True)
 
 
 # Intent: each shard must prove actual once-only execution of its assigned IDs.

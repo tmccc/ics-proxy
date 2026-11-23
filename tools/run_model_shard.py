@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tests_model.catalog import FAMILIES  # noqa: E402
+from tests_model.control_cases import reviewed_current_resolution_cases  # noqa: E402
 from tools.audit_parallel_qualification import valid_collection_contract  # noqa: E402
 from tools.qualification_collection import source_inventory  # noqa: E402
 
@@ -57,8 +58,10 @@ def observed_collection(rows: list[dict]) -> list[str]:
     return collections[0]["ids"]
 
 
-# Partition a single ordered denominator, with every registered model included in it exactly once.
-def assigned_ids(ids: list[str], manifest: list[dict], shard: int, count: int, *, full_engine: bool) -> list[str]:
+# Partition the verified complete collection, with an explicit smaller selection for routine engine checks.
+def assigned_ids(
+    ids: list[str], manifest: list[dict], shard: int, count: int, *, full_engine: bool, review: bool = False
+) -> list[str]:
     admitted = {row["node_id"] for row in manifest if row["exclusion"] is None}
     functions = {row["node_id"].split("[", 1)[0] for row in manifest}
     if full_engine:
@@ -71,6 +74,18 @@ def assigned_ids(ids: list[str], manifest: list[dict], shard: int, count: int, *
         observed = set(ids)
     if not ids or len(ids) != len(set(ids)) or observed != admitted:
         raise RuntimeError("shard collection differs from the exact registered finite universe")
+    if review:
+        if not full_engine:
+            raise RuntimeError("engine review requires the complete engine collection")
+        reviewed = {case.identifier for case in reviewed_current_resolution_cases()}
+        current = {
+            row["node_id"]: row["id"]
+            for row in manifest
+            if row["family"] == "current_resolution" and row["exclusion"] is None
+        }
+        if not reviewed or not reviewed.issubset(current.values()):
+            raise RuntimeError("review current cases differ from the full manifest")
+        ids = [identifier for identifier in ids if identifier not in current or current[identifier] in reviewed]
     return ids[shard::count]
 
 
@@ -119,11 +134,14 @@ def main() -> int:
     parser.add_argument("--shards", type=int, default=20)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--engine-collection", type=Path, help="shared complete engine discovery artifact for CI")
+    parser.add_argument("--review", action="store_true", help="use the routine current-resolution selection")
     args = parser.parse_args()
     if args.shards != 20 or not 0 <= args.shard < args.shards or not args.output.is_absolute():
         parser.error("use shard0..19 of20 and an absolute output directory")
     if os.environ.get("MODEL_SMOKE") or os.environ.get("MODEL_CASE_LIMIT"):
-        parser.error("CI model qualification never samples the declared universe")
+        parser.error("use the explicit hosted selection instead of model sampling environment variables")
+    if args.review and args.engine_collection is None:
+        parser.error("--review requires --engine-collection")
     args.output.mkdir(parents=True, exist_ok=False)
     env = {
         **os.environ,
@@ -156,7 +174,9 @@ def main() -> int:
     )
     (args.output / "manifest.log").write_text(generated.stdout + generated.stderr)
     manifest = [json.loads(line) for line in manifest_path.read_text().splitlines()]
-    selected = assigned_ids(ids, manifest, args.shard, args.shards, full_engine=args.engine_collection is not None)
+    selected = assigned_ids(
+        ids, manifest, args.shard, args.shards, full_engine=args.engine_collection is not None, review=args.review
+    )
     (args.output / "assigned-ids.json").write_text(json.dumps(selected) + "\n")
     env["SCENARIO_RESULTS"] = str(args.output / "results.jsonl")
     result = subprocess.run([*command, *selected, "--junitxml=" + str(args.output / "junit.xml")], cwd=ROOT, env=env)

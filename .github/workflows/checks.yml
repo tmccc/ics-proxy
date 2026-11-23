@@ -120,15 +120,15 @@ jobs:
         with:
           name: engine-plan
           path: ${{ runner.temp }}/engine-plan
-      - name: Run assigned engine and model cases
+      - name: Run routine engine checks
         run: |
           python tools/run_model_shard.py --shard ${{ matrix.shard }} --output "${RUNNER_TEMP}/engine" \
-            --engine-collection "${RUNNER_TEMP}/engine-plan/collection.json"
+            --engine-collection "${RUNNER_TEMP}/engine-plan/collection.json" --review
       - name: Preserve shard evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: engine-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          name: engine-review-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/engine
           if-no-files-found: error
 

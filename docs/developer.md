@@ -31,6 +31,17 @@ Run the same command in an environment built from `requirements-ha-proxy-2026.10
 Core version. Keep pytest selection explicit. The full engine and model suites cover substantially more than
 the two test files used by the engine runner’s default smoke command.
 
+## Routine engine checks
+
+Pushes and pull requests collect the complete engine suite, then run the hosted shards with
+`run_model_shard.py --review`. This selects 248 of the 1,368 current-resolution cases. It tests every
+proof boundary, reply outcome and event order in both directions between 6 A and 32 A. It varies later
+demand and checks all four directed pairs involving 16 A. The other engine and model cases run in full.
+Each selected case must pass setup, execution, teardown, and the checks for the evidence it records.
+
+Live release qualification requires the full engine collection, including all 1,368 current-resolution
+cases. Use [the release process](release-process.md) for that run.
+
 ## Required settlement checks
 
 Run these focused checks before review. Use the engine environment for the first command and run the second
@@ -41,8 +52,8 @@ python -B tools/check_control_settlement.py engine
 python -B tools/check_control_settlement.py ha
 ```
 
-The hosted checks run this selection before the full engine and Home Assistant suites. It covers both local
-and vendor-app Stop orders, including Pause overlap when a reply is lost. It also covers expired requests whose
+The hosted checks run this selection before the routine engine checks and full Home Assistant suites. It covers
+both local and vendor-app Stop orders, including Pause overlap when a reply is lost. It also covers expired requests whose
 receipt write failed, exact shutdown dependencies, closure reports, process replacement, clock adjustments, and
 a new charger Boot. The Home Assistant cases check what the session control shows while the result is pending
 and after the exact session closes.

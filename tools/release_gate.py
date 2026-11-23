@@ -2,8 +2,8 @@
 """Check the hosted result for an exact release commit.
 
 The ``checks`` job in ``.github/workflows/checks.yml`` succeeds only once static,
-engine and both Home Assistant legs pass. This optional hosted check is separate
-from the source-bound qualification audit used by ``tools/validate.py``::
+routine engine and both Home Assistant legs pass. Live deployment requires the
+complete source-bound qualification audit used by ``tools/validate.py``::
 
     python tools/release_gate.py <owner/repo> <sha> [--timeout 900]
 
