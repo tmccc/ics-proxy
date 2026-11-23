@@ -20,7 +20,7 @@ from .command_outcomes import transaction_reply_status
 from .command_processor import CommandPriority, CommandProcessor
 from .composite import ExcessiveCompositeError, FutureScheduleError, verify_composite
 from .connection_scope import CloudAttemptScope
-from .control_decisions import ControlDecisions, ProveStop, StopReplyUnconfirmedError
+from .control_decisions import ControlDecisions, ProveStop, StopDecision, StopReplyUnconfirmedError, StopZeroEvidence
 from .incident_observation import IncidentObservation, ObservationKind, ObservedReply
 from .managed_intent import decode_intent, read_pause_claim
 from .policy import DeniedError, Policy, number
@@ -554,6 +554,7 @@ class LocalControl:
         owner: tuple[object, ...] | None = None,
         priority: CommandPriority = CommandPriority.RESTRICT,
         request_id: str | None = None,
+        stop_zero: StopZeroEvidence | None = None,
     ) -> Frame:
         claim = partial(
             self._claim_stop,
@@ -565,6 +566,7 @@ class LocalControl:
             on_claim,
             owner,
             request_id,
+            stop_zero,
         )
         task = claim() if self.command_processor is None else await self.command_processor.run(claim, priority=priority)
         return await asyncio.shield(task)
@@ -580,6 +582,7 @@ class LocalControl:
         on_claim: Callable[[str], None] | None,
         owner: tuple[object, ...] | None,
         request_id: str | None,
+        stop_zero: StopZeroEvidence | None,
     ) -> asyncio.Task[Frame]:
         if station_absent and (expected_local is None or guard is None):
             raise RecoveryRequiredError("an absent station ceiling permits only an independently guarded Stop")
@@ -621,6 +624,7 @@ class LocalControl:
                     station_flowing,
                     prove_stop,
                     request_id,
+                    stop_zero,
                 )
             )
         return self._stopping
@@ -638,6 +642,7 @@ class LocalControl:
         station_flowing: Callable[[], bool] | None = None,
         prove_stop: ProveStop | None = None,
         request_id: str | None = None,
+        stop_zero: StopZeroEvidence | None = None,
     ) -> Frame:
         stop_guard: Callable[[], None] | None = None
 
@@ -661,7 +666,13 @@ class LocalControl:
         # Recheck real closure and any matched prior reply in the final queued send decision.
         def dispatch_stop(action: str) -> None:
             if action == "RemoteStopTransaction" and local is not None:
-                if not self.decisions.authorize_local_send(local, boot, ticket, protective=protective()):
+                if not self.decisions.authorize_local_send(
+                    local,
+                    boot,
+                    ticket,
+                    protective=protective(),
+                    join_unanswered=stop_zero is not None and stop_zero.stop_zero_verified(local),
+                ):
                     raise _StopAlreadyHandledError
 
         scope = self.journal.outcomes.owner_scope(request_id, ticket, boot)
@@ -698,7 +709,17 @@ class LocalControl:
                     proof = await prove_stop(local, cap_error is not None, awaiting_report)
                     stop_guard = proof.check
                     observed_flowing = proof.flowing
-            if local is not None and self.decisions.stop_needed(local, protective=protective()):
+                if (
+                    stop_zero is not None
+                    and not protective()
+                    and self.decisions.stop_decision(local, join_unanswered=True) is StopDecision.WAIT_FOR_REPORT
+                ):
+                    await stop_zero.refresh_stop_zero(local)
+            if local is not None and self.decisions.stop_needed(
+                local,
+                protective=protective(),
+                join_unanswered=stop_zero is not None and stop_zero.stop_zero_verified(local),
+            ):
                 try:
                     stop_answer = await call("RemoteStopTransaction", commands.remote_stop_transaction(local))
                 except _StopAlreadyHandledError:

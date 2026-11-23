@@ -295,8 +295,11 @@ class ManagedController:
                     if timed is not None:
                         controls.decisions.settle_pause_records(self, native, (timed,))
                     return False, station_absent
-                return controls.stop_work_needed(
-                    local, station_absent=station_absent, station_flowing=station_flowing
+                return controls.decisions.stop_work_needed(
+                    local,
+                    station_absent=station_absent,
+                    station_flowing=station_flowing,
+                    join_unanswered=local is not None and self.native.stop_zero_verified(local),
                 ), station_absent
 
             stop_needed, station_absent = self.commands.decide(
@@ -312,6 +315,7 @@ class ManagedController:
                     on_claim=partial(controls.decisions.bind_pause_stop, self.requests, scope),
                     owner=("pause", scope.intent, request, local, scope.connection),
                     request_id=request.identifier if request is not None else None,
+                    stop_zero=self.native,
                 )
         except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError, sqlite3.Error:
             return  # Intent stays paused; fresh supervision must establish zero before confirmation or any release.

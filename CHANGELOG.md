@@ -14,10 +14,15 @@
 - Linked coverage reports to the qualification files actually audited when the command runs from another directory.
 - Retired expired native readings and earlier Boot samples from live status and charger request admission.
 - Kept exact Stop rejections authoritative while their wire replies await storage.
+- Settled saved Start and Stop replies against the original attempt during normal operation and recovery.
+- Prevented an expired session Stop from being sent while its timeout update awaits storage.
+- Shared an unanswered Stop between Pause and the vendor app while the charger is verified at zero.
+- Let a definite rejection release a shutdown wait tied to the original ordinary Stop request.
 - Retried the first charger introduction after a temporary journal read failure.
 - Hid Solar Display 2 charger buttons while their Home Assistant automation is unavailable.
 - Included the service tools package in the installed source fingerprint and enforced the hosted release check deadline.
 - Used Stop time to identify the latest completed charge in native history and older Home Assistant status responses.
+- Used the later Start to break a Stop time tie and left conflicting energy readings with identical times unavailable.
 - Required Home Assistant to confirm the proxy is running and to verify a local hold explicitly before showing it.
 - Preserved the shutdown grace period for test workers and reported hard failures even when the last worker exits.
 - Recorded current meter activity when a charger report contains a fresh sample after older samples.

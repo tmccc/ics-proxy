@@ -169,6 +169,41 @@ async def test_session_stop_rechecks_native_verification(tmp_path, tls, unused_t
         await natural_stop(t, local)
 
 
+# Intent: delayed receipt publication cannot let an expired Stop reach the charger.
+# Why: a queued request's authority ends at its original elapsed deadline even after a storage failure.
+async def test_queued_stop_cannot_dispatch_after_expiry_write_rolls_back(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        local = await positive_flow(t, "daily")
+        await healthy(c)
+        target, revision = c.session_stop.target(), c.requests.intent().revision
+        assert target is not None
+        request = uuid.uuid4().hex
+        gate = t.session.gateway.charger.gate
+        async with gate.enter(10):
+            assert c.command(request, "stop_session", revision, target=target)["state"] == "accepted"
+            await asyncio.wait_for(gate.restrictive_waiting.wait(), 3)
+            elapsed = time.monotonic() + managed_session_stop.CONFIRMATION_SECONDS + 1
+            stopped_clock = SimpleNamespace(monotonic=lambda: elapsed, time=time.time)
+            monkeypatch.setattr(managed_session_stop, "time", stopped_clock)
+            j.db.execute(
+                "CREATE TEMP TRIGGER refuse_stop_expiry BEFORE UPDATE ON managed_requests "
+                f"WHEN NEW.id='{request}' AND NEW.state='failed' "
+                "BEGIN SELECT RAISE(ABORT, 'temporary refusal'); END"
+            )
+            c.session_stop.expire()
+            assert c.requests.receipt(request)["state"] == "accepted"
+            j.db.execute("DROP TRIGGER refuse_stop_expiry")
+            assert c.session_stop.target() == target
+
+        assert c.session_stop.worker is not None
+        await asyncio.wait_for(c.session_stop.worker, 3)
+        assert not bench.remote_stop.is_set()
+        assert not j.outcomes.session_stop_dispatched(local)
+        receipt = c.requests.receipt(request)
+        assert receipt["state"] == "failed" and receipt["result"]["classification"] == "stop_not_sent"
+
+
 # Intent: the original Stop receipt can confirm when its exact session closes before the worker gets the wire.
 # Why: a real report withdraws the open target but still needs fresh native proof before the receipt succeeds.
 async def test_session_stop_awaits_closure_when_session_closes_in_gate(tmp_path, tls, unused_tcp_port, monkeypatch):

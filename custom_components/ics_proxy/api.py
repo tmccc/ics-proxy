@@ -52,6 +52,23 @@ def _history(value: object, *, proxy: bool = False) -> tuple[list[dict[str, Any]
     return rows, len(rows) == len(value)
 
 
+# Older status responses omit the scalar. Compare both timestamps in UTC and require agreement if both tie.
+def _latest_history_energy(rows: list[dict[str, Any]]) -> tuple[int | float | None, bool]:
+    latest_times: tuple[datetime, datetime] | None = None
+    latest_energy: int | float | None = None
+    for row in rows:
+        stopped = _history_time(row["stopped_at"])
+        started = _history_time(row["started_at"])
+        if stopped is None or started is None:
+            continue
+        times = stopped, started
+        if latest_times is None or times > latest_times:
+            latest_times, latest_energy = times, row["energy_kwh"]
+        elif times == latest_times and latest_energy != row["energy_kwh"]:
+            latest_energy = None
+    return latest_energy, latest_times is None or latest_energy is not None
+
+
 class ProxyError(Exception):
     """A fixed safe error, without credentials, URLs or raw peer bodies."""
 
@@ -172,16 +189,9 @@ class ProxyClient:
                     energy if type(energy) in (int, float) and 0 <= energy <= 1e9 else None
                 )
             elif result["charger_latest_completion_known"]:
-                latest = max(
-                    (
-                        (stopped, row["energy_kwh"])
-                        for row in result["charger_sessions"]
-                        if (stopped := _history_time(row["stopped_at"])) is not None
-                    ),
-                    key=lambda item: item[0],
-                    default=None,
-                )
-                result["last_session_energy_kwh"] = latest[1] if latest is not None else None
+                latest_energy, latest_known = _latest_history_energy(result["charger_sessions"])
+                result["last_session_energy_kwh"] = latest_energy
+                result["charger_latest_completion_known"] = latest_known
         return result
 
     # Retry only temporary read failures within the command caller's existing deadline.

@@ -14,11 +14,17 @@ from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[1]
 STOP_TEST = "tests/test_managed_session_stop.py"
+PAUSE_OVERLAP = (
+    "tests/test_managed_cloud_zero_controls.py::test_local_pause_and_cloud_stop_share_unanswered_stop_at_zero"
+)
 REBASE_TEST = (
     "tests/test_managed_observed_freshness.py::test_expired_session_stop_sample_stays_expired_after_wall_rebase"
 )
 SHUTDOWN_TEST = "tests/test_real_process_death.py::test_process_cut_during_shutdown_stop"
 JOURNAL_TEST = "tests/test_journal_fault_recovery.py::test_forwarded_reply_recovery_preserves_ambiguous_start_delivery"
+SHUTDOWN_JOIN = (
+    "tests/test_journal_fault_recovery.py::test_shutdown_waits_for_exact_prior_stops_or_an_independent_attempt"
+)
 HA_TEST = "tests_ha_proxy/test_client.py::test_session_stop_shares_the_vendor_wire_in_either_order"
 
 SUITES = {
@@ -37,11 +43,17 @@ SUITES = {
             f"{STOP_TEST}::test_exact_stop_rejection_fences_receipt_after_replacement[vendor]",
             f"{STOP_TEST}::test_live_stop_confirmation_uses_elapsed_time[-30]",
             f"{STOP_TEST}::test_live_stop_confirmation_uses_elapsed_time[30]",
+            f"{STOP_TEST}::test_queued_stop_cannot_dispatch_after_expiry_write_rolls_back",
+            f"{PAUSE_OVERLAP}[local]",
+            f"{PAUSE_OVERLAP}[vendor]",
             f"{REBASE_TEST}[admission]",
             f"{REBASE_TEST}[dispatch]",
             f"{STOP_TEST}::test_session_stop_target_awaits_current_boot_supervision",
             f"{SHUTDOWN_TEST}[sent]",
             f"{SHUTDOWN_TEST}[unissued]",
+            f"{SHUTDOWN_JOIN}[None]",
+            f"{SHUTDOWN_JOIN}[own-wire]",
+            f"{SHUTDOWN_JOIN}[legacy]",
             f"{JOURNAL_TEST}[startup]",
             f"{JOURNAL_TEST}[live-retry]",
         ),

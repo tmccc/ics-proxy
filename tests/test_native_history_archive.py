@@ -79,6 +79,26 @@ def test_latest_native_completion_uses_stop_time_without_a_managed_close(history
     assert not damaged.latest_completion_known
 
 
+# Intent: resolve equal Stop times by Start time while honoring the exact managed closure.
+# Why: native row order cannot distinguish records whose timestamps and energy disagree.
+@pytest.mark.parametrize(
+    ("start", "meter_stop", "expected_energy"),
+    [(1100, 7000, 2.0), (1000, 7000, None), (1000, 12000, 7.0)],
+    ids=["later-start", "ambiguous-energy", "same-energy"],
+)
+def test_native_completion_resolves_timestamp_ties(start: int, meter_stop: int, expected_energy: float | None) -> None:
+    rows = (
+        row(1002) | {"startTime": 1000, "stopTime": 1250, "meterStop": 12000},
+        row(1001) | {"startTime": start, "stopTime": 1250, "meterStop": meter_stop},
+    )
+    for records in (rows, rows[::-1]):
+        history = summarize_charger_history(records)
+        assert history.complete and history.latest_completion_known == (expected_energy is not None)
+        assert history.last_energy == expected_energy
+        managed = summarize_charger_history(records, latest_closed=1002)
+        assert managed.latest_completion_known and managed.last_energy == 7.0
+
+
 # Intent: any number of absent original records is archived and reported without rewriting original admission data.
 # Why: firmware history retention must not force a charging fault or silently erase the complete original archive.
 def test_missing_originals_are_retained_with_unchanged_admission_history(history_journal: Journal) -> None:

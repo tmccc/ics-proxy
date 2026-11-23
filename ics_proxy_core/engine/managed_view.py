@@ -182,6 +182,8 @@ def summarize_charger_history(
     summaries: list[dict[str, Any]] = []
     completed: dict[int, int] = {}
     energy: dict[int, float] = {}
+    latest_times = (0, 0)
+    latest_energy: float | None = None
     newest_unreadable = 0.0
     unreadable_recent = False
     latest_time = time.time() + 30
@@ -215,6 +217,11 @@ def summarize_charger_history(
         if stop:
             completed[identifier] = stop
             energy[identifier] = (last - first) / 1000
+            times = stop, start
+            if times > latest_times:
+                latest_times, latest_energy = times, energy[identifier]
+            elif times == latest_times and latest_energy != energy[identifier]:
+                latest_energy = None
         summaries.append(
             {
                 "started_at": datetime.fromtimestamp(start, UTC).isoformat(),
@@ -224,17 +231,17 @@ def summarize_charger_history(
         )
     complete = newest_unreadable == 0
     if latest_closed is None:
-        latest_id = max(completed, key=completed.__getitem__, default=None)
-        latest_known = complete or latest_id is not None and completed[latest_id] > newest_unreadable
+        # Coincident timestamps can establish energy only when the matching records agree.
+        latest_known = complete if not completed else latest_energy is not None and latest_times[0] > newest_unreadable
     else:
         # The journal can receive the Stop before native history includes that same assigned ID.
-        latest_id = latest_closed
+        latest_energy = energy.get(latest_closed)
         latest_known = not unreadable_recent and max(completed, default=None) == latest_closed
     return ChargerHistorySummary(
         sorted(summaries, key=lambda r: r["started_at"], reverse=True)[:20],
         complete,
         completed,
-        energy.get(latest_id) if latest_id is not None else None,
+        latest_energy,
         latest_known,
     )
 

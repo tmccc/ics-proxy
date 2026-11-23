@@ -43,6 +43,7 @@ class SessionStop:
     local: int
     intent: ControlIntent
     connection: ControlScope
+    confirmation_deadline: float
 
 
 class ManagedSessionStop:
@@ -106,7 +107,7 @@ class ManagedSessionStop:
                     },
                 },
             )
-        scope = SessionStop(identifier, target, local, intent, connection)
+        scope = SessionStop(identifier, target, local, intent, connection, confirmation_deadline)
         self.worker = c.commands.start(partial(self._send, scope), priority=CommandPriority.RESTRICT)
         return {"id": identifier, "action": STOP_SESSION, "state": "accepted", "result": {"accepted_at": accepted}}
 
@@ -129,6 +130,8 @@ class ManagedSessionStop:
                 if session is not None and session.closed:
                     raise StopAlreadyHandledError  # The original report still needs independent closure evidence.
                 raise RecoveryRequiredError("Stop lost its current session")
+            if time.monotonic() >= scope.confirmation_deadline:
+                raise RecoveryRequiredError("Stop expired before dispatch")
 
         # Commit possible dispatch before the sender can write, including when the wire reply is lost.
         def dispatch(_action: str) -> None:

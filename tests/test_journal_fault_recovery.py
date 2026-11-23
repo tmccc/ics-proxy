@@ -6,6 +6,7 @@ from contextlib import closing
 
 import pytest
 
+from ics_proxy_core.engine.managed_intent import ManagedRequests, insert_request
 from ics_proxy_core.engine.store import Journal
 from tests.prototype_rig import START
 
@@ -228,3 +229,50 @@ def test_forwarded_reply_recovery_preserves_ambiguous_start_delivery(tmp_path, r
             "classification": "owner_control_or_delivery_uncertain",
             "delivery_token": delivery.token,
         }
+
+
+# Intent: only exact prior refusals release an unissued shutdown's wait after journal replacement.
+# Why: a legacy dependency or a possible shutdown wire can still own the same open session.
+@pytest.mark.parametrize("independent", [None, "own-wire", "legacy"])
+def test_shutdown_waits_for_exact_prior_stops_or_an_independent_attempt(tmp_path, independent):
+    path = tmp_path / "joined-shutdown.db"
+    with closing(Journal(path, "synthetic")) as j:
+        j.put("managed_mode", {"mode": "app_schedule"})
+        ManagedRequests(j)
+        local = j.start("start-report", START)["transactionId"]
+        requests = ("original-stop-a", "original-stop-b")
+        wires = []
+        for request in requests:
+            insert_request(j, request, "stop_session", 0, {"_session_stop": {"local": local, "dispatched": True}})
+            j.db.execute("UPDATE managed_requests SET state='running' WHERE id=?", (request,))
+            scope = j.outcomes.owner_scope(request, request, "boot")
+            wire = scope.sent(request, "RemoteStopTransaction", {"transactionId": local})
+            assert wire is not None
+            wires.append((scope, wire))
+        for ticket in ("original-shutdown", "replacement-shutdown"):
+            with j.atomic():
+                j.outcomes.claim_shutdown_stop(ticket, local, ticket, "boot")
+            claim = j.get("trial_shutdown_attempt")
+            assert claim["prior_pending_stop"] and claim["prior_local_attempts"] == list(requests)
+            assert claim["stop_wire"] is None and j.outcomes.unanswered_shutdown_stop(local)
+        if independent == "own-wire":
+            scope = j.outcomes.owner_scope(None, ticket, "boot")
+            scope.sent("shutdown-wire", "RemoteStopTransaction", {"transactionId": local})
+        elif independent == "legacy":
+            del claim["prior_local_attempts"]
+            j.put("trial_shutdown_attempt", claim)
+        unrelated = j.outcomes.owner_scope(requests[1], "another-session", "boot")
+        wrong = unrelated.sent("wrong-session-wire", "RemoteStopTransaction", {"transactionId": local + 1})
+        assert wrong is not None
+        unrelated.received(wrong, [3, wrong.wire, {"status": "Rejected"}])
+        first, first_wire = wires[0]
+        first.received(first_wire, [3, first_wire.wire, {"status": "Rejected"}])
+        assert j.outcomes.unanswered_shutdown_stop(local)
+        last, last_wire = wires[1]
+        last.received(last_wire, [3, last_wire.wire, {"status": "Rejected"}])
+        j.outcomes.record_shutdown_stop(ticket, "uncertain")
+
+    with closing(Journal(path, "synthetic")) as reopened:
+        assert reopened.active() == local
+        assert not reopened.outcomes.session_stop_dispatched(local)
+        assert reopened.outcomes.unanswered_shutdown_stop(local) is (independent is not None)

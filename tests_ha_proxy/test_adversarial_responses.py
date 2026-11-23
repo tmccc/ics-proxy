@@ -136,6 +136,38 @@ async def test_history_energy_fallback_uses_completion_time(actual_hass, peer):
     assert actual_hass.states.get(sensor).state == "2.0"
 
 
+# Intent: older status responses use Start time to resolve an equal Stop time, independent of row order.
+# Why: different offsets can express the same instant, and a tied energy needs agreement between records.
+@pytest.mark.parametrize(
+    ("start", "energy", "expected"),
+    [
+        ("2025-12-31T22:30:00-02:00", 7.0, "7.0"),
+        ("2025-12-31T22:00:00-02:00", 7.0, "unknown"),
+        ("2025-12-31T22:00:00-02:00", 2.0, "2.0"),
+    ],
+    ids=["later-start", "ambiguous-energy", "same-energy"],
+)
+async def test_history_energy_fallback_resolves_timestamp_ties(actual_hass, peer, start, energy, expected):
+    records = [
+        {
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "stopped_at": "2026-01-01T02:00:00+00:00",
+            "energy_kwh": 2.0,
+        },
+        {"started_at": start, "stopped_at": "2026-01-01T00:00:00-02:00", "energy_kwh": energy},
+    ]
+    peer["state"]["charger_sessions"] = records
+    coordinator = (await setup(actual_hass, peer)).runtime_data
+    sensor = "sensor.ics_proxy_last_session_energy"
+    assert actual_hass.states.get(sensor).state == expected
+    assert coordinator.data["charger_latest_completion_known"] == (expected != "unknown")
+
+    peer["state"]["charger_sessions"] = records[::-1]
+    await coordinator.async_refresh()
+    assert actual_hass.states.get(sensor).state == expected
+    assert coordinator.data["charger_latest_completion_known"] == (expected != "unknown")
+
+
 # Intent: even a direct enormous-integer current request gets a safe validation error before any management command.
 # Why: HA's normal service coercion is not the numeric boundary's only callable path.
 async def test_huge_integer_current_is_safely_rejected(actual_hass, peer):

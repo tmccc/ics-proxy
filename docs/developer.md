@@ -42,9 +42,10 @@ python -B tools/check_control_settlement.py ha
 ```
 
 The hosted checks run this selection before the full engine and Home Assistant suites. It covers both local
-and vendor-app Stop orders, lost and late replies, failed journal writes, closure before and after the charger
-report, process replacement, clock adjustments, and a new charger Boot. The Home Assistant cases check what
-the session control shows while the result is pending and after the exact session closes.
+and vendor-app Stop orders, including Pause overlap when a reply is lost. It also covers expired requests whose
+receipt write failed, exact shutdown dependencies, closure reports, process replacement, clock adjustments, and
+a new charger Boot. The Home Assistant cases check what the session control shows while the result is pending
+and after the exact session closes.
 
 ## Public replay files
 

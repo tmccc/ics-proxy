@@ -590,6 +590,14 @@ class CommandOutcomes:
 
     # Pin the target before any wire work and retain an older unanswered Stop for that same session.
     def claim_shutdown_stop(self, attempt: str, local: int | None, ticket: str, boot: str | None) -> None:
+        prior_pending = False
+        local_attempts: tuple[str, ...] = ()
+        if local is not None and self.journal.active() == local:
+            prior_pending = self.accepted_stop(local)
+            if not prior_pending:
+                prior_pending, inherited = self._shutdown_stop_dependencies(local)
+                if not prior_pending:
+                    local_attempts = tuple(dict.fromkeys((*inherited, *self.session_stop_dispatches(local))))
         self.journal.put(
             "trial_shutdown_attempt",
             {
@@ -598,7 +606,8 @@ class CommandOutcomes:
                 "ticket": ticket,
                 "boot": boot,
                 "state": "pending",
-                "prior_pending_stop": self.awaits_stop_report(local),
+                "prior_pending_stop": prior_pending or bool(local_attempts),
+                **({"prior_local_attempts": local_attempts} if local_attempts else {}),
                 "stop_wire": None,
             },
         )
@@ -691,8 +700,36 @@ class CommandOutcomes:
     def unanswered_vendor_stop(self, local: int) -> bool:
         return bool(self.vendor_stop_dispatches(local))
 
+    # Pause and other owner Stops may have crossed the wire without a session-only receipt.
+    def unanswered_owner_stop(self, local: int) -> bool:
+        tickets = {
+            row[0]
+            for row in self.journal.db.execute(
+                "SELECT DISTINCT ticket FROM owner_command_wires WHERE action='RemoteStopTransaction' AND local=? "
+                "AND (reply IS NULL OR reply NOT IN ('Accepted','Rejected'))",
+                (local,),
+            )
+        }
+        tickets.update(
+            wire.ticket
+            for wire in self._owner_writes.values()
+            if wire.action == "RemoteStopTransaction" and wire.local == local
+        )
+        return any(
+            wire.action == "RemoteStopTransaction"
+            and wire.local == local
+            and wire.reply not in ("Accepted", "Rejected")
+            for ticket in tickets
+            for wire in self.owner_wires("ticket", ticket)
+        )
+
     # This is evidence to wait, without an Accepted reply that can be sent to another caller.
     def unanswered_shutdown_stop(self, local: int) -> bool:
+        pending, local_attempts = self._shutdown_stop_dependencies(local)
+        return pending or bool(local_attempts)
+
+    # A joined ordinary Stop can settle independently of an older claim or this shutdown's own wire.
+    def _shutdown_stop_dependencies(self, local: int) -> tuple[bool, tuple[str, ...]]:
         shutdown = self.journal.get("trial_shutdown_attempt", {})
         ticket = shutdown.get("ticket")
         if (
@@ -700,23 +737,39 @@ class CommandOutcomes:
             or not isinstance(ticket, str)
             or shutdown.get("state") not in ("pending", "uncertain")
         ):
-            return False
+            return False, ()
+        local_attempts: tuple[str, ...] = ()
         if shutdown.get("prior_pending_stop"):
-            return True
+            attempts = shutdown.get("prior_local_attempts")
+            if (
+                not isinstance(attempts, list)
+                or not attempts
+                or not all(isinstance(item, str) and item for item in attempts)
+            ):
+                return True, ()  # Older claims did not identify the underlying Stop.
+            rejections = stop_rejections(self.journal)
+            local_attempts = tuple(
+                row[0]
+                for row in self.journal.db.execute(
+                    f"{rejections.prefix}SELECT a.value FROM json_each(?) a "
+                    f"WHERE NOT {rejections.owner_refusal('a.value', '?')}",
+                    (*rejections.bindings, encoded(attempts), local),
+                )
+            )
         if shutdown.get("unsent"):
-            return False
+            return False, local_attempts
         stops = [
             wire
             for wire in self.owner_wires("ticket", ticket)
             if wire.local == local and wire.action == "RemoteStopTransaction"
         ]
         if any(wire.reply != "Rejected" for wire in stops):
-            return True
+            return True, local_attempts
         # An absent wire row is only conclusive for a new claim that still proves its Stop was never issued.
         if "stop_wire" not in shutdown:
-            return not stops
+            return not stops, local_attempts
         marked = shutdown["stop_wire"]
-        return marked is not None and not any(wire.wire == marked for wire in stops)
+        return marked is not None and not any(wire.wire == marked for wire in stops), local_attempts
 
     # Read one original mutation. Historical unrelated rows cannot lend it a reply or local session.
     def vendor(self, mutation: object) -> VendorCommand | None:

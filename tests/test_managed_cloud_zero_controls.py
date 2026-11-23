@@ -290,6 +290,53 @@ async def test_local_pause_and_cloud_stop_share_one_charger_stop(tmp_path, tls, 
             assert sum(f[2] == "StopTransaction" for f in rig.bench.lifecycle_wires) == 1
 
 
+# An unanswered Stop owns its original session while independent evidence verifies zero.
+@pytest.mark.parametrize("first", ["local", "vendor"])
+async def test_local_pause_and_cloud_stop_share_unanswered_stop_at_zero(
+    tmp_path, tls, unused_tcp_port, monkeypatch, first
+):
+    async with mp.managed_bench(tmp_path, tls, unused_tcp_port, bench_type=StartReplyBench) as rig:
+        async with running(rig, "shared-unanswered-stop") as (session, c, charger):
+            await mp.healthy(c)
+            b = ChargeRig(rig, session, c, charger)
+            local = await positive_flow(b, "daily")
+            j, peer = session.journal, session.gateway.charger
+            vendor = j.vendor_id(local)
+            assert vendor is not None
+            send, held, entered = delay_reply(monkeypatch, rig, charger, "RemoteStopTransaction")
+            monkeypatch.setattr(peer, "timeout", 0.3)
+            pause, request = uuid.uuid4().hex, uuid.uuid4().hex
+
+            def pause_worker():
+                assert c.command(pause, "pause", c.requests.intent().revision)["state"] == "accepted"
+                assert c.pause_task is not None
+                return c.pause_task
+
+            def cloud_stop():
+                return asyncio.create_task(
+                    rig.bench.cloud_call(request, "RemoteStopTransaction", {"transactionId": vendor})
+                )
+
+            first_task = pause_worker() if first == "local" else cloud_stop()
+            await asyncio.wait_for(entered.wait(), 3)
+            second_task = cloud_stop() if first == "local" else pause_worker()
+            await asyncio.wait_for(asyncio.gather(first_task, second_task), 4)
+
+            cloud = second_task if first == "local" else first_task
+            assert cloud.result()[:2] == [4, request]
+            stops = [frame[3] for frame in rig.bench.device_calls if frame[2] == "RemoteStopTransaction"]
+            assert stops == [{"transactionId": local}]
+            assert j.active() == local and not j.outcomes.accepted_stop(local)
+            assert rig.bench.firmware.effective_limit() == 0 and c.requests.receipt(pause)["state"] == "accepted"
+
+            await send(held[0])
+            await until(lambda: j.outcomes.accepted_stop(local))
+            await close_daily(b, local, "native")
+            assert c.requests.intent().mode == "paused"
+            assert j.outcomes.stop_report_closed(local)
+            assert c.requests.receipt(pause)["state"] == "completed"
+
+
 # Intent: a late local Stop acknowledgement can cover a vendor Stop that has prepared but has not sent.
 # Why: the final decision must use the latest real reply and zero proof, and remove any unsent reservation.
 @pytest.mark.recovery_replay
@@ -318,6 +365,12 @@ async def test_cloud_stop_reuses_late_local_acceptance_at_send_boundary(tmp_path
             validating, resume = asyncio.Event(), asyncio.Event()
             validate = g.charger.validate_send
             assert validate is not None
+
+            # The unresolved attempt can join only once the current zero proof is available.
+            zero_verified = c.native.stop_zero_verified
+            monkeypatch.setattr(
+                c.native, "stop_zero_verified", lambda local: validating.is_set() and zero_verified(local)
+            )
 
             # Hold only the vendor's actual outgoing validation after its mutation has been prepared.
             async def hold_stop(action, payload):
@@ -378,6 +431,12 @@ async def test_local_pause_reuses_late_vendor_acceptance_at_send_boundary(tmp_pa
             validating, resume = asyncio.Event(), asyncio.Event()
             validate = g.charger.validate_send
             assert validate is not None
+
+            # The unresolved attempt can join only once the current zero proof is available.
+            zero_verified = c.native.stop_zero_verified
+            monkeypatch.setattr(
+                c.native, "stop_zero_verified", lambda local: validating.is_set() and zero_verified(local)
+            )
 
             # Hold the local Stop after it has established zero and before its final queued authorization.
             async def hold_stop(action, payload):
