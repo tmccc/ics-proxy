@@ -21,6 +21,7 @@ from tests.charge_rig import owner_rig, positive_flow, ready
 from tests.managed_rig import healthy, managed_bench, starts
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
+from tests.test_managed_boot_supersession import delay_reply
 from tests.test_rpc_validation_deadlines import NativeAuditPeer
 from tests.tls_support import tls as tls
 
@@ -155,8 +156,9 @@ async def test_commissioning_stop_does_not_cross_a_repeat_boot(tmp_path, tls, un
 
 # Intent: close a transaction that reports a previously issued owner Start during shutdown.
 # Why: denying new authorizations must still leave enough time to settle a Start already accepted by the charger.
+@pytest.mark.parametrize("slow_zero", [False, True], ids=["verified-zero", "report-before-zero-reply"])
 async def test_managed_shutdown_stops_late_transaction_for_already_issued_owner_start(
-    tmp_path, tls, unused_tcp_port, monkeypatch
+    tmp_path, tls, unused_tcp_port, monkeypatch, slow_zero
 ):
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         c, j, controls = b.controller, b.session.journal, b.session.gateway.controls
@@ -165,12 +167,30 @@ async def test_managed_shutdown_stops_late_transaction_for_already_issued_owner_
         tag = starts(b.rig)[0][3]["idTag"]
         assert j.get("local_start_receipt")["stage"] == "accepted" and j.active() is None
 
+        body = START | {"idTag": tag}
+        report = None
+        if slow_zero:
+            send, held, entered = delay_reply(monkeypatch, b.rig, b.charger, "SetChargingProfile")
         c.request_stop()
         shutdown = asyncio.create_task(b.session.close())
+        if slow_zero:
+            await asyncio.wait_for(entered.wait(), 3)
+            report = asyncio.create_task(
+                b.rig.bench.call(b.charger, "late-issued-owner-start", "StartTransaction", body)
+            )
+            try:
+                await asyncio.sleep(1.25)
+                assert not report.done() and j.active() is None
+            finally:
+                await send(held[0])
         await until(lambda: controls.ready and controls.desired() == 0)
         fresh = await b.rig.bench.call(b.charger, "fresh-authorize-during-shutdown", "Authorize", {"idTag": tag})
         assert fresh[2]["idTagInfo"]["status"] == "Invalid"
-        start = await b.rig.bench.call(b.charger, "late-issued-owner-start", "StartTransaction", START | {"idTag": tag})
+        start = (
+            await report
+            if report is not None
+            else await b.rig.bench.call(b.charger, "late-issued-owner-start", "StartTransaction", body)
+        )
         assert start[0] == 3 and start[2]["idTagInfo"]["status"] == "Accepted"
         local = start[2]["transactionId"]
         assert j.active() == local and not j.get("control")["start_pending"]

@@ -22,9 +22,11 @@ from tests.managed_rig import healthy
 from tests.management_peer import TOKEN, call
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
+from tests.service_recovery_helpers import running_service
 from tests.test_managed_boot_supersession import delay_reply
 from tests.test_managed_normal_start import natural_stop, zero_power_session
 from tests.tls_support import tls as tls
+from tools import managed_proxy
 
 
 # Intent: a zero-watt session can be stopped immediately after its Start completes on the management socket.
@@ -403,6 +405,54 @@ async def test_joined_session_stop_settles_from_late_rejection(tmp_path, tls, un
         result = c.requests.receipt(receipt)
         assert result["state"] == "failed" and result["result"]["classification"] == "stop_rejected"
         assert j.active() == local and c.requests.intent().mode == "app"
+
+
+# Intent: the service retries publication of the same closed Stop receipt after SQLite rolls back its write.
+# Why: failure to publish an already verified closure must leave charger supervision and app mode running.
+async def test_service_retries_closed_stop_receipt_publication(tmp_path, tls, unused_tcp_port_factory, monkeypatch):
+    monkeypatch.setattr(managed_proxy, "_SUPERVISION_POLL_SECONDS", 0.2)
+    async with running_service(tmp_path, tls, unused_tcp_port_factory, monkeypatch, 6) as service:
+        charge = service.charge
+        journal, bench = charge.session.journal, charge.rig.bench
+        local = await positive_flow(charge, "daily", call_id=uuid.uuid4().hex)
+        before = await service.published(state="healthy", power=True)
+        view = (await call(service.api, "status"))["result"]
+        target, revision = view["stop_target"], view["control_revision"]
+        assert isinstance(target, str)
+        request = uuid.uuid4().hex
+        accepted = await call(service.api, "stop_session", id=request, revision=revision, target=target)
+        assert accepted["result"]["state"] == "accepted"
+        await until(lambda: journal.outcomes.accepted_stop(local))
+
+        refused = asyncio.Event()
+        journal.db.create_function("note_stop_receipt_attempt", 0, refused.set)
+        journal.db.execute(
+            "CREATE TEMP TRIGGER refuse_closed_stop_receipt BEFORE UPDATE ON managed_requests "
+            f"WHEN NEW.id='{request}' AND NEW.state='completed' "
+            "BEGIN SELECT note_stop_receipt_attempt(); SELECT RAISE(ABORT, 'receipt storage unavailable'); END"
+        )
+        try:
+            bench.firmware.active = None
+            await service.close_daily(local)
+            await asyncio.wait_for(refused.wait(), 5)
+            await service.published(before["checked_at"], state="healthy")
+            pending = (await call(service.api, "receipt", request_id=request))["result"]
+            assert pending["state"] == "running" and pending["target"] == target
+            assert journal.active() is None and not journal.db.in_transaction
+        finally:
+            if not service.task.done():
+                journal.db.execute("DROP TRIGGER refuse_closed_stop_receipt")
+
+        await until(lambda: charge.controller.requests.receipt(request)["state"] == "completed")
+        receipt = (await call(service.api, "receipt", request_id=request))["result"]
+        assert receipt["id"] == request and receipt["target"] == target and receipt["revision"] == revision
+        assert receipt["result"]["session_stopped"] is True
+        final = (await call(service.api, "status"))["result"]
+        assert final["charging_session_open"] is False and final["desired_control"] == "app"
+        assert final["station_ceiling_a"] == 6 and final["control_revision"] == revision
+        assert [frame[3] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
 
 
 # Intent: a vendor Stop whose device response was an error still covers the same possible physical effect.

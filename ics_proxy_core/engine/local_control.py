@@ -51,6 +51,7 @@ from .station import StationChoice
 from .store import Journal, RecoveryRequiredError, ReleaseDeferredError, StationZeroStorageError, fingerprint
 
 Call = Callable[[str, dict[str, Any]], Awaitable[Frame]]
+COMPOSITE_RETRY_SECONDS = 1.0
 
 
 class ControlSupersededError(DeniedError):
@@ -410,7 +411,7 @@ class LocalControl:
                 if error.ahead_seconds > 1 or attempt == 2:
                     raise UnavailableError("composite schedule remains outside present coverage") from None
                 if retry_deadline is None:
-                    retry_deadline = loop.time() + 1
+                    retry_deadline = loop.time() + COMPOSITE_RETRY_SECONDS
                 wait_until = min(loop.time() + 0.25, retry_deadline)
                 while loop.time() < wait_until:
                     decision = check()

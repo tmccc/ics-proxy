@@ -436,6 +436,26 @@ class TrialSession:
             },
         )
 
+    # A listener failure before the first Boot leaves an admission with no physical or lifecycle authority.
+    def _first_listener_pending(self) -> bool:
+        j = self.journal
+        return (
+            not self.started
+            and j.phase.read().active
+            and j.phase.starting is True
+            and j.get("native_bounded_handover", {}).get("stage") == "admitted"
+            and j.get("trial_binding") is None
+            and j.get("boot") is None
+            and j.get("managed_current_capability") is None
+            and j.control.read().explicit_local_hold
+            and not j.fault.latched()
+            and j.db.execute(
+                "SELECT 1 FROM trial_resources UNION ALL SELECT 1 FROM mutations "
+                "UNION ALL SELECT 1 FROM transactions UNION ALL SELECT 1 FROM outbox LIMIT 1"
+            ).fetchone()
+            is None
+        )
+
     # Verify native admission or recovery before the listener opens; actual Boot still establishes readiness.
     async def start(self) -> None:
         phase = self.journal.phase.read()
@@ -443,6 +463,11 @@ class TrialSession:
             recover_unreported_local_start(self.journal)
         if phase.value == "prepared":
             await self.native_bounded.admit()
+        elif self._first_listener_pending():
+            native = await self.native_bounded.read(closed=True, initial=True, allow_original_route=True)
+            self.gateway.decide(
+                lambda: self._accept_startup_observation(native, first_listener=True), priority=CommandPriority.RESTRICT
+            )
         elif phase.supervised:
             selected = self._commissioned_selection()
             known_local = (
@@ -484,8 +509,11 @@ class TrialSession:
         self.started = True
 
     # Publish startup's checked session and restrictive hold through the shared owner.
-    def _accept_startup_observation(self, native: HandoverEvidence) -> None:
-        self.gateway.controls.decisions.recovery.accept_startup(self, native)
+    def _accept_startup_observation(self, native: HandoverEvidence, *, first_listener: bool = False) -> None:
+        if first_listener and not self._first_listener_pending():
+            raise UnavailableError("first listener recovery was superseded")
+        route = self.native_bounded.initial_listener_route(native) if first_listener else "trial"
+        self.gateway.controls.decisions.recovery.accept_startup(self, native, route=route)
 
     # A small explicit operator interface keeps all controls inside the original gateway ownership rules.
     async def command(self, value: dict[str, Any]) -> dict[str, Any]:

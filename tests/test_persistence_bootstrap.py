@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,8 @@ from pathlib import Path
 import pytest
 
 import ics_proxy_core
+from ics_proxy_core.engine.managed import ManagedController
+from ics_proxy_core.engine.native_faults import NativeContentError
 from ics_proxy_core.engine.rpc import InboundCache
 from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError
@@ -91,8 +94,6 @@ async def test_legacy_pristine_baseline_gap_reintroduces_over_real_tls(tmp_path,
         assert session.gateway.charger.sender is None and not session.gateway.controls.ready
         assert rig.bench.device_calls == []
         await session.start()
-        from ics_proxy_core.engine.managed import ManagedController
-
         controller = ManagedController(session)
         rig.route_to_trial()
         async with rig.charger(session) as charger:
@@ -101,6 +102,57 @@ async def test_legacy_pristine_baseline_gap_reintroduces_over_real_tls(tmp_path,
             assert rig.bench.received_limits[0] == 0 and rig.bench.received_limits[-1] == 6
             assert len(rig.peer.requests) > 0
             await session.close()
+
+
+# Intent: an occupied first listener leaves the same admission retryable on either approved route.
+# Why: opening a listener and receiving a genuine Boot must stay separate from the durable admission commit.
+@pytest.mark.parametrize("route", ["original", "trial"])
+async def test_first_listener_retries_unchanged_admission(tmp_path, tls, unused_tcp_port, route):
+    async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
+        original_configuration = dict(rig.peer.configuration)
+        first = managed_session(rig)
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", unused_tcp_port))
+            occupied.listen()
+            with pytest.raises(OSError):
+                await first.start()
+        assert not first.started and first.journal.phase.read().active and first.journal.phase.starting is True
+        assert first.journal.get("trial_binding") is None and first.journal.get("boot") is None
+        admission = first.journal.get("native_bounded_handover")
+        allocation = first.journal.get("trial_allocation"), first.journal.get("next_transaction")
+        stat = first.journal.path.stat()
+        with pytest.raises(RecoveryRequiredError, match="active owner"):
+            construct(rig)
+        await first.close()
+        assert rig.peer.configuration == original_configuration and not rig.bench.device_calls
+
+        if route == "trial":
+            rig.route_to_trial()
+        replacement = managed_session(rig)
+        await replacement.start()
+        assert replacement.started and replacement.runtime.port == unused_tcp_port
+        reopened = replacement.journal.path.stat()
+        assert (reopened.st_dev, reopened.st_ino) == (stat.st_dev, stat.st_ino)
+        assert replacement.journal.get("native_bounded_handover") == admission
+        assert (replacement.journal.get("trial_allocation"), replacement.journal.get("next_transaction")) == allocation
+        assert replacement.journal.get("trial_binding") is None and replacement.journal.get("boot") is None
+        assert replacement.journal.phase.starting is True and replacement.gateway.controls.desired() == 0
+        assert not replacement.gateway.controls.ready and not rig.bench.device_calls and not rig.bench.calls
+
+        ManagedController(replacement)
+        rig.route_to_trial()
+        async with rig.charger(replacement) as charger:
+            await introduced(rig, replacement, charger, "first-listener-retry")
+            assert replacement.journal.get("trial_binding") is not None
+            assert rig.bench.received_limits and set(rig.bench.received_limits) == {0}
+            await replacement.close()
+
+        rig.peer.configuration = original_configuration
+        commissioned = managed_session(rig)
+        with pytest.raises(NativeContentError, match="configuration"):
+            await commissioned.start()
+        assert not commissioned.started and commissioned.runtime._server is None
+        assert set(rig.bench.received_limits) == {0}
 
 
 # Intent: unrelated metadata, receipt/debt rows or tables cannot turn an ordinary journal into connected admission.

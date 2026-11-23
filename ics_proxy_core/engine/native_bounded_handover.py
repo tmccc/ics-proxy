@@ -36,7 +36,7 @@ from .recovery_contracts import ALLOW, GateDecision, Guard, Pending, Prerequisit
 from .rpc import IntroductionDeferredError, UnavailableError
 from .security import SecurityError, StaleEvidenceError
 from .station import StationChoice
-from .store import RecoveryRequiredError, StationZeroStorageError, fingerprint
+from .store import RecoveryRequiredError, StationZeroStorageError, encoded, fingerprint
 from .trial_allocation import initialize_allocation, verify_initial_history
 from .trial_evidence import Resource, profile_projection
 from .trial_handover_evidence import HandoverEvidence, ObserveHandover
@@ -164,6 +164,10 @@ class NativeBoundedHandover:
             "resources": [tuple(row) for row in resources],
         }
 
+    # First listener recovery may still observe the exact original configuration before the route switch.
+    def initial_listener_route(self, native: HandoverEvidence) -> str:
+        return "original" if encoded(native.configuration) == encoded(self.spec.configuration("original")) else "trial"
+
     # Read rich native evidence under current authority; eligible repair audits are fenced before observation.
     async def read(
         self,
@@ -175,6 +179,7 @@ class NativeBoundedHandover:
         closing_local: int | None = None,
         selected_current: int | None = None,
         stop_only: bool = False,
+        allow_original_route: bool = False,
     ) -> HandoverEvidence:
         result = await self._read(
             route,
@@ -184,6 +189,7 @@ class NativeBoundedHandover:
             closing_local=closing_local,
             selected_current=selected_current,
             stop_only=stop_only,
+            allow_original_route=allow_original_route,
         )
         if isinstance(result, Pending):
             raise AssertionError("legacy native read returned a managed prerequisite")
@@ -207,6 +213,7 @@ class NativeBoundedHandover:
         closing_local: int | None = None,
         selected_current: int | None = None,
         stop_only: bool = False,
+        allow_original_route: bool = False,
     ) -> HandoverEvidence | Pending:
         repair, gateway = None if stop_only else self.repair_audits, self.gateway
 
@@ -230,6 +237,7 @@ class NativeBoundedHandover:
             content_current = False
             strict_complete = False
             resource_error: NativeContentError | None = None
+            observed_route = route
 
             # Only the newest resolved read may invalidate freshness; an older outcome cannot erase its successor.
             def invalidate() -> None:
@@ -250,7 +258,8 @@ class NativeBoundedHandover:
                 if not current():
                     raise AuditSupersededError("native bounded audit was superseded by local authority")
                 content_current = True
-                measured = self._inspect(native, route=route)
+                observed_route = self.initial_listener_route(native) if allow_original_route else route
+                measured = self._inspect(native, route=observed_route)
                 if (
                     selected_current is not None
                     and gateway.journal.current_change.read().settled_or_missing
@@ -309,7 +318,7 @@ class NativeBoundedHandover:
             except _NativeMeasurementError as error:
                 invalidate()
                 if (
-                    route == "trial"
+                    observed_route == "trial"
                     and error.sequence == sequence
                     and error.authority == self.authority()
                     and not isinstance(
@@ -369,19 +378,19 @@ class NativeBoundedHandover:
             if repair is not None:
                 repair.finish(attempt, "validated")
             self.last_verified_at = native.physical.observed_at
-            if route == "trial":
+            if observed_route == "trial":
                 self._remember_stop_sample(native, sequence)
             if not stop_only and self.observation_listener is not None:
                 self.observation_listener(native)
             # A valid open source remains fresh while this particular operation awaits a closed station.
             if closed:
                 if as_result:
-                    self._inspect(native, route=route).require()
+                    self._inspect(native, route=observed_route).require()
                     decision = readiness_decision(native, True, self.allow_unplugged, None)
                     if isinstance(decision, Pending):
                         return decision
                 else:
-                    self.require(native, route=route, closed=True)
+                    self.require(native, route=observed_route, closed=True)
             return native
 
         try:

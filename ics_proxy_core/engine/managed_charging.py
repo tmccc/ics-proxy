@@ -12,7 +12,8 @@ from typing import TYPE_CHECKING, Any
 from .command_processor import CommandPriority
 from .connection_scope import CloudAttemptScope, control_scope_matches, current_control_scope
 from .control_decisions import ExpiredStartStop
-from .local_control import local_start_receipt
+from .local_control import COMPOSITE_RETRY_SECONDS, local_start_receipt
+from .managed_intent import ControlIntent
 from .managed_settlement import current_candidate
 from .managed_sources import confirmed_vendor_start, known_plan_source
 from .managed_start_cancellation import CancellationRetirement, retire_cancelled_start
@@ -422,17 +423,38 @@ class ManagedCharging:
             and c.native.introduced_revision == g.controls._revision
         )
 
-    # Join the real owner Pause zero before admitting the delayed report of its already issued Start.
-    async def prepare_owner_report(self, payload: dict[str, Any], *, _reclassified: bool = False) -> None:
+    # Wait for the existing protection to verify zero, without waiting for the session that this report identifies.
+    async def _wait_for_report_hold(
+        self, tag: str, intent: ControlIntent, operations: set[asyncio.Task[Any]], deadline: float
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        while operations and self.controller.requests.intent() == intent and not self.can_record_owner(tag):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            _, operations = await asyncio.wait(
+                operations, timeout=min(remaining, 0.05), return_when=asyncio.FIRST_COMPLETED
+            )
+
+    # Join the real owner hold before admitting the delayed report of its already issued Start.
+    async def prepare_owner_report(
+        self, payload: dict[str, Any], *, _reclassified: bool = False, _hold_deadline: float | None = None
+    ) -> None:
         c, j = self.controller, self.journal
         g, tag = c.session.gateway, payload.get("idTag")
         if j.active() is not None or not isinstance(tag, str) or not self.matches_pending_start(tag):
             return
+        # Allow an in-flight command to retire, followed by Set, composite, and its bounded retry.
+        deadline = (
+            _hold_deadline
+            if _hold_deadline is not None
+            else asyncio.get_running_loop().time() + 3 * g.charger.timeout + COMPOSITE_RETRY_SECONDS
+        )
         if c.stopping:
             # Join the retiring service's zero attempt. This report cannot acquire new positive authority.
             stopping = g.controls._stopping
             if stopping is not None and not stopping.done():
-                await asyncio.wait((stopping,), timeout=min(1.0, g.charger.timeout))
+                await self._wait_for_report_hold(tag, c.requests.intent(), {stopping}, deadline)
             if not self.can_record_owner(tag):
                 raise UnavailableError("the already issued Start report awaits verified shutdown zero")
             return
@@ -443,22 +465,14 @@ class ManagedCharging:
             operations = set(g.controls._operations)
             if c.pause_task is not None and not c.pause_task.done():
                 operations.add(c.pause_task)
-            # Let the already-owned Set and composite verification finish without waiting for session closure.
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + 2 * g.charger.timeout
-            while operations and c.requests.intent() == intent and not self.can_record_owner(tag):
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
-                _, operations = await asyncio.wait(
-                    operations, timeout=min(remaining, 0.05), return_when=asyncio.FIRST_COMPLETED
-                )
+            await self._wait_for_report_hold(tag, intent, operations, deadline)
             current = c.requests.intent()
-            if current.mode == "app":
+            if current != intent:
+                # No report proof has been acquired yet. Start fresh under the new intent within the original budget.
                 if _reclassified:
                     raise UnavailableError("Start report authority changed again during its control handoff")
-                return await self.prepare_owner_report(payload, _reclassified=True)
-            if current != intent or not self.can_record_owner(tag):
+                return await self.prepare_owner_report(payload, _reclassified=True, _hold_deadline=deadline)
+            if not self.can_record_owner(tag):
                 raise UnavailableError("the acknowledged owner report awaits verified Pause zero")
 
     # Ask the owner whether an already-issued Start may report under the existing hold.

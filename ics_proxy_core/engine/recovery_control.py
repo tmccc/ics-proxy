@@ -619,7 +619,7 @@ class RecoveryControl:
                 self.journal.phase.restrict(control)
 
     # Establish startup's actual session and resources before publishing the restricted introduction.
-    def accept_startup(self, session: TrialSession, native: HandoverEvidence) -> None:
+    def accept_startup(self, session: TrialSession, native: HandoverEvidence, *, route: str = "trial") -> None:
         if self.journal.get("trial_binding") is None:
             session.native_bounded.require_known_session(native)
         else:
@@ -627,7 +627,7 @@ class RecoveryControl:
         session.book.owned_present(native.physical)
         self.journal.control.hold(self.journal.get("control", {}))
         if self.journal.get("trial_binding") is None:
-            session.native_bounded.spec.require_admission(native, self.journal.identity)
+            session.native_bounded.spec.require_admission(native, self.journal.identity, route=route)
             if self.journal.db.execute("SELECT 1 FROM trial_resources LIMIT 1").fetchone():
                 raise RecoveryRequiredError("unintroduced connected recovery cannot adopt existing resources")
             self.journal.require_allocation()

@@ -7,12 +7,14 @@ import sqlite3
 import uuid
 from contextlib import closing, nullcontext
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from ics_proxy_core.engine.gateway import decode
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.recovery_contracts import GateDecision
+from ics_proxy_core.frames import build_call_result
 from tests.handover_helpers import crash
 from tests.managed_rig import healthy, introduced, managed_session, pending_cloud_offer, starts
 from tests.native_schedule_support import ZONE, timer_bench
@@ -24,7 +26,8 @@ from tests.tls_support import tls as tls
 
 # Intent: a genuine Start may reach the proxy while the existing Pause zero verification is still on the wire.
 # Why: the proxy needs the report to identify the session, even when the charger confirms the zero hold slowly.
-async def test_held_cloud_start_waits_for_pause_zero_ack(tmp_path, tls, unused_tcp_port, monkeypatch):
+@pytest.mark.parametrize("new_pause", [False, True], ids=["same-pause", "new-pause-before-proof"])
+async def test_held_cloud_start_waits_for_pause_zero_ack(tmp_path, tls, unused_tcp_port, monkeypatch, new_pause):
     async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
         c, journal, gateway = b.c, b.session.journal, b.session.gateway
         await b.acknowledge_older_owner_start()
@@ -42,8 +45,24 @@ async def test_held_cloud_start_waits_for_pause_zero_ack(tmp_path, tls, unused_t
             "idTag": "CLOUD_OWNER",
             "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
         }
+        reporting = asyncio.Event()
+        reports = gateway.start_reports
+        assert reports is not None
+        prepare = reports.prepare_hold
+
+        async def observe_report(payload):
+            reporting.set()
+            await prepare(payload)
+
+        monkeypatch.setattr(reports, "prepare_hold", observe_report)
         report = asyncio.create_task(b.rig.bench.call(b.sock, "late-start", "StartTransaction", body))
         try:
+            await asyncio.wait_for(reporting.wait(), 3)
+            if new_pause:
+                older = pause
+                pause = uuid.uuid4().hex
+                c.command(pause, "pause", c.requests.intent().revision)
+                assert c.requests.receipt(older)["result"]["classification"] == "superseded_by_pause"
             # Keep the actual Set reply away for longer than the former one-second admission wait.
             await asyncio.sleep(1.25)
             assert not report.done()
@@ -51,6 +70,65 @@ async def test_held_cloud_start_waits_for_pause_zero_ack(tmp_path, tls, unused_t
             await send(held[0])
         answer = await report
         assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted", answer
+        local = answer[2]["transactionId"]
+        b.rig.peer.plan_session = (local, 987655)
+        assert journal.active() == local and b.device.effective_limit() == 0
+        await c.pause_task
+        async with asyncio.timeout(4):
+            while not b.stops():
+                await c.tick()
+                await asyncio.sleep(0.02)
+        assert b.stops() == [local] and b.device.effective_limit() == 0
+        await b.close_transaction(local)
+        assert (await healthy(c))["local_hold_verified"]
+        assert c.requests.receipt(pause)["state"] == "completed"
+
+
+# Intent: a genuine held Start can wait through the permitted retry of a future-dated composite.
+# Why: each wire reply can arrive within its timeout even when the complete verification takes longer than two RPCs.
+async def test_held_cloud_start_waits_for_pause_composite_retry(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        c, journal, gateway = b.c, b.session.journal, b.session.gateway
+        await b.acknowledge_older_owner_start()
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        await c.tick()
+        gateway.charger.timeout = 0.65
+        send, held, entered = delay_reply(monkeypatch, b.rig, b.sock, "SetChargingProfile")
+        send_or_hold_set = b.sock.send
+        composites = 0
+
+        async def delay_composite(raw):
+            nonlocal composites
+            answer = decode(raw)
+            call = next((frame for frame in b.rig.bench.device_calls if frame[1] == answer[1]), None)
+            if answer[0] == 3 and call is not None and call[2] == "GetCompositeSchedule":
+                composites += 1
+                if composites == 1:
+                    await asyncio.sleep(0.47)
+                    answer[2]["scheduleStart"] = (datetime.now(UTC) + timedelta(seconds=0.2)).isoformat()
+                    raw = build_call_result(answer[1], answer[2])
+                elif composites == 2:
+                    await asyncio.sleep(0.46)
+            await send_or_hold_set(raw)
+
+        monkeypatch.setattr(b.sock, "send", delay_composite)
+        pause = uuid.uuid4().hex
+        c.command(pause, "pause", c.requests.intent().revision)
+        await asyncio.wait_for(entered.wait(), 3)
+        b.device.active = 987654
+        b.rig.peer.plan_session = (987654, 987655)
+        body = START | {
+            "idTag": "CLOUD_OWNER",
+            "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
+        }
+        report = asyncio.create_task(b.rig.bench.call(b.sock, "late-start", "StartTransaction", body))
+        try:
+            await asyncio.sleep(0.47)
+        finally:
+            await send(held[0])
+        answer = await report
+        assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted", answer
+        assert composites == 2 and gateway.controls.ready
         local = answer[2]["transactionId"]
         b.rig.peer.plan_session = (local, 987655)
         assert journal.active() == local and b.device.effective_limit() == 0

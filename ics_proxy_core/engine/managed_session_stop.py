@@ -192,15 +192,29 @@ class ManagedSessionStop:
         )
 
     # Only a real receipt transition needs a write lock. A busy begin can wait for the next poll.
-    def _update_receipts(self, assignments: str, values: tuple[Any, ...], where: str, binding: tuple[Any, ...]) -> None:
+    def _update_receipts(
+        self,
+        assignments: str,
+        values: tuple[Any, ...],
+        where: str,
+        binding: tuple[Any, ...],
+        *,
+        retry_after_rollback: bool = False,
+    ) -> None:
         j = self.controller.session.journal
         if j.db.execute(f"SELECT 1 FROM managed_requests WHERE {where} LIMIT 1", binding).fetchone() is None:
             return
+        transaction_started = False
         try:
             with j.atomic(retry_busy=True):
+                transaction_started = True
                 j.db.execute(f"UPDATE managed_requests SET {assignments} WHERE {where}", values + binding)
         except JournalStartBusy:
             return  # The existing receipt is still accurate because the write never began.
+        except sqlite3.Error:
+            if not retry_after_rollback or not transaction_started or j.db.in_transaction:
+                raise
+            # The physical closure is already durable. The next fresh observation can publish the same receipt.
 
     # A fresh native observation and the genuine Stop report must agree before a receipt completes.
     def observed(self, native: HandoverEvidence) -> None:
@@ -219,6 +233,7 @@ class ManagedSessionStop:
             (),
             CLOSED_REQUESTS,
             (STOP_SESSION,),
+            retry_after_rollback=True,
         )
 
     # Cloud reconciliation must not erase an independently confirmed local closure.
