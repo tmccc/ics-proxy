@@ -432,7 +432,7 @@ def publish_poll(
 ) -> dict[str, Any]:
     remaining = expires - time.time()
     result = dict(poll, pid=pid, started_at=started, certificate_remaining_seconds=remaining, running=True)
-    if remaining <= 1800:
+    if remaining <= 1800 and result.get("state") in ("healthy", "local_only") and result.get("fault") is None:
         result.update(state="degraded", fault="listener_certificate_expiring")
     result["diagnostics"] = diagnostic_snapshot(c, result)
     return with_reporting(result, observe(result))

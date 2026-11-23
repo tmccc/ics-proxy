@@ -17,9 +17,10 @@ for ``pyproject.toml`` and keeps the display form (hyphen) elsewhere::
     python tools/version.py bump 1.8.0-rc3  # pyproject gets 1.8.0rc3
 
 ``check`` exits non-zero when the files do not agree. It is enforced by
-``tests/test_version_consistency.py`` so CI fails on drift. ``bump`` updates
-``pyproject.toml`` and the manifest; add the matching CHANGELOG heading
-yourself because release notes are human-written.
+``tests/test_version_consistency.py`` so CI fails on drift. An explicit tag
+also requires pending changelog notes to be included in the release entry.
+``bump`` updates ``pyproject.toml`` and the manifest. Add the matching
+CHANGELOG heading yourself because release notes are human-written.
 """
 
 from __future__ import annotations
@@ -66,10 +67,16 @@ def read_manifest(path: Path) -> str:
     return str(json.loads(path.read_text())["version"])
 
 
-# List the version headings of the changelog.
-# The top heading must match the released version.
-def read_changelog_headings() -> list[str]:
-    return re.findall(r"^##\s+(\S+)", CHANGELOG.read_text(), re.MULTILINE)
+# Visible notes can include prose and nested headings. Comments can hold an empty template.
+def has_unreleased_notes(changelog: str) -> bool:
+    visible = re.sub(r"<!--.*?-->", "", changelog, flags=re.DOTALL)
+    headings = list(re.finditer(r"^##[ \t]+(\S+)[^\n]*$", visible, re.MULTILINE))
+    for index, heading in enumerate(headings):
+        if heading[1].casefold() in ("unreleased", "[unreleased]"):
+            end = headings[index + 1].start() if index + 1 < len(headings) else len(visible)
+            if visible[heading.end() : end].strip():
+                return True
+    return False
 
 
 # Compare the package with the manifest, the newest numeric changelog heading, and the tag when publishing.
@@ -81,11 +88,16 @@ def check(tag: str | None = None) -> int:
         manifest = read_manifest(path)
         if canonical(pyproject) != canonical(manifest):
             problems.append(f"pyproject.toml ({pyproject}) differs from {path.parent.name} manifest ({manifest})")
-    latest = next((heading for heading in read_changelog_headings() if re.match(r"\d", heading)), "")
+    changelog = CHANGELOG.read_text()
+    headings = re.findall(r"^##\s+(\S+)", changelog, re.MULTILINE)
+    latest = next((heading for heading in headings if re.match(r"\d", heading)), "")
     if canonical(latest) != canonical(pyproject):
         problems.append(f"CHANGELOG.md latest numeric heading is {latest or 'missing'}, expected {pyproject}")
-    if tag is not None and (not tag.startswith("v") or canonical(tag[1:]) != canonical(pyproject)):
-        problems.append(f"release tag ({tag}) differs from the checked-out version ({pyproject})")
+    if tag is not None:
+        if not tag.startswith("v") or canonical(tag[1:]) != canonical(pyproject):
+            problems.append(f"release tag ({tag}) differs from the checked-out version ({pyproject})")
+        if has_unreleased_notes(changelog):
+            problems.append("CHANGELOG.md has pending Unreleased notes. Move them into the tagged release entry.")
     if problems:
         for problem in problems:
             print(f"VERSION MISMATCH: {problem}", file=sys.stderr)

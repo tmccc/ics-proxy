@@ -59,6 +59,53 @@ def test_proxy_change_detection_includes_standalone_dependency_pins(releases):
     assert checks.changed_proxy(repo, new_pin, old_pin) is True
 
 
+# Intent: the interpreter that runs the installation week has every candidate standalone pin before it can pass.
+@pytest.mark.parametrize(
+    ("ha_version", "websockets_version", "extra_version", "passes"),
+    [
+        ("2026.10.4", "16.0", "2", True),
+        ("2026.11.0", "16.0", "2", True),
+        ("2026.11.0", "15.0.1", "2", False),
+        ("2026.11.0", "16.0", None, False),
+    ],
+)
+def test_installation_week_requires_candidate_standalone_pins(
+    tmp_path, monkeypatch, ha_version, websockets_version, extra_version, passes
+):
+    source = tmp_path / "candidate"
+    source.mkdir()
+    (source / "requirements-trial.txt").write_text("websockets==16.0\nfixture_extra==2\n")
+    (source / "requirements-ha-proxy.txt").write_text("homeassistant==2026.11.0\n")
+    (source / "requirements-ha-proxy-2026.10.txt").write_text("homeassistant==2026.10.4\n")
+    previous = tmp_path / "installed"
+    previous.mkdir()
+    (previous / "requirements-trial.txt").write_text("websockets==15.0.1\n")
+    packages = [["homeassistant", ha_version], ["WebSockets", websockets_version]]
+    if extra_version is not None:
+        packages.append(["fixture.extra", extra_version])
+    monkeypatch.setattr(checks, "runtime_identity", lambda python, source: {"packages": packages})
+    attempts = []
+
+    def run(check, python, source, attempt, installed):
+        assert installed == previous
+        attempts.append(attempt)
+        classname, name = check.case.rsplit(".", 1)
+        (attempt / "pytest.xml").write_text(f'<testsuite><testcase classname="{classname}" name="{name}"/></testsuite>')
+
+    monkeypatch.setattr(checks, "run_check", run)
+    output = tmp_path / "evidence"
+    args = (checks.WEEK, source, output, {"commit": "a", "source_digest": "b"}, sys.executable)
+    if passes:
+        checks.ensure_check(*args, installed=("previous", previous))
+        checks.ensure_check(*args, installed=("previous", previous))
+        assert len(attempts) == 1
+        assert (attempts[0].parent / "passed.json").is_file()
+    else:
+        with pytest.raises(ValueError, match="standalone runtime pins differ from the installation week runtime"):
+            checks.ensure_check(*args, installed=("previous", previous))
+        assert not attempts and not output.exists()
+
+
 # Intent: the unit shipped to standalone operators counts as a proxy release input.
 def test_proxy_change_detection_includes_packaged_unit(releases):
     repo, _, _, installed = releases

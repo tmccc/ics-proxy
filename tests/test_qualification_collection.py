@@ -348,6 +348,81 @@ def test_coverage_cli_forwards_chosen_collection_executors(tmp_path, monkeypatch
     assert len(commands) == 1 and commands[0][-2:] == ["--collection-executors", str(chosen)]
 
 
+# Intent: the coverage CLI reads the exact audits freshly written by validation when launched outside the checkout.
+# Why: same-named caller files must never be mistaken for the validator's evidence.
+@pytest.mark.parametrize("relative_bundle", [False, True], ids=["absolute-bundle", "relative-bundle"])
+def test_coverage_cli_reads_the_validated_evidence(tmp_path, monkeypatch, relative_bundle):
+    from tools import recovery_coverage, validate
+
+    source, caller, frozen = (tmp_path / name for name in ("source", "caller", "frozen"))
+    commit = {"commit": "synthetic-validated-commit", "source_digest": "synthetic-validated-digest"}
+    suites = ("engine-model", "ha-proxy", "ha-proxy-2026.10")
+    phases = {suite: f"artifacts/{suite}" for suite in suites}
+    for suite, phase in phases.items():
+        config = source / phase / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"suite": suite, "workers": 20, "mode": "full", "expected_packages": {}}))
+        decoy = caller / phase / "audit.json"
+        decoy.parent.mkdir(parents=True)
+        decoy.write_text(json.dumps({"synthetic_unvalidated_audit": True}))
+    (source / "bundle.json").write_text(json.dumps(commit | {"phases": phases, "synthetic_decoy": True}))
+    bundle_path = caller / "bundle.json"
+    bundle_path.write_text(json.dumps(commit | {"phases": phases}))
+    chosen = caller / "executors.json"
+    chosen.write_text("{}")
+    written = {}
+
+    # Run the actual validator's path handling and represent only the auditor output, without launching workers.
+    def audited_step(name, command, results, *, cwd):
+        assert Path(command[2]) == frozen / "tools/audit_parallel_qualification.py" and cwd == frozen
+        assert command[-2:] == ["--collection-executors", str(chosen)]
+        batch = Path(command[3])
+        config = json.loads((batch / "config.json").read_text())
+        audit = config | commit | {"full_qualification_passed": True, "synthetic_fresh_audit": True}
+        path = batch / "audit.json"
+        path.write_text(json.dumps(audit))
+        written[config["suite"]] = path
+        return subprocess.CompletedProcess(command, 0, json.dumps(audit))
+
+    def run_validator(command, *, cwd, check):
+        assert command[:3] == [sys.executable, "-B", str(source / "tools/validate.py")]
+        assert command[3:6] == ["--deployment-target", "qualification-only", "--tests-only"]
+        assert cwd == source and check is True
+        bundle = Path(command[command.index("--qualification-report") + 1])
+        executors = Path(command[command.index("--collection-executors") + 1])
+        with monkeypatch.context() as child:
+            child.chdir(cwd)
+            assert bundle.resolve() == bundle_path
+            validate.audit_qualification(bundle, frozen, commit, sys.executable, {}, executors)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.chdir(caller)
+    monkeypatch.setattr(recovery_coverage, "ROOT", source)
+    monkeypatch.setattr(recovery_coverage, "matrix", lambda: {"SYNTHETIC_NOT_QUALIFICATION": True})
+    monkeypatch.setattr(recovery_coverage.subprocess, "run", run_validator)
+    monkeypatch.setattr(validate, "run_step", audited_step)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "recovery_coverage",
+            "--output",
+            "coverage.json",
+            "--qualification-report",
+            bundle_path.name if relative_bundle else str(bundle_path),
+            "--collection-executors",
+            chosen.name,
+        ],
+    )
+    assert recovery_coverage.main() == 0
+    assert written == {suite: source / phase / "audit.json" for suite, phase in phases.items()}
+    report = json.loads((caller / "coverage.json").read_text())
+    assert report["qualification"] == commit | {
+        "phases": {suite: json.loads(path.read_text()) for suite, path in written.items()}
+    }
+    assert report["execution_status"] == "all three complete 20-worker suites freshly re-audited"
+
+
 # Intent: timed-out collection cleanup removes only its exact nonce-owned container and never another owner's container.
 # Why: killing a Docker CLI alone does not bound a surviving container; ownership must be verified before removal.
 @pytest.mark.parametrize("owner", ["correct", "different", "already-removed", "already-removed-lowercase"])

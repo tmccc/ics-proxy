@@ -66,6 +66,8 @@ def main():
     args = parser.parse_args()
     report = matrix()
     if args.qualification_report:
+        bundle_path = args.qualification_report.resolve()
+        executors = args.collection_executors.resolve() if args.collection_executors else None
         subprocess.run(
             [
                 sys.executable,
@@ -75,21 +77,23 @@ def main():
                 "qualification-only",
                 "--tests-only",
                 "--qualification-report",
-                str(args.qualification_report),
-                *(["--collection-executors", str(args.collection_executors)] if args.collection_executors else []),
+                str(bundle_path),
+                *(["--collection-executors", str(executors)] if executors else []),
             ],
             cwd=ROOT,
             check=True,
         )
-        bundle = json.loads(args.qualification_report.read_text())
+        bundle = json.loads(bundle_path.read_text())
         report["qualification"] = {
             "commit": bundle["commit"],
             "source_digest": bundle["source_digest"],
             "phases": {
-                name: json.loads((Path(path) / "audit.json").read_text()) for name, path in bundle["phases"].items()
+                # The validator resolves paths inside the bundle from its repository working directory.
+                name: json.loads(((ROOT / path).resolve() / "audit.json").read_text())
+                for name, path in bundle["phases"].items()
             },
         }
-        report["execution_status"] = "all three complete20-worker suites freshly re-audited"
+        report["execution_status"] = "all three complete 20-worker suites freshly re-audited"
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     return 0
 

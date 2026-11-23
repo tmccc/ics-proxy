@@ -13,10 +13,11 @@ from types import SimpleNamespace
 import pytest
 
 from ics_proxy_core.constants import HUB_PROFILE_ID
-from ics_proxy_core.engine import trial_evidence
+from ics_proxy_core.engine import managed_view, native_bounded_handover, trial_evidence, trial_handover_evidence
 from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
-from tests.charge_rig import actual_stop, owner_start, positive_flow, ready
+from ics_proxy_core.engine.store import RecoveryRequiredError
+from tests.charge_rig import actual_stop, owner_start, positive_flow, ready, report_actual_stop
 from tests.current_rig import commissioned
 from tests.managed_rig import healthy, starts
 from tests.prototype_rig import START
@@ -384,3 +385,80 @@ async def test_unchanged_inventory_recheck_does_not_need_a_write(tmp_path, tls, 
             assert status["state"] == "healthy" and status["local_hold_verified"] is paused
         finally:
             j.db.execute("DROP TRIGGER refuse_same_digest")
+
+
+# Intent: a wall-clock correction cannot restore an expired Stop target or allow its waiting worker to send.
+# Why: the exact session must have a current periodic reading even if an auxiliary read confirms the same session.
+@pytest.mark.parametrize("queued", [False, True], ids=["admission", "dispatch"])
+async def test_expired_session_stop_sample_stays_expired_after_wall_rebase(
+    tmp_path, tls, unused_tcp_port, monkeypatch, queued
+):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j = b.controller, b.session.journal
+        local = await positive_flow(b, "daily")
+        elapsed = 0
+        clock = SimpleNamespace(time=time.time, monotonic=lambda: time.monotonic() + elapsed)
+        for module in (managed_view, native_bounded_handover, trial_handover_evidence):
+            monkeypatch.setattr(module, "time", clock)
+        published = dict(await healthy(c), running=True, certificate_remaining_seconds=86400)
+        target = refresh_for_read(c, published)["stop_target"]
+        assert target is not None
+        intent = c.requests.intent()
+        request = uuid.uuid4().hex
+
+        def rebase() -> None:
+            nonlocal elapsed
+            elapsed += 16
+            clock.time = lambda: time.time() + elapsed
+            assert refresh_for_read(c, published)["stop_target"] is None
+            clock.time = time.time
+            view = refresh_for_read(c, published)
+            assert 0 <= view["native_age_seconds"] <= 15
+            assert view["stop_target"] is None
+
+        if queued:
+            gate = b.session.gateway.charger.gate
+            async with gate.enter(10):
+                assert c.command(request, "stop_session", intent.revision, target=target)["state"] == "accepted"
+                await asyncio.wait_for(gate.restrictive_waiting.wait(), 3)
+                rebase()
+            assert c.session_stop.worker is not None
+            await asyncio.wait_for(c.session_stop.worker, 3)
+            assert c.requests.receipt(request)["result"]["classification"] == "stop_not_sent"
+        else:
+            rebase()
+            with pytest.raises(RecoveryRequiredError, match="current verified session"):
+                c.command(request, "stop_session", intent.revision, target=target)
+            assert c.requests.receipt(request)["state"] == "not_found"
+        assert not b.rig.bench.remote_stop.is_set() and not j.outcomes.session_stop_dispatched(local)
+
+        observe = c.native.observe
+
+        async def slow_observation():
+            nonlocal elapsed
+            sample = await observe()
+            elapsed += 16
+            return sample
+
+        with monkeypatch.context() as reader:
+            reader.setattr(c.native, "observe", slow_observation)
+            await c.native.read()
+            assert not c.native.session_stop_verified(local)
+        await c.native.read()
+        assert c.native.session_stop_verified(local)
+        assert refresh_for_read(c, published)["stop_target"] is None
+        published = dict(await healthy(c), running=True, certificate_remaining_seconds=86400)
+        assert refresh_for_read(c, published)["stop_target"] == target
+        request = uuid.uuid4().hex
+        c.command(request, "stop_session", intent.revision, target=target)
+        await until(lambda: j.outcomes.accepted_stop(local))
+        await report_actual_stop(b, local)
+        assert c.requests.intent() == intent
+
+        # The saved report also needs a current independent closure sample before the receipt completes.
+        closure = await c.native.read(closed=True)
+        elapsed += 6
+        c.session_stop.observed(closure)
+        assert c.requests.receipt(request)["state"] == "running"
+        await healthy(c)
+        assert c.requests.receipt(request)["state"] == "completed"

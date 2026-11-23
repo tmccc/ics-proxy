@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .native_faults import NativeContentError
@@ -38,6 +39,15 @@ class HandoverEvidence:
     saved_schedule_digest: str = ""
     saved_schedule: dict[str, Any] | None = None
     session_plan_id: int | None = None
+    observed_monotonic: float | None = field(default=None, compare=False)
+
+    # Keep the epoch check and bound the elapsed lifetime even if the system clock changes.
+    def fresh_for_stop(self, max_age: float) -> bool:
+        return (
+            self.observed_monotonic is not None
+            and 0 <= time.monotonic() - self.observed_monotonic <= max_age
+            and 0 <= time.time() - self.physical.observed_at <= max_age
+        )
 
     # Hash the complete private view, not a public boolean or the proxy's desired profile.
     @property

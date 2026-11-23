@@ -3,13 +3,14 @@
 
 import json
 import sqlite3
+import time
 import uuid
 
 import pytest
 
 from ics_proxy_core.engine.managed_diagnostics import snapshot
 from ics_proxy_core.engine.managed_native_repair import AUDITS, REVOCATIONS, NativeRepairAudits
-from ics_proxy_core.engine.managed_view import health_snapshot, refresh_for_read, with_reporting
+from ics_proxy_core.engine.managed_view import health_snapshot, publish_poll, refresh_for_read, with_reporting
 from ics_proxy_core.engine.native_faults import NativeContentError
 from ics_proxy_core.engine.store import fingerprint
 from tests.current_rig import adjustable
@@ -45,6 +46,32 @@ def test_cached_health_ages_certificate_validity():
     assert health_snapshot(source, 10000)["healthy"]
     current = health_snapshot(source, 10002)
     assert not current["healthy"] and "certificate_validity_insufficient" in current["health_blockers"]
+
+
+@pytest.mark.parametrize(
+    ("state", "fault", "expected"),
+    [
+        ("healthy", None, ("degraded", "listener_certificate_expiring")),
+        ("attention", "measured_output_limit_exceeded", ("attention", "measured_output_limit_exceeded")),
+        ("stopping", None, ("stopping", None)),
+    ],
+)
+async def test_expiring_certificate_preserves_primary_poll_status(
+    tmp_path, tls, unused_tcp_port, monkeypatch, state, fault, expected
+):
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+        controller = rig.controller
+        poll = await healthy(controller)
+        if fault is not None:
+            controller.fault(fault)
+        poll.update(state=state, fault=fault)
+        reporting = Reporting(managed_proxy.ROOT)
+        now = time.time()
+        published = publish_poll(controller, poll, pid=1, started=now, expires=now + 1200, observe=reporting.observe)
+        live = refresh_for_read(controller, published)
+        for status in (published, live, published["diagnostics"]["timeline"][-1]):
+            assert (status["state"], status.get("fault")) == expected
+        assert not live["healthy"] and "certificate_validity_insufficient" in live["health_blockers"]
 
 
 # Intent: the status read uses the current delivery queue and cloud session acknowledgement together.

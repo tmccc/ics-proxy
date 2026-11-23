@@ -5,6 +5,13 @@
 - Fixed a timing issue that could prevent Pause from recording and stopping a session the charger reported late.
 - Rechecked current charger evidence before sending a session-only Stop and preserved pending Pause through history repair.
 - Preserved Stop confirmation through a temporary receipt write failure and supported retrying the first listener bind.
+- Kept supervision running when a Stop timeout or rejection receipt write rolls back and used elapsed time for Stop
+  confirmation and native evidence freshness.
+- Confirmed a queued Stop from the exact original session's verified closure and made the shutdown hold claim atomic.
+- Preserved existing fault and shutdown status when the listener certificate is nearing expiry.
+- Checked the standalone dependency pins during the installation rehearsal and documented the first charger handover.
+- Kept release tags from omitting pending changelog entries and spaced proxy restarts during temporary charger outages.
+- Linked coverage reports to the qualification files actually audited when the command runs from another directory.
 - Resolved known Start rejections under a verified Pause and recorded whether shutdown reached the Stop send boundary.
 - Kept Home Assistant’s management requests on loopback and preserved Start and Stop after a failed unload.
 - Extracted the active iCS engine, Home Assistant client, tests, deployment tools and documentation into a standalone repository.

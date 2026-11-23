@@ -10,8 +10,12 @@ There are three complete worker suites: `engine-model`, `ha-proxy` (Home Assista
 environment options. Use `tools/validate.py --help` to check a complete qualification bundle and its trusted
 collection executors. Both release targets include recovery discovery. The verifier uses the candidate's seeded
 event orders and checks the recorded observations for each history. `ics-proxy` also checks the standalone
-runtime pins. A change to the standalone service, its dependency pins, or its packaged systemd unit triggers an
-installation week against the installed build.
+runtime pins in the engine worker and in the Home Assistant interpreter that runs the standalone service during
+the installation week. A change to the standalone service, its dependency pins, or its packaged systemd unit
+triggers that rehearsal against the installed build.
+
+Before creating a release tag, move the changes from `Unreleased` into the matching version section of
+`CHANGELOG.md`. Run `python tools/version.py check vX.Y.Z` with the intended tag.
 
 A previously installed commit from the upstream layout may be present only in the original checkout.
 For a cross-repository rehearsal, import that exact verified commit into your local checkout with
@@ -40,7 +44,9 @@ and release checks on a copy before replacing the service.
 The installation week starts the Python service directly. For a systemd deployment, stage the adapted
 [service unit](../packaging/ics-proxy.service.example) as an `ics-proxy.service` file and verify it with
 `systemd-analyze verify /path/to/staged/ics-proxy.service` on the target host. Check the unit's execution paths,
-service account, writable state directory, watchdog and stop timeout. Run its `managed_proxy.py check` invocation
+service account, writable state directory, watchdog and stop timeout. The example spaces restart attempts three
+seconds apart so a brief charger outage can recover under the default systemd start limits. Check the spacing
+against any limits configured on the target host. Run its `managed_proxy.py check` invocation
 against the staged source and corresponding private configuration as the configured service account.
 
 Stop and restart with the configured service manager in the authorized window.

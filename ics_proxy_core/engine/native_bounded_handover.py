@@ -8,6 +8,7 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import Any
 
 from .. import commands
@@ -396,6 +397,7 @@ class NativeBoundedHandover:
         try:
             try:
                 async with asyncio.timeout(15):
+                    started = time.monotonic()
                     native = await self.observe()
             except TimeoutError as error:
                 raise NativeTransportUnavailableError("complete native observation exceeded its deadline") from error
@@ -412,6 +414,7 @@ class NativeBoundedHandover:
         ) as error:
             failure = error
             return gateway.decide(lambda: settle(failure))
+        native = replace(native, observed_monotonic=started)
         return gateway.decide(lambda: settle(native))
 
     # Compose immutable checks before a private measured verdict; it is never usable positive authority.
@@ -696,7 +699,7 @@ class NativeBoundedHandover:
             sample is not None
             and sample.physical.transaction_open
             and sample.physical.observed_at == self.last_verified_at
-            and 0 <= time.time() - self.last_verified_at <= 15
+            and sample.fresh_for_stop(15)
         )
 
     # Refresh independent evidence before reusing an earlier Stop. A missing proof permits a guarded physical Stop.
@@ -719,6 +722,7 @@ class NativeBoundedHandover:
             or sample.physical.observed_at != self.last_verified_at
             or not sample.physical.transaction_open
             or j.active() != local
+            or not sample.fresh_for_stop(5)
         ):
             return False
         try:
@@ -739,7 +743,11 @@ class NativeBoundedHandover:
             if latest is None:
                 return False
             native = latest
-        if not native.physical.transaction_open or native.physical.native_transaction_id != j.active():
+        if (
+            not native.physical.transaction_open
+            or native.physical.native_transaction_id != j.active()
+            or not native.fresh_for_stop(5)
+        ):
             return False
         try:
             native.physical.require_fresh(j.identity, 5)

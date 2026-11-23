@@ -2,9 +2,11 @@
 # Modified for the standalone iCS proxy repository.
 """Run static checks and re-audit complete 20-worker qualification, or run an explicit targeted test selection.
 
-    python tools/validate.py --qualification-report /absolute/path/bundle.json
+    python tools/validate.py --qualification-report /path/bundle.json --installed-proxy-commit "$INSTALLED_COMMIT"
     python tools/validate.py --quick    # skip pytest
-    python tools/validate.py --tests-only -k issue171   # targeted only, not full qualification
+    python tools/validate.py --tests-only -k managed_session_stop   # targeted only, not full qualification
+
+For a changed standalone proxy, also pass --ics-ha-python with the pinned Home Assistant interpreter.
 
 On Windows tests that fail for environment reasons only (for example CRLF checkout changes to fixture digests or
 the bash-based search tool tests) are listed in ``tools/known_env_failures.txt`` and ignored there; any other
@@ -253,7 +255,9 @@ def run_full_qualification(
                 )
             engine_packages = audit_qualification(path, source, metadata, python, results, collection_executors)
             if target == "ics-proxy":
-                ics_predeployment.require_standalone_pins(source, engine_packages)
+                ics_predeployment.require_standalone_pins(
+                    source, engine_packages.items(), runtime="audited engine runtime"
+                )
             if ics_release and all(results.values()):
                 output = path.resolve().parent / "ics-predeployment"
                 ics_predeployment.ensure_check(ics_predeployment.DISCOVERY, source, output, metadata, python)

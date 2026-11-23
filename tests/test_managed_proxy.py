@@ -250,9 +250,9 @@ async def test_refused_startup_does_not_normalize_managed_start(tmp_path, tls, u
 # Intent: a shutdown request revokes pending positive authority both during audit and at the actual send guard.
 # Why: an already awaited native observation must not release six amperes after the service has begun stopping.
 @pytest.mark.parametrize(
-    ("read_number", "reject_claim"),
-    [(1, False), (3, False), (1, True)],
-    ids=["initial-audit", "positive-send-guard", "failed-shutdown-claim"],
+    ("read_number", "failed_claim_phase"),
+    [(1, None), (3, None), (1, "active"), (1, "blocked")],
+    ids=["initial-audit", "positive-send-guard", "failed-shutdown-claim", "failed-blocked-shutdown-claim"],
 )
 async def test_managed_shutdown_supersedes_awaited_release(
     tmp_path: Path,
@@ -260,7 +260,7 @@ async def test_managed_shutdown_supersedes_awaited_release(
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
     read_number: int,
-    reject_claim: bool,
+    failed_claim_phase: str | None,
 ) -> None:
     async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
         session = managed_session(rig)
@@ -289,7 +289,10 @@ async def test_managed_shutdown_supersedes_awaited_release(
             try:
                 await asyncio.wait_for(entered.wait(), 3)
                 j = session.journal
-                if reject_claim:
+                if failed_claim_phase is not None:
+                    if failed_claim_phase == "blocked":
+                        j.phase.block()
+                    assert j.phase.read().value == failed_claim_phase
                     control = j.get("control", {})
                     j.db.execute(
                         "CREATE TEMP TRIGGER reject_shutdown_claim BEFORE INSERT ON meta "
@@ -299,16 +302,17 @@ async def test_managed_shutdown_supersedes_awaited_release(
                         with pytest.raises(sqlite3.IntegrityError, match="shutdown claim refused"):
                             controller.request_stop()
                         assert controller.stopping and j.get("control", {}) == control
+                        assert not j.db.in_transaction and j.phase.read().value == failed_claim_phase
                     finally:
                         j.db.execute("DROP TRIGGER reject_shutdown_claim")
                 else:
                     controller.request_stop()
-                controller.request_stop()  # Duplicate process signals retain one stopping ticket.
                 ticket = j.get("control", {}).get("ticket")
+                controller.request_stop()  # Duplicate process signals retain one stopping ticket.
                 proceed.set()
                 status = await asyncio.wait_for(task, 3)
                 assert not status["owner_control_enabled"]
-                if not reject_claim:
+                if failed_claim_phase is None:
                     assert status["state"] == "stopping"
                 assert controller.released_epoch is None and not session.journal.get("managed_control_fault")
                 assert j.get("control", {}).get("ticket") == ticket

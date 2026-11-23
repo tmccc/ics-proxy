@@ -27,8 +27,22 @@ if TYPE_CHECKING:
 STOP_SESSION = "stop_session"
 CONFIRMATION_SECONDS = 20
 STOP_COMPLETION_FIELDS = "state='completed',result=json_set(result,'$.session_stopped',json('true'))"
+REJECTED_ATTEMPTS = (
+    "(EXISTS (SELECT 1 FROM owner_command_wires WHERE request=managed_requests.id "
+    "AND action='RemoteStopTransaction' AND reply='Rejected') OR "
+    "COALESCE(json_array_length(result,'$._session_stop.local_attempts') "
+    "+ json_array_length(result,'$._session_stop.vendor_attempts'),0) > 0 "
+    "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.local_attempts') a "
+    "WHERE NOT EXISTS (SELECT 1 FROM owner_command_wires w WHERE w.request=a.value "
+    "AND w.local=json_extract(managed_requests.result,'$._session_stop.local') "
+    "AND w.action='RemoteStopTransaction' AND w.reply='Rejected')) "
+    "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.vendor_attempts') a "
+    "WHERE NOT EXISTS (SELECT 1 FROM vendor_command_scope v JOIN mutations m ON m.token=v.mutation "
+    "WHERE v.mutation=a.value AND v.local=json_extract(managed_requests.result,'$._session_stop.local') "
+    "AND m.origin='vendor' AND m.action='RemoteStopTransaction' AND v.wire_result='Rejected')))"
+)
 CLOSED_REQUESTS = (
-    "action=? AND state IN ('accepted','running','uncertain') AND EXISTS ("
+    f"action=? AND state IN ('accepted','running','uncertain') AND NOT {REJECTED_ATTEMPTS} AND EXISTS ("
     "SELECT 1 FROM transactions WHERE local=json_extract(managed_requests.result,'$._session_stop.local') "
     "AND stop IS NOT NULL)"
 )
@@ -67,7 +81,7 @@ class ManagedSessionStop:
             or native is None
             or not native.physical.transaction_open
             or native.physical.native_transaction_id != local
-            or not 0 <= time.time() - native.physical.observed_at <= 15
+            or not native.fresh_for_stop(15)
             or not c.native.session_stop_verified(local)
         ):
             return None
@@ -90,13 +104,22 @@ class ManagedSessionStop:
         if self.worker is not None and not self.worker.done():
             raise RecoveryRequiredError("the current session Stop is still being sent")
         accepted = time.time()
+        confirmation_deadline = time.monotonic() + CONFIRMATION_SECONDS
         with j.atomic():
             insert_request(
                 j,
                 identifier,
                 STOP_SESSION,
                 revision,
-                {"accepted_at": accepted, "target": target, "_session_stop": {"local": local, "dispatched": False}},
+                {
+                    "accepted_at": accepted,
+                    "target": target,
+                    "_session_stop": {
+                        "local": local,
+                        "dispatched": False,
+                        "confirmation_deadline": confirmation_deadline,
+                    },
+                },
             )
         scope = SessionStop(identifier, target, local, intent, connection)
         self.worker = c.commands.start(partial(self._send, scope), priority=CommandPriority.RESTRICT)
@@ -113,10 +136,14 @@ class ManagedSessionStop:
                 c.stopping
                 or c.requests.intent() != scope.intent
                 or not control_scope_matches(g, scope.connection)
-                or self.target() != scope.target
                 or not request_pending(j, scope.identifier, STOP_SESSION, scope.intent.revision)
             ):
-                raise RecoveryRequiredError("Stop lost its current session or request")
+                raise RecoveryRequiredError("Stop lost its current request")
+            if self.target() != scope.target:
+                session = j.outcomes.session(scope.local)
+                if session is not None and session.closed:
+                    raise StopAlreadyHandledError  # The original report still needs independent closure evidence.
+                raise RecoveryRequiredError("Stop lost its current session")
 
         # Commit possible dispatch before the sender can write, including when the wire reply is lost.
         def dispatch(_action: str) -> None:
@@ -179,33 +206,21 @@ class ManagedSessionStop:
         self._update_receipts(
             "state='failed',result=json_set(result,'$.classification','stop_rejected')",
             (),
-            "action=? AND state IN ('running','uncertain') AND EXISTS ("
-            "SELECT 1 FROM owner_command_wires WHERE request=managed_requests.id AND reply='Rejected')",
+            f"action=? AND state IN ('running','uncertain') AND {REJECTED_ATTEMPTS}",
             (STOP_SESSION,),
+            retry_after_rollback=not replaced,
         )
-        self._update_receipts(
-            "state='failed',result=json_set(result,'$.classification','stop_rejected')",
-            (),
-            "action=? AND state IN ('running','uncertain') "
-            "AND (json_array_length(result,'$._session_stop.local_attempts') "
-            "+ json_array_length(result,'$._session_stop.vendor_attempts')) > 0 "
-            "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.local_attempts') a "
-            "WHERE NOT EXISTS (SELECT 1 FROM owner_command_wires w WHERE w.request=a.value "
-            "AND w.local=json_extract(managed_requests.result,'$._session_stop.local') "
-            "AND w.action='RemoteStopTransaction' AND w.reply='Rejected')) "
-            "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.vendor_attempts') a "
-            "WHERE NOT EXISTS (SELECT 1 FROM vendor_command_scope v JOIN mutations m ON m.token=v.mutation "
-            "WHERE v.mutation=a.value AND v.local=json_extract(managed_requests.result,'$._session_stop.local') "
-            "AND m.origin='vendor' AND m.action='RemoteStopTransaction' AND v.wire_result='Rejected'))",
-            (STOP_SESSION,),
-        )
+        # The same rejection evidence also excludes a receipt from closure while its failure write awaits retry.
         self._update_receipts(
             "state=CASE WHEN json_extract(result,'$._session_stop.dispatched') "
             "OR json_extract(result,'$._session_stop.joined') "
             "THEN 'uncertain' ELSE 'failed' END,result=json_set(result,'$.classification',?)",
             ("process_replaced" if replaced else "stop_not_confirmed",),
-            "action=? AND state IN ('accepted','running') AND (? OR json_extract(result,'$.accepted_at')<=?)",
-            (STOP_SESSION, replaced, time.time() - CONFIRMATION_SECONDS),
+            f"action=? AND state IN ('accepted','running') AND NOT {REJECTED_ATTEMPTS} "
+            "AND (? OR COALESCE(json_extract(result,'$._session_stop.confirmation_deadline')<=?, "
+            "json_extract(result,'$.accepted_at')<=?))",
+            (STOP_SESSION, replaced, time.monotonic(), time.time() - CONFIRMATION_SECONDS),
+            retry_after_rollback=not replaced,
         )
 
     # Only a real receipt transition needs a write lock. A busy begin can wait for the next poll.
@@ -231,7 +246,7 @@ class ManagedSessionStop:
         except sqlite3.Error:
             if not retry_after_rollback or not transaction_started or j.db.in_transaction:
                 raise
-            # The physical closure is already durable. The next fresh observation can publish the same receipt.
+            # The original evidence remains intact. The next poll can retry publication.
 
     # A fresh native observation and the genuine Stop report must agree before a receipt completes.
     def observed(self, native: HandoverEvidence) -> None:
@@ -240,7 +255,7 @@ class ManagedSessionStop:
         if (
             native.physical.transaction_open != (active is not None)
             or native.physical.native_transaction_id != active
-            or not 0 <= time.time() - native.physical.observed_at <= 5
+            or not native.fresh_for_stop(5)
             or active is None
             and (native.physical.power_w != 0 or any(value != 0 for value in native.currents_a + native.powers_w))
         ):

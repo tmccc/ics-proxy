@@ -2618,7 +2618,8 @@ class ControlDecisions:
             if retiring():
                 return
             self.shutdown_requested = True
-            self.control._claim(True, stopping=True)
+            with self.journal.atomic():
+                self.control._claim(True, stopping=True)
 
         self.peer.decide(claim, priority=CommandPriority.SHUTDOWN)
 

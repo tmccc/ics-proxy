@@ -6,7 +6,8 @@ Leave the charger on its original setup while preparing and inspecting the evide
 
 1. Install Python 3.14 and OpenSSL on Linux. Create a virtual environment and install `requirements-trial.txt`.
 2. Prepare a private configuration using [the trial example](../packaging/trial/trial.json.example). Choose the
-   charger’s existing approved current limits and substitute its actual installation values locally.
+   charger’s existing approved current limits and substitute its actual installation values locally. The supported
+   baseline has a single connector with a saved user limit and installer ceiling of 32 A.
 3. Keep the listener TLS key, authentication files, native credentials, native bounded specification, baseline,
    and management token outside the checkout. Install them for the service account with restrictive permissions.
    Keep the writable journal and evidence in a private state directory.
@@ -38,11 +39,21 @@ proxy](../ics_proxy_core/engine/store.py#L40). Use the validated private evidenc
 The baseline capture supplies the original configuration. The native schedule, commissioning capability digest,
 and OCPP Boot evidence must be obtained separately before commissioning.
 
-The installation guides start with commissioning at a restricted current. The independent evidence must confirm
-the actual profile, journal and saved resources before authorizing normal operation. The separate
-`tools/prepare_managed_current.py` action requires exclusive journal ownership and the already verified zero hold
-before preparing the supported native capability. Use its read-only checks first. Supplying an arbitrary higher
-current in a configuration file cannot establish that capability.
+## First handover
+
+1. After the preflight passes, use the authorized charger controls to set both the saved and effective user
+   limits to 6 A. Keep the original backend route and all other saved settings unchanged. Confirm that the car
+   is plugged in and idle, the native session is closed, and the charger reports zero output.
+2. Start the proxy service while the charger still uses the original route. Wait for the proxy to confirm the
+   charger listener is open. In the systemd example, the service reports ready with the status
+   `Waiting for verified charger and owner control` at this point.
+3. Point the charger at the configured proxy route using the four `trial_route` fields. Keep the saved and
+   effective user limits at 6 A through the first charger Boot. Verify the proxy binds that Boot and reports
+   the expected zero hold before authorizing normal operation.
+
+Confirm the actual profile, journal and saved resources before authorizing normal operation. The separate
+`tools/prepare_managed_current.py` action requires exclusive journal ownership and the verified zero hold before
+preparing the supported native capability. Use its read-only checks first.
 
 ## Run the service
 

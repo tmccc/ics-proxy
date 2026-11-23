@@ -13,6 +13,13 @@ from tools import version
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture
+def changelog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "CHANGELOG.md"
+    monkeypatch.setattr(version, "CHANGELOG", path)
+    return path
+
+
 # Intent: run the version check tool and require that it reports no drift.
 # Why: CI fails on a mismatch, so a release can never carry two different versions.
 def test_version_is_in_sync() -> None:
@@ -25,22 +32,46 @@ def test_version_is_in_sync() -> None:
 
 # Intent: the publishing gate accepts the current release tag and refuses a different version.
 # Why: a historical changelog heading must not let a new archive publish under its old tag.
-def test_release_tag_must_match_the_checked_out_version(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_release_tag_must_match_the_checked_out_version(monkeypatch: pytest.MonkeyPatch, changelog: Path) -> None:
     monkeypatch.setattr(version, "read_pyproject", lambda: "1.10.0rc2")
     monkeypatch.setattr(version, "read_manifest", lambda path: "1.10.0-rc2")
-    monkeypatch.setattr(version, "read_changelog_headings", lambda: ["Unreleased", "1.10.0-rc2", "1.9.0"])
+    changelog.write_text("## Unreleased\n\n## 1.10.0-rc2\n\nCurrent\n\n## 1.9.0\n\nPrevious\n")
 
     assert version.main(["version.py", "check", "v1.10.0-rc2"]) == 0
     assert version.main(["version.py", "check", "v1.9.0"]) == 1
 
 
+# Intent: pending notes allow development checks and prevent tagging the otherwise matching release.
+@pytest.mark.parametrize(
+    ("unreleased", "release_allowed"),
+    [
+        ("", True),
+        ("## Unreleased\n\n", True),
+        ("## Unreleased\n\n<!-- Release note template -->\n\n", True),
+        ("## Unreleased\n\n### Fixed\n\n- Preserve charging records.\n\n", False),
+        ("## [Unreleased]\n\nPreserve charging records.\n\n", False),
+    ],
+)
+def test_release_tag_checks_pending_notes(monkeypatch, changelog, capsys, unreleased, release_allowed):
+    monkeypatch.setattr(version, "read_pyproject", lambda: "1.10.0rc2")
+    monkeypatch.setattr(version, "read_manifest", lambda path: "1.10.0-rc2")
+    changelog.write_text(f"{unreleased}## 1.10.0-rc2\n\nReleased changes.\n")
+
+    assert version.main(["version.py", "check"]) == 0
+    assert version.main(["version.py", "check", "v1.10.0rc2"]) == int(not release_allowed)
+    if not release_allowed:
+        assert "pending Unreleased notes" in capsys.readouterr().err
+
+
 # Intent: distinct numeric version components must cause actual release-version drift to fail.
 # Why: stripping dots made two different releases compare equal and let CI miss a mismatch.
 @pytest.mark.parametrize("package,manifest", [("0.2.3", "0.23"), ("1.10.0", "11.0.0")])
-def test_numeric_components_do_not_collapse(monkeypatch: pytest.MonkeyPatch, package: str, manifest: str) -> None:
+def test_numeric_components_do_not_collapse(
+    monkeypatch: pytest.MonkeyPatch, changelog: Path, package: str, manifest: str
+) -> None:
     monkeypatch.setattr(version, "read_pyproject", lambda: package)
     monkeypatch.setattr(version, "read_manifest", lambda path: manifest)
-    monkeypatch.setattr(version, "read_changelog_headings", lambda: [manifest])
+    changelog.write_text(f"## {manifest}\n")
 
     assert version.check() == 1
 
@@ -55,10 +86,10 @@ def test_prerelease_display_spelling_remains_equivalent(display: str) -> None:
 # Intent: both manifest versions and the latest release heading must agree with the package.
 # Why: one stale client manifest or an older matching heading used to escape the release check.
 @pytest.mark.parametrize("client,latest", [("0.2.2", "0.2.3"), ("0.2.3", "0.2.4")])
-def test_client_and_latest_changelog_are_checked(monkeypatch, client, latest):
+def test_client_and_latest_changelog_are_checked(monkeypatch, changelog, client, latest):
     monkeypatch.setattr(version, "read_pyproject", lambda: "0.2.3")
     monkeypatch.setattr(version, "read_manifest", lambda path: client if path.parent.name == "ics_proxy" else "0.2.3")
-    monkeypatch.setattr(version, "read_changelog_headings", lambda: ["Unreleased", latest, "0.2.3"])
+    changelog.write_text(f"## Unreleased\n\n## {latest}\n\n## 0.2.3\n")
     assert version.check() == 1
 
 

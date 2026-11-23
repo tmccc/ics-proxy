@@ -12,6 +12,8 @@ import signal
 import subprocess
 import tarfile
 import tempfile
+from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree
@@ -68,15 +70,22 @@ def changed_proxy(repo: Path, candidate: str, installed: str | None) -> bool:
     return bool(git(repo, "diff", "--name-only", installed, candidate, "--", *PROXY_INPUTS).strip())
 
 
-# Require qualification to have exercised the packages that the standalone installer will use.
-def require_standalone_pins(source: Path, audited_packages: dict[str, str]) -> None:
-    expected = dict(
-        line.strip().split("==", 1)
+def normalized_package_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name.strip().lower())
+
+
+# Require all candidate standalone pins in each interpreter used to exercise the service.
+def require_standalone_pins(source: Path, packages: Iterable[tuple[str, str]], *, runtime: str) -> None:
+    expected = [
+        line.split("==", 1)
         for line in (source / "requirements-trial.txt").read_text().splitlines()
         if line.strip() and not line.lstrip().startswith("#")
-    )
-    if not expected or any(audited_packages.get(name) != version for name, version in expected.items()):
-        raise ValueError("standalone runtime pins differ from the audited engine runtime")
+    ]
+    installed: dict[str, set[str]] = defaultdict(set)
+    for name, version in packages:
+        installed[normalized_package_name(name)].add(version)
+    if not expected or any(installed[normalized_package_name(name)] != {version.strip()} for name, version in expected):
+        raise ValueError(f"standalone runtime pins differ from the {runtime}")
 
 
 # Export the exact installed commit without opening its running installation or checking out another branch.
@@ -303,6 +312,7 @@ def ensure_check(
         }
         if dict(runtime["packages"]).get("homeassistant") not in versions:
             raise ValueError("installation week requires a pinned Home Assistant runtime")
+        require_standalone_pins(source, runtime["packages"], runtime="installation week runtime")
     inputs = {
         "check": check.name,
         "commit": metadata["commit"],

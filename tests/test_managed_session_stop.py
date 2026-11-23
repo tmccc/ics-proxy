@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from websockets.asyncio.client import connect
 
+from ics_proxy_core.engine import managed_session_stop
 from ics_proxy_core.engine.gateway import decode
 from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
 from ics_proxy_core.engine.managed_session_stop import ManagedSessionStop
@@ -27,6 +30,34 @@ from tests.test_managed_boot_supersession import delay_reply
 from tests.test_managed_normal_start import natural_stop, zero_power_session
 from tests.tls_support import tls as tls
 from tools import managed_proxy
+
+
+@pytest.mark.parametrize("wall_step", [-30, 30])
+async def test_live_stop_confirmation_uses_elapsed_time(tmp_path, tls, unused_tcp_port, monkeypatch, wall_step):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+        c, j = rig.controller, rig.session.journal
+        c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await zero_power_session(rig)
+        await healthy(c)
+        identifier = uuid.uuid4().hex
+        start = time.monotonic()
+        c.command(identifier, "stop_session", c.requests.intent().revision, target=c.session_stop.target())
+        await until(lambda: j.outcomes.accepted_stop(local))
+        assert c.requests.receipt(identifier)["state"] == "running"
+        clock = SimpleNamespace(time=lambda: time.time() + wall_step, monotonic=lambda: start + 1)
+        with monkeypatch.context() as adjustment:
+            adjustment.setattr(managed_session_stop, "time", clock)
+            c.session_stop.expire()
+            assert c.requests.receipt(identifier)["state"] == "running"
+            clock.monotonic = lambda: start + managed_session_stop.CONFIRMATION_SECONDS + 1
+            c.session_stop.expire()
+            receipt = c.requests.receipt(identifier)
+            assert receipt["state"] == "uncertain" and receipt["result"]["classification"] == "stop_not_confirmed"
+        await natural_stop(rig, local)
+        await healthy(c)
+        assert c.requests.receipt(identifier)["state"] == "completed"
+        assert sum(frame[2] == "RemoteStopTransaction" for frame in rig.rig.bench.device_calls) == 1
 
 
 # Intent: a zero-watt session can be stopped immediately after its Start completes on the management socket.
@@ -131,6 +162,36 @@ async def test_session_stop_rechecks_native_verification(tmp_path, tls, unused_t
         assert c.command(uuid.uuid4().hex, "stop_session", revision, target=target)["state"] == "accepted"
         await until(lambda: j.outcomes.accepted_stop(local))
         await natural_stop(t, local)
+
+
+# Intent: the original Stop receipt can confirm when its exact session closes before the worker gets the wire.
+# Why: a real report withdraws the open target but still needs fresh native proof before the receipt succeeds.
+async def test_session_stop_awaits_closure_when_session_closes_in_gate(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        local = await positive_flow(t, "daily")
+        await healthy(c)
+        target, intent = c.session_stop.target(), c.requests.intent()
+        assert isinstance(target, str)
+        request = uuid.uuid4().hex
+
+        gate = t.session.gateway.charger.gate
+        async with gate.enter(10):
+            assert c.command(request, "stop_session", intent.revision, target=target)["state"] == "accepted"
+            await asyncio.wait_for(gate.restrictive_waiting.wait(), 3)
+            await natural_stop(t, local)
+            assert c.session_stop.target() is None
+        assert c.session_stop.worker is not None
+        await asyncio.wait_for(c.session_stop.worker, 3)
+        assert c.requests.receipt(request)["state"] == "accepted"
+        assert not j.outcomes.session_stop_dispatched(local) and not bench.remote_stop.is_set()
+
+        status = await healthy(c)
+        receipt = c.requests.receipt(request, include_binding=True)
+        assert receipt["state"] == "completed" and receipt["result"]["session_stopped"] is True
+        assert receipt["target"] == target and receipt["revision"] == intent.revision
+        assert status["charging_session_open"] is False and c.requests.intent() == intent
+        assert not bench.remote_stop.is_set()
 
 
 # Intent: an identical Boot on the same connection withdraws the previous session's Stop target.
@@ -452,6 +513,82 @@ async def test_service_retries_closed_stop_receipt_publication(tmp_path, tls, un
         final = (await call(service.api, "status"))["result"]
         assert final["charging_session_open"] is False and final["desired_control"] == "app"
         assert final["station_ceiling_a"] == 6 and final["control_revision"] == revision
+        assert [frame[3] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
+
+
+# Intent: a rolled-back timeout or rejection receipt must leave service supervision running.
+# Why: neither expiry nor a genuine closure can overtake a deferred, already known rejection.
+@pytest.mark.parametrize("outcome", ["expiry", "rejection", "joined-rejection"])
+async def test_service_retries_session_stop_receipt_updates(
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch, outcome
+):
+    monkeypatch.setattr(managed_proxy, "_SUPERVISION_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(managed_session_stop, "CONFIRMATION_SECONDS", 1)
+    async with running_service(tmp_path, tls, unused_tcp_port_factory, monkeypatch, 6) as service:
+        charge = service.charge
+        controller, journal, bench = charge.controller, charge.session.journal, charge.rig.bench
+        local = await positive_flow(charge, "daily")
+        await until(lambda: controller.session_stop.target() is not None)
+        target = controller.session_stop.target()
+        revision = controller.requests.intent().revision
+        dispatched = uuid.uuid4().hex
+        request = uuid.uuid4().hex if outcome == "joined-rejection" else dispatched
+        send, held, entered = delay_reply(monkeypatch, charge.rig, charge.charger, "RemoteStopTransaction")
+        monkeypatch.setattr(charge.session.gateway.charger, "timeout", 0.2)
+
+        refused = asyncio.Event()
+        journal.db.create_function("note_stop_receipt_refusal", 0, refused.set)
+        expected_state = "uncertain" if outcome == "expiry" else "failed"
+        journal.db.execute(
+            "CREATE TEMP TRIGGER refuse_stop_receipt_update BEFORE UPDATE ON managed_requests "
+            f"WHEN NEW.id='{request}' AND NEW.state='{expected_state}' "
+            "BEGIN SELECT note_stop_receipt_refusal(); SELECT RAISE(ABORT, 'receipt storage unavailable'); END"
+        )
+        try:
+            accepted = await call(service.api, "stop_session", id=dispatched, revision=revision, target=target)
+            assert accepted["result"]["state"] == "accepted"
+            await asyncio.wait_for(entered.wait(), 3)
+            await asyncio.wait_for(controller.session_stop.worker, 3)
+            if request != dispatched:
+                joined = await call(service.api, "stop_session", id=request, revision=revision, target=target)
+                assert joined["result"]["state"] == "accepted"
+                await asyncio.wait_for(controller.session_stop.worker, 3)
+            if outcome != "expiry":
+                await send(build_call_result(decode(held[0])[1], {"status": "Rejected"}))
+
+            await asyncio.wait_for(refused.wait(), 5)
+            before = await service.published()
+            await service.published(before["checked_at"], state="healthy", desired="app")
+            assert controller.requests.receipt(request)["state"] == "running"
+            assert not journal.db.in_transaction
+            if outcome == "expiry":
+                assert journal.outcomes.session_stop_dispatches(local) == (dispatched,)
+            else:
+                # Leave the refusal in place until both closure evidence and the expiry deadline are available.
+                await service.close_daily(local)
+                await controller.session_stop.confirm_while_blocked()
+                assert controller.requests.receipt(request)["state"] == "running"
+                await asyncio.sleep(managed_session_stop.CONFIRMATION_SECONDS)
+                before = await service.published()
+                closed = await service.published(before["checked_at"], state="healthy", desired="app")
+                assert closed["charging_session_open"] is False
+                assert controller.requests.receipt(request)["state"] == "running"
+        finally:
+            if not service.task.done():
+                journal.db.execute("DROP TRIGGER refuse_stop_receipt_update")
+
+        await until(lambda: controller.requests.receipt(request)["state"] == expected_state)
+        saved = (await call(service.api, "receipt", request_id=request))["result"]
+        assert saved["id"] == request and saved["target"] == target and saved["revision"] == revision
+        if outcome == "expiry":
+            assert saved["result"]["classification"] == "stop_not_confirmed"
+            assert journal.outcomes.session_stop_dispatches(local) == (dispatched,)
+            await service.close_daily(local)
+            await until(lambda: controller.requests.receipt(request)["state"] == "completed")
+        else:
+            assert saved["result"]["classification"] == "stop_rejected"
         assert [frame[3] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
             {"transactionId": local}
         ]
