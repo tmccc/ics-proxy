@@ -290,7 +290,8 @@ async def test_local_pause_and_cloud_stop_share_one_charger_stop(tmp_path, tls, 
             assert sum(f[2] == "StopTransaction" for f in rig.bench.lifecycle_wires) == 1
 
 
-# An unanswered Stop owns its original session while independent evidence verifies zero.
+# Intent: Pause and the vendor app share an unanswered Stop for the same session at verified zero.
+# Why: neither request order should repeat the Stop or treat the missing reply as an acceptance.
 @pytest.mark.parametrize("first", ["local", "vendor"])
 async def test_local_pause_and_cloud_stop_share_unanswered_stop_at_zero(
     tmp_path, tls, unused_tcp_port, monkeypatch, first
@@ -307,11 +308,13 @@ async def test_local_pause_and_cloud_stop_share_unanswered_stop_at_zero(
             monkeypatch.setattr(peer, "timeout", 0.3)
             pause, request = uuid.uuid4().hex, uuid.uuid4().hex
 
+            # Return the managed Pause task so the test can wait on either request order.
             def pause_worker():
                 assert c.command(pause, "pause", c.requests.intent().revision)["state"] == "accepted"
                 assert c.pause_task is not None
                 return c.pause_task
 
+            # Address the same session through the independently connected vendor app.
             def cloud_stop():
                 return asyncio.create_task(
                     rig.bench.cloud_call(request, "RemoteStopTransaction", {"transactionId": vendor})
