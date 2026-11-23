@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fixed a timing issue that could prevent Pause from recording and stopping a session the charger reported late.
 - Extracted the active iCS engine, Home Assistant client, tests, deployment tools and documentation into a standalone repository.
 - Preserved one proxy owner for charging actions and retained the existing control and journal formats.
 - Kept queued charger reports for normal delivery during verified history repair, retried temporary native read failures,

@@ -93,6 +93,115 @@ async def test_reported_start_rechecks_a_superseded_profile_read(
         await b.close_transaction(local)
 
 
+# Intent: record a real delayed cloud Start at zero while the original Pause settles or ordinary polls advance.
+# Why: the original zero hold admits its exact report, while a new Pause or newer failed poll invalidates it.
+@pytest.mark.parametrize("concurrent", ["pause_settlement", "repeated_polls", "new_pause", "failed_poll"])
+async def test_held_cloud_start_survives_fresh_evidence_under_its_pause(
+    tmp_path, tls, unused_tcp_port, monkeypatch, concurrent
+):
+    peer_type = OrderedNativePeer if concurrent == "failed_poll" else SchedulePeer
+    async with timer_bench(tmp_path, tls, unused_tcp_port, peer_type=peer_type) as b:
+        c, journal = b.c, b.session.journal
+        native = c.native
+        await b.acknowledge_older_owner_start()
+        b.clock.now = int(datetime(2026, 11, 11, 6, tzinfo=ZONE).timestamp())
+        await c.tick()
+        grant = journal.get("vendor_start_grant")
+        before_starts = list(starts(b.rig))
+        pause = uuid.uuid4().hex
+        closed_sample, finish_closed_sample = asyncio.Event(), asyncio.Event()
+        read, observe = native.read, native.observe_profiles
+        poll_orders = []
+
+        # The original Pause observes closed zero before the station presents the delayed Start.
+        async def hold_closed_observation(*args, **kwargs):
+            sample = await read(*args, **kwargs)
+            if asyncio.current_task() is c.pause_task:
+                assert not sample.physical.transaction_open
+                closed_sample.set()
+                await finish_closed_sample.wait()
+            return sample
+
+        with monkeypatch.context() as patch:
+            if concurrent == "pause_settlement":
+                patch.setattr(native, "read", hold_closed_observation)
+            c.command(pause, "pause", c.requests.intent().revision)
+            try:
+                if concurrent == "pause_settlement":
+                    await asyncio.wait_for(closed_sample.wait(), 3)
+                else:
+                    await c.pause_task
+                control = journal.get("control")
+                assert control["uncertain"] is (concurrent == "pause_settlement")
+                assert b.session.gateway.controls.ready and b.device.effective_limit() == 0
+                assert journal.active() is None and grant.get("local") is None
+
+                # Let real observations or a genuine new owner decision finish after a profile sample was fetched.
+                async def interleave_profile_observation():
+                    profiles = await observe()
+                    if concurrent == "pause_settlement" and not finish_closed_sample.is_set():
+                        finish_closed_sample.set()
+                        await c.pause_task
+                    elif concurrent == "new_pause" and journal.get("control")["ticket"] == control["ticket"]:
+                        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+                        await c.pause_task
+                    elif concurrent in ("repeated_polls", "failed_poll") and len(poll_orders) < 2:
+                        sequence = native.read_sequence
+                        if concurrent == "failed_poll":
+                            b.rig.peer.unavailable = True
+                            try:
+                                with pytest.raises(NativeTransportUnavailableError):
+                                    await native.read()
+                            finally:
+                                b.rig.peer.unavailable = False
+                        else:
+                            await asyncio.create_task(c.tick())
+                        poll_orders.append((sequence, native.last_resolved_read, native.last_verified_at))
+                    return profiles
+
+                patch.setattr(native, "observe_profiles", interleave_profile_observation)
+                b.device.active = 987654
+                b.rig.peer.plan_session = (987654, 987655)
+                body = START | {
+                    "idTag": "CLOUD_OWNER",
+                    "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
+                }
+                reply = await b.rig.bench.call(b.sock, "late-cloud-owner", "StartTransaction", body)
+            finally:
+                finish_closed_sample.set()
+
+        assert b.device.effective_limit() == 0 and starts(b.rig) == before_starts
+        latest = journal.get("control")
+        if concurrent in ("new_pause", "failed_poll"):
+            if concurrent == "new_pause":
+                assert latest["ticket"] != control["ticket"]
+            else:
+                assert latest == control
+                [(sequence, resolved, verified)] = poll_orders
+                assert sequence < resolved and verified == 0
+            assert reply[0] == 4, reply
+            assert journal.active() is None and journal.get("vendor_start_grant") == grant and not b.stops()
+            return
+        if concurrent == "pause_settlement":
+            assert latest == {**control, "uncertain": False}
+        else:
+            assert poll_orders and all(
+                sequence < resolved and verified > 0 for sequence, resolved, verified in poll_orders
+            )
+        assert reply[0] == 3 and reply[2]["idTagInfo"]["status"] == "Accepted", (reply, poll_orders)
+        local = reply[2]["transactionId"]
+        b.rig.peer.plan_session = (local, 987655)
+        assert journal.active() == local
+        async with asyncio.timeout(4):
+            while not b.stops():
+                await c.tick()
+                await asyncio.sleep(0.02)
+        assert b.stops() == [local] and c.requests.receipt(pause)["state"] == "accepted"
+        await b.close_transaction(local)
+        assert (await healthy(c))["local_hold_verified"]
+        assert c.requests.receipt(pause)["state"] == "completed"
+
+
 class OrderedNativePeer(SchedulePeer):
     """Only the independent HTTP peer holds or replaces its selected final native response."""
 

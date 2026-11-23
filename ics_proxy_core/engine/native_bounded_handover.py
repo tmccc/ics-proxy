@@ -25,6 +25,7 @@ from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .local_control import local_start_receipt
 from .managed_current import managed_current_ceiling
+from .managed_intent import OWNER_PAUSE, decode_intent, decode_pause_claim
 from .managed_native_repair import NativeRepairAudits, RepairAttempt
 from .native_bounded import NativeBoundedSpec, NativeReadinessError, _require_ready, readiness_decision
 from .native_faults import MeasuredValues, NativeContentError, _NativeMeasurementError
@@ -137,6 +138,9 @@ class NativeBoundedHandover:
 
     # Local changes invalidate a native read even when the charger returned a complete, individually valid body.
     def authority(self, *, include_observed_digests: bool = True) -> str:
+        return fingerprint(self._authority_state(include_observed_digests=include_observed_digests))
+
+    def _authority_state(self, *, include_observed_digests: bool) -> dict[str, Any]:
         gateway, journal = self.gateway, self.gateway.journal
         # A report checks the latest observed digest against its sample at commit. Its ownership uses the receipt.
         resources = journal.db.execute(
@@ -144,23 +148,21 @@ class NativeBoundedHandover:
             if include_observed_digests
             else "SELECT key, desired, confirmed, state FROM trial_resources ORDER BY key"
         )
-        return fingerprint(
-            {
-                "epoch": gateway._charger_epoch,
-                "boot_observation": gateway.boot_observation,
-                "revision": gateway.controls._revision,
-                "phase": journal.phase.read().value,
-                "control": journal.get("control"),
-                "lifecycle": journal.lifecycle_position(),
-                "boot": journal.get("boot"),
-                "binding": journal.get("trial_binding"),
-                "grant": journal.get("vendor_start_grant"),
-                "state": journal.get("native_bounded_handover"),
-                "current_capability": journal.get("managed_current_capability"),
-                "ordinary_recovery": journal.get("managed_ordinary_recovery"),
-                "resources": [tuple(row) for row in resources],
-            }
-        )
+        return {
+            "epoch": gateway._charger_epoch,
+            "boot_observation": gateway.boot_observation,
+            "revision": gateway.controls._revision,
+            "phase": journal.phase.read().value,
+            "control": journal.get("control"),
+            "lifecycle": journal.lifecycle_position(),
+            "boot": journal.get("boot"),
+            "binding": journal.get("trial_binding"),
+            "grant": journal.get("vendor_start_grant"),
+            "state": journal.get("native_bounded_handover"),
+            "current_capability": journal.get("managed_current_capability"),
+            "ordinary_recovery": journal.get("managed_ordinary_recovery"),
+            "resources": [tuple(row) for row in resources],
+        }
 
     # Read rich native evidence under current authority; eligible repair audits are fenced before observation.
     async def read(
@@ -796,15 +798,40 @@ class NativeBoundedHandover:
         g, j = self.gateway, self.gateway.journal
 
         # An inventory readback can add a digest without changing the authority or the confirmed profile.
-        def report_scope() -> tuple[str, str]:
-            return self.authority(include_observed_digests=False), fingerprint(j.get("managed_control_intent"))
+        def report_scope() -> dict[str, Any]:
+            return {
+                **self._authority_state(include_observed_digests=False),
+                "intent": j.get("managed_control_intent"),
+                "pause": j.get(OWNER_PAUSE),
+            }
 
-        original_scope = g.decide(report_scope)
+        original = g.decide(report_scope)
+        expected = fingerprint(original)
+        intent, control = original["intent"], original["control"]
+        confirmed = None
+        if (
+            isinstance(intent, dict)
+            and intent.get("mode") == "paused"
+            and isinstance(control, dict)
+            and control.get("owner") == "local"
+            and control.get("inhibit") is True
+            and control.get("uncertain") is True
+            and decode_pause_claim(original["pause"]).owns(decode_intent(intent), control.get("ticket"))
+            and g.controls.ready
+            and g.controls.desired() == 0
+        ):
+            confirmed = fingerprint({**original, "control": {**control, "uncertain": False}})
 
         # Recheck both before starting a read and before using its result.
         def require_original_scope() -> None:
-            if report_scope() != original_scope:
+            nonlocal expected, confirmed
+            current = fingerprint(report_scope())
+            if current == expected:
+                return
+            if current != confirmed or not g.controls.ready or g.controls.desired() != 0:
                 raise AuditSupersededError("reported Start crossed a change to its charging owner")
+            # Confirmation of this same Pause can advance the fence once. Reopening uncertainty cannot.
+            expected, confirmed = current, None
 
         # Share the observation order with full native reads so a superseded result cannot revoke a newer proof.
         def begin() -> int:
@@ -830,15 +857,15 @@ class NativeBoundedHandover:
         try:
             async with asyncio.timeout(5):
                 # A newer poll may record inventory proof. Reread under the same owner within the deadline.
-                for _ in range(2):
+                while True:
                     sequence = g.decide(begin)
                     profiles = await self.observe_profiles()
                     result = await g.decide_report(lambda: check(sequence, profiles))
                     if result is not None:
                         return result
+                    await asyncio.sleep(0)
         except TimeoutError as error:
             raise UnavailableError("the native station profile read timed out") from error
-        raise AuditSupersededError("reported Start profile read was superseded")
 
     # This check runs inside the actual outgoing RPC gate, after waits and immediately before the send guard.
     async def validate_send(self, action: str, payload: dict[str, Any]) -> Guard | Pending | None:

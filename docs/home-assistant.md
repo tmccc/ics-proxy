@@ -11,9 +11,11 @@ leave the management listener off public interfaces.
 
 The entities show current and power, vehicle connection, session state, selected limit, control mode and
 diagnostics. Start and the session-only Stop service use the same proxy as the vendor app. Pause holds at
-zero. Return gives control back to the app and charger schedule once the proxy can verify the necessary
-conditions. A session can remain open while charging power is zero. The proxy confirms closure from the
-charger’s closing report and fresh independent evidence.
+zero. A charger can report a session after Pause if an earlier Start was already accepted. The proxy keeps
+the zero hold, records that session, and stops the exact session it recorded. A session can remain open
+while charging power is zero. The proxy confirms closure from the charger’s closing report and fresh
+independent evidence. Return gives control back to the app and charger schedule once the proxy can verify
+the necessary conditions.
 
 The `ics_proxy.session_command` action returns a response for the exact Start or Stop request. See
 [the touchscreen example](../examples/solar-display-2/README.md) for the request format. An unclear Stop
