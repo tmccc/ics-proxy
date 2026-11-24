@@ -29,7 +29,13 @@ from .managed_current import managed_current_ceiling
 from .managed_intent import OWNER_PAUSE, decode_intent, decode_pause_claim
 from .managed_native_repair import NativeRepairAudits, RepairAttempt
 from .managed_records import CurrentFailureReason
-from .native_bounded import NativeBoundedSpec, NativeReadinessError, _require_ready, readiness_decision
+from .native_bounded import (
+    MANAGED_RESTORE_INTENT,
+    NativeBoundedSpec,
+    NativeReadinessError,
+    _require_ready,
+    readiness_decision,
+)
 from .native_faults import MeasuredValues, NativeContentError, _NativeMeasurementError
 from .native_history import MissingOriginalHistoryError, audit_history, inspect_history
 from .native_http import NativeTransportUnavailableError
@@ -1177,7 +1183,26 @@ class NativeBoundedHandover:
 
     # Recheck that teardown or a lost reply did not leave any proxy-owned resource installed.
     def _require_route_cleanup(self, native: HandoverEvidence) -> None:
-        require_lifecycle_idle(self.gateway)
+        gateway, journal = self.gateway, self.gateway.journal
+        require_lifecycle_idle(gateway)
+        state = journal.get("native_bounded_handover", {})
+        fault = journal.get("trial_inventory_fault", {})
+        # A recorded direct-vendor route retry can independently verify that a reappeared profile is gone.
+        if (
+            isinstance(fault, dict)
+            and fault.get("reason") == "resource_reappeared"
+            and isinstance(resource := fault.get("resource"), str)
+            and resource.startswith("profile:")
+            and journal.phase.read().value == "backend_restore_pending"
+            and state.get("stage") == "route_intent"
+            and journal.get(MANAGED_RESTORE_INTENT) == self.spec.digest
+            and self.allow_unplugged
+            and gateway.charger.sender is None
+        ):
+            if not native.is_fresh(5):
+                raise StaleEvidenceError("restoration requires fresh native evidence")
+            self.book.require_restored_inventory(native.physical, resource)
+            return
         if self.book.owned_present(native.physical):
             raise SecurityError("native bounded resources remain installed")
 

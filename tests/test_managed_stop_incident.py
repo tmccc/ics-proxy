@@ -159,6 +159,12 @@ def test_stop_report_uses_only_exact_retained_checkpoints(tmp_path, vendor, stat
         duplicate = json.dumps(asdict(correct))[:-1] + f',"{binding_key}":"{uuid.uuid4().hex}"}}'
         journal.db.execute("UPDATE meta SET value=? WHERE key=?", (duplicate, key))
         assert stop_incident_report(path, events, vendor=vendor)["wire"]["reply"] == "missing"
+        if not vendor and status == "Accepted":
+            conflict = replace(correct, wire=uuid.uuid4().hex, local=local + 1, reply=None)
+            journal.outcomes.record_owner_wire(conflict)
+            journal.put(key, asdict(correct))
+            assert stop_incident_report(path, events)["wire"]["reply"] == "unknown"
+            journal.db.execute("DELETE FROM owner_command_wires WHERE wire=?", (conflict.wire,))
         journal.db.execute(f"CREATE TEMP TRIGGER refuse_primary {refusal} BEGIN SELECT RAISE(ABORT, 'test'); END")
         frame = [3, wire, {"status": status}]
         if vendor:
@@ -184,6 +190,11 @@ def test_stop_report_keeps_joined_replies_with_their_original_attempt(tmp_path):
         reply = OwnerWire(wire, first, first, BOOT, STOP_ACTION, local, None, "Rejected")
         journal.outcomes.record_owner_wire(reply)
         journal.outcomes.record_owner_wire(replace(reply, request=uuid.uuid4().hex, wire=uuid.uuid4().hex))
+        orphan, orphan_wire = uuid.uuid4().hex, uuid.uuid4().hex
+        journal.put(
+            f"retained_stop_owner:{orphan_wire}",
+            asdict(OwnerWire(orphan_wire, orphan, orphan, BOOT, STOP_ACTION, local, None, "Accepted")),
+        )
         vendor = vendor_attempt(journal, local, uuid.uuid4().hex, result="Accepted")
         wrong_session = vendor_attempt(journal, local + 1, uuid.uuid4().hex, result="Rejected")
         joined = write_request(
@@ -191,7 +202,7 @@ def test_stop_report_keeps_joined_replies_with_their_original_attempt(tmp_path):
             local,
             dispatched=False,
             joined=True,
-            local_attempts=[first],
+            local_attempts=[first, orphan],
             vendor_attempts=[vendor, wrong_session],
         )
         report = stop_incident_report(path, events)
@@ -201,6 +212,7 @@ def test_stop_report_keeps_joined_replies_with_their_original_attempt(tmp_path):
         attempts = report["wire"]["joined_attempts"]
         assert [(attempt["origin"], attempt["request"], attempt["reply"]) for attempt in attempts] == [
             ("local", reference(first), "rejected"),
+            ("local", reference(orphan), "unknown"),
             ("vendor", reference(vendor), "accepted"),
             ("vendor", reference(wrong_session), "unknown"),
         ]

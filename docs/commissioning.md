@@ -217,6 +217,9 @@ vendor connection before restoring and independently checking the original curre
 If the tool stops partway through, keep the service stopped and the car unplugged. Retain the journal and rerun
 the same restore action after correcting the reported problem. It uses the recorded stage and the charger’s
 actual settings to pick up where it stopped. Once the tool has recorded profile cleanup, the remaining steps use
-the charger’s local interface. If the settings conflict with the commissioned record or the
-charger reports an open session, resolve the issue with the installer before proceeding. When the tool reports
+the charger’s local interface. If a cleared proxy profile reappears during listener retirement, the tool stops
+before changing the route. After the installer removes the reappeared profile, rerun the same restore action.
+The tool verifies that the inventory matches the commissioned original resources and retains the recorded fault
+in the journal. If the settings conflict with the commissioned record or the charger reports an open session,
+resolve the issue with the installer before proceeding. When the tool reports
 `complete: true`, keep the proxy retired and confirm direct vendor-app access before reconnecting the car.

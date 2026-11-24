@@ -6,6 +6,7 @@ import argparse
 import json
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tests_model.catalog import FAMILIES, SCHEMA  # noqa: E402
 from tests_model.coverage import RISKS  # noqa: E402
+from tools.qualification_collection import ROOTS as QUALIFICATION_ROOTS  # noqa: E402
 
 
 # Declared coverage never masquerades as execution; finite denominators and focused-only areas remain distinct.
@@ -68,31 +70,35 @@ def main():
     if args.qualification_report:
         bundle_path = args.qualification_report.resolve()
         executors = args.collection_executors.resolve() if args.collection_executors else None
-        subprocess.run(
-            [
-                sys.executable,
-                "-B",
-                str(ROOT / "tools/validate.py"),
-                "--deployment-target",
-                "qualification-only",
-                "--tests-only",
-                "--qualification-report",
-                str(bundle_path),
-                *(["--collection-executors", str(executors)] if executors else []),
-            ],
-            cwd=ROOT,
-            check=True,
-        )
-        bundle = json.loads(bundle_path.read_text())
-        report["qualification"] = {
-            "commit": bundle["commit"],
-            "source_digest": bundle["source_digest"],
-            "phases": {
-                # The validator resolves paths inside the bundle from its repository working directory.
-                name: json.loads(((ROOT / path).resolve() / "audit.json").read_text())
-                for name, path in bundle["phases"].items()
-            },
-        }
+        with tempfile.TemporaryDirectory(prefix="recovery-coverage-") as scratch:
+            audited = Path(scratch) / "qualification.json"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(ROOT / "tools/validate.py"),
+                    "--deployment-target",
+                    "qualification-only",
+                    "--tests-only",
+                    "--qualification-report",
+                    str(bundle_path),
+                    "--qualification-audit-output",
+                    str(audited),
+                    *(["--collection-executors", str(executors)] if executors else []),
+                ],
+                cwd=ROOT,
+                check=True,
+            )
+            qualification = json.loads(audited.read_text())
+            if (
+                not isinstance(qualification, dict)
+                or not isinstance(qualification.get("commit"), str)
+                or not isinstance(qualification.get("source_digest"), str)
+                or not isinstance(qualification.get("phases"), dict)
+                or qualification["phases"].keys() != QUALIFICATION_ROOTS.keys()
+            ):
+                raise ValueError("invalid qualification audit output")
+            report["qualification"] = qualification
         report["execution_status"] = "all three complete 20-worker suites freshly re-audited"
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     return 0

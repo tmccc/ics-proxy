@@ -17,6 +17,7 @@ from .trial_handover_evidence import HandoverEvidence, require_digest
 from .trial_resources import Baseline
 
 ROUTE_FIELDS = frozenset({"sDomain", "sPort", "sURL", "allowSelfSign"})
+MANAGED_RESTORE_INTENT = "managed_vendor_restore"
 
 
 # Route changes are explicit native strings; neither credential fields nor another setting can enter this map.

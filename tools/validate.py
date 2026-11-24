@@ -162,6 +162,7 @@ def audit_qualification(path, source, metadata, python, results, collection_exec
     ):
         raise ValueError("qualification bundle does not cover this exact source and every required suite")
     engine_packages = {}
+    phase_audits = {}
     for suite in sorted(required):
         batch = Path(bundle["phases"][suite]).resolve()
         config = json.loads((batch / "config.json").read_text())
@@ -197,9 +198,10 @@ def audit_qualification(path, source, metadata, python, results, collection_exec
         ):
             results[f"qualification ({suite})"] = False
             raise ValueError("fresh raw audit did not establish full qualification for this exact suite/source")
+        phase_audits[suite] = audited
         if suite == "engine-model":
             engine_packages = config["expected_packages"]
-    return engine_packages
+    return engine_packages, phase_audits
 
 
 # Give the approved receipt its final name after the exact staged source is in place.
@@ -233,11 +235,11 @@ def run_full_qualification(
     validated_snapshot: Path | None = None,
     deployment: Deployment | None = None,
     include_static: bool = True,
-) -> None:
+) -> dict | None:
     if path is None:
         print("Full qualification requires --qualification-report from tools/parallel_qualify.py (20 workers).")
         results["full qualification"] = False
-        return
+        return None
     try:
         if validated_snapshot is not None and not include_static:
             raise ValueError("a deployment snapshot requires static checks")
@@ -259,7 +261,9 @@ def run_full_qualification(
                 )
             if week and deployment.installed_python is not None and not deployment.installed_python.is_file():
                 raise ValueError("--ics-installed-python must select the previous standalone interpreter")
-            engine_packages = audit_qualification(path, source, metadata, python, results, collection_executors)
+            engine_packages, phase_audits = audit_qualification(
+                path, source, metadata, python, results, collection_executors
+            )
             if target == "ics-proxy":
                 ics_predeployment.require_standalone_pins(
                     source, engine_packages.items(), runtime="audited engine runtime"
@@ -283,8 +287,14 @@ def run_full_qualification(
                         ),
                     )
                     results["installation week"] = True
-            if destination is not None and all(results.values()):
-                publish_snapshot(source, destination, metadata)
+            if all(results.values()):
+                if destination is not None:
+                    publish_snapshot(source, destination, metadata)
+                return {
+                    "commit": metadata["commit"],
+                    "source_digest": metadata["source_digest"],
+                    "phases": phase_audits,
+                }
     except (
         OSError,
         ValueError,
@@ -295,6 +305,7 @@ def run_full_qualification(
     ) as error:
         print(f"Full qualification is invalid: {type(error).__name__}: {error}")
         results["full qualification"] = False
+    return None
 
 
 # Orchestrate the CI-equivalent checks.
@@ -312,6 +323,11 @@ def main() -> int:
     parser.add_argument("--qualification-report", type=Path, default=os.environ.get("OCPP_QUALIFICATION_REPORT"))
     parser.add_argument(
         "--collection-executors", type=Path, help="explicit trusted source-pinned collection executor map"
+    )
+    parser.add_argument(
+        "--qualification-audit-output",
+        type=Path,
+        help="write fresh, successful phase audits as JSON for a qualification-only run",
     )
     parser.add_argument("--validated-snapshot", type=Path, help="retain the source that passed full qualification")
     parser.add_argument(
@@ -342,6 +358,10 @@ def main() -> int:
         parser.error("--validated-snapshot requires full validation")
     if args.validated_snapshot and args.deployment_target == "qualification-only":
         parser.error("an evidence audit cannot produce a deployment snapshot")
+    if args.qualification_audit_output and (
+        args.quick or args.expression or args.deployment_target != "qualification-only"
+    ):
+        parser.error("--qualification-audit-output requires a full qualification-only audit")
     python = venv_python()
     results: dict[str, bool] = {}
 
@@ -360,7 +380,7 @@ def main() -> int:
             print(f"  NEW FAILURE: {item}")
         print("Targeted engine tests only; full qualification requires all three 20-worker suites.")
     elif not args.quick:
-        run_full_qualification(
+        qualification = run_full_qualification(
             args.qualification_report,
             python,
             results,
@@ -371,6 +391,12 @@ def main() -> int:
             ),
             include_static=not args.tests_only,
         )
+        if qualification is not None and args.qualification_audit_output is not None:
+            try:
+                args.qualification_audit_output.write_text(json.dumps(qualification, indent=2) + "\n")
+            except OSError as error:
+                print(f"Unable to write qualification audit output: {error}")
+                results["qualification audit output"] = False
 
     print("\nSummary")
     for name, ok in results.items():

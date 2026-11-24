@@ -409,6 +409,9 @@ def test_coverage_cli_forwards_chosen_collection_executors(tmp_path, monkeypatch
     # Only CLI propagation is exercised here; no validator, worker, test body or qualification is launched.
     def capture(command, **kwargs):
         commands.append(command)
+        receipt = Path(command[command.index("--qualification-audit-output") + 1])
+        phases = dict.fromkeys(recovery_coverage.QUALIFICATION_ROOTS, {})
+        receipt.write_text(json.dumps({"commit": "synthetic", "source_digest": "synthetic", "phases": phases}))
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(recovery_coverage.subprocess, "run", capture)
@@ -430,13 +433,13 @@ def test_coverage_cli_forwards_chosen_collection_executors(tmp_path, monkeypatch
     assert len(commands) == 1 and commands[0][-2:] == ["--collection-executors", str(chosen)]
 
 
-# Intent: the coverage CLI reads the exact audits freshly written by validation when launched outside the checkout.
-# Why: same-named caller files must never be mistaken for the validator's evidence.
+# Intent: the coverage CLI retains the validator's exact source and audit output when launched outside the checkout.
+# Why: the input bundle and cached audits can change after validation passes.
 @pytest.mark.parametrize("relative_bundle", [False, True], ids=["absolute-bundle", "relative-bundle"])
 def test_coverage_cli_reads_the_validated_evidence(tmp_path, monkeypatch, relative_bundle):
     from tools import recovery_coverage, validate
 
-    source, caller, frozen = (tmp_path / name for name in ("source", "caller", "frozen"))
+    source, caller = (tmp_path / name for name in ("source", "caller"))
     commit = {"commit": "synthetic-validated-commit", "source_digest": "synthetic-validated-digest"}
     suites = ("engine-model", "ha-proxy", "ha-proxy-2026.10")
     phases = {suite: f"artifacts/{suite}" for suite in suites}
@@ -447,43 +450,61 @@ def test_coverage_cli_reads_the_validated_evidence(tmp_path, monkeypatch, relati
         decoy = caller / phase / "audit.json"
         decoy.parent.mkdir(parents=True)
         decoy.write_text(json.dumps({"synthetic_unvalidated_audit": True}))
-    (source / "bundle.json").write_text(json.dumps(commit | {"phases": phases, "synthetic_decoy": True}))
+    (source / "bundle.json").write_text(json.dumps({"commit": "decoy", "source_digest": "decoy", "phases": phases}))
     bundle_path = caller / "bundle.json"
     bundle_path.write_text(json.dumps(commit | {"phases": phases}))
     chosen = caller / "executors.json"
     chosen.write_text("{}")
-    written = {}
+    frozen_sources, receipts = [], []
+    written, verified = {}, {}
+
+    # Keep the repository working directory and independent audit source distinct.
+    def freeze_candidate(repo, frozen):
+        assert repo == source
+        frozen_sources.append(frozen)
+        return commit
 
     # Run the actual validator's path handling and represent only the auditor output, without launching workers.
     def audited_step(name, command, results, *, cwd):
+        (frozen,) = frozen_sources
         assert command[1:4] == ["-B", "-X", f"pycache_prefix={frozen.parent / 'qualification-audit-bytecode'}"]
         assert Path(command[4]) == frozen / "tools/audit_parallel_qualification.py" and cwd == frozen
         assert command[-2:] == ["--collection-executors", str(chosen)]
         batch = Path(command[5])
         config = json.loads((batch / "config.json").read_text())
         audit = config | commit | {"full_qualification_passed": True, "synthetic_fresh_audit": True}
+        verified[config["suite"]] = audit
         path = batch / "audit.json"
         path.write_text(json.dumps(audit))
         written[config["suite"]] = path
+        results[name] = True
         return subprocess.CompletedProcess(command, 0, json.dumps(audit))
 
-    # Run the real audit's path resolution in the validator's selected working directory.
+    # Run the production validator CLI logic, then replace the external inputs before returning to coverage.
     def run_validator(command, *, cwd, check):
         assert command[:3] == [sys.executable, "-B", str(source / "tools/validate.py")]
         assert command[3:6] == ["--deployment-target", "qualification-only", "--tests-only"]
         assert cwd == source and check is True
-        bundle = Path(command[command.index("--qualification-report") + 1])
-        executors = Path(command[command.index("--collection-executors") + 1])
+        receipt = Path(command[command.index("--qualification-audit-output") + 1])
+        receipts.append(receipt)
         with monkeypatch.context() as child:
             child.chdir(cwd)
-            assert bundle.resolve() == bundle_path
-            validate.audit_qualification(bundle, frozen, commit, sys.executable, {}, executors)
+            child.setattr(sys, "argv", command[2:])
+            assert validate.main() == 0
+        assert receipt.is_file()
+        bundle_path.write_text(
+            json.dumps({"commit": "replacement-commit", "source_digest": "replacement-digest", "phases": phases})
+        )
+        for path in written.values():
+            path.write_text(json.dumps({"synthetic_unvalidated_audit": True}))
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.chdir(caller)
     monkeypatch.setattr(recovery_coverage, "ROOT", source)
     monkeypatch.setattr(recovery_coverage, "matrix", lambda: {"SYNTHETIC_NOT_QUALIFICATION": True})
     monkeypatch.setattr(recovery_coverage.subprocess, "run", run_validator)
+    monkeypatch.setattr(validate, "ROOT", source)
+    monkeypatch.setattr(validate, "freeze", freeze_candidate)
     monkeypatch.setattr(validate, "run_step", audited_step)
     monkeypatch.setattr(
         sys,
@@ -501,10 +522,10 @@ def test_coverage_cli_reads_the_validated_evidence(tmp_path, monkeypatch, relati
     assert recovery_coverage.main() == 0
     assert written == {suite: source / phase / "audit.json" for suite, phase in phases.items()}
     report = json.loads((caller / "coverage.json").read_text())
-    assert report["qualification"] == commit | {
-        "phases": {suite: json.loads(path.read_text()) for suite, path in written.items()}
-    }
+    assert report["qualification"] == commit | {"phases": verified}
     assert report["execution_status"] == "all three complete 20-worker suites freshly re-audited"
+    (receipt,) = receipts
+    assert not receipt.parent.exists()
 
 
 # Intent: timed-out collection cleanup removes only its exact nonce-owned container and never another owner's container.

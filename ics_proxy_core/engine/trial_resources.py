@@ -500,6 +500,20 @@ class ResourceBook:
             raise
         return sorted(result, key=lambda r: (r.identifier == HUB_PROFILE_ID, r.key))
 
+    # Prove exact cleanup for a direct-vendor route retry while retaining the inventory fault and receipts.
+    def require_restored_inventory(self, evidence: Evidence, reappeared: str) -> None:
+        evidence.require_unplugged(self.journal.identity, max_age=5)
+        self.check_originals(evidence)
+        states = {row["key"]: row["state"] for row in self.journal.db.execute("SELECT key, state FROM trial_resources")}
+        current_keys = {resource.key for resource in evidence.resources}
+        original_keys = {resource.key for resource in self.baseline.resources}
+        if (
+            states.get(reappeared) != "absent_verified"
+            or any(state != "absent_verified" for state in states.values())
+            or current_keys != original_keys
+        ):
+            raise NativeContentError("resources", "native inventory reconciliation is still required")
+
     # Keep a proved missing profile fenced even when SQLite cannot save the inventory observation.
     def record_missing_station(self, evidence: Evidence) -> bool:
         key = f"profile:{HUB_PROFILE_ID}"

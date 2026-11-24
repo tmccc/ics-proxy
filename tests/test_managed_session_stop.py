@@ -17,6 +17,7 @@ from websockets.asyncio.client import connect
 from ics_proxy_core.engine import managed_session_stop, rpc
 from ics_proxy_core.engine.command_outcomes import ForwardedReply, OwnerWire
 from ics_proxy_core.engine.gateway import Gateway, decode
+from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
 from ics_proxy_core.engine.managed_intent import ManagedRequests, insert_request
 from ics_proxy_core.engine.managed_session_stop import ManagedSessionStop
@@ -24,10 +25,10 @@ from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError
 from ics_proxy_core.frames import build_call_error, build_call_result
-from tests.charge_rig import owner_rig, positive_flow, report_actual_stop
+from tests.charge_rig import ChargeRig, owner_rig, positive_flow, report_actual_stop
 from tests.current_rig import adjustable, locally_ready, select
 from tests.handover_helpers import crash
-from tests.managed_rig import healthy
+from tests.managed_rig import healthy, introduced, managed_session
 from tests.management_peer import TOKEN, call
 from tests.native_peer_failures import InterruptedNativePeer
 from tests.prototype_rig import BOOT, START
@@ -1029,6 +1030,81 @@ def test_retained_session_stop_without_primary_requires_its_exact_claim(tmp_path
         journal.outcomes.retry_owner_writes()
         assert journal.outcomes.accepted_stop(local) is (damage == "none")
         assert journal.active() == local
+
+
+# Intent: keep definite protective Stop replies even when neither primary wire write succeeded.
+# Why: Pause and shutdown have distinct ticket and dispatch bindings, including older shutdown records.
+@pytest.mark.parametrize("operation", ["pause", "shutdown", "legacy_shutdown"])
+def test_retained_protective_stop_keeps_its_original_binding(tmp_path, operation):
+    path = tmp_path / "stop-journal.sqlite"
+    ticket, boot, wire = "stop-ticket", "boot", "stop-wire"
+    key = f"retained_stop_owner:{wire}"
+    with closing(Journal(path, "synthetic-charger")) as journal:
+        local = journal.start("start-report", START)["transactionId"]
+        binding = {"ticket": ticket, "boot": boot, "local": local}
+        request = None
+        if operation == "pause":
+            ManagedRequests(journal)
+            request = "pause-request"
+            insert_request(journal, request, "pause", 0, {"_stop": binding}, state="running")
+        else:
+            if operation == "shutdown":
+                binding["stop_wire"] = wire
+            journal.put("trial_shutdown_attempt", binding)
+        reply = OwnerWire(wire, request, ticket, boot, "RemoteStopTransaction", local, None, "Accepted")
+        journal.put(key, asdict(reply))
+
+    with closing(Journal(path, "synthetic-charger")) as journal:
+        assert journal.outcomes.accepted_stop(local, ticket=ticket)
+        journal.outcomes.retry_owner_writes()
+        assert journal.outcomes.owner_wires("ticket", ticket) == (reply,)
+        assert journal.get(key) is None
+
+
+# Intent: leave an orphaned reply in the journal while sending a real Stop for the same open session.
+# Why: a checkpoint without a dispatch claim cannot cover a subsequent request.
+async def test_orphan_retained_stop_does_not_cover_next_request(tmp_path, tls, unused_tcp_port, monkeypatch, caplog):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        j, rig = t.session.journal, t.rig
+        local = await positive_flow(t, "daily")
+        orphan, wire = uuid.uuid4().hex, uuid.uuid4().hex
+        key = f"retained_stop_owner:{wire}"
+        saved = asdict(OwnerWire(wire, orphan, orphan, "old-boot", "RemoteStopTransaction", local, None, "Accepted"))
+        j.put(key, saved)
+        await t.controller.charging.close()
+        await crash(t.session)
+        caplog.clear()
+
+        session = managed_session(rig)
+        j, bench = session.journal, rig.bench
+        assert j.active() == local
+        j.outcomes.retry_owner_writes()
+        assert not j.outcomes.accepted_stop(local)
+        await session.start()
+        c = ManagedController(session)
+        try:
+            async with rig.charger(session) as charger:
+                await introduced(rig, session, charger, "replacement-stop-boot")
+                await healthy(c)
+                target, revision = c.session_stop.target(), c.requests.intent().revision
+                assert target is not None
+                request = uuid.uuid4().hex
+                assert c.command(request, "stop_session", revision, target=target)["state"] == "accepted"
+                await asyncio.wait_for(bench.remote_stop.wait(), 3)
+                await until(lambda: j.outcomes.accepted_stop(local))
+                attempt = j.outcomes.accepted_stop_attempt(local)
+                assert attempt is not None and attempt.identifier == request
+                await natural_stop(ChargeRig(rig, session, c, charger), local)
+                await healthy(c)
+                assert c.requests.receipt(request)["state"] == "completed"
+            stops = [frame[3]["transactionId"] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"]
+            assert stops == [local]
+            assert j.get(key) == saved
+            assert not j.outcomes.owner_wires("request", orphan)
+            assert caplog.text.count("Invalid retained owner transaction reply checkpoint") == 1
+        finally:
+            await c.charging.close()
+            await session.close()
 
 
 # Intent: the service retries publication of the same closed Stop receipt after SQLite rolls back its write.

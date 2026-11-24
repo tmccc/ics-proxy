@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Resume an interrupted return to the vendor backend once fresh readings confirm that a reappearing proxy
+  profile has been removed.
+- Require evidence of the original session Stop before using a retained reply as acceptance.
+- Build recovery coverage reports from the qualification results that the validator actually checked.
 - Join an earlier same-session Stop when accepting the local request and retain verified closure through
   temporary receipt write failures.
 - Allow restricted restart after a known Stop during a vendor outage while the charger’s local status catches up.

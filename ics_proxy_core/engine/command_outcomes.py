@@ -546,6 +546,7 @@ class CommandOutcomes:
                         is not None
                     ):
                         return False
+                    return True
                 elif action == "pause":
                     bound = result.get("_stop")
                     if (
@@ -564,7 +565,8 @@ class CommandOutcomes:
                     reply.boot,
                     reply.local,
                 )
-        return True
+        # Session-only Stops use the request ID as their ticket and require the claim above.
+        return reply.request != reply.ticket
 
     # A forwarded checkpoint still belongs to the original vendor mutation and exact charger call.
     def _retained_vendor_replies(self) -> tuple[ForwardedReply, ...]:

@@ -70,15 +70,29 @@ def owner_reply(db: sqlite3.Connection, tables: set[str], request: str, local: i
     primary = []
     if "owner_command_wires" in tables:
         primary = db.execute(
-            "SELECT wire,boot,reply FROM owner_command_wires "
-            "WHERE request=? AND ticket=? AND action=? AND local=? LIMIT 2",
-            (request, request, STOP_ACTION, local),
+            "SELECT wire,boot,reply,local FROM owner_command_wires WHERE request=? AND ticket=? AND action=? LIMIT 2",
+            (request, request, STOP_ACTION),
         ).fetchall()
-    if len(primary) > 1 or primary and wire_id(primary[0][0]) is None:
+    if len(primary) > 1 or primary and (wire_id(primary[0][0]) is None or local_id(primary[0][3]) != local):
         return wire_fields("possible_dispatch")
     if primary and primary[0][2] is not None:
         primary_reply = REPLIES.get(primary[0][2], UNKNOWN)
         return wire_fields("possible_dispatch", primary_reply, "wire_journal" if primary_reply != UNKNOWN else None)
+
+    if not primary:
+        claim = db.execute(
+            "SELECT CASE WHEN length(result)<=65536 THEN CAST(result AS BLOB) END FROM managed_requests "
+            "WHERE id=? AND action=?",
+            (request, STOP_SESSION),
+        ).fetchone()
+        binding = object_fields(claim[0]).get("_session_stop") if claim is not None else None
+        if (
+            not isinstance(binding, dict)
+            or local_id(binding.get("local")) != local
+            or type(binding.get("dispatched")) not in (int, bool)
+            or binding["dispatched"] != 1
+        ):
+            return wire_fields()
 
     checkpoints = []
     if "meta" in tables:

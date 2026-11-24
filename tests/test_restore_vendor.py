@@ -248,23 +248,31 @@ async def test_restore_refuses_a_cleanup_connection_replacement(tmp_path, tls, u
         assert 7001 in rig.bench.firmware.profiles and rig.bench.firmware.effective_limit() == 0
 
 
-# Intent: check independently for any profile that reappears while the maintenance listener retires.
-# Why: even a verified clear should not let the proxy leave its old charging profile on the original route.
+# Intent: refuse a profile that reappears during listener retirement, then resume after independent cleanup.
+# Why: the route change requires verified absence even after a previously confirmed clear.
 async def test_restore_refuses_a_profile_reappearing_after_cleanup(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with commissioned(
         tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
     ) as test:
         rig = test.rig
+        peer, bench = rig.peer, rig.bench
         await stop_paused(test)
-        saved_profile = copy.deepcopy(rig.bench.firmware.profiles[7001])
+        saved_profile = copy.deepcopy(bench.firmware.profiles[7001])
 
         # Model the charger independently resurrecting that profile as its proxy connection goes offline.
         def reappear():
-            assert 7001 not in rig.bench.firmware.profiles
-            rig.bench.firmware.profiles[7001] = saved_profile
+            assert 7001 not in bench.firmware.profiles
+            bench.firmware.profiles[7001] = saved_profile
+
+        # Inspect the saved fault after the restoration tool closes its journal.
+        def inventory_fault():
+            with closing(sqlite3.connect(rig.prepared.config.journal)) as db:
+                row = db.execute("SELECT value FROM meta WHERE key='trial_inventory_fault'").fetchone()
+                return json.loads(row[0])
 
         config, spec = tmp_path / "trial.json", spec_file(tmp_path, rig)
-        restore = asyncio.create_task(run("restore", config, spec, rig.prepared.observer.port))
+        args = ("restore", config, spec, rig.prepared.observer.port)
+        restore = asyncio.create_task(run(*args))
         charger = asyncio.create_task(cleanup_charger(test, on_disconnect=reappear))
         try:
             with pytest.raises(SecurityError, match="resource_reappeared"):
@@ -275,9 +283,50 @@ async def test_restore_refuses_a_profile_reappearing_after_cleanup(tmp_path, tls
                 task.cancel()
             await asyncio.gather(restore, charger, return_exceptions=True)
 
-        assert [patch for patch, _, _ in rig.peer.writes] == [{"AmpLmt": "6"}]
-        assert rig.peer.configuration == rig.spec.configuration("trial")
-        assert journal_facts(rig.prepared.config.journal)[1] == "backend_restore_pending"
+        records, phase = journal_facts(rig.prepared.config.journal)
+        assert phase == "backend_restore_pending"
+        fault = {"reason": "resource_reappeared", "resource": "profile:7001"}
+        assert inventory_fault() == fault
+        rig.prepared.config.certificate.unlink()
+        rig.prepared.config.private_key.unlink()
+        peers_before = list(bench.device_calls)
+        with pytest.raises(SecurityError, match="native inventory reconciliation is still required"):
+            await asyncio.wait_for(run(*args), 5)
+        saved_profile["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] = 6
+        with pytest.raises(SecurityError, match="native inventory reconciliation is still required"):
+            await asyncio.wait_for(run(*args), 5)
+        del bench.firmware.profiles[7001]
+        bench.firmware.profiles[7002] = saved_profile | {"chargingProfileId": 7002}
+        with pytest.raises(SecurityError, match="native inventory reconciliation is still required"):
+            await asyncio.wait_for(run(*args), 5)
+        assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}]
+        assert peer.configuration == rig.spec.configuration("trial")
+        assert inventory_fault() == fault
+        del bench.firmware.profiles[7002]
+
+        # Reconnect only once the original route is observed offline at 6 A.
+        async def reconnect_vendor():
+            await peer.read_original_offline.wait()
+            assert peer.runtime_user == 60 and not bench.online
+            bench.online = True
+
+        restore = asyncio.create_task(run(*args))
+        vendor = asyncio.create_task(reconnect_vendor())
+        try:
+            result, _ = await asyncio.wait_for(asyncio.gather(restore, vendor), 5)
+            assert result == 0
+        finally:
+            for task in (restore, vendor):
+                task.cancel()
+            await asyncio.gather(restore, vendor, return_exceptions=True)
+
+        route = {key: rig.spec.original_configuration[key] for key in rig.spec.trial_route}
+        assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}, route, {"AmpLmt": "32"}]
+        assert peer.writes[1][2] is False and peer.writes[-1][2] is True
+        assert peer.configuration == rig.spec.original_configuration and peer.runtime_user == 320
+        assert bench.device_calls == peers_before and not bench.firmware.profiles
+        assert journal_facts(rig.prepared.config.journal) == (records, "complete")
+        assert inventory_fault() == fault
 
 
 # Advance only the evidence clock after TCP opens for one specific settings write.

@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 from ics_proxy_core.engine.gateway import Gateway  # noqa: E402
 from ics_proxy_core.engine.managed_current import managed_current_ceiling  # noqa: E402
 from ics_proxy_core.engine.managed_recovery_zero import require_original_zero, require_station_zero  # noqa: E402
-from ics_proxy_core.engine.native_bounded import ROUTE_FIELDS, NativeBoundedSpec  # noqa: E402
+from ics_proxy_core.engine.native_bounded import MANAGED_RESTORE_INTENT, ROUTE_FIELDS, NativeBoundedSpec  # noqa: E402
 from ics_proxy_core.engine.native_bounded_handover import NativeBoundedHandover, NativePatch  # noqa: E402
 from ics_proxy_core.engine.native_history import audit_history  # noqa: E402
 from ics_proxy_core.engine.native_history_recovery import history_recovery_idle  # noqa: E402
@@ -37,8 +37,6 @@ from ics_proxy_core.engine.trial_session import (  # noqa: E402
 )
 from tools.trial_proxy import emit, native_spec  # noqa: E402
 
-_RESTORE_INTENT = "managed_vendor_restore"
-
 
 # Freeze managed operation before lowering the independently enforced USER limit or removing any profile.
 async def prepare_cleanup(
@@ -46,7 +44,7 @@ async def prepare_cleanup(
 ) -> None:
     journal = book.journal
     phase = journal.phase.read()
-    intent = journal.get(_RESTORE_INTENT)
+    intent = journal.get(MANAGED_RESTORE_INTENT)
     if phase.cleanup and intent != spec.digest:
         raise RecoveryRequiredError("cleanup does not belong to this managed restoration")
     if phase.value in ("backend_restore_pending", "complete"):
@@ -66,7 +64,7 @@ async def prepare_cleanup(
             raise RecoveryRequiredError("restoration needs a settled managed Pause at a selected 6 A")
         require_original_zero(journal, book, spec, native)
         with journal.atomic():
-            journal.put(_RESTORE_INTENT, spec.digest)
+            journal.put(MANAGED_RESTORE_INTENT, spec.digest)
             journal.phase.begin_cleanup()
 
     if ceiling == 32:
@@ -176,7 +174,7 @@ async def run(action: str, config_path: Path, spec_path: Path, native_port: int 
     with closing(open_native_journal(config.journal, config.identity, spec, require_existing=True)) as journal:
         book = ResourceBook(journal, prepared.baseline)
         if journal.phase.read().value in ("backend_restore_pending", "complete"):
-            if journal.get(_RESTORE_INTENT) != spec.digest:
+            if journal.get(MANAGED_RESTORE_INTENT) != spec.digest:
                 raise RecoveryRequiredError("cleanup does not belong to this managed restoration")
             gateway = Gateway(journal, Policy(allow_local_start=False))
             handover = NativeBoundedHandover(
@@ -202,7 +200,7 @@ async def run(action: str, config_path: Path, spec_path: Path, native_port: int 
         require_existing_journal=True,
     )
     try:
-        if session.journal.get(_RESTORE_INTENT) != spec.digest:
+        if session.journal.get(MANAGED_RESTORE_INTENT) != spec.digest:
             raise RecoveryRequiredError("cleanup does not belong to this managed restoration")
         if session.journal.phase.read().value == "rollback":
             await cleanup_profiles(session)

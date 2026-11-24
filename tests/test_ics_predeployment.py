@@ -635,6 +635,7 @@ def test_release_checks_the_frozen_candidate_after_checkout_changes(tmp_path, mo
         assert metadata["commit"] == candidate
         assert (repo / "tools/managed_proxy.py").read_text() == "# installed\n"
         results["three suites"] = True
+        return {}, {}
 
     monkeypatch.setattr(validate, "run_step", step)
     monkeypatch.setattr(validate, "audit_qualification", audit)
@@ -672,6 +673,7 @@ def test_tests_only_audits_frozen_source_without_publishing(tmp_path, monkeypatc
         assert (source / "tools/managed_proxy.py").read_text() == "# candidate\n"
         audits.append(metadata["commit"])
         results["three suites"] = True
+        return {}, {}
 
     # Detect any unexpected static check in the tests-only path.
     def unexpected_static(*args, **kwargs):
@@ -725,7 +727,7 @@ def test_release_snapshot_waits_for_required_checks(
     def audit(path, source, metadata, python, results, executors):
         assert metadata["commit"] == candidate
         results["three suites"] = True
-        return {"websockets": "15.0.1" if pin_matches else "16.0"}
+        return {"websockets": "15.0.1" if pin_matches else "16.0"}, {}
 
     # Capture the command boundary before the release process can mark a snapshot as approved.
     def invoke(check, source, output, metadata, python, *, installed=None, installed_python=None):
@@ -775,6 +777,7 @@ def test_failed_validation_can_retry_the_same_snapshot_directory(tmp_path, monke
         if fail:
             raise ValueError("synthetic failed audit")
         results["three suites"] = True
+        return {}, {}
 
     monkeypatch.setattr(validate, "audit_qualification", audit)
     snapshot = tmp_path / "target"

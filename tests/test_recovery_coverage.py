@@ -1,9 +1,14 @@
 """Coverage declarations retain real source links, exact denominators and distinct safety/recovery obligations."""
 
+import json
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
+
 from tests_model.catalog import FAMILIES
-from tools.recovery_coverage import matrix
+from tools import recovery_coverage
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -11,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # Intent: every declared finite family and named focused risk must resolve to executable, source-pinned tests.
 # Why: a matrix with dangling links, uncounted exclusions or a missing risk is not reviewable coverage evidence.
 def test_coverage_registry_has_real_tests_and_exact_denominators():
-    report = matrix()
+    report = recovery_coverage.matrix()
     risks = {row["identifier"]: row for row in report["risks"]}
     assert len(risks) == len(report["risks"])
     for family in FAMILIES:
@@ -22,3 +27,52 @@ def test_coverage_registry_has_real_tests_and_exact_denominators():
         assert risk["safety"] and risk["recovery"] and risk["limits"] and risk["focused"]
         assert all((ROOT / path).is_file() for path in risk["focused"])
     assert report["execution_status"] == "declared only; no qualification inferred"
+
+
+# Intent: failed validation and unavailable audit output preserve the previous report and remove private scratch.
+# Why: incomplete evidence must not produce an attached qualification claim.
+@pytest.mark.parametrize(
+    ("returncode", "receipt_contents", "error"),
+    [
+        (1, None, subprocess.CalledProcessError),
+        (0, None, FileNotFoundError),
+        (0, "{", json.JSONDecodeError),
+        (0, "{}", ValueError),
+        (0, '{"commit": "synthetic", "source_digest": "synthetic", "phases": {}}', ValueError),
+    ],
+    ids=["failed-validation", "missing-receipt", "invalid-json", "missing-fields", "missing-suites"],
+)
+def test_coverage_rejects_unavailable_audit_output(tmp_path, monkeypatch, returncode, receipt_contents, error):
+    output = tmp_path / "coverage.json"
+    output.write_text("previous report")
+    receipts = []
+
+    # Simulate the subprocess exit and handoff states without launching a qualification run.
+    def validator(command, *, cwd, check):
+        receipt = Path(command[command.index("--qualification-audit-output") + 1])
+        receipts.append(receipt)
+        if receipt_contents is not None:
+            receipt.write_text(receipt_contents)
+        completed = subprocess.CompletedProcess(command, returncode)
+        if check:
+            completed.check_returncode()
+        return completed
+
+    monkeypatch.setattr(recovery_coverage.subprocess, "run", validator)
+    monkeypatch.setattr(recovery_coverage, "matrix", dict)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "recovery_coverage",
+            "--output",
+            str(output),
+            "--qualification-report",
+            str(tmp_path / "bundle.json"),
+        ],
+    )
+    with pytest.raises(error):
+        recovery_coverage.main()
+    assert output.read_text() == "previous report"
+    (receipt,) = receipts
+    assert not receipt.parent.exists()
