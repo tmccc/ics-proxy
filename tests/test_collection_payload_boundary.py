@@ -93,4 +93,5 @@ def test_actual_canonical_collection_checks_subprocess_payload(tmp_path, monkeyp
     else:
         with pytest.raises(ValueError):
             audit.canonical_collection(batch, {"suite": "engine-model", "specs": ["tests"]}, commit, checksum)
-    assert len(calls) == 1 and Path(calls[0][2]) == helper
+    (command,) = calls
+    assert Path(command[command.index("--replay-batch") - 1]) == helper
