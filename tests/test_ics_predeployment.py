@@ -332,8 +332,9 @@ def test_installation_week_requires_candidate_standalone_pins(
         packages.append(["fixture.extra", extra_version])
 
     # Keep the import selection independent of the order of installed package metadata.
-    def identity(python, source, *, homeassistant):
-        assert homeassistant
+    def identity(python, root, *, homeassistant=False):
+        assert python == sys.executable
+        assert root == (source if homeassistant else previous)
         return {"packages": sorted(packages), "homeassistant_version": active_version, "openssl_libraries": {}}
 
     monkeypatch.setattr(checks, "runtime_identity", identity)
@@ -616,19 +617,26 @@ def test_installation_week_runner_verifies_selected_home_assistant(tmp_path, act
 # Why: the results would be incorrectly attributed to the interpreter and packages hashed at entry.
 def test_predeployment_check_requires_stable_runtime_during_verification(tmp_path, monkeypatch):
     packages = [["homeassistant", "2026.11.0"], ["websockets", "15.0.1"]]
-    identities = iter(
-        {"packages": packages, "runtime_sha256": digest, "homeassistant_version": "2026.11.0"} for digest in ("a", "b")
-    )
+    runtime_digest = "before"
     (tmp_path / "requirements-trial.txt").write_text("websockets==15.0.1\n")
     (tmp_path / "requirements-ha-proxy.txt").write_text("homeassistant==2026.11.0\n")
     (tmp_path / "requirements-ha-proxy-2026.10.txt").write_text("homeassistant==2026.10.4\n")
 
-    # Simulate a passing test so only the changed runtime can withhold the receipt.
+    # The installed runtime can be probed separately without consuming the candidate's changed identity.
+    def identity(python, source, *, homeassistant=False):
+        runtime = {"packages": packages, "runtime_sha256": "installed", "openssl_libraries": {}}
+        if homeassistant:
+            runtime.update(runtime_sha256=runtime_digest, homeassistant_version="2026.11.0")
+        return runtime
+
+    # Simulate a passing test and change its runtime before the verifier decides whether to publish.
     def run(check, python, source, attempt, previous, *, ha_version, installed_python):
+        nonlocal runtime_digest
         classname, name = check.case.rsplit(".", 1)
         (attempt / "pytest.xml").write_text(f'<testsuite><testcase classname="{classname}" name="{name}"/></testsuite>')
+        runtime_digest = "after"
 
-    monkeypatch.setattr(checks, "runtime_identity", lambda python, source, *, homeassistant: next(identities))
+    monkeypatch.setattr(checks, "runtime_identity", identity)
     monkeypatch.setattr(checks, "run_check", run)
     output = tmp_path / "evidence"
     with pytest.raises(ValueError, match="installation week runtime changed during verification"):
