@@ -86,11 +86,6 @@ async def test_migrated_snapshot_requires_intact_history_and_later_pause(
         await proxy.close()
         config = proxy.rig.prepared.config
         deferred_start = "managed_deferred_start"
-        with (
-            stopped_journal(config.journal) as db,
-            pytest.raises(RollbackRefusedError, match="^journal_schema_unrehearsed$"),
-        ):
-            check_snapshot(db, config, migrated_only=True)
         with closing(sqlite3.connect(config.journal)) as db, db:
             # Recreate the historical schema on this test journal after the candidate has stopped.
             # The old build never recorded these per-wire or forwarded outcome rows.
@@ -115,6 +110,17 @@ async def test_migrated_snapshot_requires_intact_history_and_later_pause(
             old_pause = retain_history(db, time.time())
             # Successful association of a same-tag Start retains the empty marker.
             db.execute("INSERT INTO meta VALUES(?,?)", (deferred_start, "{}"))
+
+        # Even an empty authorization lookup table and its index are outside the historical rehearsal.
+        with (
+            stopped_journal(config.journal) as db,
+            pytest.raises(RollbackRefusedError, match="^journal_schema_unrehearsed$"),
+        ):
+            check_snapshot(db, config, migrated_only=True)
+        with closing(sqlite3.connect(config.journal)) as db, db:
+            assert db.execute("SELECT 1 FROM auth_pending_queries LIMIT 1").fetchone() is None
+            db.execute("DROP TABLE auth_pending_queries")
+
         snapshot = proxy.durable()
         with stopped_journal(config.journal) as db:
             assert check_snapshot(db, config, migrated_only=True) == status["control_revision"]

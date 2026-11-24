@@ -30,8 +30,8 @@ def unplugged(route: str = "trial", user: int = 6) -> HandoverEvidence:
     return replace(evidence, physical=replace(evidence.physical, cp="A", connection="Unplug"))
 
 
-# Intent: only the explicit managed trial option accepts a closed, fully zero unplugged station under native6.
-# Why: normal cable removal must not weaken connected initial admission or original32 restoration.
+# Intent: explicit unplugged validation accepts closed, zero evidence at 6 A on either supported route.
+# Why: cable removal and restoration need this evidence without weakening default admission or the bounded 32 A check.
 def test_unplugged_option_is_narrow_and_defaults_to_strict_connected_contract() -> None:
     policy, evidence = spec(), unplugged()
     with pytest.raises(SecurityError):
@@ -41,9 +41,30 @@ def test_unplugged_option_is_narrow_and_defaults_to_strict_connected_contract() 
     with pytest.raises(SecurityError):
         policy.require_admission(evidence, IDENTITY)
     with pytest.raises(SecurityError):
-        policy.require(unplugged("original"), IDENTITY, "original", allow_unplugged=True)
+        policy.require(unplugged("original"), IDENTITY, "original", closed=True)
+    policy.require(unplugged("original"), IDENTITY, "original", closed=True, allow_unplugged=True)
     with pytest.raises(SecurityError):
         policy.require(unplugged("original", 32), IDENTITY, "original", user_a=32, allow_unplugged=True)
+
+
+# Intent: the handover validator accepts unplugged original-route evidence only during cleanup.
+# Why: ordinary managed operation must not borrow the option for returning the charger to its own backend.
+async def test_managed_original_route_unplugged_check_requires_cleanup(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+) -> None:
+    async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
+        session = managed_session(rig)
+        rig.bench.cp, rig.bench.connection = "A", "Unplug"
+        evidence = await rig.prepared.observer.observe_handover()
+        session.journal.phase.activate()
+        with pytest.raises(SecurityError):
+            session.native_bounded.require(evidence, route="original", closed=True)
+
+        session.journal.phase.await_backend()
+        session.native_bounded.require(evidence, route="original", closed=True)
+        assert rig.bench.device_calls == []
 
 
 # Intent: contradictory connection, open session, offered output or any measured phase power still fails closed.
