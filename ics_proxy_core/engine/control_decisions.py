@@ -37,7 +37,7 @@ from .managed_intent import (
     request_pending,
     write_intent,
 )
-from .managed_records import CurrentFailure
+from .managed_records import CurrentFailure, CurrentFailureReason
 from .managed_release_wait import awaiting_known_stops, awaiting_observations
 from .managed_settlement import (
     charge_test_candidate,
@@ -141,12 +141,21 @@ class StopZeroEvidence(Protocol):
 
 
 class StopDecision(Enum):
-    """A Stop can use an exact acknowledgement, wait for its report, or need a physical send."""
+    """A Stop can send, use an acknowledgement, wait, or find the target no longer active."""
 
     SEND = auto()
     ACCEPTED = auto()
     WAIT_FOR_REPORT = auto()
     CLOSED = auto()
+
+
+class _StopReuse(Enum):
+    """Prior evidence to consider after checking a session-only Stop's possible dispatch."""
+
+    NO_ADDITIONAL_REUSE = auto()
+    # Includes acknowledgements retained in memory and pending shutdown attempts.
+    RECORDED = auto()
+    INCLUDE_CURRENT_BOOT_UNANSWERED = auto()
 
 
 class VendorStopAlreadyAcceptedError(Exception):
@@ -170,6 +179,8 @@ class ControlDecisions:
         self._fault_zero_retry: dict[str, float] = {}
         self._start_renewals: dict[tuple[str, int, int, str | None, str | None], asyncio.Future[bool]] = {}
 
+    # Return request
+
     # Admit an explicit Return without giving it authority to send or leaving Pause.
     def accept_return(self, controller: ManagedController, identifier: str, revision: int) -> dict[str, Any]:
         previous = controller.requests.existing(identifier, "app_control", revision)
@@ -184,6 +195,141 @@ class ControlDecisions:
         if controller.requests.intent().mode != "paused":
             raise RecoveryRequiredError("return requires a current paused intent")
         return controller.requests.accept(identifier, "app_control", revision)
+
+    # One accepted return receives one guarded attempt; uncertainty never changes persisted paused intent to app.
+    async def run_requested_return(self, controller: ManagedController, identifier: str, revision: int) -> None:
+        expected = controller.commands.decide(lambda: controller.requests.check_return_revision(identifier, revision))
+        if expected is None:
+            return
+        if controller.charging.return_blocked():
+            return  # An already accepted Return survives until observation completes the timed test under Pause.
+        j = self.journal
+        control = j.get("control", {})
+        if control.get("uncertain") and controller.requests.stop_owns_ticket(control.get("ticket")):
+            # Verify this exact protective Stop before treating Return as a positive release attempt.
+            try:
+                await controller.maintain_pause()
+            except RecoveryRequiredError, UnavailableError, TimeoutError:
+                return  # Closed zero and selective cleanup can finish while the same Return remains accepted.
+            control = j.get("control", {})
+            if controller.requests.intent() != expected or control.get("uncertain"):
+                return
+        if controller.commands.decide(lambda: controller.requests.return_waits_for_pause(expected)):
+            return  # The same Return survives the real Start and both closure reports under its Pause.
+        try:
+            await controller.recovery.restore(expected, return_request=identifier, claim_return=True)
+        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
+            return  # The owned completion retains the exact request disposition when its caller disappears.
+
+    # Mark an accepted Return running before preflight and leave busy requests accepted.
+    def claim_restore_request(
+        self,
+        coordinator: RecoveryCoordinator,
+        expected_intent: ControlIntent | None,
+        return_request: str | None,
+        claim_return: bool,
+        offline_pause: bool,
+    ) -> ControlIntent | RestoreProgress:
+        if coordinator.c.stopping:
+            return RestoreProgress(
+                RestoreState.WAITING, Pending(Prerequisite.SUPERSEDED, "managed retirement retains its hold")
+            )
+        if coordinator.pending():
+            return RestoreProgress(
+                RestoreState.WAITING,
+                Pending(Prerequisite.OWNED_OPERATION, "the current owned recovery completion remains pending"),
+            )
+        expected = expected_intent or coordinator.c.requests.intent()
+        if offline_pause and coordinator.c.requests.return_in_progress():
+            return RestoreProgress(
+                RestoreState.WAITING, Pending(Prerequisite.OWNED_OPERATION, "an explicit Return already owns recovery")
+            )
+        # The request driver claims running; the existing direct restore API retains accepted until publication.
+        if claim_return and return_request is not None:
+            try:
+                claimed = coordinator.c.requests.return_started(return_request, expected)
+            except sqlite3.Error:
+                return RestoreProgress(
+                    RestoreState.WAITING, Pending(Prerequisite.RECONCILIATION, "Return awaits journal storage")
+                )
+            if not claimed:
+                return RestoreProgress(
+                    RestoreState.WAITING, Pending(Prerequisite.SUPERSEDED, "Return no longer owns its accepted request")
+                )
+        return expected
+
+    # Return and recovery preflight
+
+    # Bind release to its original request, cloud connection and permissible source across physical reads.
+    def release_guard(
+        self,
+        c: ManagedController,
+        expected_intent: ControlIntent,
+        continuing_local: int | None,
+        return_request: str | None,
+        offline_pause: bool,
+    ) -> Guard:
+        g, j = c.session.gateway, self.journal
+        vendor_epoch = g._vendor_epoch
+        lifecycle = j.lifecycle_position() if offline_pause else None
+
+        # A replacement vendor connection cannot authorize a release prepared under the previous one.
+        def cloud_current() -> bool:
+            return (
+                g._vendor_epoch == vendor_epoch
+                and g.vendor.sender is not None
+                and g.vendor_registration == "Accepted"
+                and c.session.runtime.status.vendor_connected
+            )
+
+        can_wait_for_cloud = cloud_current() or (
+            return_request is not None and c.requests.return_awaiting_cloud(return_request, expected_intent)
+        )
+
+        # This guard also runs before LocalControl claims and again inside each actual outgoing RPC gate.
+        def guard() -> GateDecision:
+            current = (
+                c.requests.offline_pause_current(expected_intent)
+                if offline_pause
+                else c.requests.return_current(return_request, expected_intent)
+            )
+            if c.stopping or not current:
+                return Pending(Prerequisite.SUPERSEDED, "release awaits its exact current owner Return")
+            if offline_pause:
+                if j.lifecycle_position() != lifecycle:
+                    return Pending(Prerequisite.LIFECYCLE, "charging records changed during offline Pause verification")
+                decision = self.recovery.offline_return_decision(c)
+                if isinstance(decision, Pending):
+                    return decision
+            if continuing_local is not None and j.outcomes.awaits_stop_report(continuing_local):
+                return Pending(Prerequisite.LIFECYCLE, "continuation awaits the Stop's lifecycle report")
+            if not cloud_current():
+                if return_request is None:
+                    reason = Prerequisite.CLOUD
+                elif can_wait_for_cloud:
+                    reason = Prerequisite.CLOUD_ACK
+                else:
+                    reason = Prerequisite.ZERO_PROOF
+                return Pending(reason, "release awaits its current registered cloud connection")
+            if c.ordinary.active():
+                decision = c.ordinary.authority_decision(continuing_local)
+                if isinstance(decision, Pending):
+                    return decision
+            current_recovery = j.current_change.read().recovering
+            if current_recovery:
+                decision = current_source_decision(g, continuing_local)
+                if isinstance(decision, Pending):
+                    return decision
+            if (
+                continuing_local is not None
+                and not current_recovery
+                and not c.ordinary.active()
+                and not (c.charging.scoped_normal_stop() and c.charging.current_daily(continuing_local))
+            ):
+                return Pending(Prerequisite.SOURCE, "source-specific continuation was superseded")
+            return ALLOW
+
+        return guard
 
     # Keep resource observations and their zero verdict together.
     def release_zero_decision(
@@ -267,156 +413,6 @@ class ControlDecisions:
             return "vendor command is uncertain"
         return None
 
-    # One accepted return receives one guarded attempt; uncertainty never changes persisted paused intent to app.
-    async def run_requested_return(self, controller: ManagedController, identifier: str, revision: int) -> None:
-        expected = controller.commands.decide(lambda: controller.requests.check_return_revision(identifier, revision))
-        if expected is None:
-            return
-        if controller.charging.return_blocked():
-            return  # An already accepted Return survives until observation completes the timed test under Pause.
-        j = self.journal
-        control = j.get("control", {})
-        if control.get("uncertain") and controller.requests.stop_owns_ticket(control.get("ticket")):
-            # Verify this exact protective Stop before treating Return as a positive release attempt.
-            try:
-                await controller.maintain_pause()
-            except RecoveryRequiredError, UnavailableError, TimeoutError:
-                return  # Closed zero and selective cleanup can finish while the same Return remains accepted.
-            control = j.get("control", {})
-            if controller.requests.intent() != expected or control.get("uncertain"):
-                return
-        if controller.commands.decide(lambda: controller.requests.return_waits_for_pause(expected)):
-            return  # The same Return survives the real Start and both closure reports under its Pause.
-        try:
-            await controller.recovery.restore(expected, return_request=identifier, claim_return=True)
-        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError:
-            return  # The owned completion retains the exact request disposition when its caller disappears.
-
-    # The same decision handles the first write and any retained storage retry.
-    def write_return_settlement(
-        self, coordinator: RecoveryCoordinator, settlement: ReturnSettlement, retry: bool
-    ) -> None:
-        try:
-            requests = coordinator.c.requests
-            if not retry or requests.return_current(settlement.identifier, settlement.intent):
-                requests.settle_return(
-                    settlement.identifier,
-                    settlement.intent,
-                    failure=settlement.failure,
-                    await_cloud=settlement.await_cloud,
-                )
-        except sqlite3.Error:
-            coordinator._return_settlement = settlement
-        else:
-            coordinator._return_settlement = None
-
-    # Claim the accepted Return before the worker starts and leave busy requests accepted.
-    def claim_restore_request(
-        self,
-        coordinator: RecoveryCoordinator,
-        expected_intent: ControlIntent | None,
-        return_request: str | None,
-        claim_return: bool,
-        offline_pause: bool,
-    ) -> ControlIntent | RestoreProgress:
-        if coordinator.c.stopping:
-            return RestoreProgress(
-                RestoreState.WAITING, Pending(Prerequisite.SUPERSEDED, "managed retirement retains its hold")
-            )
-        if coordinator.pending():
-            return RestoreProgress(
-                RestoreState.WAITING,
-                Pending(Prerequisite.OWNED_OPERATION, "the current owned recovery completion remains pending"),
-            )
-        expected = expected_intent or coordinator.c.requests.intent()
-        if offline_pause and coordinator.c.requests.return_in_progress():
-            return RestoreProgress(
-                RestoreState.WAITING, Pending(Prerequisite.OWNED_OPERATION, "an explicit Return already owns recovery")
-            )
-        # The request driver claims running; the existing direct restore API retains accepted until publication.
-        if claim_return and return_request is not None:
-            try:
-                claimed = coordinator.c.requests.return_started(return_request, expected)
-            except sqlite3.Error:
-                return RestoreProgress(
-                    RestoreState.WAITING, Pending(Prerequisite.RECONCILIATION, "Return awaits journal storage")
-                )
-            if not claimed:
-                return RestoreProgress(
-                    RestoreState.WAITING, Pending(Prerequisite.SUPERSEDED, "Return no longer owns its accepted request")
-                )
-        return expected
-
-    # Bind release to its original request, cloud connection and permissible source across physical reads.
-    def release_guard(
-        self,
-        c: ManagedController,
-        expected_intent: ControlIntent,
-        continuing_local: int | None,
-        return_request: str | None,
-        offline_pause: bool,
-    ) -> Guard:
-        g, j = c.session.gateway, self.journal
-        vendor_epoch = g._vendor_epoch
-        lifecycle = j.lifecycle_position() if offline_pause else None
-
-        # A replacement vendor connection cannot authorize a release prepared under the previous one.
-        def cloud_current() -> bool:
-            return (
-                g._vendor_epoch == vendor_epoch
-                and g.vendor.sender is not None
-                and g.vendor_registration == "Accepted"
-                and c.session.runtime.status.vendor_connected
-            )
-
-        can_wait_for_cloud = cloud_current() or (
-            return_request is not None and c.requests.return_awaiting_cloud(return_request, expected_intent)
-        )
-
-        # This guard also runs before LocalControl claims and again inside each actual outgoing RPC gate.
-        def guard() -> GateDecision:
-            current = (
-                c.requests.offline_pause_current(expected_intent)
-                if offline_pause
-                else c.requests.return_current(return_request, expected_intent)
-            )
-            if c.stopping or not current:
-                return Pending(Prerequisite.SUPERSEDED, "release awaits its exact current owner Return")
-            if offline_pause:
-                if j.lifecycle_position() != lifecycle:
-                    return Pending(Prerequisite.LIFECYCLE, "charging records changed during offline Pause verification")
-                decision = self.recovery.offline_return_decision(c)
-                if isinstance(decision, Pending):
-                    return decision
-            if continuing_local is not None and j.outcomes.awaits_stop_report(continuing_local):
-                return Pending(Prerequisite.LIFECYCLE, "continuation awaits the Stop's lifecycle report")
-            if not cloud_current():
-                reason = (
-                    Prerequisite.CLOUD
-                    if return_request is None
-                    else (Prerequisite.CLOUD_ACK if can_wait_for_cloud else Prerequisite.ZERO_PROOF)
-                )
-                return Pending(reason, "release awaits its current registered cloud connection")
-            if c.ordinary.active():
-                decision = c.ordinary.authority_decision(continuing_local)
-                if isinstance(decision, Pending):
-                    return decision
-            current_recovery = j.current_change.read().recovering
-            if current_recovery:
-                decision = current_source_decision(g, continuing_local)
-                if isinstance(decision, Pending):
-                    return decision
-            if (
-                continuing_local is not None
-                and not current_recovery
-                and not c.ordinary.active()
-                and not (c.charging.scoped_normal_stop() and c.charging.current_daily(continuing_local))
-            ):
-                return Pending(Prerequisite.SOURCE, "source-specific continuation was superseded")
-            return ALLOW
-
-        return guard
-
     # Bind Return only after the latest native sample still proves the original hold.
     def prepare_release_attempt(
         self, c: ManagedController, attempt: ReleaseAttempt, native: HandoverEvidence | Pending
@@ -454,92 +450,7 @@ class ControlDecisions:
                 c.requests.bind_return(return_request, expected_intent, ticket, connection[0].boot)
         return attempt
 
-    # Rollback is still tied to the original Boot after the positive permission expires.
-    def require_release_boot(self, gateway: Gateway, attempt: ReleaseAttempt) -> None:
-        if not control_scope_matches(gateway, (attempt.scope, attempt.control_revision)):
-            raise UnavailableError("release rollback belongs to a superseded Boot observation")
-
-    # Publish app intent, current retirement and its receipt inside the owned wire transaction.
-    def publish_release(
-        self, c: ManagedController, attempt: ReleaseAttempt, offline_pause: bool, authority: AuthorityStamp
-    ) -> AuthorityStamp | Pending:
-        j = self.journal
-        return_request, expected_intent = attempt.request_id, attempt.intent
-        if not c.publication_is_current(authority):
-            return Pending(Prerequisite.SUPERSEDED, "release publication was superseded")
-        decision = attempt.positive_guard()
-        if isinstance(decision, Pending):
-            return decision
-        j.put("managed_owner_epoch", attempt.scope.epoch)
-        if return_request is not None:
-            c.requests.returned(return_request, expected_intent, c.current.returned_to_previous)
-        elif offline_pause:
-            write_intent(j, expected_intent, "app")
-        published = c.authority()
-        if published is None:
-            raise RecoveryRequiredError("release publication lost its exact Boot")
-        return published
-
-    # Resolve the exact Return using the positive write and its actual rollback outcome.
-    def settle_release(
-        self, c: ManagedController, attempt: ReleaseAttempt, result: OwnedReleaseResult
-    ) -> RestoreProgress:
-        g, j = c.session.gateway, self.journal
-        expected_intent, return_request = attempt.intent, attempt.request_id
-        decision = ALLOW if result.published else attempt.positive_guard()
-        disposition = release_disposition(
-            attempt.purpose,
-            result,
-            c.authority(),
-            zero_ready=g.controls.ready and g.controls.desired() == 0,
-            faulted=j.fault.latched(),
-            publication_allowed=not isinstance(decision, Pending),
-        )
-        if (
-            disposition in (ReleaseDisposition.WAIT, ReleaseDisposition.NOT_SENT)
-            and result.claimed
-            and result.effects.zero_verified
-        ):
-            with j.atomic():
-                if c.authority() != result.authority or not g.controls.ready or g.controls.desired() != 0:
-                    raise RecoveryRequiredError("owned release zero acknowledgement was superseded")
-                assert attempt.ticket is not None
-                g.controls._complete(attempt.ticket, uncertain=False)
-        if disposition is ReleaseDisposition.FAULT:
-            if not c.stopping and c.requests.intent() == expected_intent:
-                c.fault("owner_release_unconfirmed")
-                failure = result.failure
-                try:
-                    j.put(
-                        "managed_release_failure",
-                        {
-                            "type": type(failure).__name__ if failure is not None else "prerequisite_after_release",
-                            "detail": str(failure)[:1024]
-                            if failure is not None
-                            else result.pending.detail
-                            if result.pending
-                            else "release unconfirmed",
-                            "at_epoch": time.time(),
-                            "charger_rpc": g.charger.diagnostics.snapshot(),
-                        },
-                    )
-                except sqlite3.Error:
-                    pass  # The required fault already committed and the command still reports its actual failure.
-            if (
-                return_request is not None
-                and isinstance(result.failure, sqlite3.Error)
-                and result.effects.zero_verified
-                and not result.cleanup_failed
-                and not j.db.in_transaction
-                and j.fault.read({}).get("classification") == "owner_release_unconfirmed"
-            ):
-                raise RecoveryRequiredError(
-                    "Return kept the verified zero hold after a storage failure"
-                ) from result.failure
-            if result.failure is not None:
-                raise result.failure
-            raise RecoveryRequiredError("owned release did not establish shared authority")
-        return restore_progress(disposition, result)
+    # Physical claim, publication and rollback
 
     # Claim only the exact preflight hold, including its current Boot and positive guard.
     def claim_release(
@@ -576,6 +487,11 @@ class ControlDecisions:
         if attempt is not None:
             attempt.ticket = ticket
         return epoch, ticket, previous
+
+    # Rollback is still tied to the original Boot after the positive permission expires.
+    def require_release_boot(self, gateway: Gateway, attempt: ReleaseAttempt) -> None:
+        if not control_scope_matches(gateway, (attempt.scope, attempt.control_revision)):
+            raise UnavailableError("release rollback belongs to a superseded Boot observation")
 
     # Only the verified ceiling may publish shared control within the exact owner's transaction.
     def complete_release(
@@ -615,10 +531,116 @@ class ControlDecisions:
             attempt.pending = pending
         return pending
 
+    # Publish app intent, current retirement and its receipt inside the owned wire transaction.
+    def publish_release(
+        self, c: ManagedController, attempt: ReleaseAttempt, offline_pause: bool, authority: AuthorityStamp
+    ) -> AuthorityStamp | Pending:
+        j = self.journal
+        return_request, expected_intent = attempt.request_id, attempt.intent
+        if not c.publication_is_current(authority):
+            return Pending(Prerequisite.SUPERSEDED, "release publication was superseded")
+        decision = attempt.positive_guard()
+        if isinstance(decision, Pending):
+            return decision
+        j.put("managed_owner_epoch", attempt.scope.epoch)
+        if return_request is not None:
+            c.requests.returned(return_request, expected_intent, c.current.returned_to_previous)
+        elif offline_pause:
+            write_intent(j, expected_intent, "app")
+        published = c.authority()
+        if published is None:
+            raise RecoveryRequiredError("release publication lost its exact Boot")
+        return published
+
     # Asserting zero belongs to the same release claim and cannot overwrite a newer owner.
     def begin_release_rollback(self, epoch: int, ticket: str) -> None:
         self.control._complete(ticket, inhibit=True)
         self.control._check(epoch, ticket)
+
+    # Return and recovery settlement
+
+    # Resolve the exact Return using the positive write and its actual rollback outcome.
+    def settle_release(
+        self, c: ManagedController, attempt: ReleaseAttempt, result: OwnedReleaseResult
+    ) -> RestoreProgress:
+        g, j = c.session.gateway, self.journal
+        expected_intent, return_request = attempt.intent, attempt.request_id
+        decision = ALLOW if result.published else attempt.positive_guard()
+        disposition = release_disposition(
+            attempt.purpose,
+            result,
+            c.authority(),
+            zero_ready=g.controls.ready and g.controls.desired() == 0,
+            faulted=j.fault.latched(),
+            publication_allowed=not isinstance(decision, Pending),
+        )
+        if (
+            disposition in (ReleaseDisposition.WAIT, ReleaseDisposition.NOT_SENT)
+            and result.claimed
+            and result.effects.zero_verified
+        ):
+            with j.atomic():
+                if c.authority() != result.authority or not g.controls.ready or g.controls.desired() != 0:
+                    raise RecoveryRequiredError("owned release zero acknowledgement was superseded")
+                assert attempt.ticket is not None
+                g.controls._complete(attempt.ticket, uncertain=False)
+        if disposition is not ReleaseDisposition.FAULT:
+            return restore_progress(disposition, result)
+
+        # Commit the fault before trying to save its diagnostic details.
+        if not c.stopping and c.requests.intent() == expected_intent:
+            c.fault("owner_release_unconfirmed")
+            failure = result.failure
+            try:
+                j.put(
+                    "managed_release_failure",
+                    {
+                        "type": type(failure).__name__ if failure is not None else "prerequisite_after_release",
+                        "detail": str(failure)[:1024]
+                        if failure is not None
+                        else result.pending.detail
+                        if result.pending
+                        else "release unconfirmed",
+                        "at_epoch": time.time(),
+                        "charger_rpc": g.charger.diagnostics.snapshot(),
+                    },
+                )
+            except sqlite3.Error:
+                pass  # The required fault already committed and the command still reports its actual failure.
+        if (
+            return_request is not None
+            and isinstance(result.failure, sqlite3.Error)
+            and result.effects.zero_verified
+            and not result.cleanup_failed
+            and not j.db.in_transaction
+            and j.fault.read({}).get("classification") == "owner_release_unconfirmed"
+        ):
+            raise RecoveryRequiredError(
+                "Return kept the verified zero hold after a storage failure"
+            ) from result.failure
+        if result.failure is not None:
+            raise result.failure
+        raise RecoveryRequiredError("owned release did not establish shared authority")
+
+    # The same decision handles the first write and any retained storage retry.
+    def write_return_settlement(
+        self, coordinator: RecoveryCoordinator, settlement: ReturnSettlement, retry: bool
+    ) -> None:
+        try:
+            requests = coordinator.c.requests
+            if not retry or requests.return_current(settlement.identifier, settlement.intent):
+                requests.settle_return(
+                    settlement.identifier,
+                    settlement.intent,
+                    failure=settlement.failure,
+                    await_cloud=settlement.await_cloud,
+                )
+        except sqlite3.Error:
+            coordinator._return_settlement = settlement
+        else:
+            coordinator._return_settlement = None
+
+    # Current selection
 
     # Status and command admission use the same prerequisite check.
     def current_refusal(self, current: ManagedCurrentLimits, native: HandoverEvidence | None) -> str | None:
@@ -671,22 +693,28 @@ class ControlDecisions:
         g = c.session.gateway
         change = j.current_change.read()
         if (
+            # The receipt keeps the revision from before the selection was accepted.
             c.stopping
             or c.requests.intent() != selection.intent
             or not control_scope_matches(g, selection.connection)
             or not request_pending(j, selection.identifier, "set_current", selection.intent.revision - 1)
             or j.get("control", {}).get("ticket") != selection.ticket
+            # Both the journal and native evidence must still describe an idle charger.
             or j.fault.latched()
             or not j.phase.read().active
             or j.active() is not None
             or change.value.get("native_open") is True
             or j.get("control", {}).get("start_pending")
             or j.get("vendor_start_grant")
+            # The latest selected value and its saved change must still match the claim.
             or current.selected() != selection.value
             or change.identifier != selection.identifier
             or change.value.get("ticket") != selection.ticket
         ):
-            raise UnavailableError("current update was superseded by another control operation")
+            raise UnavailableError(
+                "current update was superseded by another control operation",
+                reason=CurrentFailureReason.CONTROL_SUPERSEDED,
+            )
 
     # A changed claim and its exact receipt bind inside the wire operation's transaction.
     def bind_current_selection(self, selection: CurrentSelection, ticket: str) -> None:
@@ -1193,6 +1221,8 @@ class ControlDecisions:
                 return Pending(Prerequisite.LIFECYCLE, "current recovery awaits actual lifecycle reconciliation")
         return ALLOW
 
+    # Start admission and execution
+
     # Report the first failed prerequisite in admission order.
     def start_refusal(
         self,
@@ -1205,6 +1235,8 @@ class ControlDecisions:
         c, j = charging.controller, self.journal
         g = c.session.gateway
         facts = ManagedFacts(c)
+
+        # First establish that the installation and current intent allow a Start.
         if c.stopping:
             return "service_stopping"
         if not (c.requests.intent().mode == "app" or normal and c.requests.intent().mode == "paused"):
@@ -1215,17 +1247,23 @@ class ControlDecisions:
             return "installation_not_active"
         if not g.controls.ready:
             return "station_ceiling_unconfirmed"
-        if g.controls.desired() != (0 if c.requests.intent().mode == "paused" else c.current.selected()):
+        desired_ceiling = g.controls.desired()
+        expected_ceiling = 0 if c.requests.intent().mode == "paused" else c.current.selected()
+        if desired_ceiling != expected_ceiling:
             return "station_ceiling_differs_from_selection"
         if not normal and c.current.selected() != 6:
             return "timed_test_requires_six_amperes"
         if c.current.pending():
             return "current_update_pending"
+
+        # A normal Start may request fresh approval online before doing any charger work.
         if g.policy.allow_local_start:
             return "legacy_start_enabled"
         if local and not any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags):
             if not normal or charging.authorization_status() != "renewal_required":
                 return "start_authorization_unavailable"
+
+        # Outstanding commands and lifecycle reports can still change the session.
         if j.get("control", {}).get("uncertain"):
             return "control_uncertain"
         if j.get("control", {}).get("start_pending"):
@@ -1244,19 +1282,22 @@ class ControlDecisions:
             return "request_capacity_exhausted"
         if charging.state().get("state") in ACTIVE:
             return "managed_start_active"
+
+        # With a native sample, also require a freshly observed plugged-in, idle charger.
         if not facts.boot_current():
             return "boot_unconfirmed"
         if not normal and not (c.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted"):
             return "timed_test_requires_cloud"
-        if native is not None:
-            if c.native.last_verified_at == 0 or not native.is_fresh(15):
-                return "native_observation_stale"
-            if native.physical.connection != "Plug":
-                return "vehicle_not_plugged_in"
-            if native.physical.transaction_open:
-                return "native_transaction_open"
-            if native.physical.power_w != 0:
-                return "native_power_nonzero"
+        if native is None:
+            return None
+        if c.native.last_verified_at == 0 or not native.is_fresh(15):
+            return "native_observation_stale"
+        if native.physical.connection != "Plug":
+            return "vehicle_not_plugged_in"
+        if native.physical.transaction_open:
+            return "native_transaction_open"
+        if native.physical.power_w != 0:
+            return "native_power_nonzero"
         return None
 
     # Acceptance and its one-shot deadline commit before any positive effect; duplicate identifiers return receipts.
@@ -1291,37 +1332,44 @@ class ControlDecisions:
         g = c.session.gateway
         state = charging.state()
         if (
+            # The original request must still own a live lease.
             charging.lease is not lease
             or c.stopping
             or monotonic() >= lease.deadline
             or c.requests.intent() != ControlIntent(lease.mode, lease.revision)
+            # The same charger connection and commissioned scope must still be current.
             or g._charger_epoch != lease.epoch
             or g.controls._revision != lease.control_revision
             or not g.current_boot_seen(lease.epoch)
-            or lease.accepted_boot is not None
-            and g.boot_observation != lease.accepted_boot
+            or (lease.accepted_boot is not None and g.boot_observation != lease.accepted_boot)
             or fingerprint(j.identity) != lease.identity
             or c.native.spec.digest != lease.spec
+            # The selected ceiling and installation must still allow the original Start.
             or g.policy.allow_local_start
             or not 6 <= g.policy.max_current_a <= 32
             or c.current.selected() != lease.current_a
             or c.current.pending()
             or j.fault.latched()
             or not j.phase.read().active
+            # The saved Start and any later control work must still permit the send.
             or state.get("id") != lease.identifier
             or state.get("state") not in ACTIVE
             or state.get("state") == "stopping"
-            or lease.source == "local"
-            and state.get("state") == "starting"
-            and not request_pending(j, lease.identifier, "start" if lease.normal else "start_test", lease.revision)
+            or (
+                lease.source == "local"
+                and state.get("state") == "starting"
+                and not request_pending(j, lease.identifier, "start" if lease.normal else "start_test", lease.revision)
+            )
             or c.requests.return_in_progress()
-            or not stopping
-            and j.get("control", {}).get("stop_epoch", 0) != lease.stop_epoch
-            or lease.source == "local"
-            and j.db.execute(
-                "SELECT 1 FROM mutations WHERE rowid>? AND origin='vendor' AND action='RemoteStartTransaction' LIMIT 1",
-                (lease.first_mutation,),
-            ).fetchone()
+            or (not stopping and j.get("control", {}).get("stop_epoch", 0) != lease.stop_epoch)
+            or (
+                lease.source == "local"
+                and j.db.execute(
+                    "SELECT 1 FROM mutations WHERE rowid>? "
+                    "AND origin='vendor' AND action='RemoteStartTransaction' LIMIT 1",
+                    (lease.first_mutation,),
+                ).fetchone()
+            )
         ):
             raise DeniedError("managed test Start permission expired or was superseded")
 
@@ -2108,6 +2156,8 @@ class ControlDecisions:
         if self.stop_work_needed(scope.local, station_flowing=station_flowing):
             await self.control.stop(expected_local=scope.local, guard=guard, prove_stop=prove_stop)
 
+    # Shared Stop decision and dispatch
+
     # An accepted known-session Stop waits for its genuine closure instead of repeating after each native poll.
     def stop_acknowledged(self, local: int | None, *, protective: bool = False) -> bool:
         # A Stop sent under a previously sound zero cannot cover a newly observed loss of that protection.
@@ -2124,15 +2174,14 @@ class ControlDecisions:
         return self.peer.decide(accepted, priority=CommandPriority.RESTRICT)
 
     # Apply the same exact-session and prior-reply decision for both local and vendor Stop requests.
-    def stop_decision(
+    def _stop_decision(
         self,
         local: int | None,
         *,
         protective: bool = False,
         station_flowing: Callable[[], bool] | None = None,
-        reuse_allowed: bool = True,
+        reuse: _StopReuse = _StopReuse.RECORDED,
         session_only: bool = False,
-        join_unanswered: bool = False,
     ) -> StopDecision:
         # Read the exact report and reply in the same queued decision as the latest draw evidence.
         def decide() -> StopDecision:
@@ -2147,16 +2196,23 @@ class ControlDecisions:
                 if self.stop_acknowledged(session.local):
                     return StopDecision.ACCEPTED
                 return StopDecision.WAIT_FOR_REPORT
-            if not reuse_allowed:
+            if reuse is _StopReuse.NO_ADDITIONAL_REUSE:
                 return StopDecision.SEND
-            protecting = protective or (station_flowing is not None and station_flowing())
-            if self.stop_acknowledged(session.local, protective=protecting):
+
+            # Lost zero or fresh draw needs a Stop bound to the current protective claim.
+            if protective or (station_flowing is not None and station_flowing()):
+                return (
+                    StopDecision.ACCEPTED
+                    if self.stop_acknowledged(session.local, protective=True)
+                    else StopDecision.SEND
+                )
+
+            if self.stop_acknowledged(session.local):
                 return StopDecision.ACCEPTED
-            if not protecting and self.journal.outcomes.unanswered_shutdown_stop(session.local):
+            if self.journal.outcomes.unanswered_shutdown_stop(session.local):
                 return StopDecision.WAIT_FOR_REPORT
             if (
-                not protecting
-                and join_unanswered
+                reuse is _StopReuse.INCLUDE_CURRENT_BOOT_UNANSWERED
                 and (boot := self.control.boot()) is not None
                 and (
                     self.journal.outcomes.unanswered_vendor_stop(session.local, boot=boot)
@@ -2168,6 +2224,12 @@ class ControlDecisions:
 
         return self.peer.decide(decide, priority=CommandPriority.RESTRICT)
 
+    # A local Stop rechecks zero before waiting for the report from an unanswered attempt.
+    def stop_wait_needs_zero_check(self, local: int) -> bool:
+        return (
+            self._stop_decision(local, reuse=_StopReuse.INCLUDE_CURRENT_BOOT_UNANSWERED) is StopDecision.WAIT_FOR_REPORT
+        )
+
     # Local operations check whether they still need to send, including after a newer receipt or report arrives.
     def stop_needed(
         self,
@@ -2175,12 +2237,11 @@ class ControlDecisions:
         *,
         protective: bool = False,
         station_flowing: Callable[[], bool] | None = None,
-        join_unanswered: bool = False,
+        zero_verified: bool = False,
     ) -> bool:
+        reuse = _StopReuse.INCLUDE_CURRENT_BOOT_UNANSWERED if zero_verified else _StopReuse.RECORDED
         return (
-            self.stop_decision(
-                local, protective=protective, station_flowing=station_flowing, join_unanswered=join_unanswered
-            )
+            self._stop_decision(local, protective=protective, station_flowing=station_flowing, reuse=reuse)
             is StopDecision.SEND
         )
 
@@ -2191,7 +2252,7 @@ class ControlDecisions:
         *,
         station_absent: bool = False,
         station_flowing: Callable[[], bool] | None = None,
-        join_unanswered: bool = False,
+        zero_verified: bool = False,
     ) -> bool:
         # Check the station and session against the same live command state.
         def decide() -> bool:
@@ -2199,11 +2260,75 @@ class ControlDecisions:
                 not station_absent
                 and (not self.control.ready or self.control.desired() != 0)
                 or self.stop_needed(
-                    local, protective=station_absent, station_flowing=station_flowing, join_unanswered=join_unanswered
+                    local, protective=station_absent, station_flowing=station_flowing, zero_verified=zero_verified
                 )
             )
 
         return self.peer.decide(decide, priority=CommandPriority.RESTRICT)
+
+    # Do not add a native read to a first vendor Stop; refresh only if a prior outcome may cover it.
+    async def prepare_vendor_stop(
+        self, local: int, evidence: StopZeroEvidence, require_origin: Callable[[], None]
+    ) -> None:
+        # Read the prior outcome and the current desired hold together after acquiring the wire gate.
+        def may_reuse() -> bool:
+            require_origin()
+            return (
+                self.control.ready
+                and self.control.desired() == 0
+                and self._stop_decision(local, reuse=_StopReuse.INCLUDE_CURRENT_BOOT_UNANSWERED)
+                in (StopDecision.ACCEPTED, StopDecision.WAIT_FOR_REPORT)
+            )
+
+        if self.peer.decide(may_reuse, priority=CommandPriority.RESTRICT):
+            await evidence.refresh_stop_zero(local)
+
+    # The gateway renders this decision with its own request ID and keeps any unsent mutation separate.
+    def require_vendor_stop(self, local: int, boot: str, evidence: StopZeroEvidence) -> None:
+        reuse = (
+            _StopReuse.INCLUDE_CURRENT_BOOT_UNANSWERED
+            if evidence.stop_zero_verified(local)
+            else _StopReuse.NO_ADDITIONAL_REUSE
+        )
+        decision = self._stop_send_decision(local, boot, reuse=reuse, session_only=True)
+        if decision is StopDecision.ACCEPTED:
+            raise VendorStopAlreadyAcceptedError
+        if decision is StopDecision.WAIT_FOR_REPORT:
+            raise RecoveryRequiredError("cloud Stop awaits the charger's original report")
+        if decision is StopDecision.CLOSED:
+            raise DeniedError("cloud Stop lost its original open session")
+
+    # Both wire callers authorize a Stop against the exact open target, prior reply and original Boot.
+    def _stop_send_decision(
+        self,
+        local: int,
+        boot: str | None,
+        *,
+        protective: bool = False,
+        reuse: _StopReuse = _StopReuse.RECORDED,
+        session_only: bool = False,
+    ) -> StopDecision:
+        decision = self._stop_decision(local, protective=protective, reuse=reuse, session_only=session_only)
+        if decision is StopDecision.SEND and self.control.boot() != boot:
+            raise UnavailableError("Stop lost its original charger Boot or open session")
+        return decision
+
+    # Authorize the local executor's send and remember exactly which attempt protects a lost zero.
+    def authorize_local_send(
+        self, local: int, boot: str | None, ticket: str, *, protective: bool, zero_verified: bool = False
+    ) -> bool:
+        reuse = _StopReuse.INCLUDE_CURRENT_BOOT_UNANSWERED if zero_verified else _StopReuse.RECORDED
+        if self._stop_send_decision(local, boot, protective=protective, reuse=reuse) is not StopDecision.SEND:
+            return False
+        if protective:
+            self._protective_stop = local, boot, self.control._revision, ticket
+        return True
+
+    # A session-only caller distinguishes joining a prior Stop from closing before dispatch.
+    def session_stop_send_decision(self, local: int, boot: str) -> StopDecision:
+        return self._stop_send_decision(local, boot, session_only=True)
+
+    # Pause
 
     # A fresh Pause owns its hold in the same transaction that saves the request and revokes a prior Return.
     def accept_pause(
@@ -2581,73 +2706,7 @@ class ControlDecisions:
             raise RecoveryRequiredError("owner Pause awaits the previously acknowledged Start lifecycle")
         requests.complete_verified_pause()
 
-    # Do not add a native read to a first vendor Stop; refresh only if a prior outcome may cover it.
-    async def prepare_vendor_stop(
-        self, local: int, evidence: StopZeroEvidence, require_origin: Callable[[], None]
-    ) -> None:
-        # Read the prior outcome and the current desired hold together after acquiring the wire gate.
-        def may_reuse() -> bool:
-            require_origin()
-            return (
-                self.control.ready
-                and self.control.desired() == 0
-                and self.stop_decision(local, join_unanswered=True)
-                in (StopDecision.ACCEPTED, StopDecision.WAIT_FOR_REPORT)
-            )
-
-        if self.peer.decide(may_reuse, priority=CommandPriority.RESTRICT):
-            await evidence.refresh_stop_zero(local)
-
-    # The gateway renders this decision with its own request ID and keeps any unsent mutation separate.
-    def require_vendor_stop(self, local: int, boot: str, evidence: StopZeroEvidence) -> None:
-        decision = self._stop_send_decision(
-            local, boot, reuse_allowed=evidence.stop_zero_verified(local), session_only=True, join_unanswered=True
-        )
-        if decision is StopDecision.ACCEPTED:
-            raise VendorStopAlreadyAcceptedError
-        if decision is StopDecision.WAIT_FOR_REPORT:
-            raise RecoveryRequiredError("cloud Stop awaits the charger's original report")
-        if decision is StopDecision.CLOSED:
-            raise DeniedError("cloud Stop lost its original open session")
-
-    # Both wire callers authorize a Stop against the exact open target, prior reply and original Boot.
-    def _stop_send_decision(
-        self,
-        local: int,
-        boot: str | None,
-        *,
-        protective: bool = False,
-        reuse_allowed: bool = True,
-        session_only: bool = False,
-        join_unanswered: bool = False,
-    ) -> StopDecision:
-        decision = self.stop_decision(
-            local,
-            protective=protective,
-            reuse_allowed=reuse_allowed,
-            session_only=session_only,
-            join_unanswered=join_unanswered,
-        )
-        if decision is StopDecision.SEND and self.control.boot() != boot:
-            raise UnavailableError("Stop lost its original charger Boot or open session")
-        return decision
-
-    # Authorize the local executor's send and remember exactly which attempt protects a lost zero.
-    def authorize_local_send(
-        self, local: int, boot: str | None, ticket: str, *, protective: bool, join_unanswered: bool = False
-    ) -> bool:
-        if (
-            self._stop_send_decision(local, boot, protective=protective, join_unanswered=join_unanswered)
-            is not StopDecision.SEND
-        ):
-            return False
-        if protective:
-            self._protective_stop = local, boot, self.control._revision, ticket
-        return True
-
-    # A session-only caller distinguishes joining a prior Stop from closing before dispatch.
-    def session_stop_send_decision(self, local: int, boot: str) -> StopDecision:
-        return self._stop_send_decision(local, boot, session_only=True)
+    # Shutdown
 
     # Revoke positive authority before attempting the durable shutdown claim, even if that write fails.
     def begin_shutdown(self, retiring: Callable[[], bool]) -> None:

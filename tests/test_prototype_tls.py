@@ -22,6 +22,7 @@ from ics_proxy_core.engine.security import (
     TRANSPORT_LOG,
     Admission,
     SecurityError,
+    authorization_matches,
     offline_server,
     offline_vendor,
 )
@@ -340,6 +341,16 @@ def test_prototype_tls_is_offline_only(tls: tuple[ssl.SSLContext, ssl.SSLContext
             offline_vendor(address, admission, client)
     with pytest.raises(SecurityError):
         offline_server(lambda _: None, admission, server, host="0.0.0.0")
+
+
+# Intent: compare supported credentials and reject text outside their format without exposing values.
+# Why: invalid text must produce a clean refusal with a safe diagnostic.
+def test_authorization_comparison_rejects_unsupported_text(caplog: pytest.LogCaptureFixture) -> None:
+    expected = "synthetic-credential"
+    assert authorization_matches(expected, expected)
+    assert not authorization_matches("different-credential", expected)
+    assert not authorization_matches("synthetic-crédential", expected)
+    assert caplog.messages == ["iCS refused an authorization header with a non-ASCII credential"]
 
 
 # Intent: malformed configured credentials are refused before any handshake can be accepted.

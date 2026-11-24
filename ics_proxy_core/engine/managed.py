@@ -299,7 +299,7 @@ class ManagedController:
                     local,
                     station_absent=station_absent,
                     station_flowing=station_flowing,
-                    join_unanswered=local is not None and self.native.stop_zero_verified(local),
+                    zero_verified=local is not None and self.native.stop_zero_verified(local),
                 ), station_absent
 
             stop_needed, station_absent = self.commands.decide(

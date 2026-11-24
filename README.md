@@ -2,8 +2,8 @@
 
 A Linux service for a supported iCS electric vehicle charger, with a thin Home Assistant client and an optional
 Solar Display 2 example. The service sits between the charger and its vendor backend. It retains session records,
-enforces the commissioned current ceiling, and keeps vendor-app and charger-scheduled operation available when the
-installation is ready.
+enforces the commissioned current ceiling, and supports the commissioned charger schedule and vendor-app controls
+when the installation is ready.
 
 **One control owner.** The proxy decides Start, session Stop, Pause, Return to app and schedule, and current changes.
 Home Assistant and the display send requests to that proxy. The proxy checks the exact session and current charger
@@ -22,10 +22,18 @@ evidence before it sends an action, and separates the charger reply from proof t
 
 The engine requires Linux, Python 3.14, OpenSSL, and the pinned Python dependencies in
 `requirements-trial.txt`. It implements the native evidence and single-connector OCPP 1.6J behavior
-used by the iCS installation this project was extracted from. Commissioning checks bind the actual
-charger, firmware, existing current settings, profile behavior, saved plan and transaction history.
-Each installation needs its own verified baseline. The native current preparation and release checks
-must be completed before enabling managed current above the commissioning limit.
+used by the iCS installation this project was extracted from. The supported setup charges on one
+phase and originally has a saved user limit and installer ceiling of 32 A. Each installation needs
+its own verified baseline covering the charger, firmware, current settings, profile behavior, saved
+plan and transaction history. Commissioning uses 6 A. After native current preparation and verification,
+the service supports whole-amp selections from 6 A to 32 A.
+
+The saved charger schedule stays fixed while the proxy is installed. **Return to app / schedule** restores
+vendor-app and schedule control through the proxy. The managed service has no supported procedure to restore
+direct operation on the original vendor backend. See [commissioning and operation](docs/commissioning.md).
+
+Native charger readings use authenticated plain HTTP. Keep that traffic on a trusted, isolated local
+network segment. See [security](SECURITY.md) for the OCPP connection settings.
 
 The client is exercised against Home Assistant Core 2026.10.4 and 2026.11.0. It communicates over an authenticated
 management WebSocket on the proxy’s loopback interface. Home Assistant can restart without interrupting the

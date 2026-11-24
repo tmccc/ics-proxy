@@ -406,6 +406,43 @@ def test_incident_reads_retained_owner_start_reply(tmp_path, dispatch_saved, rep
         journal.close()
 
 
+# Intent: recover an issued Start using only a valid retained reply when its primary write was refused.
+# Why: malformed checkpoint data must not prevent opening the journal or prove that the charger replied.
+@pytest.mark.parametrize("damaged", [False, True])
+def test_restart_checks_retained_start_reply_when_primary_write_was_refused(tmp_path, damaged):
+    path = tmp_path / "journal.db"
+    request, ticket, boot = (uuid.uuid4().hex for _ in range(3))
+    wire_id = "l-" + uuid.uuid4().hex
+    key = "retained_transaction_reply_owner:" + wire_id
+    journal = Journal(path, "OFFLINE001")
+    try:
+        ManagedRequests(journal).accept(request, "start", 0)
+        journal.starts.prepare(ticket, "tag-digest", request)
+        journal.starts.record(ticket, "issued")
+        scope = journal.outcomes.owner_scope(request, ticket, boot)
+        journal.db.execute(
+            "CREATE TEMP TRIGGER refuse_start_wire BEFORE INSERT ON owner_command_wires "
+            "BEGIN SELECT RAISE(ABORT, 'owner wire storage unavailable'); END"
+        )
+        wire = scope.sent(wire_id, "RemoteStartTransaction", {})
+        scope.received(wire, [3, wire_id, {"status": "Rejected"}])
+        saved = journal.get(key)
+        assert saved is not None
+        if damaged:
+            journal.put(key, saved | {"unexpected": "field"})
+    finally:
+        journal.close()
+
+    journal = Journal(path, "OFFLINE001")
+    try:
+        assert journal.starts.receipt()["stage"] == ("issued" if damaged else "rejected")
+        assert journal.active() is None
+        if damaged:
+            assert journal.get(key) == saved | {"unexpected": "field"}
+    finally:
+        journal.close()
+
+
 # Intent: ignore a checkpoint from another binding or one that contradicts the durable wire.
 # Why: only the original issued Start can lend its reply to this report.
 @pytest.mark.parametrize(

@@ -39,6 +39,7 @@ async def bound_collision(b):
         cause = j.get("managed_current_change")["failure"]
         assert cause["id"] == request and cause["current_a"] == 16
         assert cause["type"] == "AuditSupersededError"
+        assert cause["reason"] == "native_audit_superseded"
         assert j.get("managed_current_failure") == {"type": "SecurityError", "detail": "unrelated earlier request"}
         assert b.rig.bench.firmware.effective_limit() == 0
         return request
@@ -49,10 +50,20 @@ async def bound_collision(b):
 # Intent: a diagnostic-only outage cannot erase the real cause, before or after an actual replacement Boot.
 # Why: the old global error may belong to a different operation and supplies no authority for this recovery.
 @pytest.mark.parametrize("restart", [False, True])
-async def test_bound_failure_recovers_without_optional_diagnostic(tmp_path, tls, unused_tcp_port, monkeypatch, restart):
+@pytest.mark.parametrize("coded", [False, True], ids=["older-record", "reworded-diagnostic"])
+async def test_bound_failure_recovers_without_optional_diagnostic(
+    tmp_path, tls, unused_tcp_port, monkeypatch, restart, coded
+):
     async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch, native_peer=OneNativeResponseGate) as b:
         request = await bound_collision(b)
-        saved = copy.deepcopy(b.session.journal.get("managed_current_change")["failure"])
+        journal = b.session.journal
+        change = journal.get("managed_current_change")
+        saved = change["failure"]
+        if coded:
+            saved["detail"] = "The authority changed while the native audit was running."
+        else:
+            saved.pop("reason")
+        journal.put("managed_current_change", change)
         if not restart:
             await recover_then_return(SimpleNamespace(c=b.controller, rig=b.rig))
             assert b.controller.current.selected() == b.rig.bench.firmware.effective_limit() == 6
@@ -77,7 +88,10 @@ async def test_bound_failure_recovers_without_optional_diagnostic(tmp_path, tls,
 
 # Intent: an ineligible or changed cause never borrows a stale global collision diagnostic to clear the fault.
 # Why: request identity, submitted revision and the Pause snapshot remain live authority through native HTTP.
-@pytest.mark.parametrize("blocker", ["foreign_request", "submitted_revision", "unrelated_cause", "after_pause"])
+@pytest.mark.parametrize(
+    "blocker",
+    ["foreign_request", "submitted_revision", "unrelated_cause", "unknown_reason", "other_reason", "after_pause"],
+)
 async def test_bound_failure_refuses_unrelated_or_changed_evidence(
     tmp_path, tls, unused_tcp_port, monkeypatch, blocker
 ):
@@ -99,6 +113,8 @@ async def test_bound_failure_refuses_unrelated_or_changed_evidence(
             cause["id"] = uuid.uuid4().hex
         elif blocker == "submitted_revision":
             cause["revision"] += 1
+        elif blocker in ("unknown_reason", "other_reason"):
+            cause["reason"] = "unknown" if blocker == "unknown_reason" else "other"
         else:
             cause.update(type="SecurityError", detail="independent conflicting evidence")
         j.put("managed_current_change", {**change, "failure": cause})

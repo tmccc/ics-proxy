@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import re
 import sqlite3
@@ -25,7 +24,7 @@ from .managed import ManagedController
 from .managed_view import refresh_for_read, session_history
 from .policy import DeniedError
 from .rpc import UnavailableError
-from .security import TRANSPORT_LOG, SecurityError
+from .security import TRANSPORT_LOG, SecurityError, authorization_matches
 from .store import RecoveryRequiredError
 from .trial_config import private_json
 
@@ -84,7 +83,7 @@ class ManagementServer:
             or request.headers.get_all("Origin")
             or hosts != [f"127.0.0.1:{self.settings.port}"]
             or len(tokens) != 1
-            or not hmac.compare_digest(tokens[0], "Bearer " + self.settings.token)
+            or not authorization_matches(tokens[0], "Bearer " + self.settings.token)
         ):
             return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
         return None

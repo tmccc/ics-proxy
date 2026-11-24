@@ -13,7 +13,7 @@ from .current_policy import (
 )
 from .gateway import NativeStartReport, timestamp
 from .managed_intent import ControlIntent
-from .managed_records import CurrentFailure
+from .managed_records import CurrentFailure, CurrentFailureReason
 from .native_bounded import NativeBoundedSpec
 from .policy import DeniedError
 from .recovery_contracts import AuthorityStamp, Pending, Prerequisite
@@ -171,12 +171,14 @@ class ManagedCurrentLimits:
     ) -> None:
         c = self.controller
         decisions = c.session.gateway.controls.decisions
+        reason = error.reason if isinstance(error, UnavailableError) else None
         cause = {
             "id": identifier,
             "revision": expected.revision - 1,
             "current_a": value,
             "type": type(error).__name__,
             "detail": str(error)[:1024],
+            "reason": reason if reason in CurrentFailureReason else CurrentFailureReason.OTHER,
         }
         hold_ticket = None
         while not self._closing and not c.stopping:

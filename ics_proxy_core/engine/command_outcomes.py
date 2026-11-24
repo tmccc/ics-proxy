@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from ..frames import Frame
 from .delivery_reply import DeliveryReply
+from .ics import unique_object
 from .plans import PlanBook
-from .stop_settlement import stop_rejections
+from .stop_settlement import STOP_SESSION, stop_rejections
 from .store import Delivery, RecoveryRequiredError, encoded
 from .trial_evidence import profile_projection
 
@@ -21,6 +24,7 @@ if TYPE_CHECKING:
 TRANSACTION_COMMANDS = frozenset({"RemoteStartTransaction", "RemoteStopTransaction"})
 VENDOR_RESULTS = ("Accepted", "Rejected", "NotSupported", "Unknown", "reply")
 type TransactionReplyStatus = Literal["Accepted", "Rejected"]
+_LOGGER = logging.getLogger(__name__)
 
 
 # Only a definite transaction reply settles what the charger said, independently of its actual effect.
@@ -31,6 +35,11 @@ def transaction_reply_status(frame: Frame) -> TransactionReplyStatus | None:
         if frame[2] == {"status": "Rejected"}:
             return "Rejected"
     return None
+
+
+# JSON can contain lone surrogates that cannot be bound to SQLite text parameters.
+def _reply_identifier(value: object) -> bool:
+    return isinstance(value, str) and value.isprintable()
 
 
 @dataclass(frozen=True)
@@ -232,6 +241,7 @@ class CommandOutcomes:
         self._owner_sessions: dict[str, int] = {}
         self._read_binding_pending = False
         self._shutdown_ticket: str | None = None
+        self._reported_bad_checkpoints: set[bytes] = set()
         self.delivery_reply: DeliveryReply | None = None
 
     # Sample delivery certainty from the original report and actual reply, independently of the pump's last error.
@@ -413,22 +423,162 @@ class CommandOutcomes:
             if self.journal.db.in_transaction:
                 raise
 
-    # Read both versions of the independently committed exact reply evidence.
-    def _retained_reply_rows(self, source: Literal["owner", "vendor"]) -> list[sqlite3.Row]:
-        return self.journal.db.execute(
-            "SELECT value FROM meta WHERE key GLOB ? OR key GLOB ?",
+    # Keep damaged evidence available for inspection without logging its contents or blocking other replies.
+    def _bad_checkpoint(self, source: Literal["owner", "vendor"], key: bytes) -> None:
+        if key not in self._reported_bad_checkpoints:
+            self._reported_bad_checkpoints.add(key)
+            _LOGGER.warning(
+                "Invalid retained %s transaction reply checkpoint. Its outcome requires independent evidence.", source
+            )
+
+    # Both formats must describe a definite reply to the exact wire named by the key.
+    def _retained_replies[T: (OwnerWire, ForwardedReply)](
+        self, source: Literal["owner", "vendor"], decode: Callable[[dict[str, Any]], T | None]
+    ) -> tuple[T, ...]:
+        rows = self.journal.db.execute(
+            "SELECT CAST(key AS BLOB),CAST(value AS BLOB) FROM meta WHERE key GLOB ? OR key GLOB ?",
             (f"retained_stop_{source}:*", f"retained_transaction_reply_{source}:*"),
         ).fetchall()
+        replies: dict[str, T] = {}
+        conflicts: set[str] = set()
+        for raw_key, value in rows:
+            try:
+                key = raw_key.decode("utf-8")
+                payload = json.loads(value.decode("utf-8"), object_pairs_hook=unique_object)
+            except ValueError, RecursionError:
+                self._bad_checkpoint(source, raw_key)
+                continue
+            wire = payload.get("wire") if isinstance(payload, dict) else None
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(wire, str)
+                or len(wire) > 36
+                or not _reply_identifier(wire)
+                or key.partition(":")[2] != wire
+                or (reply := decode(payload)) is None
+                or key != self._reply_key(source, reply)
+            ):
+                self._bad_checkpoint(source, raw_key)
+                continue
+            if wire in replies:
+                conflicts.add(wire)
+                self._bad_checkpoint(source, raw_key)
+            replies[wire] = reply
+        return tuple(reply for wire, reply in replies.items() if wire not in conflicts)
 
     # Owner checkpoints retain the bound request, ticket, Boot, and exact wire.
     def _retained_owner_replies(self) -> tuple[OwnerWire, ...]:
-        rows = self._retained_reply_rows("owner")
-        return tuple(OwnerWire(**json.loads(row[0])) for row in rows)
+        replies = self._retained_replies("owner", self._decode_owner_reply)
+        session_stops = Counter(
+            reply.ticket
+            for reply in replies
+            if reply.action == "RemoteStopTransaction" and reply.ticket == reply.request
+        )
+        valid = []
+        for reply in replies:
+            if (
+                reply.action == "RemoteStopTransaction"
+                and reply.ticket == reply.request
+                and session_stops[reply.ticket] > 1
+            ):
+                self._bad_checkpoint("owner", self._reply_key("owner", reply).encode())
+            else:
+                valid.append(reply)
+        return tuple(valid)
+
+    def _decode_owner_reply(self, saved: dict[str, Any]) -> OwnerWire | None:
+        if saved.keys() != {"wire", "request", "ticket", "boot", "action", "local", "limit_a", "reply"}:
+            return None
+        action, local = saved["action"], saved["local"]
+        if (
+            action not in ("RemoteStartTransaction", "RemoteStopTransaction")
+            or saved["reply"] not in ("Accepted", "Rejected")
+            or not _reply_identifier(saved["ticket"])
+            or any(value is not None and not _reply_identifier(value) for value in (saved["request"], saved["boot"]))
+            or saved["limit_a"] is not None
+            or (action == "RemoteStartTransaction" and local is not None)
+            or (action == "RemoteStopTransaction" and (type(local) is not int or not 0 < local < 2**63))
+        ):
+            return None
+        reply = OwnerWire(**saved)
+        primary = self.journal.db.execute(
+            "SELECT wire,request,ticket,boot,action,local,limit_a,reply FROM owner_command_wires WHERE wire=?",
+            (reply.wire,),
+        ).fetchone()
+        # Both primary writes can fail. An existing primary row must agree with the checkpoint.
+        if primary is not None:
+            return reply if OwnerWire(*primary) in (reply, replace(reply, reply=None)) else None
+        if action == "RemoteStopTransaction" and not self._owner_stop_claim_matches(reply):
+            return None
+        return reply
+
+    # A pending session Stop and the latest shutdown retain independent dispatch claims.
+    def _owner_stop_claim_matches(self, reply: OwnerWire) -> bool:
+        j = self.journal
+        if j.db.execute("SELECT 1 FROM sqlite_schema WHERE name='managed_requests'").fetchone():
+            claims = j.db.execute(
+                "SELECT id,action,CAST(result AS BLOB) FROM managed_requests WHERE id=? OR (id=? AND action=?)",
+                (reply.request, reply.ticket, STOP_SESSION),
+            ).fetchall()
+            for request, action, raw in claims:
+                try:
+                    result = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+                except ValueError, RecursionError:
+                    return False
+                if not isinstance(result, dict):
+                    return False
+                if action == STOP_SESSION:
+                    bound = result.get("_session_stop")
+                    if (
+                        reply.request != request
+                        or reply.ticket != request
+                        or not isinstance(bound, dict)
+                        or type(bound.get("local")) is not int
+                        or bound["local"] != reply.local
+                        or type(bound.get("dispatched")) not in (int, bool)
+                        or bound["dispatched"] != 1
+                        or j.db.execute(
+                            "SELECT 1 FROM owner_command_wires WHERE request=? AND ticket=? "
+                            "AND action='RemoteStopTransaction' LIMIT 1",
+                            (request, request),
+                        ).fetchone()
+                        is not None
+                    ):
+                        return False
+                elif action == "pause":
+                    bound = result.get("_stop")
+                    if (
+                        isinstance(bound, dict)
+                        and bound.get("ticket") == reply.ticket
+                        and (bound.get("local"), bound.get("boot")) != (reply.local, reply.boot)
+                    ):
+                        return False
+                else:
+                    return False
+        if reply.request is None:
+            shutdown = j.get("trial_shutdown_attempt", {})
+            if isinstance(shutdown, dict) and shutdown.get("ticket") == reply.ticket and "stop_wire" in shutdown:
+                return (shutdown["stop_wire"], shutdown.get("boot"), shutdown.get("local")) == (
+                    reply.wire,
+                    reply.boot,
+                    reply.local,
+                )
+        return True
 
     # A forwarded checkpoint still belongs to the original vendor mutation and exact charger call.
     def _retained_vendor_replies(self) -> tuple[ForwardedReply, ...]:
-        rows = self._retained_reply_rows("vendor")
-        return tuple(ForwardedReply(**json.loads(row[0])) for row in rows)
+        return self._retained_replies("vendor", self._decode_vendor_reply)
+
+    def _decode_vendor_reply(self, saved: dict[str, Any]) -> ForwardedReply | None:
+        if (
+            saved.keys() != {"mutation", "action", "wire", "status"}
+            or not _reply_identifier(saved["mutation"])
+            or saved["action"] not in ("RemoteStartTransaction", "RemoteStopTransaction")
+            or saved["status"] not in ("Accepted", "Rejected")
+        ):
+            return None
+        reply = ForwardedReply(**saved)
+        return reply if self._forwarded_reply_binding(reply) is not None else None
 
     # Retire a fallback only after the original outcome is durable.
     def _clear_retained_reply(self, source: Literal["owner", "vendor"], reply: OwnerWire | ForwardedReply) -> None:
@@ -919,10 +1069,9 @@ class CommandOutcomes:
         self._clear_retained_reply("vendor", reply)
         return True
 
-    # Both live and recovered publication must match the original forwarded attempt.
-    def _record_forwarded_reply(self, reply: ForwardedReply) -> bool:
-        j = self.journal
-        row = j.db.execute(
+    # Live publication and recovery use the same original forwarded attempt binding.
+    def _forwarded_reply_binding(self, reply: ForwardedReply) -> sqlite3.Row | None:
+        row: sqlite3.Row | None = self.journal.db.execute(
             "SELECT origin,action,wire_request,state,wire_result FROM mutations "
             "JOIN vendor_command_scope ON mutation=token WHERE token=?",
             (reply.mutation,),
@@ -947,6 +1096,13 @@ class CommandOutcomes:
                 and reply.status == "Accepted"
             )
         ):
+            return None
+        return row
+
+    def _record_forwarded_reply(self, reply: ForwardedReply) -> bool:
+        j = self.journal
+        row = self._forwarded_reply_binding(reply)
+        if row is None:
             raise RecoveryRequiredError("charger reply no longer has its original forwarded command")
         if row["wire_result"] == "dispatched":
             j.record_vendor_result(reply.mutation, reply.status)

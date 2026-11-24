@@ -3,6 +3,9 @@
 ## Unreleased
 
 - Fixed Solar Display 2 showing grey charger buttons when its Home Assistant touch automation was enabled.
+- Keep damaged saved Start and Stop replies for diagnosis while recovering from valid evidence.
+- Use stable recovery reasons for new current and history records while still reading older journals.
+- Reject malformed authorization headers cleanly and document the network and electrical setup the proxy supports.
 - Added read-only incident reports for local and vendor Stops and included saved backup replies in Start reports.
 - Fixed a timing issue that could prevent Pause from recording and stopping a session the charger reported late.
 - Rechecked current charger evidence before sending a session-only Stop and preserved pending Pause through history repair.

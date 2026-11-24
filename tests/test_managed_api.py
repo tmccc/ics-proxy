@@ -9,6 +9,7 @@ import sqlite3
 import ssl
 import uuid
 from contextlib import AsyncExitStack
+from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -250,7 +251,7 @@ async def test_management_rejects_unauthorized_handshakes_without_mutation(
             headers.append(("Authorization", "Bearer " + TOKEN))
         path = "/management?command=pause" if case == "query" else "/management"
         try:
-            with pytest.raises(InvalidStatus):
+            with pytest.raises(InvalidStatus) as refusal:
                 async with connect(
                     f"ws://127.0.0.1:{port}{path}",
                     additional_headers=headers,
@@ -258,6 +259,7 @@ async def test_management_rejects_unauthorized_handshakes_without_mutation(
                     subprotocols=["ics-proxy.v1"],
                 ):
                     pass
+            assert refusal.value.response.status_code == HTTPStatus.UNAUTHORIZED
             assert session.journal.get("control") == before
             assert session.journal.db.execute("SELECT COUNT(*) FROM managed_requests").fetchone()[0] == 0
             assert rig.bench.device_calls == []

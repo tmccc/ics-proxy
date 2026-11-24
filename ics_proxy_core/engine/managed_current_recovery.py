@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 from .control_state import ControlState
 from .managed_current import managed_current_ceiling
 from .managed_intent import read_pause_claim
-from .managed_records import INTERRUPTED_CURRENT
+from .managed_records import INTERRUPTED_CURRENT, CurrentFailureReason
 from .native_bounded import NativeBoundedSpec
 from .store import Journal
 
@@ -95,6 +95,20 @@ def interrupted_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[st
     }
 
 
+# Only uncoded historical diagnostics rely on the wording used by the old writers.
+def _superseded_current_failure(failure: dict[str, Any]) -> bool:
+    if "reason" in failure:
+        return (failure["reason"], failure.get("type")) in (
+            (CurrentFailureReason.CONTROL_SUPERSEDED, "UnavailableError"),
+            (CurrentFailureReason.NATIVE_AUDIT_SUPERSEDED, "AuditSupersededError"),
+        )
+    return (failure.get("type"), failure.get("detail")) in (
+        ("UnavailableError", "current update was superseded by another control operation"),
+        ("AuditSupersededError", "a newer native observation superseded this read"),
+        ("AuditSupersededError", "native bounded audit was superseded by local authority"),
+    )
+
+
 # Match the exact durable failed request; independent closed-zero reconciliation still has to settle every debt.
 def legacy_current_evidence(c: ManagedController, fault: dict[str, Any]) -> dict[str, Any] | None:
     j = c.session.journal
@@ -110,12 +124,7 @@ def legacy_current_evidence(c: ManagedController, fault: dict[str, Any]) -> dict
         or change.get("state") != "uncertain"
         or type(change.get("current_a")) is not int
         or not 6 <= change["current_a"] <= 32
-        or (failure.get("type"), failure.get("detail"))
-        not in (
-            ("UnavailableError", "current update was superseded by another control operation"),
-            ("AuditSupersededError", "a newer native observation superseded this read"),
-            ("AuditSupersededError", "native bounded audit was superseded by local authority"),
-        )
+        or not _superseded_current_failure(failure)
     ):
         return None
     row = j.db.execute(

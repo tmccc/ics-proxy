@@ -4,16 +4,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from contextlib import closing
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
 from websockets.asyncio.client import connect
 
 from ics_proxy_core.engine import managed_session_stop
-from ics_proxy_core.engine.command_outcomes import OwnerWire
+from ics_proxy_core.engine.command_outcomes import ForwardedReply, OwnerWire
 from ics_proxy_core.engine.gateway import decode
 from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
 from ics_proxy_core.engine.managed_intent import ManagedRequests, insert_request
@@ -662,6 +664,108 @@ def test_exact_stop_rejection_fences_receipt_after_replacement(tmp_path, source)
         assert receipt["state"] == "failed"
         assert receipt["result"]["classification"] == "stop_rejected"
         assert journal.outcomes.session(local).closed
+
+
+# Intent: restart with damaged fallback evidence while preserving a separate valid Stop reply.
+# Why: a malformed or mismatched reply may neither settle its original outcome nor block the journal from opening.
+@pytest.mark.parametrize("source", ["owner", "vendor"])
+@pytest.mark.parametrize("damage", ["json", "encoding", "extra", "duplicate", "key", "binding", "status", "surrogate"])
+def test_invalid_retained_reply_is_preserved_without_blocking_restart(tmp_path, caplog, source, damage):
+    path = tmp_path / "stop-journal.sqlite"
+    action = "RemoteStopTransaction"
+    with closing(Journal(path, "synthetic-charger")) as journal:
+        local = journal.start("start-report", START)["transactionId"]
+
+        def checkpoint(wire, local):
+            if source == "owner":
+                sent = OwnerWire(wire, wire, wire, "boot", action, local, None)
+                if damage != "surrogate" or wire != "damaged-wire":
+                    journal.outcomes.record_owner_wire(sent)
+                return asdict(sent) | {"reply": "Accepted"}
+            token = journal.mutation_intent("vendor", action, {"transactionId": local})
+            journal.bind_vendor_command(
+                token, request=wire, vendor_epoch=1, boot="boot", wire=wire, local=local, profile=None
+            )
+            journal.record_vendor_result(token, "dispatched")
+            return asdict(ForwardedReply(token, action, wire, "Accepted"))
+
+        key = f"retained_stop_{source}:damaged-wire"
+        saved = checkpoint("damaged-wire", local)
+        status = "reply" if source == "owner" else "status"
+        binding = "ticket" if source == "owner" else "mutation"
+        payload = (
+            b"\xff"
+            if damage == "encoding"
+            else {
+                "json": "{",
+                "extra": json.dumps(saved | {"extra": True}),
+                "duplicate": json.dumps(saved)[:-1] + f',"{status}":"Accepted"}}',
+                "key": json.dumps(saved | {"wire": "other-wire"}),
+                "binding": json.dumps(saved | {binding: "other-binding"}),
+                "status": json.dumps(saved | {status: "Rejected"}),
+                "surrogate": json.dumps(saved | {"request" if source == "owner" else "mutation": "\ud800"}),
+            }[damage].encode()
+        )
+        journal.db.execute("INSERT INTO meta VALUES(?,CAST(? AS TEXT))", (key, payload))
+        if source == "owner" and damage == "surrogate":
+            ManagedRequests(journal)
+        journal.stop("first-stop", {"transactionId": local, "meterStop": 1200, "timestamp": "2026-01-01T00:01:00Z"})
+        next_local = journal.start("next-start", START | {"timestamp": "2026-01-01T00:02:00Z"})["transactionId"]
+        journal.put(f"retained_stop_{source}:valid-wire", checkpoint("valid-wire", next_local))
+
+    with closing(Journal(path, "synthetic-charger")) as journal:
+        journal.outcomes.retry_owner_writes()
+        if source == "owner":
+            assert all(wire.reply is None for wire in journal.outcomes.owner_wires("ticket", "damaged-wire"))
+            assert journal.outcomes.owner_wires("ticket", "valid-wire")[0].reply == "Accepted"
+        else:
+            assert journal.outcomes.vendor(saved["mutation"]).status is None
+            assert len(journal.outcomes.vendor_evidence().uncertain) == 1
+        assert not journal.outcomes.accepted_stop(local)
+        assert journal.outcomes.accepted_stop(next_local)
+        assert journal.active() == next_local
+        assert journal.db.execute("SELECT CAST(value AS BLOB) FROM meta WHERE key=?", (key,)).fetchone()[0] == payload
+        assert journal.get(f"retained_stop_{source}:valid-wire") is None
+    assert caplog.text.count(f"Invalid retained {source} transaction reply checkpoint") == 1
+
+
+# Intent: require the retained Stop reply to match its one possible dispatch, even without a primary wire.
+# Why: a damaged request link or multiple possible replies must leave the original attempt unresolved.
+@pytest.mark.parametrize("damage", ["none", "missing_request", "different_request", "different_wire", "other_primary"])
+def test_retained_session_stop_without_primary_requires_its_exact_claim(tmp_path, damage):
+    path = tmp_path / "stop-journal.sqlite"
+    request, wire, action = "stop-request", "stop-wire", "RemoteStopTransaction"
+    with closing(Journal(path, "synthetic-charger")) as journal:
+        ManagedRequests(journal)
+        journal.put("managed_mode", {"mode": "app_schedule"})
+        local = journal.start("start-report", START)["transactionId"]
+        insert_request(
+            journal,
+            request,
+            "stop_session",
+            0,
+            {"_session_stop": {"local": local, "dispatched": True}},
+            state="running",
+        )
+        saved = asdict(OwnerWire(wire, request, request, "boot", action, local, None, "Accepted"))
+        if damage == "missing_request":
+            saved["request"] = None
+        elif damage == "different_request":
+            saved["request"] = "another-request"
+        elif damage == "different_wire":
+            journal.put(
+                "retained_transaction_reply_owner:another-wire", saved | {"wire": "another-wire", "reply": "Rejected"}
+            )
+        elif damage == "other_primary":
+            journal.outcomes.record_owner_wire(OwnerWire("another-wire", request, request, "boot", action, local, None))
+        journal.put(f"retained_stop_owner:{wire}", saved)
+
+    with closing(Journal(path, "synthetic-charger")) as journal:
+        assert journal.outcomes.session_stop_dispatched(local)
+        assert journal.outcomes.accepted_stop(local) is (damage == "none")
+        journal.outcomes.retry_owner_writes()
+        assert journal.outcomes.accepted_stop(local) is (damage == "none")
+        assert journal.active() == local
 
 
 # Intent: the service retries publication of the same closed Stop receipt after SQLite rolls back its write.
