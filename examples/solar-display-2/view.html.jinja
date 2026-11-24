@@ -33,10 +33,9 @@
 {% set healthy = is_state('binary_sensor.ics_proxy_problem', 'off') %}
 {% set session = states('binary_sensor.ics_proxy_session_open') %}
 {% set request = states('input_select.general_display_2_ics_request') %}
-{% set automation = 'automation.general_display_2_ics_charger_buttons' %}
-{% set automation_enabled = is_state(automation, 'on') %}
+{% set automation_enabled = is_state('automation.general_display_2_ics_charger_buttons', 'on') %}
 {% set request_available = automation_enabled and request in ['idle', 'starting', 'stopping', 'starting_timeout', 'stopping_timeout'] %}
-{% set busy = automation_enabled and state_attr(automation, 'current') | int(0) > 0 %}
+{% set busy = automation_enabled and state_attr('automation.general_display_2_ics_charger_buttons', 'current') | int(0) > 0 %}
 {% set start_revision = state_attr('binary_sensor.ics_proxy_session_open', 'control_revision') %}
 {% set start_ok = request_available and not busy and session == 'off' and start_revision is integer and 0 <= start_revision < 2**53 and state_attr('binary_sensor.ics_proxy_session_open', 'can_start') is sameas true %}
 {% set stop_target = state_attr('binary_sensor.ics_proxy_session_open', 'stop_target') %}
