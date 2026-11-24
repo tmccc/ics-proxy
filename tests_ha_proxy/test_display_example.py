@@ -68,9 +68,7 @@ def test_display_feedback_follows_live_home_assistant_subscriptions():
     assert helper["entity_id"] == PENDING
     assert automation["entity_id"] == AUTOMATION and "attribute" not in automation
     assert busy["entity_id"] == AUTOMATION and busy["attribute"] == "current"
-    assert helper["on_value"] == automation["on_value"] == busy["on_value"] == [
-        {"script.execute": "show_ics_request_feedback"}
-    ]
+    assert helper["on_value"] == automation["on_value"] == [{"script.execute": "show_ics_request_feedback"}]
     scripts = {script["id"]: script["then"] for script in package["script"]}
     feedback = scripts["show_ics_request_feedback"][0]["lambda"]
     assert 'const bool enabled = id(canvas_ics_touch_automation).state == "on";' in feedback
@@ -78,6 +76,8 @@ def test_display_feedback_follows_live_home_assistant_subscriptions():
     assert re.search(r'if \(unavailable\)\s*\{\s*feedback = "Charger buttons unavailable";', feedback)
     assert "if (!enabled) id(canvas_pressed_control).clear();" in feedback
     assert "if (!pending && !unavailable)" in feedback
+    assert 'const bool starting = showing && enabled && request == "starting";' in feedback
+    assert 'const bool stopping = showing && enabled && request == "stopping";' in feedback
     for state, message in (("starting_timeout", "Start not confirmed"), ("stopping_timeout", "Stop not confirmed")):
         assert re.search(rf'request == "{state}"\)\s*\{{\s*feedback = "{message}";', feedback)
     assert {"script.execute": "show_ics_request_feedback"} in scripts["check_canvas_freshness"][0]["if"]["then"]
@@ -86,7 +86,9 @@ def test_display_feedback_follows_live_home_assistant_subscriptions():
         widget["button"] for widget in page["widgets"] if widget.get("button", {}).get("id") == "canvas_touch_button"
     )
     assert 'id(canvas_ics_touch_automation).state == "on"' in touch["on_press"][0]["lambda"]
-    assert 'id(canvas_ics_touch_automation).state != "on"' in touch["on_click"][0]["if"]["condition"]["lambda"]
+    click = touch["on_click"][0]["if"]["condition"]["lambda"]
+    assert 'id(canvas_ics_touch_automation).state != "on"' in click
+    assert 'request == "starting" || request == "stopping"' in click
 
 
 # Intent: test the shipped display tap guards and exact Start/Stop feedback inside Home Assistant.
@@ -276,12 +278,31 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         assert "Open session" in next_stop_frame and "Stop not confirmed" not in next_stop_frame
         assert render_marker(next_stop_frame) == f"d51a2{int(later.timestamp()):08x}{TARGET}"
 
+        # An interrupted action has no receipt to report. Its first cleanup tick after enabling restores feedback.
+        for starting, pending in ((True, "starting"), (False, "stopping")):
+            gate.clear()
+            previous_calls = len(calls)
+            hass.states.async_set(
+                SESSION, "off" if starting else "on",
+                {"can_start": True, "control_revision": REVISION} if starting else {"stop_target": TARGET},
+            )
+            tap(starting)
+            await wait_for(lambda: len(calls) == previous_calls + 1)
+            assert hass.states.get(PENDING).state == pending
+            await hass.services.async_call("automation", "turn_off", {"entity_id": AUTOMATION}, blocking=True)
+            assert hass.states.get(PENDING).state == pending
+            gate.set()
+            await hass.services.async_call("automation", "turn_on", {"entity_id": AUTOMATION}, blocking=True)
+            await wait_for(lambda: settled(pending + "_timeout"))
+            await wait_for(lambda: settled("idle"))
+            assert len(calls) == previous_calls + 1
+
         # An unavailable touch automation cannot honor either rendered charger control.
         await hass.services.async_call("automation", "turn_off", {"entity_id": AUTOMATION}, blocking=True)
         assert hass.states.get(AUTOMATION).state == "off"
         tap(False)
         await hass.async_block_till_done()
-        assert len(calls) == 4
+        assert len(calls) == 6
         for automation_state in ("off", "unavailable", None):
             if automation_state == "unavailable":
                 hass.states.async_set(AUTOMATION, automation_state, {"current": 1})
@@ -305,7 +326,7 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         await hass.services.async_call("automation", "turn_on", {"entity_id": AUTOMATION}, blocking=True)
         await wait_for(lambda: settled("idle"))
         assert "Ready to start" in template.async_render({"now": datetime.now(UTC)}, parse_result=False)
-        assert len(calls) == 4
+        assert len(calls) == 6
     finally:
         gate.set()
         await hass.async_stop(force=True)

@@ -2,7 +2,11 @@
 
 ## Unreleased
 
-- Finish a saved vendor Stop acknowledgement during startup so it cannot block repair of missing charger history.
+- Refuse hard-linked journal state files so each journal has one owner lock.
+- Finish exact saved vendor acknowledgements during startup when they would block repair of missing charger history.
+- Report the Home Assistant client build captured during setup and recover display feedback after an interrupted action.
+- Check the linked OpenSSL libraries before reusing a passing release rehearsal.
+- Read stopped, checkpointed journals from read-only backup directories in incident reports.
 - Resume an interrupted return to the vendor backend once fresh readings confirm that a reappearing proxy
   profile has been removed, including when it reappeared before the first route check.
 - Require evidence of the original session Stop before using a retained reply as acceptance.

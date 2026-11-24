@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sqlite3
+import stat
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -47,6 +48,12 @@ def fingerprint(value: Any) -> str:
     return hashlib.sha256(encoded(value).encode()).hexdigest()
 
 
+# State with another filesystem name cannot share this pathname's SQLite and owner locks.
+def require_single_state_file(info: os.stat_result) -> None:
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise RecoveryRequiredError("journal state must use regular files without hard links")
+
+
 @dataclass(frozen=True)
 class Delivery:
     """One durable cloud request, still expressed using local transaction ids."""
@@ -81,13 +88,20 @@ class Journal:
         path.parent.mkdir(parents=True, exist_ok=True)
         # Failed construction must release both the private lock and database handle.
         with ExitStack() as cleanup:
-            self._lock = open(str(path) + ".lock", "a+b")
-            cleanup.callback(self._lock.close)
-            os.chmod(str(path) + ".lock", 0o600)
+            descriptor = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+            self._lock = cleanup.enter_context(os.fdopen(descriptor, "r+b"))
+            require_single_state_file(os.fstat(descriptor))
             try:
                 fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise RecoveryRequiredError("journal already has an active owner") from None
+            for state in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm"), Path(str(path) + "-journal")):
+                try:
+                    info = state.lstat()
+                except FileNotFoundError:
+                    continue
+                require_single_state_file(info)
+            os.fchmod(descriptor, 0o600)
             from .command_outcomes import CommandOutcomes
             from .control_state import ControlAuthority
             from .installation_lifecycle import InstallationLifecycle

@@ -5,45 +5,62 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from os.path import samestat
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.const import __version__ as ha_version
 from homeassistant.core import HomeAssistant
 
-from . import ProxyEntry
 from .diagnostic_view import PHASES, STATES, diagnostics, explanation, label, number
 
+if TYPE_CHECKING:
+    from . import ProxyEntry
 
-# Only public installed source/manifest/BUILD files are inspected; private config and raw logs are never opened.
-def software() -> dict[str, Any]:
-    root = Path(__file__).resolve().parent
-    result: dict[str, Any] = {
-        "ha_core": ha_version,
-        "client_version": None,
-        "client_build": None,
-        "client_source_sha256": None,
-    }
+CLIENT_BUILD_INFO = "ics_proxy_client_build_info"
+
+
+# Read the public build fields independently. A directory replacement during the read can mix two builds.
+def client_build_info() -> dict[str, str | None]:
+    unknown: dict[str, str | None] = {"version": None, "build": None, "source_sha256": None}
+    result = dict(unknown)
     try:
-        version = json.loads((root / "manifest.json").read_text()).get("version")
+        root = Path(__file__).resolve().parent
+        original = root.stat()
+    except OSError:
+        return unknown
+    try:
+        manifest = json.loads((root / "manifest.json").read_text())
+        version = manifest.get("version") if isinstance(manifest, dict) else None
         if isinstance(version, str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-rc[0-9]+)?", version):
-            result["client_version"] = version
-        digest = hashlib.sha256()
-        for path in sorted(root.glob("*.py")):
-            digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
-        result["client_source_sha256"] = digest.hexdigest()
-        if (root / "BUILD").is_file():
-            build = (root / "BUILD").read_text().strip()
-            if re.fullmatch(r"[a-f0-9]{7,40}(?:[+-]dirty)?", build):
-                result["client_build"] = build
+            result["version"] = version
+    except OSError, ValueError, RecursionError:
+        pass
+    try:
+        build = (root / "BUILD").read_text().strip()
+        if re.fullmatch(r"[a-f0-9]{7,40}(?:[+-]dirty)?", build):
+            result["build"] = build
     except OSError, ValueError:
-        pass  # Missing public version metadata is unknown, never inferred from another checkout.
-    return result
+        pass
+    try:
+        if paths := sorted(root.glob("*.py")):
+            digest = hashlib.sha256()
+            for path in paths:
+                digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
+            result["source_sha256"] = digest.hexdigest()
+    except OSError:
+        pass
+    try:
+        current = root.stat()
+    except OSError:
+        return unknown
+    return result if samestat(original, current) and original.st_ctime_ns == current.st_ctime_ns else unknown
 
 
 # The download never refreshes the coordinator or requests a receipt; failed setup still has a useful empty report.
 async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ProxyEntry) -> dict[str, Any]:
-    metadata = await hass.async_add_executor_job(software)
+    active = hass.data.get(CLIENT_BUILD_INFO, {})
+    installed = await hass.async_add_executor_job(client_build_info)
     coordinator = getattr(entry, "runtime_data", None)
     data = (coordinator.data or {}) if coordinator is not None else {}
     status_age = coordinator.age("status_age_seconds") if coordinator is not None else None
@@ -62,7 +79,11 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ProxyEn
     source, python = public_software.get("proxy_source_sha256"), public_software.get("proxy_python")
     return {
         "software": {
-            **metadata,
+            "ha_core": ha_version,
+            "client_version": active.get("version"),
+            "client_build": active.get("build"),
+            "client_source_sha256": active.get("source_sha256"),
+            "installed_client": installed,
             "proxy_source_sha256": source
             if isinstance(source, str) and re.fullmatch(r"[a-f0-9]{64}", source)
             else None,

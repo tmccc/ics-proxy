@@ -26,9 +26,11 @@ runtime before the upgrade and after rollback, and the candidate runtime during 
 
 Both checks use a fresh Python cache location and set `OPENSSL_CONF=/dev/null` for synthetic certificates,
 including in the simulated service processes. They clear inherited `OPENSSL_*` overrides. Reusing a passing
-result requires matching test evidence, interpreter and dependency files, and the OpenSSL executables and
-rehearsal configuration. The installation week checks both assigned runtimes. Updating a package in place
-invalidates the result even when its version stays the same. Use installed packages in the interpreter's standard
+result requires matching test evidence, interpreter and dependency files, OpenSSL executables, and rehearsal
+configuration. The checks also fingerprint the OpenSSL libraries resolved for the fixture and service commands
+and loaded by the rehearsal interpreters. If the library inventory is unavailable, the check runs again. The
+installation week checks both assigned runtimes. Updating a package or a linked library in place invalidates
+the result even when its version stays the same. Use installed packages in the interpreter's standard
 library and package directories. The release checks fingerprint individual root-managed Python startup and
 shared-library files at their distribution link targets. The checks reject editable installs and other import
 roots without walking external source trees.

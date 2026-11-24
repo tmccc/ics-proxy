@@ -7,6 +7,7 @@ from homeassistant.const import MAJOR_VERSION, MINOR_VERSION, Platform
 from homeassistant.core import HomeAssistant
 
 from .coordinator import ProxyCoordinator
+from .diagnostics import CLIENT_BUILD_INFO, client_build_info
 from .notification import NOTICES
 from .session_service import register_session_service
 
@@ -14,8 +15,10 @@ PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON, Platform.
 type ProxyEntry = ConfigEntry[ProxyCoordinator]
 
 
-# Register the response action once for the domain. Setup never sends a charger command.
+# Capture the client build at domain setup, before entry retries or reloads can see newly installed files.
 async def async_setup(hass: HomeAssistant, config: dict[str, object]) -> bool:
+    if CLIENT_BUILD_INFO not in hass.data:
+        hass.data[CLIENT_BUILD_INFO] = await hass.async_add_executor_job(client_build_info)
     register_session_service(hass)
     return True
 

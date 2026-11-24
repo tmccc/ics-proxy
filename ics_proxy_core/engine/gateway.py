@@ -1517,13 +1517,22 @@ class Gateway:
         outcome = self.journal.outcomes.delivery()
         return outcome is not None and outcome.uncertain
 
-    # Finish an exact received positive lifecycle reply whenever the cloud pump is between delivery turns.
-    def settle_saved_lifecycle(self) -> bool:
+    # Finish an exact positive reply locally while the cloud pump is between delivery turns.
+    def settle_saved_delivery(self, *, cold_history: bool = False) -> bool:
         if self._flush_lock.locked():
             return False
         head = self.journal.next_delivery()
-        if head is None or head.action not in ("StartTransaction", "StopTransaction"):
+        if head is None:
             return False
+        observation = head.action in OBSERVATION_ACTIONS
+        if head.action not in ("StartTransaction", "StopTransaction") and not (cold_history and observation):
+            return False
+        if cold_history:
+            # Accept a Start only for an exact closed session. Observation acknowledgements also need idle history.
+            if head.action == "StartTransaction" and head.transaction is None:
+                return False
+            if head.action != "StopTransaction" and not self.journal.outcomes.stop_report_closed(head.transaction):
+                return False
         saved = DeliveryReply.restore(self.journal, head)
         current = self.journal.outcomes.delivery_reply
         if current is not None and saved is not None and current != saved:
@@ -1534,6 +1543,11 @@ class Gateway:
         reply.require(head)
         if not reply.storage_only(self.journal, head):
             return False
+        if observation and self.policy.strict_cloud_authorization and "idTagInfo" in reply.answer[2]:
+            try:
+                validate_info(reply.answer[2]["idTagInfo"])
+            except DeniedError:
+                return False  # Ordinary delivery still owns the rejection of malformed metadata.
         self.journal.outcomes.retain_delivery(reply)
         return self._settle_delivery(head) == "acknowledged"
 

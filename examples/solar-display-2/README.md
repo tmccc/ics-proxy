@@ -16,6 +16,10 @@ replaces it. If the automation becomes unavailable, the touchscreen immediately 
 and ignores taps on them, even while the previous image is still showing. The offline dashboard hides request
 feedback.
 
+If disabling the automation interrupts its wait for a Start or Stop, the first cleanup tick after re-enabling
+it marks the request unconfirmed. The charger buttons wait for that feedback to update before accepting another
+tap. The proxy can still settle the original request.
+
 Use this with a compatible 480 × 480 ESPHome/LVGL touchscreen whose Home Assistant renderer provides the assigned
 view and display image. The canvas example is a package for an existing board configuration. The board supplies its
 display, touch and brightness components, its fallback dashboard, and the renderer integration.
@@ -28,9 +32,8 @@ display, touch and brightness components, its fallback dashboard, and the render
    [canvas_frame.h](canvas_frame.h). Keep the image URL and image-scoped authorization in local ESPHome secrets.
    The package synchronizes its Home Assistant clock every 10 seconds to check render times. Set the renderer to
    update every 25 seconds or less with the example's 10-second download interval and 5-second HTTP timeout.
-   This leaves time for clock rounding and processing before the picture expires. Update the firmware and paired
-   preview template together so the firmware handles feedback independently of the renderer. The existing request
-   helper and automation use the same states and can be kept when updating.
+   This leaves time for clock rounding and processing before the picture expires. Update the firmware, preview
+   template and touch automation together. You can keep the existing request helper with the same options.
 4. Confirm that the automation entity ID used by the view and firmware matches the installed automation.
    In the view, write the quoted entity ID directly in both `is_state()` and `state_attr()` so GeekMagic
    loads the automation’s state. Enable the automation in Home Assistant.

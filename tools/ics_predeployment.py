@@ -40,7 +40,9 @@ DISCOVERY_CASES = 20
 SYSTEM_PYTHON_LIB = Path("/usr/lib")
 SYSTEM_PYTHON_CONFIG = Path("/etc")
 SYSTEM_OPENSSL = Path("/usr/bin/openssl")
+SYSTEM_LDD = Path("/usr/bin/ldd")
 REHEARSAL_OPENSSL_CONFIG = os.devnull
+OPENSSL_LIBRARY = r"lib(ssl|crypto)(?:-[\w.-]+)?\.so(?:\.[\w.-]+)?"
 
 
 @dataclass(frozen=True)
@@ -212,12 +214,37 @@ def runtime_content_digest(import_paths: list[str], runtime_roots: list[str]) ->
     return digest.hexdigest()
 
 
+# Resolve and hash only files reported by the loader, independent of installed package metadata.
+def tls_file_identity(path: Path, digests: dict[Path, str]) -> dict[str, str]:
+    target = path.resolve(strict=True)
+    if not target.is_file():
+        raise ValueError(f"release TLS input is not a regular file: {path}")
+    if target not in digests:
+        with target.open("rb") as stream:
+            digests[target] = hashlib.file_digest(stream, "sha256").hexdigest()
+    return {"target": str(target), "sha256": digests[target]}
+
+
+# An unavailable or incomplete loader inventory can be rehearsed afresh, but cannot identify a cached pass.
+def tls_library_identities(libraries: Iterable[Path], digests: dict[Path, str]) -> dict[str, dict[str, str]] | None:
+    paths = sorted(libraries)
+    components = {match[1] for path in paths if (match := re.fullmatch(OPENSSL_LIBRARY, path.name))}
+    if components != {"ssl", "crypto"}:
+        return None
+    try:
+        return {str(path): tls_file_identity(path, digests) for path in paths}
+    except OSError, ValueError:
+        return None
+
+
 # Bind cached results to the exact interpreter, packages and runtime files used by the release test.
 def runtime_identity(python: str, source: Path, *, homeassistant: bool = False) -> dict:
     code = """\
 import hashlib
 import json
+import re
 import site
+import ssl
 import sys
 import sysconfig
 from pathlib import Path
@@ -227,18 +254,36 @@ archive = stdlib.with_name(f'python{sys.version_info.major}{sys.version_info.min
 roots = [stdlib, archive, *map(Path, site.getsitepackages()), Path(site.getusersitepackages())]
 with Path(sys.executable).open('rb') as stream:
     executable_sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
+libraries = set()
+try:
+    with Path('/proc/self/maps').open() as mappings:
+        for line in mappings:
+            fields = line.rstrip('\\n').split(maxsplit=5)
+            if len(fields) == 6 and fields[5].startswith('/'):
+                path = fields[5]
+                if re.fullmatch(sys.argv[1], Path(path.removesuffix(' (deleted)')).name):
+                    if path.endswith(' (deleted)'):
+                        raise OSError('loaded OpenSSL library was removed during the probe')
+                    libraries.add(path)
+except OSError:
+    libraries.clear()
 print(json.dumps({
     'python': sys.version,
     'executable': sys.executable,
     'executable_sha256': executable_sha256,
     'import_paths': sys.path,
     'runtime_roots': list(map(str, roots)),
+    'openssl_libraries': sorted(libraries),
+    'openssl_version': ssl.OPENSSL_VERSION,
 }))
 """
     with tempfile.TemporaryDirectory(prefix="release-runtime-") as cache:
         command = [python, "-E", "-P", "-B", "-X", f"pycache_prefix={cache}"]
         env = clean_env()
-        identity = json.loads(subprocess.check_output([*command, "-c", code], cwd=source, env=env, timeout=20))
+        identity = json.loads(
+            subprocess.check_output([*command, "-c", code, OPENSSL_LIBRARY], cwd=source, env=env, timeout=20)
+        )
+        identity["openssl_libraries"] = tls_library_identities(map(Path, identity["openssl_libraries"]), {})
         paths = identity.pop("import_paths")
         identity["runtime_sha256"] = runtime_content_digest(paths, identity.pop("runtime_roots"))
         packages = []
@@ -266,22 +311,57 @@ print(json.dumps({
     return identity
 
 
-# The TLS fixtures select OpenSSL on PATH and the service runs it from a fixed path with the same configuration.
-def openssl_identity(source: Path) -> dict[str, str | dict[str, str]]:
-    paths = os.pathsep.join(str(source / entry) for entry in os.get_exec_path())
+# Ask the Linux loader to resolve the real executable's dependencies without running its command.
+def openssl_dependencies(executable: Path, cwd: Path, env: dict[str, str]) -> set[Path]:
+    with executable.open("rb") as stream:
+        if stream.read(4) != b"\x7fELF":
+            return set()
+    try:
+        result = subprocess.run(
+            [str(SYSTEM_LDD), str(executable)],
+            cwd=cwd,
+            env=env | {"LC_ALL": "C"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except OSError, subprocess.TimeoutExpired:
+        return set()
+    if result.returncode or any(line.rstrip().endswith("=> not found") for line in result.stdout.splitlines()):
+        return set()
+    libraries = set()
+    for line in result.stdout.splitlines():
+        loaded, address, _ = line.strip().rpartition(" (0x")
+        if not address:
+            continue
+        name, alias, location = loaded.partition(" => ")
+        location = location if alias else name
+        if re.fullmatch(OPENSSL_LIBRARY, Path(name).name) or re.fullmatch(OPENSSL_LIBRARY, Path(location).name):
+            libraries.add(cwd / location)
+    return libraries
+
+
+# The fixtures use PATH. Both builds use a fixed OpenSSL path from their own service working directory.
+def openssl_identity(source: Path, *, previous: Path | None = None) -> dict[str, object]:
+    env = clean_env()
+    paths = os.pathsep.join(str(source / entry) for entry in os.get_exec_path(env))
     selected = shutil.which("openssl", path=paths)
     if selected is None:
         raise ValueError("release checks require OpenSSL on PATH")
-    identity: dict[str, str | dict[str, str]] = {"config": REHEARSAL_OPENSSL_CONFIG}
-    digests = {}
-    for role, executable in (("fixture", Path(selected)), ("service", SYSTEM_OPENSSL)):
-        target = executable.resolve(strict=True)
-        if not target.is_file() or not os.access(target, os.X_OK):
+    identity: dict[str, object] = {"config": REHEARSAL_OPENSSL_CONFIG}
+    digests: dict[Path, str] = {}
+    invocations = [("fixture", Path(selected), source), ("service", SYSTEM_OPENSSL, source)]
+    if previous is not None:
+        invocations.append(("installed_service", SYSTEM_OPENSSL, previous))
+    for role, executable, cwd in invocations:
+        if not executable.is_file() or not os.access(executable, os.X_OK):
             raise ValueError(f"release checks require an executable OpenSSL for the {role}")
-        if target not in digests:
-            with target.open("rb") as stream:
-                digests[target] = hashlib.file_digest(stream, "sha256").hexdigest()
-        identity[role] = {"executable": str(executable), "target": str(target), "sha256": digests[target]}
+        libraries = openssl_dependencies(executable, cwd, env)
+        identity[role] = {
+            "executable": str(executable),
+            **tls_file_identity(executable, digests),
+            "libraries": tls_library_identities(libraries, digests),
+        }
     return identity
 
 
@@ -484,6 +564,7 @@ def ensure_check(
     ha_version = None
     previous = installed[1] if installed is not None else None
     previous_runtime = None
+    probe_previous_runtime = False
     if check == WEEK:
         if previous is None:
             raise ValueError("installation week requires the verified installed build")
@@ -503,21 +584,32 @@ def ensure_check(
         require_standalone_pins(source, runtime["packages"], runtime="installation week runtime")
         if installed_python is None and standalone_pins(previous) != standalone_pins(source):
             raise ValueError("provide --ics-installed-python for the installed standalone runtime when pins change")
-        previous_runtime = (
-            runtime if installed_python in (None, python) else runtime_identity(installed_python, previous)
+        # A loader override may resolve different libraries from the predecessor's working directory.
+        probe_previous_runtime = installed_python not in (None, python) or any(
+            name in os.environ for name in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT")
         )
+        previous_runtime = runtime_identity(installed_python or python, previous) if probe_previous_runtime else runtime
         require_standalone_pins(previous, previous_runtime["packages"], runtime="installed standalone runtime")
-    openssl = openssl_identity(source)
+    openssl = openssl_identity(source, previous=previous)
+    tls_libraries_verified = (
+        runtime.get("openssl_libraries") is not None
+        and (previous_runtime is None or previous_runtime.get("openssl_libraries") is not None)
+        and all(
+            isinstance(invocation, dict) and invocation.get("libraries") is not None
+            for role, invocation in openssl.items()
+            if role != "config"
+        )
+    )
 
     # Reverify the exact runtime inputs both when reusing evidence and after running a new check.
     def require_stable_inputs() -> None:
         if runtime_identity(python, source, homeassistant=homeassistant) != runtime:
             raise ValueError(f"{check.name} runtime changed during verification")
-        if installed_python is not None and installed_python != python:
+        if probe_previous_runtime:
             assert previous is not None
-            if runtime_identity(installed_python, previous) != previous_runtime:
+            if runtime_identity(installed_python or python, previous) != previous_runtime:
                 raise ValueError(f"{check.name} installed runtime changed during verification")
-        if openssl_identity(source) != openssl:
+        if openssl_identity(source, previous=previous) != openssl:
             raise ValueError(f"{check.name} OpenSSL changed during verification")
 
     inputs = {
@@ -534,7 +626,7 @@ def ensure_check(
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "run.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if attempt := passed_attempt(check, directory, inputs, orders):
+        if tls_libraries_verified and (attempt := passed_attempt(check, directory, inputs, orders)):
             require_stable_inputs()
             print(f"{check.name}: reused passing results at {attempt}", flush=True)
             return

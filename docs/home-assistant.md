@@ -52,3 +52,7 @@ Home Assistant Pause uses the protective path when the charger still needs to st
 
 The client derives availability from fresh proxy data. A vendor outage and a local charger fault have
 different meanings. The proxy can report a locally verified state while the vendor connection is down.
+
+The Home Assistant diagnostics download records the client build when this Core process first sets up the
+integration. The `installed_client` fields describe the files on disk when you download diagnostics. Those
+fields can show a newer build after a file-only deployment. Missing build information appears as `null`.

@@ -18,6 +18,8 @@ modes. `trial_proxy.py run` starts a time-limited trial, and `managed_proxy.py s
 3. Keep the configuration, listener TLS key, authentication files, native credentials, native bounded specification,
    baseline, and management token outside the checkout. Give the service account ownership of the private files
    and restrict access to that account. Keep the writable journal and evidence in a private state directory.
+   Use a separate file or a SQLite backup for journal backups. The service and maintenance tools refuse
+   hard-linked state files.
 4. Keep the charger on its original route and plug in the vehicle. Independently verify that the session is
    closed and the output is zero. Run
    `python -B tools/trial_proxy.py capture-bounded-baseline --config /etc/ics-proxy/proxy.json` as the service
@@ -98,6 +100,7 @@ status reports `shutdown_uncertain`. Verify the actual charger state before assu
 
 Run `health` and `incident` as the service account that owns the private configuration and state files. Both
 commands read saved records. `incident` reports the most recent local Start by default.
+It can also read a cleanly stopped, checkpointed journal in a read-only backup directory using a temporary private copy.
 
 ```bash
 python tools/managed_proxy.py health --config /etc/ics-proxy/proxy.json

@@ -271,6 +271,7 @@ async def test_real_ha_diagnostic_download_is_passive_redacted_and_truthful(
     assert report["snapshot_fresh"] is (not stale and not failed)
     assert report["software"]["client_version"] == str(integration.version)
     assert len(report["software"]["client_source_sha256"]) == 64
+    assert report["software"]["installed_client"]["source_sha256"] == report["software"]["client_source_sha256"]
     assert report["software"]["proxy_source_sha256"] == "c" * 64
     assert report["diagnostics"]["pending_commands"][0]["confirmation"] == "unknown"
     if stale or failed:
@@ -284,6 +285,36 @@ async def test_real_ha_diagnostic_download_is_passive_redacted_and_truthful(
     assert coordinator.data == before[0]
 
 
+# Intent: setup records the original client build before a file-only deployment, even if diagnostics first runs later.
+# Why: an entry reload keeps the already imported Python modules in the same Home Assistant process.
+async def test_diagnostics_distinguishes_current_process_from_replacement_files(
+    actual_hass, peer, tmp_path, monkeypatch
+):
+    from custom_components.ics_proxy import diagnostics
+
+    installed, staged = tmp_path / "installed", tmp_path / "staged"
+    for root, version, build in ((installed, "1.2.3", "a" * 12), (staged, "1.2.4", "b" * 12)):
+        root.mkdir()
+        (root / "manifest.json").write_text(json.dumps({"version": version}))
+        (root / "BUILD").write_text(build)
+        (root / "__init__.py").write_text(f"# {build}\n")
+    monkeypatch.setattr(diagnostics, "__file__", str(installed / "diagnostics.py"))
+    original = diagnostics.client_build_info()
+    entry = await setup(actual_hass, peer)
+    installed.rename(tmp_path / "previous")
+    staged.rename(installed)
+    assert await actual_hass.config_entries.async_reload(entry.entry_id)
+
+    software = (await diagnostics.async_get_config_entry_diagnostics(actual_hass, entry))["software"]
+    assert software["client_version"] == original["version"] == "1.2.3"
+    assert software["client_build"] == original["build"] == "a" * 12
+    assert software["client_source_sha256"] == original["source_sha256"]
+    assert software["installed_client"] == diagnostics.client_build_info()
+    assert software["installed_client"]["version"] == "1.2.4"
+    assert software["installed_client"]["build"] == "b" * 12
+    assert software["installed_client"]["source_sha256"] != original["source_sha256"]
+
+
 # Intent: failed first setup produces a bounded missing-snapshot download without needing runtime_data or a token.
 # Why: an unavailable integration is precisely when collecting diagnostics is most useful.
 async def test_diagnostic_download_handles_failed_first_setup(actual_hass):
@@ -291,6 +322,9 @@ async def test_diagnostic_download_handles_failed_first_setup(actual_hass):
 
     report = await async_get_config_entry_diagnostics(actual_hass, SimpleNamespace(data={"token": PRIVATE}))
     assert report["snapshot_available"] is False and report["snapshot_fresh"] is False
+    software = report["software"]
+    assert software["client_version"] is software["client_build"] is software["client_source_sha256"] is None
+    assert software["installed_client"]["version"] is not None
     assert PRIVATE not in json.dumps(report) and "last known" in report["summary"]
 
 
@@ -344,4 +378,4 @@ def test_client_diagnostics_keeps_the_release_candidate_version(tmp_path, monkey
 
     monkeypatch.setattr(diagnostics, "__file__", str(tmp_path / "diagnostics.py"))
     (tmp_path / "manifest.json").write_text('{"version": "1.8.0-rc2"}')
-    assert diagnostics.software()["client_version"] == "1.8.0-rc2"
+    assert diagnostics.client_build_info() == {"version": "1.8.0-rc2", "build": None, "source_sha256": None}

@@ -282,6 +282,30 @@ def test_incident_cli_uses_local_read_only_sources(tmp_path, tls, capsys, monkey
     assert not config.journal.exists() and sorted(tmp_path.iterdir()) == before
 
 
+# Intent: read the saved request from a checkpointed journal in a read-only backup directory.
+# Why: SQLite must not need to create a WAL index in the archive to report its contents.
+def test_incident_reads_a_read_only_checkpointed_backup(tmp_path):
+    archive = tmp_path / "backup"
+    archive.mkdir(mode=0o700)
+    path = archive / "journal.sqlite"
+    request = uuid.uuid4().hex
+    journal = Journal(path, "OFFLINE001")
+    try:
+        ManagedRequests(journal).accept(request, "start", 0)
+    finally:
+        journal.close()
+    files_before = sorted(archive.iterdir())
+    assert files_before == [path, archive / "journal.sqlite.lock"]
+    archived_bytes = path.read_bytes()
+    archive.chmod(0o500)
+    try:
+        saved = incident_report(path, archive / "events.jsonl")["journal"]
+        assert saved["available"] is True and saved["request"]["request"] == reference(request)
+        assert sorted(archive.iterdir()) == files_before and path.read_bytes() == archived_bytes
+    finally:
+        archive.chmod(0o700)
+
+
 # Intent: the incident command selects a retained local Stop by its redacted request reference.
 # Why: the most recent Stop may belong to a different operator request.
 def test_incident_cli_selects_the_exact_stop_reference(tmp_path, tls, capsys):

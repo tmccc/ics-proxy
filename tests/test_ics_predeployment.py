@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import py_compile
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -102,13 +103,23 @@ def test_predeployment_runtime_identity_tracks_same_version_dependency_bytes(tmp
     (site / "optional-2.0.dist-info").mkdir()
     cache = site / "__pycache__"
     cache.mkdir()
+    tls_library = tmp_path / "libssl.so.3"
+    tls_library.write_bytes(b"TLS library version one")
+    crypto_library = tmp_path / "libcrypto.so.3"
+    crypto_library.write_bytes(b"Crypto library version one")
 
     # Report only the tiny fixture's import root, without starting or inspecting other installed runtimes.
     def metadata(command, **kwargs):
         assert command[1:5] == ["-E", "-P", "-B", "-X"]
         prefix = Path(command[5].removeprefix("pycache_prefix="))
         assert not list(prefix.iterdir())
-        return json.dumps({"import_paths": [str(site)], "runtime_roots": [str(site)]})
+        return json.dumps(
+            {
+                "import_paths": [str(site)],
+                "runtime_roots": [str(site)],
+                "openssl_libraries": [str(tls_library), str(crypto_library)],
+            }
+        )
 
     with monkeypatch.context() as runtime:
         runtime.setattr(checks.subprocess, "check_output", metadata)
@@ -118,8 +129,12 @@ def test_predeployment_runtime_identity_tracks_same_version_dependency_bytes(tmp
         assert checks.runtime_identity(sys.executable, tmp_path) == before
         dependency.write_text("value = 2\n")
         after = checks.runtime_identity(sys.executable, tmp_path)
+        tls_library.write_bytes(b"TLS library version two")
+        replaced_library = checks.runtime_identity(sys.executable, tmp_path)
     assert after["packages"] == before["packages"]
     assert after["runtime_sha256"] != before["runtime_sha256"]
+    assert replaced_library["runtime_sha256"] == after["runtime_sha256"]
+    assert replaced_library["openssl_libraries"] != after["openssl_libraries"]
 
 
 # Intent: refuse editable metadata and startup markers even when the import roots remain unchanged.
@@ -157,7 +172,9 @@ def test_predeployment_runtime_rejects_editable_dependencies(tmp_path, monkeypat
         runtime.setattr(
             checks.subprocess,
             "check_output",
-            lambda *args, **kwargs: json.dumps({"import_paths": [str(site)], "runtime_roots": [str(site)]}),
+            lambda *args, **kwargs: json.dumps(
+                {"import_paths": [str(site)], "runtime_roots": [str(site)], "openssl_libraries": []}
+            ),
         )
         runtime.setattr(Path, "walk", walk_installed)
         runtime.setattr(Path, "open", open_installed)
@@ -317,7 +334,7 @@ def test_installation_week_requires_candidate_standalone_pins(
     # Keep the import selection independent of the order of installed package metadata.
     def identity(python, source, *, homeassistant):
         assert homeassistant
-        return {"packages": sorted(packages), "homeassistant_version": active_version}
+        return {"packages": sorted(packages), "homeassistant_version": active_version, "openssl_libraries": {}}
 
     monkeypatch.setattr(checks, "runtime_identity", identity)
     attempts = []
@@ -347,31 +364,51 @@ def test_installation_week_requires_candidate_standalone_pins(
         assert not attempts and not output.exists()
 
 
-# Intent: executable paths and contents from both ways of invoking OpenSSL identify a passing run.
-# Why: updating the service executable or the fixture executable can change TLS without touching Python.
+# Intent: both OpenSSL executables and the libraries selected from their working directories identify a passing run.
+# Why: an unchanged executable can load different files from the loader search path during the installation week.
 def test_release_identity_tracks_both_openssl_executables(tmp_path, monkeypatch):
     tool_bin = tmp_path / "bin"
     tool_bin.mkdir()
     fixture, service = tool_bin / "openssl", tmp_path / "system-openssl"
     for executable in (fixture, service):
-        executable.write_text("fixture version one\n")
+        shutil.copyfile(checks.SYSTEM_OPENSSL, executable)
         executable.chmod(0o700)
+    previous = tmp_path / "previous"
+    libraries = checks.openssl_dependencies(checks.SYSTEM_OPENSSL, tmp_path, checks.clean_env())
+    crypto = next(path for path in libraries if path.name.startswith("libcrypto"))
+    current_library, previous_library = (root / "tls" / crypto.name for root in (tmp_path, previous))
+    for library in (current_library, previous_library):
+        library.parent.mkdir(parents=True)
+        shutil.copyfile(crypto, library)
     monkeypatch.setenv("PATH", "bin")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "tls")
     monkeypatch.setattr(checks, "SYSTEM_OPENSSL", service)
 
-    initial = checks.openssl_identity(tmp_path)
+    initial = checks.openssl_identity(tmp_path, previous=previous)
     assert initial["fixture"]["executable"] == str(fixture)
     assert initial["service"]["executable"] == str(service)
-    fixture.write_text("fixture version two\n")
-    changed = checks.openssl_identity(tmp_path)
-    assert changed["fixture"] != initial["fixture"] and changed["service"] == initial["service"]
-    service.write_text("system version two\n")
-    assert checks.openssl_identity(tmp_path)["service"] != changed["service"]
+    assert str(current_library) in initial["fixture"]["libraries"]
+    assert str(current_library) in initial["service"]["libraries"]
+    assert str(previous_library) in initial["installed_service"]["libraries"]
+
+    for path in (fixture, service, previous_library, current_library):
+        with path.open("ab") as output:
+            output.write(b"changed fixture contents")
+        changed = checks.openssl_identity(tmp_path, previous=previous)
+        affected = {
+            fixture: {"fixture"},
+            service: {"service", "installed_service"},
+            previous_library: {"installed_service"},
+            current_library: {"fixture", "service"},
+        }[path]
+        assert {role for role in initial if initial[role] != changed[role]} == affected
+        initial = changed
 
 
 # Intent: run real certificate generation and inspection under the same OpenSSL settings a cached week represents.
 # Why: inherited config files can break synthetic certificates even when the executables stay the same.
-def test_installation_week_reuses_results_with_pinned_openssl_config(tmp_path, monkeypatch):
+@pytest.mark.parametrize("unverified", [None, "wrapper", "loader", "python"])
+def test_installation_week_reuses_results_with_pinned_openssl_config(tmp_path, monkeypatch, unverified):
     source, previous, output = (tmp_path / name for name in ("candidate", "installed", "evidence"))
     tools = source / "tools"
     tools.mkdir(parents=True)
@@ -414,8 +451,24 @@ def test_installation_week_reuses_results_with_pinned_openssl_config(tmp_path, m
         "junit = next(arg.removeprefix('--junitxml=') for arg in sys.argv if arg.startswith('--junitxml='))\n"
         f"Path(junit).write_text({report!r})\n"
     )
-    runtime = {"homeassistant_version": "2026.11.0", "packages": [["websockets", "16.0"]]}
+    runtime = {
+        "homeassistant_version": "2026.11.0",
+        "packages": [["websockets", "16.0"]],
+        "openssl_libraries": None if unverified == "python" else {},
+    }
     monkeypatch.setattr(checks, "runtime_identity", lambda *args, **kwargs: runtime)
+    libraries = checks.openssl_dependencies(checks.SYSTEM_OPENSSL, source, checks.clean_env())
+    crypto = next(path for path in libraries if path.name.startswith("libcrypto"))
+    library = tmp_path / crypto.name
+    shutil.copyfile(crypto, library)
+    monkeypatch.setenv("LD_LIBRARY_PATH", str(tmp_path))
+    if unverified == "wrapper":
+        executable = tmp_path / "openssl"
+        executable.write_text(f'#!/bin/sh\nexec {checks.SYSTEM_OPENSSL} "$@"\n')
+        executable.chmod(0o700)
+        monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    if unverified == "loader":
+        monkeypatch.setattr(checks, "SYSTEM_LDD", tmp_path / "absent-ldd")
     bad_settings = tmp_path / "broken.cnf"
     bad_settings.write_text("invalid OpenSSL configuration\n")
     monkeypatch.setenv("OPENSSL_CONF", str(bad_settings))
@@ -426,13 +479,21 @@ def test_installation_week_reuses_results_with_pinned_openssl_config(tmp_path, m
     args = (checks.WEEK, source, output, {"commit": "a", "source_digest": "b"}, sys.executable)
     checks.ensure_check(*args, installed=("old", previous))
     (receipt,) = output.glob("*/passed.json")
-    assert json.loads(receipt.read_text())["inputs"]["openssl"]["config"] == os.devnull
+    openssl = json.loads(receipt.read_text())["inputs"]["openssl"]
+    assert openssl["config"] == os.devnull
+    assert (openssl["fixture"]["libraries"] is None) == (unverified in ("wrapper", "loader"))
     assert os.environ["OPENSSL_CONF"] == str(bad_settings)
     bad_settings.write_text("a different error in inherited OpenSSL settings\n")
     monkeypatch.setenv("OPENSSL_CONF_INCLUDE", str(previous))
     checks.ensure_check(*args, installed=("old", previous))
     assert list(output.glob("*/passed.json")) == [receipt]
-    assert len(list(output.glob("*/attempt-*"))) == 1
+    assert len(list(output.glob("*/attempt-*"))) == (2 if unverified else 1)
+
+    with library.open("ab") as changed:
+        changed.write(b"rebuilt at the same version")
+    checks.ensure_check(*args, installed=("old", previous))
+    assert len(list(output.glob("*/passed.json"))) == (1 if unverified == "loader" else 2)
+    assert len(list(output.glob("*/attempt-*"))) == (3 if unverified else 2)
 
 
 # Intent: prove each build has the right dependencies and reuse a pass only while both runtimes and TLS inputs match.
@@ -446,8 +507,12 @@ def test_installation_week_verifies_split_runtimes_and_openssl(tmp_path, monkeyp
     (source / "requirements-ha-proxy-2026.10.txt").write_text("homeassistant==2026.10.4\n")
     (previous / "requirements-trial.txt").write_text("websockets==15.0.1\n")
     installed_python = str(tmp_path / "previous-python")
-    candidate_runtime = {"homeassistant_version": "2026.11.0", "packages": [["websockets", "16.0"]]}
-    old_runtime = {"runtime_sha256": "old-1", "packages": [["websockets", "15.0.1"]]}
+    candidate_runtime = {
+        "homeassistant_version": "2026.11.0",
+        "packages": [["websockets", "16.0"]],
+        "openssl_libraries": {},
+    }
+    old_runtime = {"runtime_sha256": "old-1", "packages": [["websockets", "15.0.1"]], "openssl_libraries": {}}
     openssl = "first-ssl"
     change_during_run = None
     attempts = []
@@ -479,7 +544,9 @@ def test_installation_week_verifies_split_runtimes_and_openssl(tmp_path, monkeyp
             openssl += "-changed"
 
     monkeypatch.setattr(checks, "runtime_identity", identity)
-    monkeypatch.setattr(checks, "openssl_identity", lambda source: {"fixture": openssl})
+    monkeypatch.setattr(
+        checks, "openssl_identity", lambda source, *, previous: {"fixture": {"libraries": {"test": openssl}}}
+    )
     monkeypatch.setattr(checks, "run_check", run)
     args = (checks.WEEK, source, tmp_path / "evidence", {"commit": "a", "source_digest": "b"}, sys.executable)
     installed = ("old", previous)
@@ -496,7 +563,7 @@ def test_installation_week_verifies_split_runtimes_and_openssl(tmp_path, monkeyp
     receipt = json.loads((attempts[0].parent / "passed.json").read_text())
     assert receipt["inputs"]["installed_runtime"] == old_runtime
     assert receipt["inputs"]["runtime"] == candidate_runtime
-    assert receipt["inputs"]["openssl"] == {"fixture": openssl}
+    assert receipt["inputs"]["openssl"] == {"fixture": {"libraries": {"test": openssl}}}
 
     old_runtime["runtime_sha256"] = "old-2"
     checks.ensure_check(*args, installed=installed, installed_python=installed_python)
@@ -887,7 +954,11 @@ def test_reusing_and_rechecking_discovery_results(tmp_path, monkeypatch, damage)
         )
         (path / "summary.json").write_text(json.dumps(discovery_summary(orders)))
 
-    monkeypatch.setattr(checks, "runtime_identity", lambda python, source, *, homeassistant: {"python": "fixture"})
+    monkeypatch.setattr(
+        checks,
+        "runtime_identity",
+        lambda python, source, *, homeassistant: {"python": "fixture", "openssl_libraries": {}},
+    )
     monkeypatch.setattr(checks, "run_check", run)
     args = (checks.DISCOVERY, source, tmp_path, {"commit": "a", "source_digest": "b"}, sys.executable)
     checks.ensure_check(*args)

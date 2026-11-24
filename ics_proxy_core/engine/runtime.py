@@ -532,9 +532,9 @@ class ConnectionRuntime:
             self.status.last_failure = type(failure).__name__
 
     # Retry a known local acknowledgement while leaving network delivery and physical authority separate.
-    def settle_saved_lifecycle(self) -> None:
+    def settle_saved_delivery(self, *, cold_history: bool = False) -> None:
         try:
-            settled = self.gateway.settle_saved_lifecycle()
+            settled = self.gateway.settle_saved_delivery(cold_history=cold_history)
         except (RecoveryRequiredError, ConflictError, sqlite3.Error) as error:
             self._settle_delivery_status(error)
         else:

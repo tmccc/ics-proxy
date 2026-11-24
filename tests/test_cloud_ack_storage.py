@@ -282,7 +282,7 @@ async def close_local(b, local, minute, *, id_tag=None):
 
 
 # Create the selected real delivery head and hold only its independent cloud reply.
-async def enqueue(b, action, cycle, *, tagged_stop=False):
+async def enqueue(b, action, cycle, *, tagged_stop=False, close_start=True):
     minute = 2 + cycle * 3
     local = None
     if action in ("MeterValues", "StopTransaction"):
@@ -302,9 +302,11 @@ async def enqueue(b, action, cycle, *, tagged_stop=False):
         )
         assert answer[0] == 3
         local = answer[2]["transactionId"]
-        # Persist the genuine Stop while the cloud Start reply is still withheld.
-        # This admits the supported mapping tool after a replacement loses reply certainty.
-        await close_local(b, local, minute + 1)
+        if close_start:
+            # Persist the genuine Stop while the cloud Start reply is still withheld. This admits offline mapping.
+            await close_local(b, local, minute + 1)
+        else:
+            b.rig.peer.plan_session = (local, 9)
     elif action == "StopTransaction":
         await close_local(b, local, minute + 1, id_tag="NATIVE_TIMER" if tagged_stop else None)
     else:

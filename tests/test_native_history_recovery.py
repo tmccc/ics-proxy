@@ -34,7 +34,7 @@ from tests.managed_rig import healthy, introduced, managed_bench, managed_sessio
 from tests.prototype_rig import START
 from tests.recovery_barriers import completed_control
 from tests.runtime_rig import until
-from tests.test_cloud_ack_storage import SqlFault, StorageBench, assert_retained, enqueue, wire_count
+from tests.test_cloud_ack_storage import SqlFault, StorageBench, assert_retained, close_local, enqueue, wire_count
 from tests.test_managed_normal_start import natural_stop
 from tests.test_native_bounded_handover import restore_original_route, verify_original_backend
 from tests.test_native_history_archive import unassigned
@@ -1038,7 +1038,7 @@ async def test_cold_history_acknowledgement_keeps_queued_exact_stop(
             await recovered.close()
 
 
-# Intent: a saved positive Stop reply can unblock history repair without reopening either OCPP link.
+# Intent: a saved positive reply for an idle charger can unblock history repair without reopening either OCPP link.
 # Why: the original history may have rolled off while the proxy was stopped with its ACK write unfinished.
 @pytest.mark.parametrize(
     ("action", "response"),
@@ -1047,12 +1047,18 @@ async def test_cold_history_acknowledgement_keeps_queued_exact_stop(
         ("StopTransaction", "error"),
         ("StopTransaction", "bad-info"),
         ("StartTransaction", "accepted"),
+        ("StartTransaction", "active"),
+        ("StartTransaction", "denied"),
+        ("StatusNotification", "accepted"),
+        ("StatusNotification", "bad-info"),
+        ("MeterValues", "accepted"),
     ],
 )
-async def test_cold_history_omission_with_saved_lifecycle_reply(
+async def test_cold_history_omission_with_saved_delivery_reply(
     tmp_path, tls, unused_tcp_port, monkeypatch, capsys, action, response
 ):
     originals = closed_records()
+    settles = response == "accepted"
     async with ready(
         tmp_path, tls, unused_tcp_port, monkeypatch, initial_history=originals, bench_type=StorageBench, cli_route=True
     ) as b:
@@ -1060,45 +1066,55 @@ async def test_cold_history_omission_with_saved_lifecycle_reply(
         strategy = strategy_file(rig, tmp_path)
         if action == "StopTransaction":
             rig.bench.stop_replies = [response]
-        held, local = await enqueue(b, action, 0)
+        if action == "StartTransaction" and response == "denied":
+            rig.bench.start_replies = ["Blocked"]
+        if action == "StatusNotification" and response == "bad-info":
+            rig.bench.reply_authorization[action] = {"status": "invalid"}
+        held, local = await enqueue(b, action, 0, close_start=response != "active")
+        if action == "MeterValues":
+            await close_local(b, local, 3)
 
-        # Complete the owner's separate Pause before the held cloud response can change delivery health.
-        request, revision = uuid.uuid4().hex, b.controller.requests.intent().revision
-        b.controller.command(request, "pause", revision)
-        await completed_control(b, request, mode="paused", revision=revision + 1, ceiling=0)
+        if response != "active":
+            # Complete the owner's separate Pause before the held cloud response can change delivery health.
+            request, revision = uuid.uuid4().hex, b.controller.requests.intent().revision
+            b.controller.command(request, "pause", revision)
+            await completed_control(b, request, mode="paused", revision=revision + 1, ceiling=0)
 
-        if response == "accepted":
-            fault = SqlFault("delete", held.token)
-            fault.install(journal.db)
-        else:
+        fault = SqlFault("delete", held.token)
+        rejects_stop = action == "StopTransaction" and not settles
+        if rejects_stop:
             journal.db.execute(
                 "CREATE TRIGGER refuse_stop_rejection BEFORE UPDATE OF state ON outbox WHEN NEW.state='rejected' "
                 "BEGIN SELECT RAISE(ABORT,'synthetic Stop rejection storage refusal'); END"
             )
+        else:
+            fault.install(journal.db)
         held.release.set()
         await until(lambda: b.session.runtime.status.delivery_blocked_cause == "storage")
         assert_retained(journal, held, saved=True)
+        prior_fault = journal.fault.read({})
         await b.controller.charging.close()
         await crash(b.session)
 
         rig.bench.history = copy.deepcopy(originals[1:])
         before = list(rig.bench.device_calls), list(rig.bench.calls)
-        accepted_stop = action == "StopTransaction" and response == "accepted"
         refused = managed_session(rig)
         try:
-            if action == "StartTransaction":
-                fault.remove(refused.journal.db)
-            elif response != "accepted":
+            if rejects_stop:
                 refused.journal.db.execute("DROP TRIGGER refuse_stop_rejection")
+            elif not settles:
+                fault.remove(refused.journal.db)
             with pytest.raises(MissingOriginalHistoryError):
                 await refused.start()
-            assert not refused.started and not refused.journal.fault.latched()
+            assert not refused.started and refused.journal.fault.read({}) == prior_fault
             assert_retained(refused.journal, held, saved=True)
             assert before == (rig.bench.device_calls, rig.bench.calls)
-            if not accepted_stop:
+            if not settles:
                 assert refused.journal.get("managed_stop_reply_rejection") is None
                 if action == "StartTransaction":
                     assert refused.journal.vendor_id(local) is None
+                if response == "active":
+                    assert refused.journal.active() == local
                 return
             assert refused.runtime.status.delivery_blocked_cause == "storage"
             fault.remove(refused.journal.db)
@@ -1109,8 +1125,20 @@ async def test_cold_history_omission_with_saved_lifecycle_reply(
         try:
             with pytest.raises(MissingOriginalHistoryError):
                 await refused.start()
-            assert not refused.started and refused.journal.next_delivery() is None
-            assert refused.journal.outcomes.session(local).closed
+            assert not refused.started and before == (rig.bench.device_calls, rig.bench.calls)
+            assert refused.journal.db.execute(
+                "SELECT 1 FROM delivery_replies WHERE token=?", (held.token,)
+            ).fetchone() is None
+            tail = refused.journal.next_delivery()
+            if action in ("StartTransaction", "MeterValues"):
+                assert tail is not None
+                assert (tail.action, tail.transaction, tail.state) == ("StopTransaction", local, "queued")
+            else:
+                assert tail is None
+            if action == "StartTransaction":
+                assert refused.journal.vendor_id(local) == held.answer[2]["transactionId"]
+            if local is not None:
+                assert refused.journal.outcomes.session(local).closed
             assert refused.journal.get("managed_native_failure")["source"] == "startup_history_omission"
             assert refused.journal.fault.classification() == "native_authority_or_preservation_failed"
         finally:
@@ -1135,12 +1163,15 @@ async def test_cold_history_omission_with_saved_lifecycle_reply(
         controller = ManagedController(recovered)
         try:
             async with rig.charger(recovered) as charger:
-                await introduced(rig, recovered, charger, "after-saved-stop-history-repair")
+                await introduced(rig, recovered, charger, "after-saved-reply-history-repair")
+                await until(lambda: recovered.journal.next_delivery() is None)
                 status = await healthy(controller)
                 assert status["local_hold_verified"] and status["history_warning"] == "records_absent_from_charger"
                 assert controller.requests.receipt(request)["state"] == "completed"
                 assert recovered.journal.next_delivery() is None
                 assert wire_count(rig, held.token) == 1 and not starts(rig)
+                if tail is not None:
+                    assert wire_count(rig, tail.token) == 1
                 await recovered.close()
         finally:
             await controller.charging.close()

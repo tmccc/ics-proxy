@@ -8,14 +8,16 @@ import json
 import os
 import queue
 import re
+import shutil
 import sqlite3
 import stat
+import tempfile
 import threading
 import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterator
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -289,7 +291,26 @@ def read_journal(path: Path) -> Iterator[sqlite3.Connection]:
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError("incident requires a private regular journal file")
-    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as db:
+    with ExitStack() as resources:
+        sidecars = tuple(Path(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal"))
+        parent = path.parent.stat()
+        read_only = not parent.st_mode & 0o222 or not os.access(path.parent, os.W_OK)
+        if read_only and not any(os.path.lexists(sidecar) for sidecar in sidecars):
+            # SQLite may need a WAL index even to read a checkpointed backup. Build it only on the private copy.
+            directory = resources.enter_context(tempfile.TemporaryDirectory(prefix="ics-incident-"))
+            copy = Path(directory) / "journal.sqlite"
+            shutil.copyfile(path, copy)
+            current, current_parent = path.lstat(), path.parent.stat()
+            if (
+                not os.path.samestat(info, current)
+                or info.st_ctime_ns != current.st_ctime_ns
+                or not os.path.samestat(parent, current_parent)
+                or parent.st_ctime_ns != current_parent.st_ctime_ns
+                or any(os.path.lexists(sidecar) for sidecar in sidecars)
+            ):
+                raise ValueError("incident backup changed while being copied")
+            path = copy
+        db = resources.enter_context(closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.1)))
         db.execute("PRAGMA query_only=ON")
         db.execute("BEGIN")
         yield db

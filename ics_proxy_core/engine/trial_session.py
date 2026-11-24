@@ -60,14 +60,20 @@ def validate_state_path(path: Path) -> None:
         parent = path.parent.lstat()
         if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
             raise ValueError
-        for candidate in (path, Path(str(path) + ".lock"), Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+        for suffix in ("", ".lock", "-wal", "-shm", "-journal"):
+            candidate = Path(str(path) + suffix)
             if candidate.exists() or candidate.is_symlink():
                 info = candidate.lstat()
-                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_nlink != 1
+                    or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) & 0o077
+                ):
                     raise ValueError
     except OSError, ValueError:
         raise SecurityError(
-            "trial journal requires an owned private directory and private regular state files"
+            "trial journal requires an owned private directory and private regular state files without hard links"
         ) from None
 
 
@@ -502,10 +508,9 @@ class TrialSession:
                     and self.journal.get("trial_binding")
                     and not self.journal.fault.latched()
                 ):
-                    # An exact saved Stop ACK can finish locally before history recovery checks the queue.
-                    head = self.journal.next_delivery() if not self.started else None
-                    if head is not None and head.action == "StopTransaction":
-                        self.gateway.decide(self.runtime.settle_saved_lifecycle)
+                    # Finish a saved acknowledgement locally before history recovery checks the remaining queue.
+                    if not self.started:
+                        self.gateway.decide(lambda: self.runtime.settle_saved_delivery(cold_history=True))
                     if history_recovery_idle(self.journal, retain_queued_reports=True, allow_closed_stop_receipts=True):
                         refusal = self._native_refusal(error)
                         diagnostic = {**refusal.diagnostic, "source": STARTUP_HISTORY_OMISSION}

@@ -18,7 +18,7 @@ from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError
 from ics_proxy_core.engine.trial_bootstrap import pristine_interrupted_bootstrap
 from ics_proxy_core.engine.trial_resources import ResourceBook
-from ics_proxy_core.engine.trial_session import TrialSession
+from ics_proxy_core.engine.trial_session import TrialSession, validate_state_path
 from tests.connected_rig import connected_bench
 from tests.managed_rig import healthy, introduced, managed_session
 from tests.runtime_rig import FAST
@@ -45,6 +45,35 @@ def construct(rig):
     return TrialSession(
         rig.prepared, FAST, native_bounded=rig.spec, allow_local_start=False, allow_unplugged_native=True
     )
+
+
+# Intent: refuse state files with more than one filename before opening the journal.
+# Why: every journal and its side files must belong to one pathname and one owner lock.
+@pytest.mark.parametrize("suffix", ["", ".lock", "-wal", "-shm"], ids=["journal", "lock", "wal", "shm"])
+def test_shared_state_files_are_refused(tmp_path, suffix):
+    path = tmp_path / "journal.sqlite"
+    journal = Journal(path, "OFFLINE001")
+    journal.put("probe", "retained")
+    journal.close()
+    state = path.with_name(path.name + suffix)
+    synthetic = not state.exists()
+    if synthetic:
+        state.touch(mode=0o600)
+    extra_name = tmp_path / "extra-name"
+    extra_name.hardlink_to(state)
+    with pytest.raises(SecurityError, match="without hard links"):
+        validate_state_path(path)
+    with pytest.raises(RecoveryRequiredError, match="without hard links"):
+        Journal(path, "OFFLINE001", require_existing=True)
+    extra_name.unlink()
+    if synthetic:
+        state.unlink()
+    validate_state_path(path)
+    journal = Journal(path, "OFFLINE001", require_existing=True)
+    try:
+        assert journal.get("probe") == "retained"
+    finally:
+        journal.close()
 
 
 # Intent: process death immediately before phase insertion cannot leave a committed baseline without its phase.
