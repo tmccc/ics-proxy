@@ -11,6 +11,7 @@ from tests.cloud_start_helpers import two_later_sessions
 from tests.current_rig import adjustable
 from tests.managed_rig import healthy, starts
 from tests.native_peer_failures import InterruptedNativePeer
+from tests.recovery_barriers import completed_control
 from tests.runtime_rig import until
 from tests.test_managed_stop_reply_recovery import pause
 from tests.tls_support import tls as tls
@@ -151,8 +152,9 @@ async def test_unsent_start_eventually_recovers_same_service(tmp_path, tls, unus
             assert j.get("control")["start_pending"] is False
             assert c.requests.receipt(identifier)["state"] == "failed"
             assert starts(b.rig) == [] and b.rig.bench.firmware.effective_limit() == 0
-            c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
-            assert (await healthy(c))["station_ceiling_a"] == 6
+            return_id, revision = uuid.uuid4().hex, c.requests.intent().revision
+            assert c.command(return_id, "app_control", revision)["state"] == "accepted"
+            await completed_control(b, return_id, mode="app", revision=revision + 1, ceiling=6)
             await two_later_sessions(b, selected=6, original_starts=0, first_minute=10 + cycle * 10)
             assert b.session is original_session and not b.session.closed and j.next_delivery() is None
 
@@ -203,8 +205,9 @@ async def test_current_completion_eventually_recovers_same_service(
             await pause(c)
             assert (await healthy(c))["local_hold_verified"]
             assert c.current.pending() is False and b.rig.bench.firmware.effective_limit() == 0
-            c.command(uuid.uuid4().hex, "app_control", c.requests.intent().revision)
-            assert (await healthy(c))["station_ceiling_a"] == 6
+            return_id, revision = uuid.uuid4().hex, c.requests.intent().revision
+            assert c.command(return_id, "app_control", revision)["state"] == "accepted"
+            await completed_control(b, return_id, mode="app", revision=revision + 1, ceiling=6)
             assert c.requests.receipt(identifier)["state"] == "failed"
             assert j.get("managed_current_change")["state"] == "cancelled"
             await two_later_sessions(b, selected=6, original_starts=0, first_minute=10 + cycle * 10)
