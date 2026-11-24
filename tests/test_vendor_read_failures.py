@@ -164,7 +164,8 @@ async def test_legacy_read_restart_stays_paused_until_return(tmp_path, tls, unus
                 await healthy(controller)
 
                 # Change only the independent fake native USER scalar, through the real capability preparation path.
-                async def patch_user():
+                async def patch_user(guard):
+                    guard()
                     rig.peer.configuration["AmpLmt"] = "32"
                     rig.peer.runtime_user = 320
 

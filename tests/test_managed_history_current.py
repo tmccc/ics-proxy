@@ -42,7 +42,8 @@ async def test_native32_history_acknowledgement(tmp_path, tls, unused_tcp_port, 
             book = ResourceBook(journal, rig.prepared.baseline)
 
             # The simulated native device receives only the supported USER32 write.
-            async def patch_user32():
+            async def patch_user32(guard):
+                guard()
                 rig.peer.configuration["AmpLmt"] = "32"
                 rig.peer.runtime_user = 320
 
