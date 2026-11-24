@@ -72,6 +72,8 @@ def contract_journal(path):
     return j, fault, diagnostic, ack
 
 
+# Intent: retire only the revocation for a confirmed original-history omission.
+# Why: other history failures must keep their recovery hold even when they use the same wording.
 @pytest.mark.parametrize("omission", [True, False])
 def test_history_revocation_retirement_requires_typed_omission(tmp_path, omission):
     journal, fault, _, _ = contract_journal(tmp_path / "revocation.db")

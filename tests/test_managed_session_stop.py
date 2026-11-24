@@ -676,6 +676,7 @@ def test_invalid_retained_reply_is_preserved_without_blocking_restart(tmp_path, 
     with closing(Journal(path, "synthetic-charger")) as journal:
         local = journal.start("start-report", START)["transactionId"]
 
+        # Build the retained reply for a known local or vendor attempt before applying the selected damage.
         def checkpoint(wire, local):
             if source == "owner":
                 sent = OwnerWire(wire, wire, wire, "boot", action, local, None)

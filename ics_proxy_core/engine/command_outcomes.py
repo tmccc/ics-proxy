@@ -486,6 +486,7 @@ class CommandOutcomes:
                 valid.append(reply)
         return tuple(valid)
 
+    # Validate a retained local reply against the stored wire or its original claim.
     def _decode_owner_reply(self, saved: dict[str, Any]) -> OwnerWire | None:
         if saved.keys() != {"wire", "request", "ticket", "boot", "action", "local", "limit_a", "reply"}:
             return None
@@ -569,6 +570,7 @@ class CommandOutcomes:
     def _retained_vendor_replies(self) -> tuple[ForwardedReply, ...]:
         return self._retained_replies("vendor", self._decode_vendor_reply)
 
+    # Accept a definite retained vendor reply only for its original forwarded attempt.
     def _decode_vendor_reply(self, saved: dict[str, Any]) -> ForwardedReply | None:
         if (
             saved.keys() != {"mutation", "action", "wire", "status"}
@@ -1099,6 +1101,7 @@ class CommandOutcomes:
             return None
         return row
 
+    # Save the exact reply and tell the caller whether that mutation still needs settlement.
     def _record_forwarded_reply(self, reply: ForwardedReply) -> bool:
         j = self.journal
         row = self._forwarded_reply_binding(reply)

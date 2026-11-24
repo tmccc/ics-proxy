@@ -2182,6 +2182,7 @@ class ControlDecisions:
 
         return self.peer.decide(decide, priority=CommandPriority.RESTRICT)
 
+    # Check for a vendor Stop before consulting the owner records from the same Boot.
     def _has_unanswered_stop_on_current_boot(self, local: int) -> bool:
         boot = self.control.boot()
         return boot is not None and (

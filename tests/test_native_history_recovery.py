@@ -50,6 +50,8 @@ class HistoryFault:
     before: dict[str, Any]
 
 
+# Intent: recognize a bound history omission after the diagnostic wording changes.
+# Why: recovery must still reject a different fault or a diagnostic whose saved digest does not match.
 @pytest.mark.parametrize("source", ["original_history_omission", "startup_history_omission"])
 def test_history_fault_matches_the_bound_omission_code_after_rewording(source):
     fault = {"classification": "native_authority_or_preservation_failed", "at_epoch": 2}

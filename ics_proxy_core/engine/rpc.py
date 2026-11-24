@@ -28,6 +28,7 @@ ReplyHandler = Callable[[str, Frame], bool | None]
 class UnavailableError(RuntimeError):
     """The peer did not give a confirmed outcome."""
 
+    # Preserve a stable recovery reason alongside the diagnostic message when supplied.
     def __init__(self, *args: object, reason: str | None = None) -> None:
         super().__init__(*args)
         self.reason = reason

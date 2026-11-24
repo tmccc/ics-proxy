@@ -23,6 +23,8 @@ REVISION = 42
 START_MARKER = f"start:{REVISION:014x}"
 
 
+# Intent: make the touch automation visible to the renderer's entity scan.
+# Why: without that state, the display greys out charger buttons even when the automation is enabled.
 def test_display_view_declares_touch_automation_to_renderer():
     # GeekMagic prefetches only entity IDs it can read directly from these template calls.
     view = (PROJECT / "view.html.jinja").read_text()
