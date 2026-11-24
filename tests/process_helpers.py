@@ -45,7 +45,12 @@ class ServiceProcess:
 
     # Start the real service from the selected build, optionally arming one observation before charger Boot.
     async def start(
-        self, *, arm: tuple[str, str] | None = None, source: Path | None = None, commission_route: bool = False
+        self,
+        *,
+        arm: tuple[str, str] | None = None,
+        source: Path | None = None,
+        commission_route: bool = False,
+        python: Path | None = None,
     ):
         self.generation += 1
         self.events = asyncio.Queue()
@@ -53,7 +58,7 @@ class ServiceProcess:
         cache = ("-X", f"pycache_prefix={sys.pycache_prefix}") if sys.pycache_prefix is not None else ()
         log = (self.directory / f"process-{self.generation}.stderr.log").open("w")
         self.process = await asyncio.create_subprocess_exec(
-            sys.executable,
+            python if python is not None else sys.executable,
             *(("-E",) if source is not None else ()),
             "-B",
             *cache,

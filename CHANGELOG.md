@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Join an earlier same-session Stop when accepting the local request and retain verified closure through
+  temporary receipt write failures.
+- Allow restricted restart after a known Stop during a vendor outage while the charger’s local status catches up.
+- Disable Solar Display 2 charger buttons immediately when its Home Assistant automation is unavailable.
+- Use fixed OpenSSL settings for offline release rehearsals and clarify the manual Home Assistant install path.
+- Settle session Stop receipts consistently when closure and the reply arrive in either order. Show the accepted
+  Stop attempt in reports for a request that joined it.
+- Show Solar Display 2 request feedback between image refreshes and document the automatic first handover.
+- Rehearse standalone upgrades with the installed and candidate dependency environments and track OpenSSL when
+  reusing rehearsal results.
 - Check elapsed evidence age before charger writes, including the commissioned 32 A write.
 - Require current schedule evidence when a timed charging test expires.
 - Clear an exact history-omission fault when all missing charger records return unchanged.

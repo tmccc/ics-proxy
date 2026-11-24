@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -38,6 +39,8 @@ DISCOVERY_SEED = 19
 DISCOVERY_CASES = 20
 SYSTEM_PYTHON_LIB = Path("/usr/lib")
 SYSTEM_PYTHON_CONFIG = Path("/etc")
+SYSTEM_OPENSSL = Path("/usr/bin/openssl")
+REHEARSAL_OPENSSL_CONFIG = os.devnull
 
 
 @dataclass(frozen=True)
@@ -81,17 +84,29 @@ def normalized_package_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name.strip().lower())
 
 
-# Require all candidate standalone pins in each interpreter used to exercise the service.
+# Compare the standalone requirements of the two exact builds, irrespective of comments or package spelling.
+def standalone_pins(source: Path) -> dict[str, str]:
+    expected = {}
+    for line in (source / "requirements-trial.txt").read_text().splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        name, version = line.split("==", 1)
+        name, version = normalized_package_name(name), version.strip()
+        if not name or not version or (name in expected and expected[name] != version):
+            raise ValueError("standalone runtime pins are invalid")
+        expected[name] = version
+    if not expected:
+        raise ValueError("standalone runtime pins are missing")
+    return expected
+
+
+# Require the build's exact standalone pins in the interpreter that will start it.
 def require_standalone_pins(source: Path, packages: Iterable[tuple[str, str]], *, runtime: str) -> None:
-    expected = [
-        line.split("==", 1)
-        for line in (source / "requirements-trial.txt").read_text().splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+    expected = standalone_pins(source)
     installed: dict[str, set[str]] = defaultdict(set)
     for name, version in packages:
         installed[normalized_package_name(name)].add(version)
-    if not expected or any(installed[normalized_package_name(name)] != {version.strip()} for name, version in expected):
+    if any(installed[name] != {version} for name, version in expected.items()):
         raise ValueError(f"standalone runtime pins differ from the {runtime}")
 
 
@@ -102,13 +117,14 @@ def export_installed(repo: Path, commit: str, destination: Path) -> None:
         package.extractall(destination, filter="data")
 
 
-# Use the selected virtualenv as invoked and reject leftover pytest filters and Python overrides.
+# Run the synthetic TLS fixtures with OpenSSL defaults and use the selected virtualenv as invoked.
 def clean_env() -> dict[str, str]:
     return {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(("PYTEST_", "PYTHON")) and k not in ("MODEL_WORKER_INDEX", "OCPP_WEEK_COMMISSIONING_ROOT")
-    }
+        if not k.startswith(("OPENSSL_", "PYTEST_", "PYTHON"))
+        and k not in ("MODEL_WORKER_INDEX", "OCPP_WEEK_COMMISSIONING_ROOT")
+    } | {"OPENSSL_CONF": REHEARSAL_OPENSSL_CONFIG}
 
 
 # Recognize two distribution layouts without admitting their configuration or library directories as import roots.
@@ -250,6 +266,25 @@ print(json.dumps({
     return identity
 
 
+# The TLS fixtures select OpenSSL on PATH and the service runs it from a fixed path with the same configuration.
+def openssl_identity(source: Path) -> dict[str, str | dict[str, str]]:
+    paths = os.pathsep.join(str(source / entry) for entry in os.get_exec_path())
+    selected = shutil.which("openssl", path=paths)
+    if selected is None:
+        raise ValueError("release checks require OpenSSL on PATH")
+    identity: dict[str, str | dict[str, str]] = {"config": REHEARSAL_OPENSSL_CONFIG}
+    digests = {}
+    for role, executable in (("fixture", Path(selected)), ("service", SYSTEM_OPENSSL)):
+        target = executable.resolve(strict=True)
+        if not target.is_file() or not os.access(target, os.X_OK):
+            raise ValueError(f"release checks require an executable OpenSSL for the {role}")
+        if target not in digests:
+            with target.open("rb") as stream:
+                digests[target] = hashlib.file_digest(stream, "sha256").hexdigest()
+        identity[role] = {"executable": str(executable), "target": str(target), "sha256": digests[target]}
+    return identity
+
+
 # Regenerate the search orders from the frozen candidate using the same interpreter as the search.
 def discovery_orders(python: str, source: Path) -> list[list[str]]:
     code = (
@@ -367,6 +402,7 @@ def run_check(
     previous: Path | None,
     *,
     ha_version: str | None = None,
+    installed_python: str | None = None,
 ) -> None:
     scratch = attempt / "scratch"
     scratch.mkdir()
@@ -394,6 +430,8 @@ def run_check(
         assert previous is not None
         env["OCPP_WEEK_COMMISSIONING_ROOT"] = str(previous)
         command += [f"--week-current={source}", f"--week-previous={previous}"]
+        if installed_python is not None:
+            command.append(f"--week-previous-python={installed_python}")
     log = attempt / "test.log"
     with (
         log.open("w") as output,
@@ -436,6 +474,7 @@ def ensure_check(
     python: str,
     *,
     installed: tuple[str, Path] | None = None,
+    installed_python: str | None = None,
 ) -> None:
     import fcntl
 
@@ -443,7 +482,11 @@ def ensure_check(
     runtime = runtime_identity(python, source, homeassistant=homeassistant)
     orders = discovery_orders(python, source) if check == DISCOVERY else None
     ha_version = None
+    previous = installed[1] if installed is not None else None
+    previous_runtime = None
     if check == WEEK:
+        if previous is None:
+            raise ValueError("installation week requires the verified installed build")
         pins = (
             "requirements-ha-proxy.txt",
             "requirements-ha-proxy-2026.10.txt",
@@ -458,11 +501,32 @@ def ensure_check(
         if ha_version not in versions:
             raise ValueError("installation week requires a pinned Home Assistant runtime")
         require_standalone_pins(source, runtime["packages"], runtime="installation week runtime")
+        if installed_python is None and standalone_pins(previous) != standalone_pins(source):
+            raise ValueError("provide --ics-installed-python for the installed standalone runtime when pins change")
+        previous_runtime = (
+            runtime if installed_python in (None, python) else runtime_identity(installed_python, previous)
+        )
+        require_standalone_pins(previous, previous_runtime["packages"], runtime="installed standalone runtime")
+    openssl = openssl_identity(source)
+
+    # Reverify the exact runtime inputs both when reusing evidence and after running a new check.
+    def require_stable_inputs() -> None:
+        if runtime_identity(python, source, homeassistant=homeassistant) != runtime:
+            raise ValueError(f"{check.name} runtime changed during verification")
+        if installed_python is not None and installed_python != python:
+            assert previous is not None
+            if runtime_identity(installed_python, previous) != previous_runtime:
+                raise ValueError(f"{check.name} installed runtime changed during verification")
+        if openssl_identity(source) != openssl:
+            raise ValueError(f"{check.name} OpenSSL changed during verification")
+
     inputs = {
         "check": check.name,
         "commit": metadata["commit"],
         "source_digest": metadata["source_digest"],
         "runtime": runtime,
+        "installed_runtime": previous_runtime,
+        "openssl": openssl,
         "installed": installed[0] if installed is not None else None,
     }
     key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
@@ -471,17 +535,14 @@ def ensure_check(
     with (directory / "run.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if attempt := passed_attempt(check, directory, inputs, orders):
-            if runtime_identity(python, source, homeassistant=homeassistant) != runtime:
-                raise ValueError(f"{check.name} runtime changed during verification")
+            require_stable_inputs()
             print(f"{check.name}: reused passing results at {attempt}", flush=True)
             return
         attempt = Path(tempfile.mkdtemp(dir=directory, prefix="attempt-"))
         print(f"{check.name}: running on {inputs['commit']} (log: {attempt / 'test.log'})", flush=True)
-        previous = installed[1] if installed is not None else None
-        run_check(check, python, source, attempt, previous, ha_version=ha_version)
+        run_check(check, python, source, attempt, previous, ha_version=ha_version, installed_python=installed_python)
         receipt = {"inputs": inputs, "attempt": attempt.name, "evidence": evidence(check, attempt, orders)}
-        if runtime_identity(python, source, homeassistant=homeassistant) != runtime:
-            raise ValueError(f"{check.name} runtime changed during verification")
+        require_stable_inputs()
         pending = directory / "passed.new"
         pending.write_text(json.dumps(receipt, indent=2) + "\n")
         pending.replace(directory / "passed.json")

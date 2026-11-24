@@ -14,7 +14,7 @@ from ..frames import Frame
 from .delivery_reply import DeliveryReply
 from .ics import unique_object
 from .plans import PlanBook
-from .stop_settlement import STOP_SESSION, stop_rejections
+from .stop_settlement import STOP_SESSION, StopAcceptance, stop_rejections
 from .store import Delivery, RecoveryRequiredError, encoded
 from .trial_evidence import profile_projection
 
@@ -691,45 +691,41 @@ class CommandOutcomes:
 
     # A matched reply stays with its exact allocated session across Boot and process replacement.
     def accepted_stop(self, local: int | None, *, ticket: str | None = None) -> bool:
+        return self.accepted_stop_attempt(local, ticket=ticket) is not None
+
+    # Keep the actual predecessor when a session-only request joins an already accepted Stop.
+    def accepted_stop_attempt(self, local: int | None, *, ticket: str | None = None) -> StopAcceptance | None:
         if local is None:
-            return False
-        if any(
-            reply.action == "RemoteStopTransaction"
-            and reply.reply == "Accepted"
-            and reply.local == local
-            and (ticket is None or reply.ticket == ticket)
-            for reply in self._retained_owner_replies()
-        ):
-            return True
-        if (
-            any(
+            return None
+        for wire in (*self._retained_owner_replies(), *self._owner_writes.values()):
+            if (
                 wire.action == "RemoteStopTransaction"
                 and wire.local == local
                 and wire.reply == "Accepted"
                 and (ticket is None or wire.ticket == ticket)
-                for wire in self._owner_writes.values()
-            )
-            or self.journal.db.execute(
-                "SELECT 1 FROM owner_command_wires WHERE local=:local AND action='RemoteStopTransaction' "
-                "AND reply='Accepted' AND (:ticket IS NULL OR ticket=:ticket) LIMIT 1",
-                {"local": local, "ticket": ticket},
-            ).fetchone()
-            is not None
-        ):
-            return True
-        return ticket is None and self._accepted_forwarded_stop(local)
+            ):
+                return StopAcceptance("local", wire.request or wire.ticket, wire.wire)
+        saved = self.journal.db.execute(
+            "SELECT COALESCE(request,ticket),wire FROM owner_command_wires WHERE local=:local "
+            "AND action='RemoteStopTransaction' AND reply='Accepted' AND (:ticket IS NULL OR ticket=:ticket) "
+            "ORDER BY rowid LIMIT 1",
+            {"local": local, "ticket": ticket},
+        ).fetchone()
+        if saved is not None:
+            return StopAcceptance("local", saved[0], saved[1])
+        return self._accepted_forwarded_stop(local) if ticket is None else None
 
     # A forwarded Stop has the same session effect while its exact reply is being saved or already durable.
-    def _accepted_forwarded_stop(self, local: int) -> bool:
+    def _accepted_forwarded_stop(self, local: int) -> StopAcceptance | None:
         rows = self.journal.db.execute(
             "SELECT token,wire_request,wire_result FROM vendor_command_scope JOIN mutations ON mutation=token "
             "WHERE local=? AND origin='vendor' AND action='RemoteStopTransaction' "
-            "AND wire_result IN ('Accepted','dispatched')",
+            "AND wire_result IN ('Accepted','dispatched') ORDER BY mutations.rowid",
             (local,),
         )
         for row in rows:
             if row["wire_result"] == "Accepted":
-                return True
+                return StopAcceptance("vendor", row["token"], row["wire_request"])
             reply = self._received(row["token"])
             if (
                 isinstance(reply, ForwardedReply)
@@ -737,8 +733,38 @@ class CommandOutcomes:
                 and reply.wire == row["wire_request"]
                 and reply.status == "Accepted"
             ):
-                return True
-        return False
+                return StopAcceptance("vendor", reply.mutation, reply.wire)
+        return None
+
+    # Bind live reply windows to the exact local or vendor request and allocated session.
+    def open_stop_replies(self, windows: tuple[str, ...]) -> tuple[tuple[str, str, int], ...]:
+        wires = encoded(windows)
+        attempts = {
+            ("local", wire.request, wire.local)
+            for wire in self._owner_writes.values()
+            if wire.wire in windows
+            and wire.action == "RemoteStopTransaction"
+            and wire.request is not None
+            and wire.local is not None
+        }
+        attempts.update(
+            ("local", row["request"], row["local"])
+            for row in self.journal.db.execute(
+                "SELECT request,local FROM owner_command_wires WHERE action='RemoteStopTransaction' "
+                "AND request IS NOT NULL AND local IS NOT NULL AND wire IN (SELECT value FROM json_each(?))",
+                (wires,),
+            )
+        )
+        attempts.update(
+            ("vendor", row["mutation"], row["local"])
+            for row in self.journal.db.execute(
+                "SELECT mutation,local FROM vendor_command_scope JOIN mutations ON mutation=token "
+                "WHERE origin='vendor' AND action='RemoteStopTransaction' AND local IS NOT NULL "
+                "AND wire_request IN (SELECT value FROM json_each(?))",
+                (wires,),
+            )
+        )
+        return tuple(sorted(attempts))
 
     # Pin the target before any wire work and retain an older unanswered Stop for that same session.
     def claim_shutdown_stop(self, attempt: str, local: int | None, ticket: str, boot: str | None) -> None:
@@ -828,26 +854,32 @@ class CommandOutcomes:
             self.accepted_stop(local) or self.unanswered_vendor_stop(local) or self.unanswered_shutdown_stop(local)
         )
 
+    # A closed session can retain a Stop wait only until the next connector lifecycle.
+    def latest_closed_session_stop_id(self) -> int | None:
+        latest = self.journal.db.execute(
+            "SELECT local,stop FROM transactions WHERE connector=1 ORDER BY local DESC LIMIT 1"
+        ).fetchone()
+        if (
+            latest is not None
+            and latest["stop"] is not None
+            and self.journal.db.execute("SELECT 1 FROM sqlite_schema WHERE name='managed_requests'").fetchone()
+            and self.session_stop_tracks_closure(latest["local"])
+        ):
+            return int(latest["local"])
+        return None
+
     # A possibly sent vendor Stop can still have happened when the device returns an error.
     def vendor_stop_dispatches(self, local: int, *, boot: str | None = None) -> tuple[str, ...]:
+        rejections = stop_rejections(self.journal)
         rows = self.journal.db.execute(
-            "SELECT token,wire_request FROM vendor_command_scope JOIN mutations ON mutation=token "
-            "WHERE local=:local AND origin='vendor' AND action='RemoteStopTransaction' "
-            "AND (:boot IS NULL OR charger_boot=:boot) "
-            "AND wire_result IN ('dispatched','call_error') AND state IN ('pending','uncertain') ORDER BY token",
-            {"local": local, "boot": boot},
+            f"{rejections.prefix}SELECT token FROM vendor_command_scope s JOIN mutations ON mutation=token "
+            "WHERE s.local=? AND origin='vendor' AND action='RemoteStopTransaction' "
+            "AND (? IS NULL OR charger_boot=?) "
+            "AND wire_result IN ('dispatched','call_error') AND state IN ('pending','uncertain') "
+            f"AND NOT {rejections.vendor_refusal('token', 's.local')} ORDER BY token",
+            (*rejections.bindings, local, boot, boot),
         )
-        pending = []
-        for row in rows:
-            reply = self._received(row["token"])
-            if (
-                not isinstance(reply, ForwardedReply)
-                or reply.action != "RemoteStopTransaction"
-                or reply.wire != row["wire_request"]
-                or reply.status != "Rejected"
-            ):
-                pending.append(row["token"])
-        return tuple(pending)
+        return tuple(row["token"] for row in rows)
 
     # Check the exact forwarded dispatches without treating a prepared request as sent.
     def unanswered_vendor_stop(self, local: int, *, boot: str | None = None) -> bool:

@@ -307,7 +307,7 @@ def test_installation_week_requires_candidate_standalone_pins(
     (source / "requirements-ha-proxy-2026.10.txt").write_text("homeassistant==2026.10.4\n")
     previous = tmp_path / "installed"
     previous.mkdir()
-    (previous / "requirements-trial.txt").write_text("websockets==15.0.1\n")
+    (previous / "requirements-trial.txt").write_text("# same pins\nWebSockets==16.0\nfixture.extra==2\n")
     packages = [["homeassistant", active_version], ["WebSockets", websockets_version]]
     if active_version == "2026.10.9":
         packages.append(["homeassistant", "2026.11.0"])
@@ -323,9 +323,10 @@ def test_installation_week_requires_candidate_standalone_pins(
     attempts = []
 
     # Retain one synthetic passing test report only when the candidate's pins admit the interpreter.
-    def run(check, python, source, attempt, installed, *, ha_version):
+    def run(check, python, source, attempt, installed, *, ha_version, installed_python):
         assert installed == previous
         assert ha_version == active_version
+        assert installed_python is None
         attempts.append(attempt)
         classname, name = check.case.rsplit(".", 1)
         (attempt / "pytest.xml").write_text(f'<testsuite><testcase classname="{classname}" name="{name}"/></testsuite>')
@@ -339,10 +340,174 @@ def test_installation_week_requires_candidate_standalone_pins(
         assert len(attempts) == 1
         receipt = json.loads((attempts[0].parent / "passed.json").read_text())
         assert receipt["inputs"]["runtime"]["homeassistant_version"] == active_version
+        assert receipt["inputs"]["installed_runtime"] == receipt["inputs"]["runtime"]
     else:
         with pytest.raises(ValueError, match=error):
             checks.ensure_check(*args, installed=("previous", previous))
         assert not attempts and not output.exists()
+
+
+# Intent: executable paths and contents from both ways of invoking OpenSSL identify a passing run.
+# Why: updating the service executable or the fixture executable can change TLS without touching Python.
+def test_release_identity_tracks_both_openssl_executables(tmp_path, monkeypatch):
+    tool_bin = tmp_path / "bin"
+    tool_bin.mkdir()
+    fixture, service = tool_bin / "openssl", tmp_path / "system-openssl"
+    for executable in (fixture, service):
+        executable.write_text("fixture version one\n")
+        executable.chmod(0o700)
+    monkeypatch.setenv("PATH", "bin")
+    monkeypatch.setattr(checks, "SYSTEM_OPENSSL", service)
+
+    initial = checks.openssl_identity(tmp_path)
+    assert initial["fixture"]["executable"] == str(fixture)
+    assert initial["service"]["executable"] == str(service)
+    fixture.write_text("fixture version two\n")
+    changed = checks.openssl_identity(tmp_path)
+    assert changed["fixture"] != initial["fixture"] and changed["service"] == initial["service"]
+    service.write_text("system version two\n")
+    assert checks.openssl_identity(tmp_path)["service"] != changed["service"]
+
+
+# Intent: run real certificate generation and inspection under the same OpenSSL settings a cached week represents.
+# Why: inherited config files can break synthetic certificates even when the executables stay the same.
+def test_installation_week_reuses_results_with_pinned_openssl_config(tmp_path, monkeypatch):
+    source, previous, output = (tmp_path / name for name in ("candidate", "installed", "evidence"))
+    tools = source / "tools"
+    tools.mkdir(parents=True)
+    previous.mkdir()
+    for build in (source, previous):
+        (build / "requirements-trial.txt").write_text("websockets==16.0\n")
+    for pin in ("requirements-ha-proxy.txt", "requirements-ha-proxy-2026.10.txt"):
+        (source / pin).write_text("homeassistant==2026.11.0\n")
+
+    certificate = tmp_path / "certificate.pem"
+    generate = (
+        "openssl",
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-days",
+        "1",
+        "-subj",
+        "/CN=offline.test",
+        "-addext",
+        "subjectAltName=IP:127.0.0.1",
+        "-keyout",
+        str(tmp_path / "key.pem"),
+        "-out",
+        str(certificate),
+    )
+    inspect = (str(checks.SYSTEM_OPENSSL), "x509", "-in", str(certificate), "-noout", "-dates", "-checkip", "127.0.0.1")
+    classname, name = checks.WEEK.case.rsplit(".", 1)
+    report = f'<testsuite><testcase classname="{classname}" name="{name}"/></testsuite>'
+    (tools / checks.WEEK.runner).write_text(
+        "import os, subprocess, sys\n"
+        "from pathlib import Path\n"
+        f"assert os.environ['OPENSSL_CONF'] == {os.devnull!r}\n"
+        "assert 'OPENSSL_CONF_INCLUDE' not in os.environ and 'OPENSSL_MODULES' not in os.environ\n"
+        f"subprocess.run({generate!r}, check=True)\n"
+        f"inspection = subprocess.check_output({inspect!r}, text=True, env={{**os.environ, 'LC_ALL': 'C'}})\n"
+        "assert 'IP 127.0.0.1 does match certificate' in inspection\n"
+        "junit = next(arg.removeprefix('--junitxml=') for arg in sys.argv if arg.startswith('--junitxml='))\n"
+        f"Path(junit).write_text({report!r})\n"
+    )
+    runtime = {"homeassistant_version": "2026.11.0", "packages": [["websockets", "16.0"]]}
+    monkeypatch.setattr(checks, "runtime_identity", lambda *args, **kwargs: runtime)
+    bad_settings = tmp_path / "broken.cnf"
+    bad_settings.write_text("invalid OpenSSL configuration\n")
+    monkeypatch.setenv("OPENSSL_CONF", str(bad_settings))
+    monkeypatch.setenv("OPENSSL_CONF_INCLUDE", str(tmp_path))
+    monkeypatch.setenv("OPENSSL_MODULES", str(tmp_path))
+    assert subprocess.run(generate, cwd=source, capture_output=True, timeout=20).returncode != 0
+
+    args = (checks.WEEK, source, output, {"commit": "a", "source_digest": "b"}, sys.executable)
+    checks.ensure_check(*args, installed=("old", previous))
+    (receipt,) = output.glob("*/passed.json")
+    assert json.loads(receipt.read_text())["inputs"]["openssl"]["config"] == os.devnull
+    assert os.environ["OPENSSL_CONF"] == str(bad_settings)
+    bad_settings.write_text("a different error in inherited OpenSSL settings\n")
+    monkeypatch.setenv("OPENSSL_CONF_INCLUDE", str(previous))
+    checks.ensure_check(*args, installed=("old", previous))
+    assert list(output.glob("*/passed.json")) == [receipt]
+    assert len(list(output.glob("*/attempt-*"))) == 1
+
+
+# Intent: prove each build has the right dependencies and reuse a pass only while both runtimes and TLS inputs match.
+# Why: a dependency rollout can require different service environments even though the simulated HA runner is shared.
+def test_installation_week_verifies_split_runtimes_and_openssl(tmp_path, monkeypatch):
+    source, previous = (tmp_path / name for name in ("candidate", "installed"))
+    source.mkdir()
+    previous.mkdir()
+    (source / "requirements-trial.txt").write_text("websockets==16.0\n")
+    (source / "requirements-ha-proxy.txt").write_text("homeassistant==2026.11.0\n")
+    (source / "requirements-ha-proxy-2026.10.txt").write_text("homeassistant==2026.10.4\n")
+    (previous / "requirements-trial.txt").write_text("websockets==15.0.1\n")
+    installed_python = str(tmp_path / "previous-python")
+    candidate_runtime = {"homeassistant_version": "2026.11.0", "packages": [["websockets", "16.0"]]}
+    old_runtime = {"runtime_sha256": "old-1", "packages": [["websockets", "15.0.1"]]}
+    openssl = "first-ssl"
+    change_during_run = None
+    attempts = []
+
+    # Read the assigned environment for each build so a changed runtime can invalidate the saved result.
+    def identity(python, cwd, *, homeassistant=False):
+        if cwd == source:
+            assert python == sys.executable and homeassistant
+            return candidate_runtime.copy()
+        assert cwd == previous and python == installed_python and not homeassistant
+        return old_runtime.copy()
+
+    # Keep the receipt real while recording which interpreter the release command would give the subprocess harness.
+    def run(check, python, cwd, attempt, old, *, ha_version, installed_python):
+        nonlocal openssl
+        assert (python, cwd, old, ha_version, installed_python) == (
+            sys.executable,
+            source,
+            previous,
+            "2026.11.0",
+            str(tmp_path / "previous-python"),
+        )
+        attempts.append(attempt)
+        classname, name = check.case.rsplit(".", 1)
+        (attempt / "pytest.xml").write_text(f'<testsuite><testcase classname="{classname}" name="{name}"/></testsuite>')
+        if change_during_run == "installed runtime":
+            old_runtime["runtime_sha256"] += "-changed"
+        elif change_during_run == "OpenSSL":
+            openssl += "-changed"
+
+    monkeypatch.setattr(checks, "runtime_identity", identity)
+    monkeypatch.setattr(checks, "openssl_identity", lambda source: {"fixture": openssl})
+    monkeypatch.setattr(checks, "run_check", run)
+    args = (checks.WEEK, source, tmp_path / "evidence", {"commit": "a", "source_digest": "b"}, sys.executable)
+    installed = ("old", previous)
+    with pytest.raises(ValueError, match="provide --ics-installed-python"):
+        checks.ensure_check(*args, installed=installed)
+    old_runtime["packages"] = candidate_runtime["packages"]
+    with pytest.raises(ValueError, match="pins differ from the installed standalone runtime"):
+        checks.ensure_check(*args, installed=installed, installed_python=installed_python)
+    assert not attempts
+    old_runtime["packages"] = [["websockets", "15.0.1"]]
+    checks.ensure_check(*args, installed=installed, installed_python=installed_python)
+    checks.ensure_check(*args, installed=installed, installed_python=installed_python)
+    assert len(attempts) == 1
+    receipt = json.loads((attempts[0].parent / "passed.json").read_text())
+    assert receipt["inputs"]["installed_runtime"] == old_runtime
+    assert receipt["inputs"]["runtime"] == candidate_runtime
+    assert receipt["inputs"]["openssl"] == {"fixture": openssl}
+
+    old_runtime["runtime_sha256"] = "old-2"
+    checks.ensure_check(*args, installed=installed, installed_python=installed_python)
+    openssl = "new-ssl"
+    checks.ensure_check(*args, installed=installed, installed_python=installed_python)
+    assert len(attempts) == 3
+    for change_during_run in ("installed runtime", "OpenSSL"):
+        openssl += "-next"
+        with pytest.raises(ValueError, match=change_during_run + " changed during verification"):
+            checks.ensure_check(*args, installed=installed, installed_python=installed_python)
+        assert not (attempts[-1].parent / "passed.json").exists()
 
 
 # Intent: verify the imported Home Assistant version in the runner used for probing and rehearsal.
@@ -392,7 +557,7 @@ def test_predeployment_check_requires_stable_runtime_during_verification(tmp_pat
     (tmp_path / "requirements-ha-proxy-2026.10.txt").write_text("homeassistant==2026.10.4\n")
 
     # Simulate a passing test so only the changed runtime can withhold the receipt.
-    def run(check, python, source, attempt, previous, *, ha_version):
+    def run(check, python, source, attempt, previous, *, ha_version, installed_python):
         classname, name = check.case.rsplit(".", 1)
         (attempt / "pytest.xml").write_text(f'<testsuite><testcase classname="{classname}" name="{name}"/></testsuite>')
 
@@ -563,7 +728,7 @@ def test_release_snapshot_waits_for_required_checks(
         return {"websockets": "15.0.1" if pin_matches else "16.0"}
 
     # Capture the command boundary before the release process can mark a snapshot as approved.
-    def invoke(check, source, output, metadata, python, *, installed=None):
+    def invoke(check, source, output, metadata, python, *, installed=None, installed_python=None):
         assert not (snapshot / "snapshot.json").exists()
         assert not (snapshot / "source").exists()
         assert source.name == "source" and source.parent.parent == snapshot and metadata["commit"] == candidate
@@ -571,6 +736,7 @@ def test_release_snapshot_waits_for_required_checks(
         if installed is not None:
             assert installed[0] == releases[1]
             assert (installed[1] / "tools/managed_proxy.py").read_text() == "# installed\n"
+            assert installed_python == str(Path(sys.executable).absolute())
         calls.append(check)
         if week_fails and check == checks.WEEK:
             raise ValueError("synthetic failed week")
@@ -584,7 +750,9 @@ def test_release_snapshot_waits_for_required_checks(
         sys.executable,
         results,
         validated_snapshot=snapshot,
-        deployment=validate.Deployment(target, candidate if same_proxy else installed, Path(sys.executable)),
+        deployment=validate.Deployment(
+            target, candidate if same_proxy else installed, Path(sys.executable), Path(sys.executable)
+        ),
     )
     assert tuple(calls) == expected
     passed = not week_fails and pin_matches
@@ -706,7 +874,7 @@ def test_reusing_and_rechecking_discovery_results(tmp_path, monkeypatch, damage)
     orders = checks.discovery_orders(sys.executable, source)
 
     # Write the exact raw artifacts in miniature so the cache treats them the same way as actual child output.
-    def run(check, python, source, attempt, previous, *, ha_version):
+    def run(check, python, source, attempt, previous, *, ha_version, installed_python):
         attempts.append(attempt)
         path = attempt / "discovery"
         path.mkdir()

@@ -9,16 +9,126 @@ import uuid
 import pytest
 
 from ics_proxy_core.engine.gateway import decode
+from ics_proxy_core.engine.managed import ManagedController
+from ics_proxy_core.engine.native_bounded import NativeReadinessError
+from ics_proxy_core.engine.native_bounded_handover import NativeSessionPendingError
+from ics_proxy_core.engine.recovery_contracts import Pending, Prerequisite
 from ics_proxy_core.engine.store import RecoveryRequiredError
 from ics_proxy_core.frames import build_call_error
 from tests import managed_rig as mp
 from tests.charge_rig import ChargeRig, positive_flow
+from tests.current_rig import adjustable, locally_ready, select
+from tests.handover_helpers import crash
 from tests.managed_rig import ReplyBench
 from tests.model_tls_support import listener_port, tls_for_case
 from tests.model_tls_support import model_tls as model_tls
-from tests.prototype_rig import START
+from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.test_managed_stop_reply_recovery import pause, reconcile, return_after_ack, running
+
+
+# Intent: restart while native status still shows the exact closed session from a Stop during a vendor outage.
+# Why: recovery must keep the listener available at zero while refusing an unrelated session or missing Stop proof.
+@pytest.mark.parametrize("connection", [("B", "Plug"), ("A", "Unplug")], ids=["plugged", "unplugged"])
+@pytest.mark.parametrize("accepted", [True, False], ids=["exact-stop-proof", "report-only"])
+async def test_unmapped_stop_replacement_waits_for_native_closure(
+    tmp_path, model_tls, monkeypatch, connection, accepted
+):
+    async with adjustable(tmp_path, tls_for_case(tmp_path, model_tls), listener_port(), monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        await select(t, 16)
+        await until(lambda: j.next_delivery() is None and not t.session.gateway.vendor._pending)
+        await t.session.runtime.stop_vendor()
+        await locally_ready(c)
+        c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        start = await bench.call(t.charger, "offline-start", "StartTransaction", START | {"idTag": "NATIVE_TIMER"})
+        assert start[2]["idTagInfo"]["status"] == "Accepted"
+        local = start[2]["transactionId"]
+        assert j.vendor_id(local) is None
+        t.rig.peer.plan_session = (local, 987654)
+        await locally_ready(c)
+        request = uuid.uuid4().hex
+        if accepted:
+            c.command(request, "stop_session", c.requests.intent().revision, target=c.session_stop.target())
+            await until(lambda: j.outcomes.accepted_stop(local))
+            await c.session_stop.worker
+        bench.cp, bench.connection = connection
+        t.rig.peer.permission_enabled = False
+        stop = {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100}
+        assert (await bench.call(t.charger, "offline-stop", "StopTransaction", stop))[0] == 3
+        assert j.active() is None and j.outcomes.session(local).closed
+        bench.firmware.active = local
+        if accepted:
+            assert (await c.tick())["state"] != "attention"
+            assert not j.fault.latched()
+        await crash(t.session)
+
+        replacement = mp.managed_session(t.rig)
+        try:
+            journal = replacement.journal
+            assert journal.vendor_id(local) is None and journal.outcomes.session(local).closed
+            assert journal.outcomes.accepted_stop(local) is accepted
+            refusal = NativeReadinessError if bench.connection == "Unplug" else NativeSessionPendingError
+            bench.firmware.active = local + 1
+            with pytest.raises(refusal):
+                await replacement.start()
+            assert replacement.runtime._server is None
+            bench.firmware.active = local
+            if not accepted:
+                with pytest.raises(refusal):
+                    await replacement.start()
+                assert replacement.runtime._server is None
+                # The schema marker can survive an interrupted older service setup before requests are initialized.
+                journal.db.execute("DROP TABLE managed_requests")
+                with pytest.raises(refusal):
+                    await replacement.start()
+                assert replacement.runtime._server is None
+                bench.firmware.active = None
+                await replacement.start()
+                assert replacement.started
+                return
+
+            if bench.connection == "Plug":
+                t.rig.peer.permission_enabled = True
+                with pytest.raises(NativeSessionPendingError):
+                    await replacement.start()
+                assert replacement.runtime._server is None
+                t.rig.peer.permission_enabled = False
+
+            limits_before = len(bench.received_limits)
+            calls_before = len(bench.device_calls)
+            vendor_enabled = replacement.runtime.vendor_enabled
+            replacement.runtime.vendor_enabled = lambda: False
+            await replacement.start()
+            assert replacement.started and not replacement.gateway.controls.ready
+            controller = ManagedController(replacement)
+            async with t.rig.charger(replacement) as charger:
+                assert (await bench.call(charger, "replacement-boot", "BootNotification", BOOT))[0] == 3
+                await until(lambda: replacement.gateway.controls.ready)
+                assert journal.vendor_id(local) is None
+                native = await replacement.native_bounded.read_result()
+                if bench.connection == "Unplug":
+                    assert isinstance(native, Pending) and native.reason is Prerequisite.LIFECYCLE
+                else:
+                    assert not isinstance(native, Pending) and controller.session_stop.closure_pending(native)
+                replacement.runtime.vendor_enabled = vendor_enabled
+                await until(lambda: replacement.gateway.vendor_registration == "Accepted")
+                for _ in range(4):
+                    assert (await controller.tick())["state"] == "reconciling"
+                assert journal.active() is None and not journal.fault.latched()
+                assert controller.requests.receipt(request)["state"] == "uncertain"
+                assert bench.firmware.effective_limit() == 0
+                assert bench.received_limits[limits_before:] and set(bench.received_limits[limits_before:]) == {0}
+                assert not any(
+                    call[2] in {"RemoteStartTransaction", "RemoteStopTransaction"}
+                    for call in bench.device_calls[calls_before:]
+                )
+                bench.firmware.active = None
+                await mp.healthy(controller)
+                assert controller.requests.receipt(request)["state"] == "completed"
+        finally:
+            await crash(replacement)
 
 
 # Intent: a crash before the first fault-publishing tick must not remove the exact retained Stop's recovery route.

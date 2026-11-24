@@ -7,12 +7,14 @@ from unittest.mock import patch
 import pytest
 from aiohttp.resolver import ThreadedResolver
 from homeassistant import loader
-from homeassistant.config_entries import ConfigEntries
+from homeassistant.config_entries import ConfigEntries, ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import area_registry, device_registry, entity_registry, frame
+from homeassistant.setup import async_setup_component
 
 from tests.conftest import unused_tcp_port as unused_tcp_port
 from tests.conftest import unused_tcp_port_factory as unused_tcp_port_factory
+from tests.management_peer import TOKEN
 
 
 class LoopbackResolver(ThreadedResolver):
@@ -25,6 +27,19 @@ class LoopbackResolver(ThreadedResolver):
     # HA retains the shared resolver until its final lifecycle close.
     async def close(self):
         pass
+
+
+# Use the real import flow without loading newer engine-specific test helpers into a previous build's runner.
+async def setup_proxy(hass, port):
+    assert await async_setup_component(hass, "persistent_notification", {})
+    result = await hass.config_entries.flow.async_init(
+        "ics_proxy", context={"source": "import"}, data={"port": port, "token": TOKEN}
+    )
+    await hass.async_block_till_done()
+    assert result["type"] == "create_entry", result
+    entry = result["result"]
+    assert entry.state is ConfigEntryState.LOADED
+    return entry
 
 
 # Open actual HA registries and config entries, retaining them when another process uses the same directory.

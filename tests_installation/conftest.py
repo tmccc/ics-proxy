@@ -21,6 +21,7 @@ from tests_installation.migrated_layout import AUDITED_SCHEMA  # noqa: E402
 def pytest_addoption(parser):
     parser.addoption("--week-current", type=Path)
     parser.addoption("--week-previous", type=Path)
+    parser.addoption("--week-previous-python", type=Path)
 
 
 # Confirm the two runtime sources before using the simulator.
@@ -28,10 +29,13 @@ def pytest_addoption(parser):
 def builds(pytestconfig):
     current = pytestconfig.getoption("--week-current")
     previous = pytestconfig.getoption("--week-previous")
+    previous_python = pytestconfig.getoption("--week-previous-python")
+    if previous_python is not None and (not previous_python.is_absolute() or not previous_python.is_file()):
+        raise pytest.UsageError("the installation week requires an absolute path to the previous interpreter")
     if not INSTALLED_ROOT:
         from tests_rollback.conftest import verified_builds
 
-        return (*verified_builds(current, previous), AUDITED_SCHEMA)
+        return (*verified_builds(current, previous), AUDITED_SCHEMA, previous_python)
     if (
         current != Path(__file__).resolve().parents[1]
         or previous != Path(INSTALLED_ROOT)
@@ -40,4 +44,4 @@ def builds(pytestconfig):
         raise pytest.UsageError(
             "the automatic week must commission with the installed build and test the frozen candidate"
         )
-    return current, previous, None
+    return current, previous, None, previous_python

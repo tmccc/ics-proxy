@@ -11,7 +11,7 @@ from ics_proxy_core.engine.gateway import timestamp as charger_timestamp
 from ics_proxy_core.engine.ics import unique_object
 from ics_proxy_core.engine.managed_diagnostics import timestamp as receipt_timestamp
 from ics_proxy_core.engine.policy import DeniedError
-from ics_proxy_core.engine.stop_settlement import STOP_SESSION
+from ics_proxy_core.engine.stop_settlement import STOP_NONTERMINAL_CLASSIFICATIONS, STOP_SESSION
 from tools.managed_incident import (
     MAX_REPORT_EVENTS,
     UNKNOWN,
@@ -174,6 +174,23 @@ def joined_attempts(
     db: sqlite3.Connection, tables: set[str], request: str, local: int, binding: dict[str, Any]
 ) -> list[dict[str, Any]]:
     attempts = []
+    accepted = binding.get("accepted_attempt")
+    if (
+        isinstance(accepted, dict)
+        and accepted.keys() == {"origin", "identifier", "wire"}
+        and accepted["origin"] in ("local", "vendor")
+        and (predecessor := identifier(accepted["identifier"])) is not None
+        and predecessor != request
+        and wire_id(accepted["wire"]) is not None
+    ):
+        attempts.append(
+            {
+                "origin": accepted["origin"],
+                "request": reference(predecessor),
+                "reply": "accepted",
+                "reply_source": "joined_receipt",
+            }
+        )
     for origin, key in (("local", "local_attempts"), ("vendor", "vendor_attempts")):
         tokens = binding.get(key)
         if not isinstance(tokens, list):
@@ -221,6 +238,8 @@ def local_stop(
     revision, state = row[1:3]
     result = object_fields(row[3])
     classification = result.get("classification")
+    if state == "completed" and classification in STOP_NONTERMINAL_CLASSIFICATIONS:
+        classification = None
     stopped = result.get("session_stopped")
     request = {
         "request": reference(token),
@@ -229,7 +248,7 @@ def local_stop(
         "state": state if state in ("accepted", "running", "uncertain", "completed", "failed") else UNKNOWN,
         "accepted_at": receipt_timestamp(result.get("accepted_at")),
         "classification": classification
-        if classification in ("stop_not_sent", "stop_not_confirmed", "stop_rejected", "process_replaced")
+        if classification in ("stop_not_sent", "stop_rejected", *STOP_NONTERMINAL_CLASSIFICATIONS)
         else None,
         "session_stopped": stopped if type(stopped) is bool else None,
     }

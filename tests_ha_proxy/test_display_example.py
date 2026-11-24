@@ -57,6 +57,38 @@ def test_display_resynchronizes_its_clock_at_the_download_interval():
     assert clock["update_interval"] == image["update_interval"] == "10s"
 
 
+# Intent: the touchscreen reacts to both settled outcomes and the live state of a pending request.
+# Why: a renderer running every 25 seconds can miss the entire interval of unconfirmed feedback.
+def test_display_feedback_follows_live_home_assistant_subscriptions():
+    package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
+    helper = next(sensor for sensor in package["text_sensor"] if sensor["id"] == "canvas_ics_request_state")
+    automation = next(sensor for sensor in package["text_sensor"] if sensor["id"] == "canvas_ics_touch_automation")
+    busy = next(sensor for sensor in package["sensor"] if sensor["id"] == "canvas_ics_pending_runs")
+    assert helper["platform"] == automation["platform"] == busy["platform"] == "homeassistant"
+    assert helper["entity_id"] == PENDING
+    assert automation["entity_id"] == AUTOMATION and "attribute" not in automation
+    assert busy["entity_id"] == AUTOMATION and busy["attribute"] == "current"
+    assert helper["on_value"] == automation["on_value"] == busy["on_value"] == [
+        {"script.execute": "show_ics_request_feedback"}
+    ]
+    scripts = {script["id"]: script["then"] for script in package["script"]}
+    feedback = scripts["show_ics_request_feedback"][0]["lambda"]
+    assert 'const bool enabled = id(canvas_ics_touch_automation).state == "on";' in feedback
+    assert 'const bool unavailable = showing && !enabled;' in feedback
+    assert re.search(r'if \(unavailable\)\s*\{\s*feedback = "Charger buttons unavailable";', feedback)
+    assert "if (!enabled) id(canvas_pressed_control).clear();" in feedback
+    assert "if (!pending && !unavailable)" in feedback
+    for state, message in (("starting_timeout", "Start not confirmed"), ("stopping_timeout", "Stop not confirmed")):
+        assert re.search(rf'request == "{state}"\)\s*\{{\s*feedback = "{message}";', feedback)
+    assert {"script.execute": "show_ics_request_feedback"} in scripts["check_canvas_freshness"][0]["if"]["then"]
+    page = next(page for page in package["lvgl"]["pages"] if page["id"] == "canvas_dashboard")
+    touch = next(
+        widget["button"] for widget in page["widgets"] if widget.get("button", {}).get("id") == "canvas_touch_button"
+    )
+    assert 'id(canvas_ics_touch_automation).state == "on"' in touch["on_press"][0]["lambda"]
+    assert 'id(canvas_ics_touch_automation).state != "on"' in touch["on_click"][0]["if"]["condition"]["lambda"]
+
+
 # Intent: test the shipped display tap guards and exact Start/Stop feedback inside Home Assistant.
 # Why: a stale frame, duplicate tap or old failure must never send another charger request.
 async def test_public_display_example_with_actual_ha(tmp_path):
@@ -201,33 +233,55 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         gate.clear()
         tap(True)
         await wait_for(lambda: len(calls) == 3)
+        pending_start = template.async_render({"now": render_time}, parse_result=False)
+        assert "Waiting for charger confirmation" not in pending_start
+        assert render_marker(pending_start) == f"d51a0{int(render_time.timestamp()):08x}"
         # An unrelated session change cannot complete the waiting request.
         hass.states.async_set(SESSION, "on", {"stop_target": TARGET})
         assert hass.states.get(PENDING).state == "starting"
         gate.set()
         await wait_for(lambda: settled("starting_timeout"))
-        template = Template((PROJECT / "view.html.jinja").read_text(), hass)
-        html = template.async_render({"now": datetime.now(UTC)}, parse_result=False)
+        html = template.async_render({"now": render_time}, parse_result=False)
         assert "Start not confirmed" not in html and "Open session" in html
         hass.states.async_set(SESSION, "off", {"can_start": True, "control_revision": REVISION})
-        assert "Start not confirmed" in template.async_render({"now": datetime.now(UTC)}, parse_result=False)
+        start_timeout_frame = template.async_render({"now": render_time}, parse_result=False)
+        assert "Start not confirmed" not in start_timeout_frame and "Ready to start" in start_timeout_frame
 
         hass.states.async_set(SESSION, "unavailable")
         tap(False)
         await asyncio.sleep(0.15)
         assert len(calls) == 3
-        # The bounded cleanup is UI-only. A later session must not display the previous failed press.
+        # Expiry removes the live feedback even if the same picture is still on screen.
         await wait_for(lambda: settled("idle"))
+        hass.states.async_set(SESSION, "off", {"can_start": True, "control_revision": REVISION})
+        assert template.async_render({"now": render_time}, parse_result=False) == start_timeout_frame
+
         hass.states.async_set(SESSION, "on", {"stop_target": TARGET})
-        fresh_session = template.async_render({"now": datetime.now(UTC)}, parse_result=False)
-        assert "Open session" in fresh_session and "not confirmed" not in fresh_session
+        idle_stop_frame = template.async_render({"now": render_time}, parse_result=False)
+        assert "Open session" in idle_stop_frame
+        gate.clear()
+        tap(False)
+        await wait_for(lambda: len(calls) == 4)
+        assert calls[-1] == {"action": "stop_session", "target": TARGET}
+        pending_stop = template.async_render({"now": render_time}, parse_result=False)
+        assert "Waiting for charger confirmation" not in pending_stop
+        assert render_marker(pending_stop) == f"d51a0{int(render_time.timestamp()):08x}"
+        gate.set()
+        await wait_for(lambda: settled("stopping_timeout"))
+        assert template.async_render({"now": render_time}, parse_result=False) == idle_stop_frame
+        await wait_for(lambda: settled("idle"))
+        # The next render can come after the entire unconfirmed interval. The helper carried it independently.
+        later = render_time + timedelta(seconds=25)
+        next_stop_frame = template.async_render({"now": later}, parse_result=False)
+        assert "Open session" in next_stop_frame and "Stop not confirmed" not in next_stop_frame
+        assert render_marker(next_stop_frame) == f"d51a2{int(later.timestamp()):08x}{TARGET}"
 
         # An unavailable touch automation cannot honor either rendered charger control.
         await hass.services.async_call("automation", "turn_off", {"entity_id": AUTOMATION}, blocking=True)
         assert hass.states.get(AUTOMATION).state == "off"
         tap(False)
         await hass.async_block_till_done()
-        assert len(calls) == 3
+        assert len(calls) == 4
         for automation_state in ("off", "unavailable", None):
             if automation_state == "unavailable":
                 hass.states.async_set(AUTOMATION, automation_state, {"current": 1})
@@ -251,7 +305,7 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         await hass.services.async_call("automation", "turn_on", {"entity_id": AUTOMATION}, blocking=True)
         await wait_for(lambda: settled("idle"))
         assert "Ready to start" in template.async_render({"now": datetime.now(UTC)}, parse_result=False)
-        assert len(calls) == 3
+        assert len(calls) == 4
     finally:
         gate.set()
         await hass.async_stop(force=True)

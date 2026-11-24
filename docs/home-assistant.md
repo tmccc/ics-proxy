@@ -1,6 +1,7 @@
 # Home Assistant client
 
-Copy `custom_components/ics_proxy` into the Home Assistant configuration directory, or use the
+Copy the integration to `custom_components/ics_proxy` inside your Home Assistant configuration directory.
+In Home Assistant Container, the full destination is `/config/custom_components/ics_proxy`. You can also use the
 [verified Docker installer](release-process.md) for a qualified source commit. Restart Home Assistant,
 then add **iCS local proxy** in Devices & services. Enter the running proxy’s management port and token.
 The client connects to `127.0.0.1`, and the form’s default port of `18779` matches the
@@ -21,7 +22,8 @@ the necessary conditions.
 The `ics_proxy.session_command` action returns `confirmed: true` when the proxy completes the exact request.
 See [the touchscreen example](../examples/solar-display-2/README.md) for the request format. Treat
 `confirmed: false` as unconfirmed. That result covers several outcomes, including a Stop that never went out
-and a Stop whose physical outcome is uncertain.
+and a Stop whose reply is still unknown. The session can show as closed while the proxy still waits for the
+exact Stop reply. The saved result can settle after Home Assistant's wait ends.
 
 Set `include_request_reference: true` and save the action response when you want to look up a specific Stop.
 
@@ -44,6 +46,8 @@ Before making a new Stop request after a failed attempt, check that the matching
 `journal.request.state` set to `failed`, `wire.dispatch` set to `not_sent`, and the same session is still open.
 A pending request can still send.
 A Stop that may have gone out stays tied to its original attempt while the proxy looks for closure.
+If an earlier Stop already covers the same open session when Home Assistant makes its request, the proxy joins
+that attempt. The joined request follows that attempt's result regardless of when closure arrives.
 Home Assistant Pause uses the protective path when the charger still needs to stop.
 
 The client derives availability from fresh proxy data. A vendor outage and a local charger fault have

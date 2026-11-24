@@ -9,7 +9,7 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -181,7 +181,7 @@ class ControlDecisions:
       ``issue_local_start`` records possible dispatch and ``publish_start`` publishes the owned result.
       Vendor Start checks approval and scope in ``authorize_vendor_start`` and ``require_vendor_start``.
     - Current changes use ``accept_current``, ``require_current_selection`` and ``complete_current``.
-    - Session Stop, vendor Stop and the local executor enter through ``session_stop_send_decision``,
+    - Session Stop, vendor Stop and the local executor enter through ``session_stop_decision``,
       ``require_vendor_stop`` and ``authorize_local_send``. All three lead to ``_stop_decision``.
     - Pause uses ``accept_pause`` and ``prepare_pause_stop``. ``require_pause_stop`` checks authority
       before the claim and at send. ``bind_pause_stop`` saves the claim, and ``complete_pause`` requires
@@ -2292,9 +2292,21 @@ class ControlDecisions:
             self._protective_stop = local, boot, self.control._revision, ticket
         return True
 
-    # A session-only caller distinguishes joining a prior Stop from closing before dispatch.
-    def session_stop_send_decision(self, local: int, boot: str) -> StopDecision:
-        return self._stop_send_decision(local, boot, session_only=True)
+    # Use the same predecessors at admission and when reconsidering an unbound request at the wire.
+    def session_stop_decision(self, local: int, boot: str) -> tuple[StopDecision, dict[str, Any]]:
+        outcomes = self.journal.outcomes
+        decision = self._stop_send_decision(local, boot, session_only=True)
+        if decision is StopDecision.SEND or decision is StopDecision.CLOSED:
+            return decision, {}
+        binding: dict[str, Any] = {"joined": 1}
+        if decision is StopDecision.ACCEPTED:
+            acceptance = outcomes.accepted_stop_attempt(local)
+            if acceptance is not None and acceptance.wire is not None:
+                binding["accepted_attempt"] = asdict(acceptance)
+        elif not outcomes.unanswered_shutdown_stop(local):
+            binding["local_attempts"] = outcomes.session_stop_dispatches(local)
+            binding["vendor_attempts"] = outcomes.vendor_stop_dispatches(local)
+        return decision, binding
 
     # Pause
 

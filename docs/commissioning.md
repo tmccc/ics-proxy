@@ -61,15 +61,18 @@ before resuming proxy control.
 2. Start the proxy service while the charger still uses the original route. Wait for the proxy to confirm the
    charger listener is open. In the systemd example, the service reports ready with the status
    `Waiting for verified charger and owner control` at this point.
-3. Point the charger at the configured proxy route using the four `trial_route` fields. Keep the saved and
-   effective user limits at 6 A through the first charger Boot. Verify the proxy binds that Boot and reports
-   the expected zero hold before authorizing normal operation.
+3. Choose an idle commissioning window before changing the route. Leave any vendor-app Start until after
+   verification and check when the saved schedule can next start charging.
+4. Point the charger at the configured proxy route using the four `trial_route` fields. Keep both user limits
+   at 6 A. The proxy verifies the first Boot and establishes a 0 A hold. Once the connection and recovery
+   checks pass, the proxy automatically enables app and schedule control at 6 A. The initial hold may pass
+   between status updates.
+5. Confirm the verified Boot, the 6 A ceiling, and the expected profile, journal and saved resources.
 
-Confirm the actual profile, journal and saved resources before authorizing normal operation. The separate
-`tools/prepare_managed_current.py` action requires exclusive journal ownership and the verified zero hold before
-preparing the supported native 32 A capability. Use its offline `check` first. After successful preparation and
-verification, the service can offer whole-amp selections from 6 A to 32 A when the charger is idle and the
-current selection checks pass.
+To prepare the native 32 A capability later, request **Pause charger** and verify the closed session and 0 A
+hold. Stop the service so the separate `tools/prepare_managed_current.py` action can take exclusive journal
+ownership. Use its offline `check` first. After successful preparation and verification, the service can offer
+whole-amp selections from 6 A to 32 A when the charger is idle and the current selection checks pass.
 
 ## App and schedule control
 
@@ -130,6 +133,11 @@ saved status to identify what needs attention.
 In normal app or schedule operation, three unavailable or stale full supervision checks trigger a request for
 a 0 A hold. Timing depends on how long the checks take. A session can stay open at 0 A and resume when the
 recovery checks pass.
+
+After a Stop during a vendor outage, the charger’s local status can still show that exact session open at
+zero after the proxy has recorded its closing report. On restart, the proxy can open its listener in a
+restricted state so recovery can continue. It waits for the local status to catch up before releasing
+charging control.
 
 If the proxy restarts before saving the result of a vendor authorization check, that tag needs a fresh
 vendor decision before its older approval can be used again. Other tags keep their own authorization.

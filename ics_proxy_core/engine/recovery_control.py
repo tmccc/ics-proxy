@@ -258,7 +258,22 @@ class RecoveryControl:
         j = self.journal
         return ordinary.ordinary() and (ordinary.active() or j.phase.read().value == "recovering")
 
-    # Either channel can close a real mapped session first; disagreement grants only a zero-output restrictive wait.
+    # A real session Stop can explain an unmapped native marker while it waits at zero for closure.
+    def closed_session_stop_wait(self, native: HandoverEvidence) -> bool:
+        j, physical = self.journal, native.physical
+        local = physical.native_transaction_id
+        return (
+            physical.transaction_open
+            and type(local) is int
+            and j.active() is None
+            and native.output_limit_a == 0
+            and physical.power_w == 0
+            and all(value == 0 for value in native.currents_a + native.powers_w)
+            and j.outcomes.latest_closed_session_stop_id() == local
+            and j.vendor_id(local) is None
+        )
+
+    # Either channel can close a proven session first; disagreement grants only a restrictive wait.
     def ordinary_closure_gap(self, ordinary: OrdinaryRecovery, native: HandoverEvidence) -> bool:
         j, physical = self.journal, native.physical
         local, known = physical.native_transaction_id, j.active()
@@ -278,7 +293,7 @@ class RecoveryControl:
         if not physical.transaction_open or known is not None:
             return False
         # OCPP closed first. Only the latest connector lifecycle can explain an open native report at zero.
-        return j.latest_mapped_stop(local)
+        return j.latest_mapped_stop(local) or self.closed_session_stop_wait(native)
 
     # The same exact ordinary source and owner prerequisites apply before and inside the outgoing gate.
     def ordinary_authority(
@@ -724,7 +739,8 @@ class RecoveryControl:
         if claim.binding is None or not native.physical.transaction_open or j.current_change.read().recovering:
             return None
         if (
-            j.get("managed_mode")
+            self.closed_session_stop_wait(native)
+            or j.get("managed_mode")
             and j.get("managed_control_intent", {}).get("mode") == "app"
             or handover.recovery_zero_only is not None
             and handover.recovery_zero_only()
@@ -835,6 +851,8 @@ class RecoveryControl:
                 and all(value == 0 for value in native.currents_a + native.powers_w)
             ):
                 return  # Keep reception and restrictive recovery available while native closure catches up.
+            if handover.commissioned_binding_matches(native) and self.closed_session_stop_wait(native):
+                return
             if (
                 j.current_change.read().recovering
                 and recorded_station_profile(j, handover.spec.digest, handover.spec.boot_digest)

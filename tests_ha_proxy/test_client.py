@@ -14,18 +14,17 @@ import pytest
 from aiohttp import ClientConnectionError, ClientWebSocketResponse, WSMsgType, web
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.setup import async_setup_component
 
 from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
 from tests.charge_rig import owner_rig, positive_flow
 from tests.managed_rig import healthy
+from tests.management_peer import TOKEN as TOKEN
 from tests.runtime_rig import until
 from tests.test_managed_normal_start import natural_stop
 from tests.tls_support import tls as tls
+from tests_ha_proxy.conftest import setup_proxy
 from tools.managed_incident import reference
 from tools.managed_stop_incident import stop_incident_report
-
-TOKEN = "a" * 64  # Synthetic loopback-only test credential.
 
 
 # Exercise real websocket authentication/framing without importing the OCPP engine into the HA client.
@@ -212,15 +211,7 @@ async def peer():
 
 # Configure the actual custom integration through its real import flow without touching live HA configuration.
 async def setup(hass, peer):
-    assert await async_setup_component(hass, "persistent_notification", {})
-    result = await hass.config_entries.flow.async_init(
-        "ics_proxy", context={"source": "import"}, data={"port": peer["port"], "token": TOKEN}
-    )
-    await hass.async_block_till_done()
-    assert result["type"] == "create_entry", result
-    entry = result["result"]
-    assert entry.state is ConfigEntryState.LOADED
-    return entry
+    return await setup_proxy(hass, peer["port"])
 
 
 # Intent: one HA action waits for the correct receipt, updates the session view and enables an immediate Stop.
@@ -370,8 +361,12 @@ async def test_session_stop_shares_the_vendor_wire_in_either_order(
             )
         )
         try:
-            await until(lambda: controller.session_stop.worker is not None and controller.session_stop.worker.done())
-            assert journal.outcomes.accepted_stop(local)
+            await until(
+                lambda: journal.outcomes.accepted_stop(local)
+                and journal.db.execute(
+                    "SELECT 1 FROM managed_requests WHERE action='stop_session' AND state='running' LIMIT 1"
+                ).fetchone() is not None
+            )
             if first == "local":
                 await vendor_stop()
             [(identifier,)] = journal.db.execute("SELECT id FROM managed_requests WHERE action='stop_session'")

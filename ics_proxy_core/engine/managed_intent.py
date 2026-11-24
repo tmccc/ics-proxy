@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 from .security import SecurityError
+from .stop_settlement import STOP_NONTERMINAL_CLASSIFICATIONS
 from .store import Journal, RecoveryRequiredError
 
 if TYPE_CHECKING:
@@ -479,6 +480,8 @@ class ManagedRequests:
         if command.action == "stop_session":
             target = result.pop("target", None)
             result.pop("_session_stop", None)
+            if command.state == "completed" and result.get("classification") in STOP_NONTERMINAL_CLASSIFICATIONS:
+                result.pop("classification")
         receipt: dict[str, Any] = {"id": identifier, "action": command.action, "state": command.state, "result": result}
         if include_binding:
             receipt["revision"] = command.revision

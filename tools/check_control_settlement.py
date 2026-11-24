@@ -14,6 +14,9 @@ from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[1]
 STOP_TEST = "tests/test_managed_session_stop.py"
+STOP_JOIN = f"{STOP_TEST}::test_joined_session_stop_settles_from_late_rejection"
+STOP_PUBLICATION = f"{STOP_TEST}::test_accepted_stop_closure_survives_publication_refusal"
+STOP_RESTART = "tests/test_managed_stop_replacement.py::test_unmapped_stop_replacement_waits_for_native_closure"
 PAUSE_OVERLAP = (
     "tests/test_managed_cloud_zero_controls.py::test_local_pause_and_cloud_stop_share_unanswered_stop_at_zero"
 )
@@ -40,10 +43,34 @@ SUITES = {
             f"{STOP_TEST}::test_session_stop_shares_the_vendor_wire_in_either_order[ocpp-vendor]",
             f"{STOP_TEST}::test_session_stop_reuses_a_wire_with_a_lost_reply[local]",
             f"{STOP_TEST}::test_session_stop_reuses_a_wire_with_a_lost_reply[vendor]",
+            f"{STOP_JOIN}[closure-first-local]",
+            f"{STOP_JOIN}[closure-first-vendor]",
+            f"{STOP_JOIN}[rejection-first-local]",
+            f"{STOP_JOIN}[rejection-first-vendor]",
+            f"{STOP_JOIN}[closure-first-local-wire-busy]",
+            f"{STOP_JOIN}[closure-first-vendor-wire-busy]",
+            f"{STOP_JOIN}[rejection-first-local-wire-busy]",
+            f"{STOP_JOIN}[rejection-first-vendor-wire-busy]",
+            f"{STOP_TEST}::test_session_stop_awaits_closure_when_session_closes_in_gate",
+            f"{STOP_TEST}::test_verified_closure_survives_stop_reply_window[Accepted]",
+            f"{STOP_TEST}::test_verified_closure_survives_stop_reply_window[Rejected]",
+            f"{STOP_TEST}::test_verified_closure_survives_stop_reply_window[expired]",
+            f"{STOP_TEST}::test_verified_closure_survives_stop_reply_window[disconnected]",
+            f"{STOP_TEST}::test_joined_stop_report_retains_accepted_predecessor[local]",
+            f"{STOP_TEST}::test_joined_stop_report_retains_accepted_predecessor[vendor]",
             f"{STOP_TEST}::test_buffered_late_stop_rejection_fences_receipts[local]",
             f"{STOP_TEST}::test_buffered_late_stop_rejection_fences_receipts[vendor]",
             f"{STOP_TEST}::test_exact_stop_rejection_fences_receipt_after_replacement[owner]",
             f"{STOP_TEST}::test_exact_stop_rejection_fences_receipt_after_replacement[vendor]",
+            f"{STOP_TEST}::test_replacement_settles_only_saved_verified_stop_closure[old-receipt]",
+            f"{STOP_TEST}::test_replacement_settles_only_saved_verified_stop_closure[verified-closure]",
+            f"{STOP_PUBLICATION}[next-poll]",
+            f"{STOP_PUBLICATION}[marker-refused]",
+            f"{STOP_PUBLICATION}[replacement]",
+            f"{STOP_RESTART}[exact-stop-proof-plugged]",
+            f"{STOP_RESTART}[exact-stop-proof-unplugged]",
+            f"{STOP_RESTART}[report-only-plugged]",
+            f"{STOP_RESTART}[report-only-unplugged]",
             f"{STOP_TEST}::test_live_stop_confirmation_uses_elapsed_time[-30]",
             f"{STOP_TEST}::test_live_stop_confirmation_uses_elapsed_time[30]",
             f"{STOP_TEST}::test_queued_stop_cannot_dispatch_after_expiry_write_rolls_back",

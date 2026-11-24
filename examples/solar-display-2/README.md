@@ -9,8 +9,12 @@ and the renderer serves an older image again, a previously expired image can rea
 
 The Home Assistant automation verifies the device, screen, frame age, position and original marker before sending
 a request. Start also requires the current control revision and permission to start. Stop requires the target to
-match the current open session. Pending feedback comes from Home Assistant. An unconfirmed message clears after
-about 20 seconds.
+match the current open session. The touchscreen shows pending and unconfirmed feedback for the exact request from
+the live Home Assistant helper, including between image downloads. While the automation is enabled, an
+unconfirmed message clears on the first five-second cleanup tick after 20 seconds, or when a new request
+replaces it. If the automation becomes unavailable, the touchscreen immediately greys out both charger buttons
+and ignores taps on them, even while the previous image is still showing. The offline dashboard hides request
+feedback.
 
 Use this with a compatible 480 × 480 ESPHome/LVGL touchscreen whose Home Assistant renderer provides the assigned
 view and display image. The canvas example is a package for an existing board configuration. The board supplies its
@@ -25,7 +29,8 @@ display, touch and brightness components, its fallback dashboard, and the render
    The package synchronizes its Home Assistant clock every 10 seconds to check render times. Set the renderer to
    update every 25 seconds or less with the example's 10-second download interval and 5-second HTTP timeout.
    This leaves time for clock rounding and processing before the picture expires. Update the firmware and paired
-   preview template together.
+   preview template together so the firmware handles feedback independently of the renderer. The existing request
+   helper and automation use the same states and can be kept when updating.
 4. Confirm that the automation entity ID used by the view and firmware matches the installed automation.
    In the view, write the quoted entity ID directly in both `is_state()` and `state_attr()` so GeekMagic
    loads the automation’s state. Enable the automation in Home Assistant.

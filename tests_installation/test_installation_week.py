@@ -1,21 +1,24 @@
 """One advancing simulated installation across a week and two standalone builds."""
 
 import json
+import os
+import sys
 from pathlib import Path
 
 from tests.model_tls_support import model_tls as model_tls
 from tests.model_tls_support import tls_for_case
 from tests.process_helpers import process_rig
 from tests.recovery_barriers import require_zero_held
-from tests_ha_proxy.conftest import actual_core
-from tests_ha_proxy.test_client import setup
+from tests_ha_proxy.conftest import actual_core, setup_proxy
 from tests_installation.migrated_layout import seed_old_layout, verify_layout
 from tests_installation.scheduled_week import ScheduledWeek, WeekPeer, press_button
 
 
 # Check that the actual process and saved file are those used by the rehearsal, rather than backups or copies.
-def verify_build(proxy, source, journal, original, layout):
-    assert Path(f"/proc/{proxy.process.pid}/cwd").resolve() == source
+def verify_build(proxy, source, journal, original, layout, python=None):
+    process = Path(f"/proc/{proxy.process.pid}")
+    assert (process / "cwd").resolve() == source
+    assert (process / "cmdline").read_bytes().split(b"\0", 1)[0] == os.fsencode(python or sys.executable)
     current = journal.stat()
     assert (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino)
     verify_layout(journal, layout)
@@ -56,7 +59,7 @@ def assert_same_pause_receipt(receipt, expected, saved):
 # Intent: retain the same week of charging, owner controls, and migrated journal while updating and going back.
 # Why: a new journal or a simulated app reply would miss failures that depend on previously saved work.
 async def test_week_on_migrated_installation(tmp_path, model_tls, unused_tcp_port_factory, monkeypatch, builds):
-    current, previous, layout = builds
+    current, previous, layout, previous_python = builds
     journal = tmp_path / "state.db"
     seed_old_layout(journal)
     original = journal.stat()
@@ -73,10 +76,10 @@ async def test_week_on_migrated_installation(tmp_path, model_tls, unused_tcp_por
         ) as proxy,
         actual_core(tmp_path / "home-assistant") as hass,
     ):
-        await proxy.start(source=previous)
+        await proxy.start(source=previous, python=previous_python)
         await proxy.status()
-        verify_build(proxy, previous, journal, original, layout)
-        entry = await setup(hass, {"port": proxy.port})
+        verify_build(proxy, previous, journal, original, layout, previous_python)
+        entry = await setup_proxy(hass, proxy.port)
         week = ScheduledWeek(proxy)
 
         await week.finish(await week.start(0, 6))
@@ -118,8 +121,8 @@ async def test_week_on_migrated_installation(tmp_path, model_tls, unused_tcp_por
         await proxy.close()
         assert proxy.process.returncode == 0
         verify_layout(journal, layout)
-        await proxy.start(source=previous)
-        verify_build(proxy, previous, journal, original, layout)
+        await proxy.start(source=previous, python=previous_python)
+        verify_build(proxy, previous, journal, original, layout, previous_python)
         recovered = await proxy.status(
             lambda state: state.get("local_hold_verified") is True and state.get("can_return") is True
         )
@@ -144,4 +147,4 @@ async def test_week_on_migrated_installation(tmp_path, model_tls, unused_tcp_por
         assert_same_pause_receipt(await proxy.completed_control(pause["id"]), pause, saved_pause)
         assert saved_pause in proxy.durable()["requests"]
         assert len(week.bench.history) == len(week.starting_history) + 7
-        verify_build(proxy, previous, journal, original, layout)
+        verify_build(proxy, previous, journal, original, layout, previous_python)

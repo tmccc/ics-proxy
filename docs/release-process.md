@@ -16,12 +16,22 @@ the installation week. The rehearsal verifies the version it imports against the
 A change to the standalone service, its dependency pins, or its packaged systemd unit triggers that rehearsal
 against the installed build.
 
-Both checks use a fresh Python cache location, including the simulated service processes they start. Reusing a
-passing result requires matching test evidence and the same interpreter and dependency files. Updating a package
-in place invalidates the previous result even when its version stays the same. Use installed packages in the
-interpreter's standard library and package directories. The release checks fingerprint individual root-managed
-Python startup and shared-library files at their distribution link targets. The checks reject editable installs
-and other import roots without walking external source trees.
+Pass `--ics-ha-python /path/to/ha-env/bin/python` to run the installation week. When the installed and
+candidate `requirements-trial.txt` pins differ, also pass `--ics-installed-python /path/to/old-env/bin/python`
+with the verified installed build's standalone dependencies. The same option can select a distinct runtime
+when the pins match. With matching pins and no separate interpreter, the service processes share the Home
+Assistant environment. The simulator imports the archived build's commissioning code in the Home Assistant
+environment. Those imports must work with the candidate dependencies. The service processes use the installed
+runtime before the upgrade and after rollback, and the candidate runtime during the upgrade.
+
+Both checks use a fresh Python cache location and set `OPENSSL_CONF=/dev/null` for synthetic certificates,
+including in the simulated service processes. They clear inherited `OPENSSL_*` overrides. Reusing a passing
+result requires matching test evidence, interpreter and dependency files, and the OpenSSL executables and
+rehearsal configuration. The installation week checks both assigned runtimes. Updating a package in place
+invalidates the result even when its version stays the same. Use installed packages in the interpreter's standard
+library and package directories. The release checks fingerprint individual root-managed Python startup and
+shared-library files at their distribution link targets. The checks reject editable installs and other import
+roots without walking external source trees.
 
 Before creating a release tag, move the changes from `Unreleased` into the matching version section of
 `CHANGELOG.md`. Run `python tools/version.py check vX.Y.Z` with the intended tag.
@@ -56,7 +66,8 @@ The installation week starts the Python service directly. For a systemd deployme
 service account, writable state directory, watchdog and stop timeout. The example spaces restart attempts three
 seconds apart so a brief charger outage can recover under the default systemd start limits. Check the spacing
 against any limits configured on the target host. Run its `managed_proxy.py check` invocation
-against the staged source and corresponding private configuration as the configured service account.
+against the staged source and corresponding private configuration with the configured service account and its
+deployment environment, including its OpenSSL settings.
 
 Stop and restart with the configured service manager in the authorized window.
 Confirm the installed source fingerprint, current setting, state, vendor availability and preserved charging records.

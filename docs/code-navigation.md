@@ -46,21 +46,30 @@ flowchart LR
 
 1. `ManagedSessionStop.accept()` saves the Home Assistant request against the exact open session and current
    control revision. A vendor-app Stop reaches the gateway, which maps its transaction ID to the same local session.
+   The shared decision records an earlier Stop that already covers this session when it accepts the request.
+   The result then follows that earlier attempt even if the session closes while the request would have waited
+   for the charger.
    [Local request](../ics_proxy_core/engine/managed_session_stop.py) · [Vendor request](../ics_proxy_core/engine/gateway.py)
 2. Immediately before send, both paths use the shared Stop decision in `ControlDecisions`. The decision can allow
    a send on the original charger Boot, reuse an exact acceptance, wait for an earlier attempt's report, or find
-   that the target is no longer open. Possible dispatch is recorded before the wire send.
+   that the target is no longer open. If the session closes before dispatch and there was no earlier Stop to join,
+   verified closure can satisfy the request. Possible dispatch is recorded before the wire send.
    [Shared decision](../ics_proxy_core/engine/control_decisions.py) · [Wire boundary](../ics_proxy_core/engine/rpc.py)
 3. The charger reply is recorded against that attempt. A matching `Accepted` lets the owner wait for closure.
-   An actual closing report establishes closure of the exact session. Receipt settlement still checks for an
-   exact rejection, including a rejection saved in a separate checkpoint.
+   The closing report and independent charger reading establish physical closure. The receipt can wait for the
+   exact reply even after the session shows as closed. A definite rejection settles that attempt as failed,
+   including when the reply is saved in a separate checkpoint. If the reply window ends without an answer,
+   the verified closure can settle the receipt. The proxy retains verified closure while it retries a failed
+   receipt write. An incident report can show the earlier accepted reply that a local request joined.
    [Command evidence](../ics_proxy_core/engine/command_outcomes.py) · [Stop settlement](../ics_proxy_core/engine/stop_settlement.py)
 
 Session Stop leaves app or schedule mode in place. Pause claims a zero hold and can also stop the exact session.
 With current independent zero evidence, Pause and the vendor app can wait for an unanswered Stop on the same
 charger connection. A newer Pause can act after reconnecting. Lost zero or fresh draw can require a separately
-authorized protective Stop. The [settlement checks](../tools/check_control_settlement.py) cover both local and
-vendor request orders, including lost replies and overlapping Pause.
+authorized protective Stop. A distinct vendor request for a still-open session can send another Stop if the
+proxy lacks a verified zero hold and no unresolved Stop already covers it. The
+[settlement checks](../tools/check_control_settlement.py) cover both local and vendor request orders, including
+lost replies and overlapping Pause.
 
 ## Follow a Return to app or schedule
 

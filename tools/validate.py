@@ -7,6 +7,7 @@
     python tools/validate.py --tests-only -k managed_session_stop   # targeted only, not full qualification
 
 For a changed standalone proxy, also pass --ics-ha-python with the pinned Home Assistant interpreter.
+If the standalone dependency pins changed, provide --ics-installed-python for the previous runtime.
 
 On Windows tests that fail for environment reasons only (for example CRLF checkout changes to fixture digests or
 the bash-based search tool tests) are listed in ``tools/known_env_failures.txt`` and ignored there; any other
@@ -44,6 +45,7 @@ class Deployment:
     target: str
     installed: str | None
     ha_python: Path | None
+    installed_python: Path | None = None
 
 
 # Pick the repository virtualenv interpreter for the current OS, falling back to the running Python.
@@ -255,6 +257,8 @@ def run_full_qualification(
                 raise ValueError(
                     "provide --ics-ha-python from a pinned Home Assistant runtime for the installation week"
                 )
+            if week and deployment.installed_python is not None and not deployment.installed_python.is_file():
+                raise ValueError("--ics-installed-python must select the previous standalone interpreter")
             engine_packages = audit_qualification(path, source, metadata, python, results, collection_executors)
             if target == "ics-proxy":
                 ics_predeployment.require_standalone_pins(
@@ -274,6 +278,9 @@ def run_full_qualification(
                         metadata,
                         str(deployment.ha_python.absolute()),
                         installed=(deployment.installed, previous),
+                        installed_python=(
+                            str(deployment.installed_python.absolute()) if deployment.installed_python else None
+                        ),
                     )
                     results["installation week"] = True
             if destination is not None and all(results.values()):
@@ -324,6 +331,12 @@ def main() -> int:
         default=os.environ.get("OCPP_ICS_HA_PYTHON"),
         help="pinned Home Assistant interpreter used for a changed standalone proxy",
     )
+    parser.add_argument(
+        "--ics-installed-python",
+        type=Path,
+        default=os.environ.get("OCPP_ICS_INSTALLED_PYTHON"),
+        help="standalone interpreter with the installed build's pins, required when those pins change",
+    )
     args = parser.parse_args()
     if args.validated_snapshot and (args.quick or args.tests_only or args.expression):
         parser.error("--validated-snapshot requires full validation")
@@ -353,7 +366,9 @@ def main() -> int:
             results,
             validated_snapshot=args.validated_snapshot,
             collection_executors=args.collection_executors,
-            deployment=Deployment(args.deployment_target, args.installed_proxy_commit, args.ics_ha_python),
+            deployment=Deployment(
+                args.deployment_target, args.installed_proxy_commit, args.ics_ha_python, args.ics_installed_python
+            ),
             include_static=not args.tests_only,
         )
 

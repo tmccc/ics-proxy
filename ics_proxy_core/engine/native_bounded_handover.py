@@ -363,7 +363,8 @@ class NativeBoundedHandover:
                 if applicable and as_result and isinstance(error, NativeReadinessError) and error.unplugged_at_zero:
                     local = error.native.physical.native_transaction_id
                     active = gateway.journal.active()
-                    if local == active or active is None and gateway.journal.latest_mapped_stop(local):
+                    known = local == active or active is None and gateway.journal.latest_mapped_stop(local)
+                    if known or gateway.controls.decisions.recovery.closed_session_stop_wait(error.native):
                         return Pending(Prerequisite.LIFECYCLE, str(error), error)
                 raise
             except sqlite3.Error as error:
@@ -769,7 +770,7 @@ class NativeBoundedHandover:
         journal = self.gateway.journal
         active = journal.active()
         if active is None and journal.get("managed_mode"):
-            return journal.latest_mapped_stop_id()
+            return journal.latest_mapped_stop_id() or journal.outcomes.latest_closed_session_stop_id()
         return active
 
     # A physical/ledger closure gap is ordinary pending evidence and never authority to adopt or stop a session.

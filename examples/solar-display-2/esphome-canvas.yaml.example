@@ -136,6 +136,12 @@ text_sensor:
     internal: true
     on_value:
       - script.execute: show_ics_request_feedback
+  - platform: homeassistant
+    id: canvas_ics_touch_automation
+    entity_id: automation.general_display_2_ics_charger_buttons
+    internal: true
+    on_value:
+      - script.execute: show_ics_request_feedback
   - platform: template
     id: canvas_screen_source
     name: Screen source
@@ -158,14 +164,41 @@ script:
     mode: restart
     then:
       - lambda: |-
-          // Show the accepted tap immediately from HA state, between image downloads.
+          // Show control availability and request feedback between image downloads.
+          const auto &request = id(canvas_ics_request_state).state;
           const bool busy = id(canvas_ics_pending_runs).state > 0;
-          const bool starting = busy && id(canvas_ics_request_state).state == "starting";
-          const bool stopping = busy && id(canvas_ics_request_state).state == "stopping";
+          const bool enabled = id(canvas_ics_touch_automation).state == "on";
+          const bool showing = id(canvas_showing);
+          const bool unavailable = showing && !enabled;
+          const bool starting = showing && enabled && busy && request == "starting";
+          const bool stopping = showing && enabled && busy && request == "stopping";
+          const bool pending = starting || stopping;
+          if (!enabled) id(canvas_pressed_control).clear();
+          const char *feedback = nullptr;
+          if (unavailable) {
+            feedback = "Charger buttons unavailable";
+          } else if (pending) {
+            feedback = "Waiting for charger confirmation";
+          } else if (showing && request == "starting_timeout") {
+            feedback = "Start not confirmed";
+          } else if (showing && request == "stopping_timeout") {
+            feedback = "Stop not confirmed";
+          }
+          auto *hint = id(canvas_ics_request_hint);
+          auto *hint_label = id(canvas_ics_request_hint_label);
+          if (hint != nullptr && hint_label != nullptr) {
+            if (feedback == nullptr) {
+              lv_obj_add_flag(hint, LV_OBJ_FLAG_HIDDEN);
+            } else {
+              lv_label_set_text(hint_label, feedback);
+              lv_obj_set_style_text_color(hint_label, lv_color_hex(pending ? 0x91A8C1 : 0xFFC477), 0);
+              lv_obj_clear_flag(hint, LV_OBJ_FLAG_HIDDEN);
+            }
+          }
           auto *start_button = id(canvas_ics_start_feedback);
           auto *stop_button = id(canvas_ics_stop_feedback);
           if (start_button == nullptr || stop_button == nullptr) return;
-          if (!starting && !stopping) {
+          if (!pending && !unavailable) {
             lv_obj_add_flag(start_button, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(stop_button, LV_OBJ_FLAG_HIDDEN);
             return;
@@ -228,6 +261,7 @@ script:
                 id: canvas_showing
                 value: "false"
             - lvgl.page.show: offline_dashboard
+            - script.execute: show_ics_request_feedback
             - text_sensor.template.publish:
                 id: canvas_screen_source
                 state: Offline
@@ -297,6 +331,25 @@ lvgl:
                   align: CENTER
                   text_font: montserrat_22
                   text: STOP ICS
+        - obj:
+            id: canvas_ics_request_hint
+            x: 20
+            y: 432
+            width: 440
+            height: 24
+            bg_color: 0x0B1119
+            bg_opa: COVER
+            border_width: 0
+            radius: 0
+            pad_all: 0
+            clickable: false
+            scrollbar_mode: "OFF"
+            hidden: true
+            widgets:
+              - label:
+                  id: canvas_ics_request_hint_label
+                  align: CENTER
+                  text_font: montserrat_14
         # LVGL gives post-rotation visible pixels. The full-screen hit surface
         # lets HA route future controls without further firmware changes.
         - button:
@@ -319,7 +372,7 @@ lvgl:
                   const auto button = solar_display::charger_button_at(press_point.x, press_point.y);
                   id(canvas_pressed_button) = static_cast<int>(button);
                   id(canvas_pressed_control).clear();
-                  if (button != solar_display::ChargerButton::NONE &&
+                  if (button != solar_display::ChargerButton::NONE && id(canvas_ics_touch_automation).state == "on" &&
                       uint32_t(millis() - id(canvas_frame_control_changed_ms)) >= 100) {
                     id(canvas_pressed_control) = id(canvas_frame_control);
                   }
@@ -336,7 +389,8 @@ lvgl:
                       const auto button = solar_display::charger_button_at(point.x, point.y);
                       const bool charger_button = button != ChargerButton::NONE;
                       if (charger_button &&
-                          (static_cast<int>(button) != id(canvas_pressed_button) ||
+                          (id(canvas_ics_touch_automation).state != "on" ||
+                           static_cast<int>(button) != id(canvas_pressed_button) ||
                            id(canvas_pressed_control) != id(canvas_frame_control) ||
                            (button == ChargerButton::START && !id(canvas_pressed_control).starts_with("start:")) ||
                            (button == ChargerButton::STOP && !id(canvas_pressed_control).starts_with("stop:")))) {

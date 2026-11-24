@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from .store import encoded
 
@@ -11,7 +11,27 @@ if TYPE_CHECKING:
     from .store import Journal
 
 STOP_SESSION = "stop_session"
-STOP_COMPLETION_FIELDS = "state='completed',result=json_set(result,'$.session_stopped',json('true'))"
+STOP_NONTERMINAL_CLASSIFICATIONS = ("stop_not_confirmed", "process_replaced")
+STOP_CLOSURE_VERIFIED = "json_type(result,'$._session_stop.closure_verified') IS 'true'"
+STOP_CLOSURE_FIELDS = "result=json_set(result,'$._session_stop.closure_verified',json('true'))"
+STOP_COMPLETION_FIELDS = (
+    "state='completed',result=json_set(json_remove(result,'$.classification'),"
+    "'$.session_stopped',json('true'),'$._session_stop.closure_verified',json('true'))"
+)
+STOP_BUFFERED_CLOSURE = (
+    "EXISTS (SELECT 1 FROM json_each(?) proof WHERE proof.key=managed_requests.id "
+    "AND proof.value=json_extract(managed_requests.result,'$._session_stop.local'))"
+)
+_OPEN_REPLY = (
+    "EXISTS (SELECT 1 FROM json_each(?) windows "
+    "WHERE json_extract(windows.value,'$[2]')=json_extract(managed_requests.result,'$._session_stop.local') AND ("
+    "(json_extract(windows.value,'$[0]')='local' AND (json_extract(windows.value,'$[1]')=managed_requests.id "
+    "OR EXISTS (SELECT 1 FROM json_each(managed_requests.result,'$._session_stop.local_attempts') a "
+    "WHERE a.value=json_extract(windows.value,'$[1]')))) OR "
+    "(json_extract(windows.value,'$[0]')='vendor' AND EXISTS ("
+    "SELECT 1 FROM json_each(managed_requests.result,'$._session_stop.vendor_attempts') a "
+    "WHERE a.value=json_extract(windows.value,'$[1]')))))"
+)
 _OWNER_REJECTIONS = (
     "SELECT request,local FROM owner_command_wires WHERE action='RemoteStopTransaction' AND reply='Rejected'"
 )
@@ -30,6 +50,21 @@ _EFFECTIVE_REJECTIONS = (
 
 
 @dataclass(frozen=True)
+class StopAcceptance:
+    """The exact accepted predecessor a joining request used."""
+
+    origin: Literal["local", "vendor"]
+    identifier: str
+    wire: str | None
+
+
+# Retain only reply windows that still belong to this receipt or one of its joined Stop attempts.
+def stop_reply_window_predicate(journal: Journal, wires: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+    attempts = journal.outcomes.open_stop_replies(wires) if wires else ()
+    return (_OPEN_REPLY, (encoded(attempts),)) if attempts else ("0", ())
+
+
+@dataclass(frozen=True)
 class StopRejections:
     """The same saved and retained replies feed send decisions and receipt publication."""
 
@@ -42,6 +77,10 @@ class StopRejections:
     def owner_refusal(self, request: str, local: str) -> str:
         return f"EXISTS (SELECT 1 FROM {self.owner} w WHERE w.request={request} AND w.local={local})"
 
+    # A vendor refusal belongs to the recorded mutation and its translated local session.
+    def vendor_refusal(self, mutation: str, local: str) -> str:
+        return f"EXISTS (SELECT 1 FROM {self.vendor} v WHERE v.mutation={mutation} AND v.local={local})"
+
     # A direct refusal suffices. Every attempt named by a joined request must have refused it.
     @property
     def receipts(self) -> str:
@@ -53,7 +92,7 @@ class StopRejections:
             "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.local_attempts') a "
             f"WHERE NOT {self.owner_refusal('a.value', local)}) "
             "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.vendor_attempts') a "
-            f"WHERE NOT EXISTS (SELECT 1 FROM {self.vendor} v WHERE v.mutation=a.value AND v.local={local})))"
+            f"WHERE NOT {self.vendor_refusal('a.value', local)}))"
         )
 
     # A genuine closure settles the waiting request when its exact Stop attempts still permit it.

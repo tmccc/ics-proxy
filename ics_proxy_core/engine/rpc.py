@@ -296,6 +296,10 @@ class Peer:
     def has_pending_call(self, wire: str | None) -> bool:
         return wire is not None and wire in self._pending
 
+    # Only dispatched calls with a receiver can still record a reply, including after their caller times out.
+    def reply_windows(self) -> tuple[str, ...]:
+        return (*self._receivers, *self._late_receivers)
+
     # Use the shared queue for state decisions made from replies, including during exception cleanup.
     def decide[T](self, decision: Callable[[], T], *, priority: CommandPriority = CommandPriority.NORMAL) -> T:
         processor = self.command_processor
@@ -306,7 +310,7 @@ class Peer:
         wire = frame[1]
         future = self._pending.get(wire)
         waiting = future is not None and not future.done()
-        receiver = self._receivers.pop(wire, None)
+        receiver = self._receivers.get(wire)
         late = self._late_receivers.get(wire)
         late_reply = late is not None and receiver is None and late.timer.when() > asyncio.get_running_loop().time()
         self.diagnostics.reply(len(wire), waiting or receiver is not None or late_reply, late=late_reply)
@@ -316,17 +320,24 @@ class Peer:
             self._finish_late_receiver(wire, frame if late_reply else None)
         if receiver is not None:
             priority, record = receiver
-            self.decide(lambda: record(frame), priority=priority)
+
+            # A queued settlement sees either the open window or the saved outcome in this same turn.
+            def finish() -> None:
+                self._receivers.pop(wire, None)
+                record(frame)
+
+            self.decide(finish, priority=priority)
 
     # The matching reply and retirement of its window are one decision turn.
     def _finish_late_receiver(self, wire: str, answer: Frame | None = None) -> None:
-        receiver = self._late_receivers.pop(wire, None)
+        receiver = self._late_receivers.get(wire)
         if receiver is None:
             return
-        receiver.timer.cancel()
 
         # Release the window even if handling the matching reply fails.
         def finish() -> None:
+            self._late_receivers.pop(wire, None)
+            receiver.timer.cancel()
             try:
                 if answer is not None:
                     receiver.receive(answer)

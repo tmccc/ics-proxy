@@ -20,10 +20,14 @@ from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
 from .stop_settlement import (
     SAVED_STOP_REJECTIONS,
+    STOP_BUFFERED_CLOSURE,
+    STOP_CLOSURE_FIELDS,
+    STOP_CLOSURE_VERIFIED,
     STOP_COMPLETION_FIELDS,
     STOP_SESSION,
     StopRejections,
     stop_rejections,
+    stop_reply_window_predicate,
 )
 from .store import JournalStartBusy, RecoveryRequiredError, encoded, fingerprint
 
@@ -53,6 +57,7 @@ class ManagedSessionStop:
     def __init__(self, controller: ManagedController) -> None:
         self.controller = controller
         self.worker: asyncio.Task[None] | None = None
+        self._verified_closures: dict[str, int] = {}
         self.expire(replaced=True)
 
     # Expose an opaque target only for a verified sample of the exact current open session.
@@ -76,6 +81,12 @@ class ManagedSessionStop:
 
     # Persist the exact target and revision before a worker can act, with no change to Pause or Return intent.
     def accept(self, identifier: str, revision: int, target: str) -> dict[str, Any]:
+        return self.controller.commands.decide(
+            lambda: self._accept(identifier, revision, target), priority=CommandPriority.RESTRICT
+        )
+
+    # Admission and predecessor selection share the turn used by charger replies and lifecycle reports.
+    def _accept(self, identifier: str, revision: int, target: str) -> dict[str, Any]:
         c, j, g = self.controller, self.controller.session.journal, self.controller.session.gateway
         existing = c.requests.existing(identifier, STOP_SESSION, revision)
         if existing is not None:
@@ -87,11 +98,15 @@ class ManagedSessionStop:
             raise RecoveryRequiredError("Stop requires the current verified session")
         if not c.requests.has_capacity():
             raise RecoveryRequiredError("management receipt capacity requires operator maintenance")
-        if self.worker is not None and not self.worker.done():
-            raise RecoveryRequiredError("the current session Stop is still being sent")
         accepted = time.time()
         confirmation_deadline = time.monotonic() + CONFIRMATION_SECONDS
         with j.atomic():
+            decision, binding = g.controls.decisions.session_stop_decision(local, connection[0].boot)
+            if decision is StopDecision.CLOSED:
+                raise RecoveryRequiredError("Stop requires the current verified session")
+            needs_dispatch = decision is StopDecision.SEND
+            if needs_dispatch and self.worker is not None and not self.worker.done():
+                raise RecoveryRequiredError("the current session Stop is still being sent")
             insert_request(
                 j,
                 identifier,
@@ -104,11 +119,14 @@ class ManagedSessionStop:
                         "local": local,
                         "dispatched": False,
                         "confirmation_deadline": confirmation_deadline,
+                        **binding,
                     },
                 },
+                state="accepted" if needs_dispatch else "running",
             )
-        scope = SessionStop(identifier, target, local, intent, connection, confirmation_deadline)
-        self.worker = c.commands.start(partial(self._send, scope), priority=CommandPriority.RESTRICT)
+        if needs_dispatch:
+            scope = SessionStop(identifier, target, local, intent, connection, confirmation_deadline)
+            self.worker = c.commands.start(partial(self._send, scope), priority=CommandPriority.RESTRICT)
         return {"id": identifier, "action": STOP_SESSION, "state": "accepted", "result": {"accepted_at": accepted}}
 
     # Only the original owner, Boot and session can dispatch this Stop, even after another command enters the gate.
@@ -135,14 +153,12 @@ class ManagedSessionStop:
 
         # Commit possible dispatch before the sender can write, including when the wire reply is lost.
         def dispatch(_action: str) -> None:
-            decision = g.controls.decisions.session_stop_send_decision(scope.local, boot)
+            decision, binding = g.controls.decisions.session_stop_decision(scope.local, boot)
             if decision is StopDecision.CLOSED:
                 raise StopAlreadyHandledError
             with j.atomic():
-                binding: dict[str, Any] = {"dispatched": 1} if decision is StopDecision.SEND else {"joined": 1}
-                if decision is StopDecision.WAIT_FOR_REPORT and not j.outcomes.unanswered_shutdown_stop(scope.local):
-                    binding["local_attempts"] = j.outcomes.session_stop_dispatches(scope.local)
-                    binding["vendor_attempts"] = j.outcomes.vendor_stop_dispatches(scope.local)
+                if decision is StopDecision.SEND:
+                    binding["dispatched"] = 1
                 j.db.execute(
                     "UPDATE managed_requests SET state='running',result=json_patch(result,?) WHERE id=?",
                     (encoded({"_session_stop": binding}), scope.identifier),
@@ -195,12 +211,15 @@ class ManagedSessionStop:
     def expire(self, *, replaced: bool = False) -> None:
         rejections = stop_rejections(self.controller.session.journal)
         self._publish_rejections(rejections)
+        self._settle_closure(rejections)
+        verified, proofs = self._closure_proof()
         # The same rejection evidence also excludes a receipt from closure while its failure write awaits retry.
         self._update_receipts(
             "state=CASE WHEN json_extract(result,'$._session_stop.dispatched') "
             "OR json_extract(result,'$._session_stop.joined') "
+            f"OR {verified} "
             "THEN 'uncertain' ELSE 'failed' END,result=json_set(result,'$.classification',?)",
-            ("process_replaced" if replaced else "stop_not_confirmed",),
+            (*proofs, "process_replaced" if replaced else "stop_not_confirmed"),
             f"action=? AND state IN ('accepted','running') AND NOT {rejections.receipts} "
             "AND (? OR COALESCE(json_extract(result,'$._session_stop.confirmation_deadline')<=?, "
             "json_extract(result,'$.accepted_at')<=?))",
@@ -226,10 +245,10 @@ class ManagedSessionStop:
         *,
         rejections: StopRejections = SAVED_STOP_REJECTIONS,
         retry_after_rollback: bool = False,
-    ) -> None:
+    ) -> bool:
         j = self.controller.session.journal
         if not self._has_receipts(where, binding, rejections):
-            return
+            return True
         transaction_started = False
         try:
             with j.atomic(retry_busy=True):
@@ -239,11 +258,13 @@ class ManagedSessionStop:
                     rejections.bindings + values + binding,
                 )
         except JournalStartBusy:
-            return  # The existing receipt is still accurate because the write never began.
+            return False  # The existing receipt is still accurate because the write never began.
         except sqlite3.Error:
             if not retry_after_rollback or not transaction_started or j.db.in_transaction:
                 raise
             # The original evidence remains intact. The next poll can retry publication.
+            return False
+        return True
 
     # A fresh native observation and the genuine Stop report must agree before a receipt completes.
     def observed(self, native: HandoverEvidence) -> None:
@@ -257,12 +278,57 @@ class ManagedSessionStop:
             and (native.physical.power_w != 0 or any(value != 0 for value in native.currents_a + native.powers_w))
         ):
             return
-        rejections = stop_rejections(j)
+        self._settle_closure(stop_rejections(j), observed=True)
+
+    # A refused database write can leave the same exact closure available in memory.
+    def _closure_proof(self) -> tuple[str, tuple[str, ...]]:
+        if self._verified_closures:
+            return f"({STOP_CLOSURE_VERIFIED} OR {STOP_BUFFERED_CLOSURE})", (encoded(self._verified_closures),)
+        return STOP_CLOSURE_VERIFIED, ()
+
+    # Save verified closure separately so a refused completion cannot roll back the observation.
+    def _checkpoint_closure(self, rejections: StopRejections, *, observed: bool) -> None:
+        if not observed and not self._verified_closures:
+            return
+        where = f"{rejections.closed_receipts} AND NOT {STOP_CLOSURE_VERIFIED}"
+        bindings: tuple[str, ...] = (STOP_SESSION,)
+        if not observed:
+            where += f" AND {STOP_BUFFERED_CLOSURE}"
+            bindings += (encoded(self._verified_closures),)
+        j = self.controller.session.journal
+        # A previously buffered receipt may already have completed or been rejected.
+        self._verified_closures = {
+            row[0]: row[1]
+            for row in j.db.execute(
+                f"{rejections.prefix}SELECT id,json_extract(result,'$._session_stop.local') "
+                f"FROM managed_requests WHERE {where}",
+                (*rejections.bindings, *bindings),
+            )
+        }
+        if self._verified_closures and self._update_receipts(
+            STOP_CLOSURE_FIELDS,
+            (),
+            f"{rejections.closed_receipts} AND {STOP_BUFFERED_CLOSURE} AND NOT {STOP_CLOSURE_VERIFIED}",
+            (STOP_SESSION, encoded(self._verified_closures)),
+            rejections=rejections,
+            retry_after_rollback=True,
+        ):
+            self._verified_closures.clear()
+
+    # Keep verified closure when an exact normal or late receiver can still deliver a refusal.
+    def _settle_closure(self, rejections: StopRejections, *, observed: bool = False) -> None:
+        self._checkpoint_closure(rejections, observed=observed)
+        proof, proofs = self._closure_proof()
+        closed = f"{rejections.closed_receipts} AND {proof}"
+        if not self._has_receipts(closed, (STOP_SESSION, *proofs), rejections):
+            return
+        session = self.controller.session
+        pending, windows = stop_reply_window_predicate(session.journal, session.gateway.charger.reply_windows())
         self._update_receipts(
             STOP_COMPLETION_FIELDS,
             (),
-            rejections.closed_receipts,
-            (STOP_SESSION,),
+            f"{closed} AND NOT {pending}",
+            (STOP_SESSION, *proofs, *windows),
             rejections=rejections,
             retry_after_rollback=True,
         )
@@ -301,13 +367,7 @@ class ManagedSessionStop:
         local = physical.native_transaction_id
         if not physical.transaction_open or local is None or active is not None:
             return False
-        latest = j.db.execute("SELECT local,stop FROM transactions ORDER BY local DESC LIMIT 1").fetchone()
-        return bool(
-            latest is not None
-            and latest["local"] == local
-            and latest["stop"] is not None
-            and j.outcomes.session_stop_tracks_closure(local)
-        )
+        return j.outcomes.latest_closed_session_stop_id() == local
 
     # Retire the wire worker before the journal closes. Its dispatch marker survives cancellation.
     async def close(self) -> None:
