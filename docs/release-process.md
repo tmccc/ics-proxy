@@ -19,8 +19,9 @@ against the installed build.
 Both checks use a fresh Python cache location, including the simulated service processes they start. Reusing a
 passing result requires matching test evidence and the same interpreter and dependency files. Updating a package
 in place invalidates the previous result even when its version stays the same. Use installed packages in the
-interpreter's standard library and package directories. The release checks reject editable installs and other import
-roots without walking external source trees.
+interpreter's standard library and package directories. The release checks fingerprint individual root-managed
+Python startup and shared-library files at their distribution link targets. The checks reject editable installs
+and other import roots without walking external source trees.
 
 Before creating a release tag, move the changes from `Unreleased` into the matching version section of
 `CHANGELOG.md`. Run `python tools/version.py check vX.Y.Z` with the intended tag.

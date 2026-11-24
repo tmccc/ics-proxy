@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import os
 import py_compile
 import subprocess
 import sys
@@ -212,6 +213,71 @@ def test_predeployment_runtime_file_links_cannot_escape_package_roots(tmp_path, 
     monkeypatch.setattr(Path, "open", forbidden)
     with pytest.raises(ValueError, match="unrecognized Python runtime link"):
         checks.runtime_content_digest(paths, roots)
+
+
+# Intent: bind the exact distribution startup and library link targets to the runtime fingerprint.
+# Why: those installed files must affect evidence without making their directories import roots.
+@pytest.mark.parametrize("layout", ["startup", "library"])
+def test_predeployment_runtime_hashes_root_managed_distribution_links(tmp_path, monkeypatch, layout):
+    lib = tmp_path / "usr/lib"
+    config = tmp_path / "etc"
+    stdlib = lib / "python3.14"
+    stdlib.mkdir(parents=True)
+    if layout == "startup":
+        module = stdlib / "sitecustomize.py"
+        target = config / "python3.14/sitecustomize.py"
+        target.parent.mkdir(parents=True)
+        module.symlink_to(target)
+    else:
+        module = stdlib / "config-3.14-x86_64-linux-gnu/libpython3.14.so"
+        module.parent.mkdir()
+        soname = lib / "x86_64-linux-gnu/libpython3.14.so.1"
+        target = soname.with_name(soname.name + ".0")
+        target.parent.mkdir()
+        soname.symlink_to(target.name)
+        module.symlink_to("../../x86_64-linux-gnu/libpython3.14.so.1")
+    for directory in (lib, stdlib, target.parent, config if layout == "startup" else module.parent):
+        directory.chmod(0o755)
+    target.write_bytes(b"installed")
+    target.chmod(0o644)
+    monkeypatch.setattr(checks, "SYSTEM_PYTHON_LIB", lib)
+    monkeypatch.setattr(checks, "SYSTEM_PYTHON_CONFIG", config)
+    lstat = Path.lstat
+    walk = Path.walk
+    untrusted = None
+
+    # Emulate ownership of fixture system paths without requiring root to run the tests.
+    def ownership(path):
+        values = list(lstat(path))
+        values[4] = 1000 if path == untrusted else 0
+        return os.stat_result(values)
+
+    # Only the approved import root may be walked, even though one target is read outside it.
+    def walk_import_root(path, *args, **kwargs):
+        assert path == stdlib
+        return walk(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", ownership)
+    monkeypatch.setattr(Path, "walk", walk_import_root)
+    paths = [str(stdlib)]
+    initial = checks.runtime_content_digest(paths, paths)
+    target.write_bytes(b"changed")
+    assert checks.runtime_content_digest(paths, paths) != initial
+
+    target.chmod(0o664)
+    with pytest.raises(ValueError, match="unrecognized Python runtime link"):
+        checks.runtime_content_digest(paths, paths)
+    target.chmod(0o644)
+    untrusted = module
+    with pytest.raises(ValueError, match="unrecognized Python runtime link"):
+        checks.runtime_content_digest(paths, paths)
+    untrusted = None
+    other = target.with_suffix(".other")
+    other.write_bytes(b"outside the recognized layout")
+    module.unlink()
+    module.symlink_to(other)
+    with pytest.raises(ValueError, match="unrecognized Python runtime link"):
+        checks.runtime_content_digest(paths, paths)
 
 
 # Intent: the interpreter that runs the installation week has every candidate standalone pin before it can pass.

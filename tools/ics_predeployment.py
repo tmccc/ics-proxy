@@ -9,6 +9,7 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -35,6 +36,8 @@ PROXY_INPUTS = (
 )
 DISCOVERY_SEED = 19
 DISCOVERY_CASES = 20
+SYSTEM_PYTHON_LIB = Path("/usr/lib")
+SYSTEM_PYTHON_CONFIG = Path("/etc")
 
 
 @dataclass(frozen=True)
@@ -108,6 +111,41 @@ def clean_env() -> dict[str, str]:
     }
 
 
+# Recognize two distribution layouts without admitting their configuration or library directories as import roots.
+def system_runtime_link(path: Path, target: Path) -> bool:
+    startup = path.name == "sitecustomize.py"
+    stdlib = path.parent if startup else path.parent.parent
+    version = re.fullmatch(r"python([0-9]+\.[0-9]+)", stdlib.name)
+    if stdlib.parent != SYSTEM_PYTHON_LIB or version is None:
+        return False
+    if startup:
+        expected = SYSTEM_PYTHON_CONFIG / stdlib.name / path.name
+        links = [(path, str(expected))]
+        parents = (SYSTEM_PYTHON_LIB, stdlib, SYSTEM_PYTHON_CONFIG, expected.parent)
+    else:
+        number = version[1]
+        config = re.fullmatch(rf"config-{re.escape(number)}-([a-z0-9_]+(?:-[a-z0-9_]+)+)", path.parent.name)
+        if config is None or path.name != f"libpython{number}.so":
+            return False
+        platform = config[1]
+        soname = SYSTEM_PYTHON_LIB / platform / f"libpython{number}.so.1"
+        expected = soname.with_name(soname.name + ".0")
+        links = [(path, f"../../{platform}/{soname.name}"), (soname, expected.name)]
+        parents = (SYSTEM_PYTHON_LIB, stdlib, path.parent, expected.parent)
+    if target != expected:
+        return False
+    for link, destination in links:
+        info = link.lstat()
+        if not stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or os.readlink(link) != destination:
+            return False
+    for parent in parents:
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            return False
+    info = target.lstat()
+    return stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022
+
+
 # Bind installed importable files to a receipt, including dependencies with unchanged metadata versions.
 def runtime_content_digest(import_paths: list[str], runtime_roots: list[str]) -> str:
     paths = [Path(location) for location in import_paths]
@@ -144,7 +182,8 @@ def runtime_content_digest(import_paths: list[str], runtime_roots: list[str]) ->
                         digest.update(b"link\0" + os.fsencode(os.readlink(path)) + b"\0")
                         target = path.resolve()
                         bases = paths if target.is_dir() else roots
-                        if not any(target.is_relative_to(base) for base in bases):
+                        within_runtime = any(target.is_relative_to(base) for base in bases)
+                        if not (within_runtime or system_runtime_link(path, target)):
                             raise ValueError(f"unrecognized Python runtime link: {path}")
                     if target.is_file():
                         with target.open("rb") as stream:
