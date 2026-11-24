@@ -390,18 +390,17 @@ def _reconcile(
                         "history reconciliation requires the matching native fault and a settled journal"
                     )
             current = list(native.history)
-            startup = failure.get("source") == STARTUP_HISTORY_OMISSION and fault.get(
-                "native_failure_digest"
-            ) == fingerprint(failure)
-            allow_missing = True
-            if startup:
+            recording_policy: dict[str, Any] | None = policy
+            # A digest-bound omission can retire under the original strict policy once its records return.
+            typed_omission = failure.get("source") in (ORIGINAL_HISTORY_OMISSION, STARTUP_HISTORY_OMISSION)
+            if typed_omission and journal.get("native_history_policy") is None:
                 try:
                     inspect_history(journal, spec.digest, current, False)
                 except MissingOriginalHistoryError:
                     pass
                 else:
-                    allow_missing = False
-            summary = record_history_policy(journal, policy if allow_missing else None, current)
+                    recording_policy = None
+            summary = record_history_policy(journal, recording_policy, current)
         journal.fault.clear()
         journal.phase.recover()
         journal.control.hold(control)

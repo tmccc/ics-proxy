@@ -80,7 +80,7 @@ class ManagedCharging:
         self._closing = False
         self.timer: asyncio.Task[None] | None = None
         self.changed = asyncio.Event()
-        self.source: tuple[HandoverEvidence, str | None, int] | None = None
+        self.source: tuple[HandoverEvidence, str | None, int, int] | None = None
         controller.session.gateway.controls.decisions.restore_charging_request(self)
         controller.native.observation_listener = partial(
             controller.session.gateway.controls.decisions.schedule.record_start_source, self
@@ -154,7 +154,7 @@ class ManagedCharging:
             return "not_ready"
         if any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags):
             return "ready"
-        if any(g.local_start_expired(tag) for tag in g.policy.allowed_tags):
+        if any(g.local_start_needs_renewal(tag) for tag in g.policy.allowed_tags):
             return (
                 "renewal_required"
                 if self.controller.session.runtime.status.vendor_connected

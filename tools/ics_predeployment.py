@@ -15,6 +15,7 @@ import tempfile
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
+from importlib.metadata import DistributionFinder, MetadataPathFinder
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -107,17 +108,107 @@ def clean_env() -> dict[str, str]:
     }
 
 
-# Bind cached results to the interpreter and its installed package versions, including the HA pin.
-def runtime_identity(python: str, source: Path) -> dict:
-    code = (
-        "import hashlib, json, sys, importlib.metadata as m; from pathlib import Path; "
-        "print(json.dumps({'python': sys.version, 'executable': sys.executable, "
-        "'executable_sha256': hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest(), "
-        "'packages': sorted((d.metadata['Name'].lower(), d.version) for d in m.distributions())}))"
-    )
-    return json.loads(
-        subprocess.check_output([python, "-E", "-B", "-c", code], cwd=source, env=clean_env(), timeout=20)
-    )
+# Bind installed importable files to a receipt, including dependencies with unchanged metadata versions.
+def runtime_content_digest(import_paths: list[str], runtime_roots: list[str]) -> str:
+    paths = [Path(location) for location in import_paths]
+    roots = [Path(location) for location in runtime_roots]
+    for path in paths:
+        resolved = path.resolve()
+        if not any(path.is_relative_to(root) for root in roots) or not any(
+            resolved.is_relative_to(root) for root in roots
+        ):
+            raise ValueError(f"unrecognized Python runtime import location: {path}")
+
+    digest = hashlib.sha256(json.dumps(import_paths).encode())
+
+    # An unreadable directory leaves the interpreter's available imports unknown.
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for root in sorted(set(paths)):
+        if any(parent in paths for parent in root.parents):
+            continue
+        digest.update(os.fsencode(root) + b"\0")
+        if root.is_dir():
+            digest.update(b"directory\0")
+            for parent, dirs, files in root.walk(on_error=raise_walk_error):
+                digest.update(os.fsencode(parent.relative_to(root)) + b"\0")
+                dirs[:] = sorted(name for name in dirs if name != "__pycache__")
+                for name in sorted(files):
+                    path = parent / name
+                    if parent in paths and (name.endswith(".egg-link") or name.startswith("__editable__")):
+                        raise ValueError(f"editable Python installs are unsupported by release checks: {path}")
+                    target = path
+                    digest.update(os.fsencode(path.relative_to(root)) + b"\0")
+                    if path.is_symlink():
+                        digest.update(b"link\0" + os.fsencode(os.readlink(path)) + b"\0")
+                        target = path.resolve()
+                        bases = paths if target.is_dir() else roots
+                        if not any(target.is_relative_to(base) for base in bases):
+                            raise ValueError(f"unrecognized Python runtime link: {path}")
+                    if target.is_file():
+                        with target.open("rb") as stream:
+                            digest.update(b"file\0" + hashlib.file_digest(stream, "sha256").digest())
+        elif root.is_file():
+            with root.open("rb") as stream:
+                digest.update(b"file\0" + hashlib.file_digest(stream, "sha256").digest())
+        else:
+            digest.update(b"missing\0")
+    return digest.hexdigest()
+
+
+# Bind cached results to the exact interpreter, packages and runtime files used by the release test.
+def runtime_identity(python: str, source: Path, *, homeassistant: bool = False) -> dict:
+    code = """\
+import hashlib
+import json
+import site
+import sys
+import sysconfig
+from pathlib import Path
+
+stdlib = Path(sysconfig.get_path('stdlib'))
+archive = stdlib.with_name(f'python{sys.version_info.major}{sys.version_info.minor}.zip')
+roots = [stdlib, archive, *map(Path, site.getsitepackages()), Path(site.getusersitepackages())]
+with Path(sys.executable).open('rb') as stream:
+    executable_sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
+print(json.dumps({
+    'python': sys.version,
+    'executable': sys.executable,
+    'executable_sha256': executable_sha256,
+    'import_paths': sys.path,
+    'runtime_roots': list(map(str, roots)),
+}))
+"""
+    with tempfile.TemporaryDirectory(prefix="release-runtime-") as cache:
+        command = [python, "-E", "-P", "-B", "-X", f"pycache_prefix={cache}"]
+        env = clean_env()
+        identity = json.loads(subprocess.check_output([*command, "-c", code], cwd=source, env=env, timeout=20))
+        paths = identity.pop("import_paths")
+        identity["runtime_sha256"] = runtime_content_digest(paths, identity.pop("runtime_roots"))
+        packages = []
+        for distribution in MetadataPathFinder.find_distributions(DistributionFinder.Context(path=paths)):
+            fields = distribution.metadata
+            name = fields.get("Name")
+            if (record := distribution.read_text("direct_url.json")) is not None:
+                origin = json.loads(record)
+                if not isinstance(origin, dict):
+                    raise ValueError(f"invalid Python installation metadata: {name}")
+                directory = origin.get("dir_info")
+                if isinstance(directory, dict) and directory.get("editable") is True:
+                    raise ValueError(f"editable Python installs are unsupported by release checks: {name}")
+            if name and (version := fields.get("Version")):
+                packages.append([name.lower(), version])
+        identity["packages"] = sorted(packages)
+        if homeassistant:
+            identity["homeassistant_version"] = subprocess.check_output(
+                [*command, str(source / "tools" / WEEK.runner), "--print-ha-version"],
+                cwd=source,
+                env=env,
+                timeout=20,
+                text=True,
+            ).strip()
+    return identity
 
 
 # Regenerate the search orders from the frozen candidate using the same interpreter as the search.
@@ -127,14 +218,10 @@ def discovery_orders(python: str, source: Path) -> list[list[str]]:
         "select = runpy.run_path('tests_discovery/schedules.py')['selected_orders']; "
         "print(json.dumps(select(int(sys.argv[1]), int(sys.argv[2]))))"
     )
-    orders = json.loads(
-        subprocess.check_output(
-            [python, "-I", "-B", "-c", code, str(DISCOVERY_SEED), str(DISCOVERY_CASES)],
-            cwd=source,
-            env=clean_env(),
-            timeout=20,
-        )
-    )
+    with tempfile.TemporaryDirectory(prefix="release-discovery-") as cache:
+        command = [python, "-I", "-B", "-X", f"pycache_prefix={cache}", "-c", code]
+        command += [str(DISCOVERY_SEED), str(DISCOVERY_CASES)]
+        orders = json.loads(subprocess.check_output(command, cwd=source, env=clean_env(), timeout=20))
     if (
         not isinstance(orders, list)
         or len(orders) != DISCOVERY_CASES
@@ -233,18 +320,31 @@ def evidence(check: Check, attempt: Path, orders: list[list[str]] | None) -> dic
 
 
 # Retain failures as well as successes, and stop child processes if a check exhausts its time.
-def run_check(check: Check, python: str, source: Path, attempt: Path, previous: Path | None) -> None:
+def run_check(
+    check: Check,
+    python: str,
+    source: Path,
+    attempt: Path,
+    previous: Path | None,
+    *,
+    ha_version: str | None = None,
+) -> None:
     scratch = attempt / "scratch"
     scratch.mkdir()
-    env = clean_env() | {"TMPDIR": str(scratch)}
-    command = [
-        python,
-        "-E",
-        "-B",
+    cache = scratch.resolve() / "python-bytecode"
+    env = clean_env() | {"TMPDIR": str(scratch), "PYTHONPYCACHEPREFIX": str(cache)}
+    command = [python, "-E", "-B"]
+    if check == WEEK:
+        assert ha_version is not None
+        command.append("-P")
+    command += [
+        "-X",
+        f"pycache_prefix={cache}",
         str(source / "tools" / check.runner),
-        check.directory,
-        "--junitxml=" + str(attempt / "pytest.xml"),
     ]
+    if ha_version is not None:
+        command.append(f"--expected-ha-version={ha_version}")
+    command += [check.directory, "--junitxml=" + str(attempt / "pytest.xml")]
     if check == DISCOVERY:
         command += [
             "--discovery-output=" + str(attempt / "discovery"),
@@ -300,8 +400,10 @@ def ensure_check(
 ) -> None:
     import fcntl
 
-    runtime = runtime_identity(python, source)
+    homeassistant = check == WEEK
+    runtime = runtime_identity(python, source, homeassistant=homeassistant)
     orders = discovery_orders(python, source) if check == DISCOVERY else None
+    ha_version = None
     if check == WEEK:
         pins = (
             "requirements-ha-proxy.txt",
@@ -313,7 +415,8 @@ def ensure_check(
             for line in (source / pin).read_text().splitlines()
             if line.startswith("homeassistant==")
         }
-        if dict(runtime["packages"]).get("homeassistant") not in versions:
+        ha_version = runtime["homeassistant_version"]
+        if ha_version not in versions:
             raise ValueError("installation week requires a pinned Home Assistant runtime")
         require_standalone_pins(source, runtime["packages"], runtime="installation week runtime")
     inputs = {
@@ -329,12 +432,17 @@ def ensure_check(
     with (directory / "run.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if attempt := passed_attempt(check, directory, inputs, orders):
+            if runtime_identity(python, source, homeassistant=homeassistant) != runtime:
+                raise ValueError(f"{check.name} runtime changed during verification")
             print(f"{check.name}: reused passing results at {attempt}", flush=True)
             return
         attempt = Path(tempfile.mkdtemp(dir=directory, prefix="attempt-"))
         print(f"{check.name}: running on {inputs['commit']} (log: {attempt / 'test.log'})", flush=True)
-        run_check(check, python, source, attempt, installed[1] if installed is not None else None)
+        previous = installed[1] if installed is not None else None
+        run_check(check, python, source, attempt, previous, ha_version=ha_version)
         receipt = {"inputs": inputs, "attempt": attempt.name, "evidence": evidence(check, attempt, orders)}
+        if runtime_identity(python, source, homeassistant=homeassistant) != runtime:
+            raise ValueError(f"{check.name} runtime changed during verification")
         pending = directory / "passed.new"
         pending.write_text(json.dumps(receipt, indent=2) + "\n")
         pending.replace(directory / "passed.json")

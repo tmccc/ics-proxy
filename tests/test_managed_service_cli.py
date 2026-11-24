@@ -28,6 +28,7 @@ from ics_proxy_core.engine.recovery_contracts import Prerequisite, RestoreState
 from ics_proxy_core.engine.rpc import UnavailableError
 from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError
+from ics_proxy_core.engine.trial_evidence import NativeObserver
 from ics_proxy_core.engine.trial_session import TrialSession, save_private
 from tests.connected_rig import connected_bench, strategy_file
 from tests.management_peer import TOKEN, call
@@ -37,7 +38,7 @@ from tests.test_native_repair_storage import refused_write
 from tests.test_ordinary_legacy_transport_recovery import legacy_fault
 from tests.tls_support import tls as tls
 from tests.trial_helpers import config_files
-from tools import managed_proxy, trial_proxy
+from tools import acknowledge_native_history, managed_proxy, prepare_managed_current, trial_proxy
 from tools.managed_reporting import ReportWriter
 
 
@@ -349,6 +350,30 @@ async def test_managed_check_and_serve_refuse_matching_loopback_ports(tmp_path, 
         assert not rig.prepared.config.journal.exists() and not rig.bench.device_calls
 
 
+# Intent: repair commands require an existing journal before initializing state or reading the charger.
+# Why: a stale configuration path must leave the original records and its mistaken destination untouched.
+@pytest.mark.parametrize("tool", ["reconciliation", "history", "current"])
+async def test_operator_writes_refuse_a_missing_journal(tmp_path, tls, unused_tcp_port, monkeypatch, tool):
+    async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
+        config_path, spec = tmp_path / "trial.json", strategy_file(rig, tmp_path)
+        config = rig.prepared.config
+
+        # Fail immediately if any of the write entry points starts a fresh native observation.
+        async def unexpected_read(_observer):
+            pytest.fail("repair contacted the charger without an existing journal")
+
+        monkeypatch.setattr(NativeObserver, "observe_handover", unexpected_read)
+        with pytest.raises(RecoveryRequiredError, match="existing charger journal"):
+            if tool == "reconciliation":
+                with trial_proxy.operator_journal(config, rig.spec, inspect=False):
+                    pytest.fail("reconciliation opened a new journal")
+            elif tool == "history":
+                await acknowledge_native_history.run("acknowledge", config_path, spec)
+            else:
+                await prepare_managed_current.run("prepare-native32", config_path, spec)
+        assert not tuple(config.journal.parent.glob(f"{config.journal.name}*"))
+
+
 # Intent: stopped inspection sees committed WAL data while leaving the original database and sidecars untouched.
 # Why: a crash can leave the exact current evidence in the WAL, and inspection must not change that evidence.
 async def test_operator_inspection_reads_a_stopped_wal_without_writing_it(tmp_path, tls, unused_tcp_port):
@@ -437,7 +462,7 @@ async def test_managed_runner_rejects_rollback_without_charger_listener(
         monkeypatch.setattr(managed_proxy, "preflight", lambda path: rig.prepared)
         monkeypatch.setattr(managed_proxy, "notify", notifications.append)
         monkeypatch.setattr(managed_proxy.ManagementServer, "start", unexpected_management_start)
-        with pytest.raises(RecoveryRequiredError, match="charger listener"):
+        with pytest.raises(RecoveryRequiredError, match="restoration has begun"):
             await managed_proxy.serve(tmp_path / "trial.json", spec_path, management_path)
 
         assert not any(value.startswith("READY=1") for value in notifications)

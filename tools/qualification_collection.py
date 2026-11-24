@@ -257,10 +257,14 @@ def runtime_digest(config):
         raise ValueError("qualification runtime identity is incomplete")
     digest = hashlib.sha256(json.dumps(identity).encode() + b"\0")
     for path in sorted(base.rglob("*")):
-        if (not path.is_file() and not path.is_symlink()) or "__pycache__" in path.parts or path.suffix == ".pyc":
+        relative = path.relative_to(base)
+        # Ignore generated caches. Standalone .pyc modules can still load and are pinned like other runtime files.
+        if (not path.is_file() and not path.is_symlink()) or (
+            "__pycache__" in relative.parts and path.suffix == ".pyc"
+        ):
             continue
         data = os.readlink(path).encode() if path.is_symlink() else path.read_bytes()
-        digest.update(str(path.relative_to(base)).encode() + b"\0" + hashlib.sha256(data).digest())
+        digest.update(str(relative).encode() + b"\0" + hashlib.sha256(data).digest())
 
     # Bind each system entry's access mode and ownership without elevating the worker to read it.
     def access_digest(info):
@@ -438,6 +442,7 @@ def replay(batch, commit, checksum):
             "PYTHONPATH": str(batch / "source/tools") + ":" + str(batch / "source"),
             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": str(scratch / "python-bytecode"),
             "PYTEST_ADDOPTS": "",
             "PYTEST_PLUGINS": "",
             "XDG_CACHE_HOME": str(scratch / "cache"),

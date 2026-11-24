@@ -20,6 +20,7 @@ from ics_proxy_core.engine.rpc import UnavailableError
 from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
 from ics_proxy_core.engine.station import StationChoice
 from ics_proxy_core.engine.store import RecoveryRequiredError
+from ics_proxy_core.engine.trial_handover_evidence import HandoverEvidence
 from tests.connected_rig import ConnectedBench, connected_bench
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
@@ -67,7 +68,7 @@ async def restore_original_route(rig: ConnectedBench, session: Any, charger: Any
     patches: list[dict[str, Any]] = []
 
     # The injected native writer changes independent device state and never edits the coordinator's journal.
-    async def patch(values: dict[str, Any]) -> None:
+    async def patch(values: dict[str, Any], _evidence: HandoverEvidence) -> None:
         patches.append(copy.deepcopy(values))
         rig.peer.configuration.update(values)
 
@@ -389,7 +390,7 @@ async def test_backend_confirmation_requires_fresh_offline_then_online(
         premature: list[dict[str, Any]] = []
 
         # An old online bit after TLS retirement cannot authorize applying the original route.
-        async def patch_before_offline(values: dict[str, Any]) -> None:
+        async def patch_before_offline(values: dict[str, Any], _evidence: HandoverEvidence) -> None:
             premature.append(values)
 
         # Retire the actual socket while deliberately retaining the independent native peer's old online view.
@@ -426,7 +427,7 @@ async def test_fresh_native_guard_blocks_original32_release(
         writes: list[dict[str, Any]] = []
 
         # The writer must remain unused when actual native admission is no longer satisfied.
-        async def patch(values: dict[str, Any]) -> None:
+        async def patch(values: dict[str, Any], _evidence: HandoverEvidence) -> None:
             writes.append(values)
 
         with pytest.raises(SecurityError):
@@ -446,7 +447,7 @@ async def test_lost_original_route_reply_reconciles_after_process_replacement(
         retires = 0
 
         # Apply exactly the original four fields on the independent peer before losing the reply.
-        async def lost_reply(values: dict[str, Any]) -> None:
+        async def lost_reply(values: dict[str, Any], _evidence: HandoverEvidence) -> None:
             writes.append(copy.deepcopy(values))
             rig.peer.configuration.update(values)
             raise UnavailableError("synthetic lost original-route response")
@@ -485,7 +486,7 @@ async def test_lost_original32_reply_reconciles_after_restart_without_rewrite(
         writes: list[dict[str, Any]] = []
 
         # Independently apply the real device effect before losing the native setter acknowledgement.
-        async def lost_reply(values: dict[str, Any]) -> None:
+        async def lost_reply(values: dict[str, Any], _evidence: HandoverEvidence) -> None:
             writes.append(copy.deepcopy(values))
             rig.peer.configuration.update(values)
             rig.peer.runtime_user = 320
@@ -521,7 +522,7 @@ async def test_native_final_completion_is_atomic_and_reconciles_without_rewrite(
         writes: list[dict[str, Any]] = []
 
         # Change only the independently held native USER setting, leaving every other configuration byte unchanged.
-        async def patch(values: dict[str, Any]) -> None:
+        async def patch(values: dict[str, Any], _evidence: HandoverEvidence) -> None:
             writes.append(copy.deepcopy(values))
             rig.peer.configuration.update(values)
             rig.peer.runtime_user = 320
@@ -559,7 +560,7 @@ async def test_original_schedule_start_after32_restore_remains_native_activity(
         await verify_original_backend(rig, session)
 
         # The independent manufacturer's scheduled Start follows restoration, after the proxy transport retired.
-        async def patch(values: dict[str, Any]) -> None:
+        async def patch(values: dict[str, Any], _evidence: HandoverEvidence) -> None:
             rig.peer.configuration.update(values)
             rig.peer.runtime_user = 320
             rig.peer.paused, rig.peer.permission_enabled = False, True

@@ -210,6 +210,13 @@ def test_stop_report_keeps_joined_replies_with_their_original_attempt(tmp_path):
         assert report["wire"]["dispatch"] == "not_sent"
         assert report["wire"]["reply"] == "unknown"
         assert not report["wire"]["joined_attempts"]
+        exact = stop_incident_report(path, events, request_reference=reference(first))
+        assert exact["journal"]["request"]["request"] == reference(first)
+        assert exact["wire"]["dispatch"] == "possible_dispatch" and exact["wire"]["reply"] == "rejected"
+        for absent in (first, reference(vendor), reference(uuid.uuid4().hex)):
+            report = stop_incident_report(path, events, request_reference=absent)
+            assert report["journal"]["available"] and report["journal"]["request"] is None
+            assert report["wire"]["dispatch"] == report["wire"]["reply"] == "unknown"
         prepared = vendor_attempt(journal, local, uuid.uuid4().hex, result="prepared")
         report = stop_incident_report(path, events, vendor=True)
         assert report["journal"]["request"]["request"] == reference(prepared)

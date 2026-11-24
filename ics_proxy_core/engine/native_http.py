@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 from .ics import unique_object
 from .native_faults import NativeContentError
-from .security import SecurityError
+from .security import SecurityError, StaleEvidenceError
 from .store import encoded
 
 MAXIMUM = 2 * 1024 * 1024
@@ -112,7 +113,15 @@ def decoded_native_json(raw: bytes | str) -> Any:
 
 
 # The whole request has one deadline; closing the stream on cancellation does not leave a background reader running.
-async def read_native(host: str, port: int, authorization: str, action: str, data: str | dict[str, Any] | None) -> Any:
+async def read_native(
+    host: str,
+    port: int,
+    authorization: str,
+    action: str,
+    data: str | dict[str, Any] | None,
+    *,
+    before_send: Callable[[], None] | None = None,
+) -> Any:
     writer: asyncio.StreamWriter | None = None
     content_refusal: NativeContentError | None = None
     payload: dict[str, Any] = {"action": action}
@@ -128,6 +137,8 @@ async def read_native(host: str, port: int, authorization: str, action: str, dat
                 "Authorization: " + authorization + "\r\nContent-Type: application/json\r\n"
                 "Accept-Encoding: identity\r\nConnection: close\r\nContent-Length: " + str(len(body)) + "\r\n\r\n"
             ).encode("ascii") + body
+            if before_send is not None:
+                before_send()
             writer.write(request)
             await writer.drain()
             try:
@@ -159,8 +170,8 @@ async def read_native(host: str, port: int, authorization: str, action: str, dat
                 result = decoded_native_json(result)
             encoded(result)
             return result
-    except NativeTransportUnavailableError:
-        raise  # This subclass is a ValueError too; application unavailability must survive the strict outer boundary.
+    except NativeTransportUnavailableError, StaleEvidenceError:
+        raise  # Preserve unavailable replies and evidence that expired before sending without reclassifying them.
     except NativeContentError as error:
         content_refusal = error
         raise

@@ -69,12 +69,15 @@ class Journal:
         capacity: int = 10000,
         *,
         check_existing: Callable[[sqlite3.Connection], None] | None = None,
+        require_existing: bool = False,
     ) -> None:
         import fcntl
 
         self.path = path
         self.identity = identity
         self.capacity = capacity
+        if require_existing and not path.is_file():
+            raise RecoveryRequiredError("the existing charger journal is required")
         path.parent.mkdir(parents=True, exist_ok=True)
         # Failed construction must release both the private lock and database handle.
         with ExitStack() as cleanup:
@@ -99,7 +102,8 @@ class Journal:
                     if check_existing is not None:
                         check_existing(existing)
                     self.retired_plan_ids = schedule_history(existing)
-            self.db = sqlite3.connect(path, isolation_level=None)
+            database = path.resolve().as_uri() + "?mode=rw" if require_existing else path
+            self.db = sqlite3.connect(database, uri=require_existing, isolation_level=None)
             cleanup.callback(self.db.close)
             self.control = ControlAuthority(self)
             self.phase = InstallationLifecycle(self)

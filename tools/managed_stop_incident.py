@@ -203,17 +203,21 @@ def joined_attempts(
     return attempts
 
 
-# Keep the latest local receipt selected even if it never dispatched.
-def local_stop(db: sqlite3.Connection, tables: set[str]) -> tuple[dict[str, Any] | None, int | None, dict[str, Any]]:
-    row = None
-    if "managed_requests" in tables:
-        row = db.execute(
-            "SELECT id,revision,state,CASE WHEN length(result)<=65536 THEN result END FROM managed_requests "
-            "WHERE action=? ORDER BY rowid DESC LIMIT 1",
-            (STOP_SESSION,),
-        ).fetchone()
-    if row is None or (token := identifier(row[0])) is None:
+# Keep the latest receipt by default. An exact reference can only select a single retained local Stop.
+def local_stop(
+    db: sqlite3.Connection, tables: set[str], request_reference: str | None
+) -> tuple[dict[str, Any] | None, int | None, dict[str, Any]]:
+    if "managed_requests" not in tables:
         return None, None, wire_fields()
+    db.create_function("incident_reference", 1, reference, deterministic=True)
+    rows = db.execute(
+        "SELECT id,revision,state,CASE WHEN length(result)<=65536 THEN result END FROM managed_requests "
+        "WHERE action=? AND (? IS NULL OR incident_reference(id)=?) ORDER BY rowid DESC LIMIT ?",
+        (STOP_SESSION, request_reference, request_reference, 1 if request_reference is None else 2),
+    ).fetchall()
+    if len(rows) != 1 or (token := identifier(rows[0][0])) is None:
+        return None, None, wire_fields()
+    row = rows[0]
     revision, state = row[1:3]
     result = object_fields(row[3])
     classification = result.get("classification")
@@ -262,9 +266,11 @@ def vendor_stop(db: sqlite3.Connection, tables: set[str]) -> tuple[dict[str, Any
 
 
 # The bound session's recorded closure and cloud delivery are evidence independent of any command outcome.
-def journal_fields(db: sqlite3.Connection, *, vendor: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+def journal_fields(
+    db: sqlite3.Connection, *, vendor: bool, request_reference: str | None
+) -> tuple[dict[str, Any], dict[str, Any]]:
     tables = {name for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    request, local, wire = (vendor_stop if vendor else local_stop)(db, tables)
+    request, local, wire = vendor_stop(db, tables) if vendor else local_stop(db, tables, request_reference)
     lifecycle = "unbound" if request is not None and local is None else UNKNOWN
     mapping, stop_at = UNKNOWN, None
     delivery: list[dict[str, Any]] = []
@@ -294,14 +300,18 @@ def journal_fields(db: sqlite3.Connection, *, vendor: bool) -> tuple[dict[str, A
     }, wire
 
 
-def stop_incident_report(journal: Path, event_path: Path, *, vendor: bool = False) -> dict[str, Any]:
-    """Read the latest retained Stop of one origin and show independent lifecycle and service evidence."""
+def stop_incident_report(
+    journal: Path, event_path: Path, *, vendor: bool = False, request_reference: str | None = None
+) -> dict[str, Any]:
+    """Read a retained Stop and show independent lifecycle and service evidence."""
+    if request_reference is not None and (vendor or identifier(request_reference) is None):
+        raise ValueError("An exact reference must identify a local Stop")
     processes = [
         {**row, "run": reference(row["run"])} for row in observations(event_path) if row["event"] == "process_started"
     ]
     try:
         with read_journal(journal) as db:
-            saved, wire = journal_fields(db, vendor=vendor)
+            saved, wire = journal_fields(db, vendor=vendor, request_reference=request_reference)
     except OSError, ValueError, sqlite3.Error:
         saved = {
             "available": False,

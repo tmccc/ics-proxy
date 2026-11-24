@@ -183,12 +183,18 @@ def require_supported_installation(
 
 # Check the exact installation under the journal lock before any normalisation, including in offline tools.
 def open_native_journal(
-    path: Path, identity: str, spec: NativeBoundedSpec, *, allow_local_start: bool | None = None
+    path: Path,
+    identity: str,
+    spec: NativeBoundedSpec,
+    *,
+    allow_local_start: bool | None = None,
+    require_existing: bool = False,
 ) -> Journal:
     return Journal(
         path,
         identity,
         check_existing=lambda db: require_supported_installation(db, spec, allow_local_start=allow_local_start),
+        require_existing=require_existing,
     )
 
 
@@ -205,6 +211,7 @@ class TrialSession:
         handover_observe: ObserveHandover | None = None,
         allow_local_start: bool = True,
         allow_unplugged_native: bool = False,
+        require_existing_journal: bool = False,
     ) -> None:
         if not isinstance(native_bounded, NativeBoundedSpec):
             raise SecurityError("session requires an explicit native bounded specification")
@@ -213,7 +220,11 @@ class TrialSession:
         self.prepared = prepared
         config = prepared.config
         self.journal = open_native_journal(
-            config.journal, config.identity, native_bounded, allow_local_start=allow_local_start
+            config.journal,
+            config.identity,
+            native_bounded,
+            allow_local_start=allow_local_start,
+            require_existing=require_existing_journal,
         )
         try:
             self.book = ResourceBook(self.journal, prepared.baseline)

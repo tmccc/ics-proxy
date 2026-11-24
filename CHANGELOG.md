@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Check elapsed evidence age before charger writes, including the commissioned 32 A write.
+- Require current schedule evidence when a timed charging test expires.
+- Clear an exact history-omission fault when all missing charger records return unchanged.
+- Bound authorization refusal retries while preserving the order of accepted and refused decisions.
+- Require fresh authorization after a restart interrupts the recording of a vendor decision.
+- Save late vendor refusals and preserve their ordering when the approval cache fills.
+- Recheck unplugged zero-output evidence at the point of sending vendor restoration writes.
+- Check the Home Assistant version actually used by the installation rehearsal and reject editable dependencies.
+- Isolate Python bytecode caches, check dependency contents before reusing release results, and verify SSH worker
+  paths upfront.
+- Expire stale Solar Display 2 images and accept fresh images after Home Assistant's clock moves backward.
+- Add an optional Home Assistant Stop reference to look up the exact request in an incident report.
+- Resume vendor restoration after profile cleanup without loading the retired listener credentials.
+- Require an existing journal for operator repair and current preparation.
 - Add a checked procedure to restore the original vendor route and current on an unplugged managed charger.
 - List eligible fault reconciliation candidates with one read-only inspection.
 - Fixed Solar Display 2 showing grey charger buttons when its Home Assistant touch automation was enabled.

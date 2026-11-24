@@ -170,6 +170,8 @@ def audit_qualification(path, source, metadata, python, results, collection_exec
             [
                 python,
                 "-B",
+                "-X",
+                f"pycache_prefix={source.parent / 'qualification-audit-bytecode'}",
                 str(source / "tools/audit_parallel_qualification.py"),
                 str(batch),
                 "--expected-commit",

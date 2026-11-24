@@ -23,7 +23,7 @@ from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 from tests.trial_helpers import config_files
 from tools import managed_proxy
-from tools.managed_incident import MAX_REPORT_EVENTS, incident_report
+from tools.managed_incident import MAX_REPORT_EVENTS, incident_report, reference
 
 
 # Obtain the exact same read-only report as the CLI for this independent process fixture.
@@ -280,6 +280,26 @@ def test_incident_cli_uses_local_read_only_sources(tmp_path, tls, capsys, monkey
             "joined_attempts": [],
         }
     assert not config.journal.exists() and sorted(tmp_path.iterdir()) == before
+
+
+# Intent: the incident command selects a retained local Stop by its redacted request reference.
+# Why: the most recent Stop may belong to a different operator request.
+def test_incident_cli_selects_the_exact_stop_reference(tmp_path, tls, capsys):
+    config, file = config_files(tmp_path, 21010, 21011)
+    first, later = uuid.uuid4().hex, uuid.uuid4().hex
+    journal = Journal(config.journal, "OFFLINE001")
+    try:
+        requests = ManagedRequests(journal)
+        requests.accept(first, "stop_session", 0)
+        requests.finish(first, "failed", {"classification": "stop_not_sent"})
+        requests.accept(later, "stop_session", 0)
+    finally:
+        journal.close()
+    arguments = ["incident", "--config", str(file), "--kind", "stop"]
+    assert managed_proxy.main([*arguments, "--request-reference", reference(first)]) == 0
+    output = capsys.readouterr().out
+    assert json.loads(output)["journal"]["request"]["request"] == reference(first)
+    assert first not in output and later not in output
 
 
 # Intent: a newer unsent local Start remains the incident selected after cloud test metadata replaces it.

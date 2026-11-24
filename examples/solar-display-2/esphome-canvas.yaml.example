@@ -6,6 +6,11 @@ http_request:
   timeout: 5s
   follow_redirects: false
 
+time:
+  - platform: homeassistant
+    id: canvas_ha_time
+    update_interval: 10s
+
 image:
   - platform: online_image
     id: canvas_image
@@ -13,6 +18,7 @@ image:
     url: !secret canvas_image_url
     request_headers:
       Authorization: !secret canvas_authorization
+      Cache-Control: no-cache
     format: PNG
     type: RGB565
     transparency: opaque
@@ -22,10 +28,18 @@ image:
     on_download_finished:
       - lambda: |-
           // LVGL only sees this completed front frame, never the decoder's
-          // working buffer. A304 validates liveness without redrawing it.
+          // working buffer. A 304 validates the fetch without refreshing the render time.
           auto &frame = solar_display::canvas_frame();
+          const uint32_t now_ms = millis();
           if (!cached) {
-            auto result = frame.commit(*id(canvas_image));
+            const auto &download = *id(canvas_image);
+            const auto marker = solar_display::StableCanvasFrame::read_marker(download);
+            const auto now = id(canvas_ha_time).now();
+            if (!now.is_valid() || !frame.freshness().accepts(marker.rendered_at, now_ms, now.timestamp)) {
+              id(reset_canvas_image).execute();
+              return;
+            }
+            auto result = frame.commit(download);
             if (result == solar_display::StableCanvasFrame::CommitResult::INVALID) {
               ESP_LOGW("canvas_frame", "Completed image could not be committed");
               id(reset_canvas_image).execute();
@@ -46,34 +60,29 @@ image:
                 }
               }
             }
+            frame.freshness().publish_render(marker.rendered_at, now_ms, now.timestamp);
+            if (marker.control != id(canvas_frame_control)) {
+              // Flush the updated buttons before allowing a touch to use their new target.
+              lv_refr_now(lv_obj_get_display(id(canvas_image_widget)));
+              id(canvas_frame_control) = marker.control;
+              id(canvas_frame_control_changed_ms) = millis();
+              id(canvas_pressed_control).clear();
+            }
           } else if (!frame.ready()) {
             id(reset_canvas_image).execute();
             return;
           }
-          id(canvas_last_success_ms) = millis();
+          frame.freshness().note_fetch(now_ms);
           id(canvas_image_ready) = true;
           id(show_canvas_dashboard).execute();
-          if (!cached) {
-            const auto control = frame.control_marker();
-            if (control != id(canvas_frame_control)) {
-              // Flush the updated buttons before allowing a touch to use their new target.
-              lv_refr_now(lv_obj_get_display(id(canvas_image_widget)));
-              id(canvas_frame_control) = control;
-              id(canvas_frame_control_changed_ms) = millis();
-              id(canvas_pressed_control).clear();
-            }
-          }
+          id(check_canvas_freshness).execute();
           id(show_ics_request_feedback).execute();
     on_error:
       # The front frame survives a failed download; retry in the back buffer.
-      # The normal45-second liveness limit still controls the offline screen.
+      # The fetch and render deadlines still control the offline screen.
       - script.execute: reset_canvas_image
 
 globals:
-  - id: canvas_last_success_ms
-    type: uint32_t
-    restore_value: false
-    initial_value: "0"
   - id: canvas_image_ready
     type: bool
     restore_value: false
@@ -183,10 +192,12 @@ script:
       - if:
           condition:
             lambda: |-
+              const auto now = id(canvas_ha_time).now();
               return id(dashboard_ha_connected) &&
                   api::global_api_server->is_connected_with_state_subscription() &&
                   id(canvas_image_ready) &&
-                  uint32_t(millis() - id(canvas_last_success_ms)) < 45000;
+                  now.is_valid() &&
+                  solar_display::canvas_frame().freshness().fresh(millis(), now.timestamp);
           then:
             - if:
                 condition:
@@ -206,11 +217,12 @@ script:
       - if:
           condition:
             lambda: |-
+              const auto now = id(canvas_ha_time).now();
               return id(canvas_showing) &&
                   (!id(dashboard_ha_connected) ||
                    !api::global_api_server->is_connected_with_state_subscription() ||
-                   !id(canvas_image_ready) ||
-                   uint32_t(millis() - id(canvas_last_success_ms)) >= 45000);
+                   !id(canvas_image_ready) || !now.is_valid() ||
+                   !solar_display::canvas_frame().freshness().fresh(millis(), now.timestamp));
           then:
             - globals.set:
                 id: canvas_showing
@@ -318,7 +330,8 @@ lvgl:
                       const auto point = esphome::lvgl::LvglComponent::get_touch_relative_to_obj(
                           id(canvas_touch_button));
                       const uint32_t now = millis();
-                      const uint32_t age_ms = now - id(canvas_last_success_ms);
+                      const auto clock = id(canvas_ha_time).now();
+                      auto &frame = solar_display::canvas_frame();
                       using solar_display::ChargerButton;
                       const auto button = solar_display::charger_button_at(point.x, point.y);
                       const bool charger_button = button != ChargerButton::NONE;
@@ -332,7 +345,8 @@ lvgl:
                       if (point.x < 0 || point.x >= 480 || point.y < 0 || point.y >= 442 ||
                           (charger_button && id(canvas_ics_pending_runs).state > 0) ||
                           !id(canvas_showing) || !id(canvas_image_ready) ||
-                          !solar_display::canvas_frame().ready() || age_ms >= 45000 ||
+                          !frame.ready() || !clock.is_valid() ||
+                          !frame.freshness().fresh(now, clock.timestamp) ||
                           !id(dashboard_ha_connected) ||
                           !api::global_api_server->is_connected_with_state_subscription() ||
                           (id(canvas_touch_event_count) != 0 &&
@@ -340,7 +354,7 @@ lvgl:
                       id(canvas_last_touch_ms) = now;
                       id(canvas_touch_x) = point.x;
                       id(canvas_touch_y) = point.y;
-                      id(canvas_touch_age_seconds) = age_ms / 1000;
+                      id(canvas_touch_age_seconds) = frame.freshness().render_age_ms(now, clock.timestamp) / 1000;
                       ++id(canvas_touch_event_count);
                       return true;
                   then:

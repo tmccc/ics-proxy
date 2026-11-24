@@ -109,7 +109,7 @@ async def test_installation_replay(tmp_path, tls, unused_tcp_port, order):
             model = step(step(model, "original backend offline observed"), "later original backend online verified")
 
             # The synthetic backend applies the one expected setting after the original route is proven.
-            async def restore(values):
+            async def restore(values, _evidence):
                 assert values == {"AmpLmt": "32"}
                 rig.peer.configuration.update(values)
                 rig.peer.runtime_user = 320

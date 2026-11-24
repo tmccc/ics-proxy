@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import py_compile
 import subprocess
 import sys
 from pathlib import Path
@@ -60,19 +61,173 @@ def test_proxy_change_detection_includes_standalone_dependency_pins(releases):
     assert checks.changed_proxy(repo, new_pin, old_pin) is True
 
 
+# Intent: a release subprocess imports fresh dependency source even if its normal cache contains older code.
+# Why: -B disables writes but still reads previously installed bytecode, and -E ignores Python environment flags.
+def test_release_check_reads_fresh_source(tmp_path):
+    source = tmp_path / "source"
+    tools = source / "tools"
+    tools.mkdir(parents=True)
+    module = tools / "example_dependency.py"
+    module.write_text("value = 'stale'\n")
+    py_compile.compile(
+        str(module),
+        cfile=str(tools / "__pycache__" / f"example_dependency.{sys.implementation.cache_tag}.pyc"),
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        doraise=True,
+    )
+    module.write_text("value = 'fresh'\n")
+    (tools / checks.DISCOVERY.runner).write_text(
+        "import os, sys, example_dependency\n"
+        "assert sys.pycache_prefix == os.environ['PYTHONPYCACHEPREFIX']\n"
+        "assert example_dependency.value == 'fresh'\n"
+    )
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    checks.run_check(checks.DISCOVERY, sys.executable, source, attempt, None)
+    assert not (attempt / "scratch/python-bytecode").exists()
+
+
+# Intent: reused evidence follows dependency contents with stable versions and ignores generated import caches.
+# Why: rebuilding or editing an installed dependency at the same version changes what the verifier runs.
+def test_predeployment_runtime_identity_tracks_same_version_dependency_bytes(tmp_path, monkeypatch):
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    dependency = site / "fixture_dependency.py"
+    dependency.write_text("value = 1\n")
+    dist = site / "fixture_dependency-1.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text("Name: fixture-dependency\nVersion: 1.0\n")
+    (dist / "direct_url.json").write_text(json.dumps({"url": tmp_path.as_uri(), "dir_info": {}}))
+    (site / "optional-2.0.dist-info").mkdir()
+    cache = site / "__pycache__"
+    cache.mkdir()
+
+    # Report only the tiny fixture's import root, without starting or inspecting other installed runtimes.
+    def metadata(command, **kwargs):
+        assert command[1:5] == ["-E", "-P", "-B", "-X"]
+        prefix = Path(command[5].removeprefix("pycache_prefix="))
+        assert not list(prefix.iterdir())
+        return json.dumps({"import_paths": [str(site)], "runtime_roots": [str(site)]})
+
+    monkeypatch.setattr(checks.subprocess, "check_output", metadata)
+    before = checks.runtime_identity(sys.executable, tmp_path)
+    assert before["packages"] == [["fixture-dependency", "1.0"]]
+    (cache / "fixture_dependency.pyc").write_bytes(b"cache only")
+    assert checks.runtime_identity(sys.executable, tmp_path) == before
+    dependency.write_text("value = 2\n")
+    after = checks.runtime_identity(sys.executable, tmp_path)
+    assert after["packages"] == before["packages"]
+    assert after["runtime_sha256"] != before["runtime_sha256"]
+
+
+# Intent: refuse editable metadata and startup markers even when the import roots remain unchanged.
+# Why: editable finders can make external dependency source importable without listing it on sys.path.
+@pytest.mark.parametrize("editable", ["metadata", "egg-link", "finder"])
+def test_predeployment_runtime_rejects_editable_dependencies(tmp_path, monkeypatch, editable):
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    outside = tmp_path / "external-project"
+    outside.mkdir()
+    if editable == "metadata":
+        dist = site / "fixture_dependency-1.0.dist-info"
+        dist.mkdir()
+        (dist / "METADATA").write_text("Name: fixture-dependency\nVersion: 1.0\n")
+        (dist / "direct_url.json").write_text(json.dumps({"url": outside.as_uri(), "dir_info": {"editable": True}}))
+    elif editable == "egg-link":
+        (site / "fixture-dependency.egg-link").write_text(str(outside) + "\n.\n")
+    else:
+        (site / "__editable__.fixture_dependency-1.0.pth").write_text("import editable_fixture_finder\n")
+
+    monkeypatch.setattr(
+        checks.subprocess,
+        "check_output",
+        lambda *args, **kwargs: json.dumps({"import_paths": [str(site)], "runtime_roots": [str(site)]}),
+    )
+    walk = Path.walk
+    open_file = Path.open
+
+    # Fail the test if release validation walks the editable source directory.
+    def walk_installed(path, *args, **kwargs):
+        assert path.is_relative_to(site)
+        return walk(path, *args, **kwargs)
+
+    # A single file read outside the installed runtime would also miss the intended boundary.
+    def open_installed(path, *args, **kwargs):
+        assert path.is_relative_to(site)
+        return open_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "walk", walk_installed)
+    monkeypatch.setattr(Path, "open", open_installed)
+    with pytest.raises(ValueError, match="editable Python installs are unsupported"):
+        checks.runtime_identity(sys.executable, tmp_path)
+
+
+# Intent: reject an unexpected import location before scanning any directory, including one added through a link.
+# Why: a path added by site startup could otherwise cause release validation to walk unrelated data.
+@pytest.mark.parametrize("linked", [False, True])
+def test_predeployment_runtime_does_not_walk_outside_package_roots(tmp_path, monkeypatch, linked):
+    site = tmp_path / "site-packages"
+    extra = tmp_path / "unrelated"
+    site.mkdir()
+    extra.mkdir()
+    if linked:
+        link = site / "external"
+        link.symlink_to(extra, target_is_directory=True)
+        extra = link
+
+    # Verify the bad import location is found before opening even a known package tree.
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unexpected runtime directory traversal")
+
+    monkeypatch.setattr(Path, "walk", forbidden)
+    with pytest.raises(ValueError, match="unrecognized Python runtime import location"):
+        checks.runtime_content_digest([str(site), str(extra)], [str(site)])
+
+
+# Intent: hash within-runtime file links and refuse an escaping link before opening its target.
+# Why: checking import directories alone cannot confine a linked dependency file.
+def test_predeployment_runtime_file_links_cannot_escape_package_roots(tmp_path, monkeypatch):
+    site = tmp_path / "site-packages"
+    stdlib = tmp_path / "stdlib"
+    site.mkdir()
+    stdlib.mkdir()
+    target = stdlib / "fixture.py"
+    target.write_text("value = 1\n")
+    module = site / "fixture.py"
+    module.symlink_to(target)
+    paths, roots = [str(site)], [str(site), str(stdlib)]
+    before = checks.runtime_content_digest(paths, roots)
+    target.write_text("value = 2\n")
+    assert checks.runtime_content_digest(paths, roots) != before
+
+    external = tmp_path / "external.py"
+    external.write_text("value = 3\n")
+    module.unlink()
+    module.symlink_to(external)
+
+    # A refused link must leave its external file unread.
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unexpected runtime file opened")
+
+    monkeypatch.setattr(Path, "open", forbidden)
+    with pytest.raises(ValueError, match="unrecognized Python runtime link"):
+        checks.runtime_content_digest(paths, roots)
+
+
 # Intent: the interpreter that runs the installation week has every candidate standalone pin before it can pass.
 # Why: the old build's pins and a matching Home Assistant version cannot verify the candidate runtime by themselves.
 @pytest.mark.parametrize(
-    ("ha_version", "websockets_version", "extra_version", "passes"),
+    ("active_version", "websockets_version", "extra_version", "error"),
     [
-        ("2026.10.4", "16.0", "2", True),
-        ("2026.11.0", "16.0", "2", True),
-        ("2026.11.0", "15.0.1", "2", False),
-        ("2026.11.0", "16.0", None, False),
+        ("2026.10.4", "16.0", "2", None),
+        ("2026.11.0", "16.0", "2", None),
+        ("2026.11.0", "15.0.1", "2", "standalone runtime pins differ from the installation week runtime"),
+        ("2026.11.0", "16.0", None, "standalone runtime pins differ from the installation week runtime"),
+        ("2026.10.9", "16.0", "2", "installation week requires a pinned Home Assistant runtime"),
     ],
 )
 def test_installation_week_requires_candidate_standalone_pins(
-    tmp_path, monkeypatch, ha_version, websockets_version, extra_version, passes
+    tmp_path, monkeypatch, active_version, websockets_version, extra_version, error
 ):
     source = tmp_path / "candidate"
     source.mkdir()
@@ -82,15 +237,24 @@ def test_installation_week_requires_candidate_standalone_pins(
     previous = tmp_path / "installed"
     previous.mkdir()
     (previous / "requirements-trial.txt").write_text("websockets==15.0.1\n")
-    packages = [["homeassistant", ha_version], ["WebSockets", websockets_version]]
+    packages = [["homeassistant", active_version], ["WebSockets", websockets_version]]
+    if active_version == "2026.10.9":
+        packages.append(["homeassistant", "2026.11.0"])
     if extra_version is not None:
         packages.append(["fixture.extra", extra_version])
-    monkeypatch.setattr(checks, "runtime_identity", lambda python, source: {"packages": packages})
+
+    # Keep the import selection independent of the order of installed package metadata.
+    def identity(python, source, *, homeassistant):
+        assert homeassistant
+        return {"packages": sorted(packages), "homeassistant_version": active_version}
+
+    monkeypatch.setattr(checks, "runtime_identity", identity)
     attempts = []
 
     # Retain one synthetic passing test report only when the candidate's pins admit the interpreter.
-    def run(check, python, source, attempt, installed):
+    def run(check, python, source, attempt, installed, *, ha_version):
         assert installed == previous
+        assert ha_version == active_version
         attempts.append(attempt)
         classname, name = check.case.rsplit(".", 1)
         (attempt / "pytest.xml").write_text(f'<testsuite><testcase classname="{classname}" name="{name}"/></testsuite>')
@@ -98,15 +262,83 @@ def test_installation_week_requires_candidate_standalone_pins(
     monkeypatch.setattr(checks, "run_check", run)
     output = tmp_path / "evidence"
     args = (checks.WEEK, source, output, {"commit": "a", "source_digest": "b"}, sys.executable)
-    if passes:
+    if error is None:
         checks.ensure_check(*args, installed=("previous", previous))
         checks.ensure_check(*args, installed=("previous", previous))
         assert len(attempts) == 1
-        assert (attempts[0].parent / "passed.json").is_file()
+        receipt = json.loads((attempts[0].parent / "passed.json").read_text())
+        assert receipt["inputs"]["runtime"]["homeassistant_version"] == active_version
     else:
-        with pytest.raises(ValueError, match="standalone runtime pins differ from the installation week runtime"):
+        with pytest.raises(ValueError, match=error):
             checks.ensure_check(*args, installed=("previous", previous))
         assert not attempts and not output.exists()
+
+
+# Intent: verify the imported Home Assistant version in the runner used for probing and rehearsal.
+# Why: a second installed distribution may show a pin that the interpreter never imports.
+@pytest.mark.parametrize("active_version", ["2026.10.4", "2026.11.0", "2026.10.9"])
+def test_installation_week_runner_verifies_selected_home_assistant(tmp_path, active_version):
+    runner = Path(__file__).resolve().parents[1] / "tools" / checks.WEEK.runner
+    inactive_version = "2026.10.4" if active_version == "2026.11.0" else "2026.11.0"
+    active, inactive = tmp_path / "active", tmp_path / "inactive"
+    for root, version in ((active, active_version), (inactive, inactive_version)):
+        package = root / "homeassistant"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        (package / "const.py").write_text(f"__version__ = {version!r}\n")
+        metadata = root / f"homeassistant-{version}.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text(f"Name: homeassistant\nVersion: {version}\n")
+    bootstrap = (
+        "import runpy, sys; "
+        "sys.path[:0] = sys.argv[1:3]; "
+        "script, *args = sys.argv[3:]; "
+        "sys.argv[:] = [script, *args]; "
+        "runpy.run_path(script, run_name='__main__')"
+    )
+    command = [sys.executable, "-E", "-P", "-B", "-c", bootstrap, str(active), str(inactive), str(runner)]
+    probe = subprocess.run([*command, "--print-ha-version"], capture_output=True, text=True, check=True)
+    assert probe.stdout.strip() == active_version
+    rehearsal = subprocess.run([*command, f"--expected-ha-version={inactive_version}"], capture_output=True, text=True)
+    assert rehearsal.returncode != 0
+    assert f"imported Home Assistant {active_version}. Expected {inactive_version}" in rehearsal.stderr
+
+    (active / "homeassistant/const.py").write_text(f"__version__ = {inactive_version!r}\n")
+    mismatched = subprocess.run([*command, "--print-ha-version"], capture_output=True, text=True)
+    assert mismatched.returncode != 0
+    assert f"imported Home Assistant {inactive_version}. Metadata reports {active_version}" in mismatched.stderr
+
+
+# Intent: retain the logs but withhold release results if the runtime changes during the run.
+# Why: the results would be incorrectly attributed to the interpreter and packages hashed at entry.
+def test_predeployment_check_requires_stable_runtime_during_verification(tmp_path, monkeypatch):
+    packages = [["homeassistant", "2026.11.0"], ["websockets", "15.0.1"]]
+    identities = iter(
+        {"packages": packages, "runtime_sha256": digest, "homeassistant_version": "2026.11.0"} for digest in ("a", "b")
+    )
+    (tmp_path / "requirements-trial.txt").write_text("websockets==15.0.1\n")
+    (tmp_path / "requirements-ha-proxy.txt").write_text("homeassistant==2026.11.0\n")
+    (tmp_path / "requirements-ha-proxy-2026.10.txt").write_text("homeassistant==2026.10.4\n")
+
+    # Simulate a passing test so only the changed runtime can withhold the receipt.
+    def run(check, python, source, attempt, previous, *, ha_version):
+        classname, name = check.case.rsplit(".", 1)
+        (attempt / "pytest.xml").write_text(f'<testsuite><testcase classname="{classname}" name="{name}"/></testsuite>')
+
+    monkeypatch.setattr(checks, "runtime_identity", lambda python, source, *, homeassistant: next(identities))
+    monkeypatch.setattr(checks, "run_check", run)
+    output = tmp_path / "evidence"
+    with pytest.raises(ValueError, match="installation week runtime changed during verification"):
+        checks.ensure_check(
+            checks.WEEK,
+            tmp_path,
+            output,
+            {"commit": "a", "source_digest": "b"},
+            sys.executable,
+            installed=("previous", tmp_path),
+        )
+    assert list(output.glob("*/attempt-*/pytest.xml"))
+    assert not list(output.glob("*/passed.json"))
 
 
 # Intent: the unit shipped to standalone operators counts as a proxy release input.
@@ -403,7 +635,7 @@ def test_reusing_and_rechecking_discovery_results(tmp_path, monkeypatch, damage)
     orders = checks.discovery_orders(sys.executable, source)
 
     # Write the exact raw artifacts in miniature so the cache treats them the same way as actual child output.
-    def run(check, python, source, attempt, previous):
+    def run(check, python, source, attempt, previous, *, ha_version):
         attempts.append(attempt)
         path = attempt / "discovery"
         path.mkdir()
@@ -413,7 +645,7 @@ def test_reusing_and_rechecking_discovery_results(tmp_path, monkeypatch, damage)
         )
         (path / "summary.json").write_text(json.dumps(discovery_summary(orders)))
 
-    monkeypatch.setattr(checks, "runtime_identity", lambda python, source: {"python": "fixture"})
+    monkeypatch.setattr(checks, "runtime_identity", lambda python, source, *, homeassistant: {"python": "fixture"})
     monkeypatch.setattr(checks, "run_check", run)
     args = (checks.DISCOVERY, source, tmp_path, {"commit": "a", "source_digest": "b"}, sys.executable)
     checks.ensure_check(*args)

@@ -49,11 +49,14 @@ class ServiceProcess:
     ):
         self.generation += 1
         self.events = asyncio.Queue()
+        # The installation rehearsal uses -E, so pass the supervisor's empty cache path explicitly.
+        cache = ("-X", f"pycache_prefix={sys.pycache_prefix}") if sys.pycache_prefix is not None else ()
         log = (self.directory / f"process-{self.generation}.stderr.log").open("w")
         self.process = await asyncio.create_subprocess_exec(
             sys.executable,
             *(("-E",) if source is not None else ()),
             "-B",
+            *cache,
             "-m",
             "tests.process_service_child",
             str(self.directory / "trial.json"),

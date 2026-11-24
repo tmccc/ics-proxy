@@ -18,9 +18,31 @@ while charging power is zero. The proxy confirms closure from the charger’s cl
 independent evidence. Return gives control back to the app and charger schedule once the proxy can verify
 the necessary conditions.
 
-The `ics_proxy.session_command` action returns a response for the exact Start or Stop request. See
-[the touchscreen example](../examples/solar-display-2/README.md) for the request format. You can make a
-new Stop request for the current session if the proxy confirms that the earlier Stop never went out.
+The `ics_proxy.session_command` action returns `confirmed: true` when the proxy completes the exact request.
+See [the touchscreen example](../examples/solar-display-2/README.md) for the request format. Treat
+`confirmed: false` as unconfirmed. That result covers several outcomes, including a Stop that never went out
+and a Stop whose physical outcome is uncertain.
+
+Set `include_request_reference: true` and save the action response when you want to look up a specific Stop.
+
+```yaml
+- action: ics_proxy.session_command
+  data:
+    action: stop_session
+    target: "{{ state_attr('binary_sensor.ics_proxy_session_open', 'stop_target') }}"
+    include_request_reference: true
+  response_variable: stop_result
+```
+
+Use `stop_result.request_reference` with `incident --kind stop --request-reference` on the proxy host. The
+[Stop incident report](commissioning.md#run-the-service) uses the same value in `journal.request.request`, even
+if a later Stop has arrived. A `null` action reference means Home Assistant refused the request locally. A
+reference identifies an attempt, which may have been refused before the proxy saved it. If the report has no
+matching request, check the charger’s current state before drawing conclusions about that attempt.
+
+Before making a new Stop request after a failed attempt, check that the matching report has
+`journal.request.state` set to `failed`, `wire.dispatch` set to `not_sent`, and the same session is still open.
+A pending request can still send.
 A Stop that may have gone out stays tied to its original attempt while the proxy looks for closure.
 Home Assistant Pause uses the protective path when the charger still needs to stop.
 

@@ -8,11 +8,19 @@ the repository.
 There are three complete worker suites: `engine-model`, `ha-proxy` (Home Assistant 2026.11), and
 `ha-proxy-2026.10`. Use `tools/parallel_qualify.py --help` for the required worker image, interpreter, output and
 environment options. Use `tools/validate.py --help` to check a complete qualification bundle and its trusted
-collection executors. Both release targets include recovery discovery. The verifier uses the candidate's seeded
+collection executors. SSH qualification requires absolute paths for the supervisor's `--worker-python` and
+`--worker-root`. Both release targets include recovery discovery. The verifier uses the candidate's seeded
 event orders and checks the recorded observations for each history. `ics-proxy` also checks the standalone
 runtime pins in the engine worker and in the Home Assistant interpreter that runs the standalone service during
-the installation week. A change to the standalone service, its dependency pins, or its packaged systemd unit
-triggers that rehearsal against the installed build.
+the installation week. The rehearsal verifies the version it imports against the candidate's Home Assistant pins.
+A change to the standalone service, its dependency pins, or its packaged systemd unit triggers that rehearsal
+against the installed build.
+
+Both checks use a fresh Python cache location, including the simulated service processes they start. Reusing a
+passing result requires matching test evidence and the same interpreter and dependency files. Updating a package
+in place invalidates the previous result even when its version stays the same. Use installed packages in the
+interpreter's standard library and package directories. The release checks reject editable installs and other import
+roots without walking external source trees.
 
 Before creating a release tag, move the changes from `Unreleased` into the matching version section of
 `CHANGELOG.md`. Run `python tools/version.py check vX.Y.Z` with the intended tag.
@@ -59,3 +67,4 @@ uncertain charger outcome must be reconciled before a rollback can safely use a 
 Builds from before stable recovery reasons can reject a newer failure record for an unsettled current change.
 Reconcile that change with the build that recorded it before considering a downgrade. The installation
 rehearsal covers a settled journal and does not establish downgrade compatibility for every failure state.
+Resolve interrupted vendor authorization checks on the build that recorded them before considering a downgrade.

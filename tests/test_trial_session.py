@@ -484,7 +484,7 @@ async def test_trial_session_full_lifecycle_and_verified_rollback(
         await verify_original_backend(rig, session)
 
         # Apply only the explicit synthetic native patch; verification still comes through real HTTP.
-        async def patch(values):
+        async def patch(values, _evidence):
             rig.peer.configuration.update(values)
             rig.peer.runtime_user = int(rig.peer.configuration["AmpLmt"]) * 10
 

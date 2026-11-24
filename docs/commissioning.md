@@ -109,6 +109,10 @@ They show possible dispatch, any recorded reply, and evidence of closure for tha
 latest service status and recent process starts separately so those observations can be compared with the request.
 A command can remain uncertain until the charger reports more evidence.
 
+To select a specific local Stop, add `--request-reference` followed by the `request_reference` from the
+[Home Assistant action response](home-assistant.md). A readable journal with no matching request reports
+`journal.available` as `true` and `journal.request` as `null`.
+
 ## Recover availability
 
 Start with Home Assistant’s **Control mode** and the `health` command above. Keep the private journal and
@@ -126,6 +130,9 @@ saved status to identify what needs attention.
 In normal app or schedule operation, three unavailable or stale full supervision checks trigger a request for
 a 0 A hold. Timing depends on how long the checks take. A session can stay open at 0 A and resume when the
 recovery checks pass.
+
+If the proxy restarts before saving the result of a vendor authorization check, that tag needs a fresh
+vendor decision before its older approval can be used again. Other tags keep their own authorization.
 
 Three refused supervision checks can latch a fault when the charger returns conflicting or unsupported data.
 A missing reading leaves that refusal count in place. A valid, accepted check clears the count. A strict refusal
@@ -161,6 +168,9 @@ Reconciliation requires a stopped service, exclusive access to its journal, a ve
 output, and independent evidence for the specific issue. Keep a private state backup before writing
 reconciliation records.
 
+If a recorded history fault was caused only by missing records and those records have all returned unchanged,
+the history tool can clear that exact fault while keeping strict history checking in place.
+
 ## Roll back software
 
 [Software rollback](release-process.md) concerns the proxy build and its journal while the charger stays on the
@@ -180,6 +190,8 @@ installer before using the procedure on the charger.
 2. Stop the proxy service and keep it stopped. Keep the charger powered and reachable. Back up the private
    journal, commissioning files and charger settings.
 3. Run the offline check as the proxy service account. Run the explicit restore action from the same checkout.
+   The offline check verifies the private native inputs. The restore validates the listener credentials before the
+   stage that needs them.
 
 ```bash
 python -B tools/restore_vendor.py check --config /etc/ics-proxy/proxy.json \
@@ -196,6 +208,7 @@ vendor connection before restoring and independently checking the original curre
 
 If the tool stops partway through, keep the service stopped and the car unplugged. Retain the journal and rerun
 the same restore action after correcting the reported problem. It uses the recorded stage and the charger’s
-actual settings to pick up where it stopped. If the settings conflict with the commissioned record or the
+actual settings to pick up where it stopped. Once the tool has recorded profile cleanup, the remaining steps use
+the charger’s local interface. If the settings conflict with the commissioned record or the
 charger reports an open session, resolve the issue with the installer before proceeding. When the tool reports
 `complete: true`, keep the proxy retired and confirm direct vendor-app access before reconnecting the car.

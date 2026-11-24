@@ -101,9 +101,11 @@ async def paused_ready(
 
 
 # The only injected native writer changes the independently held USER scalar, never journal authority or OCPP state.
-def native_writer(test: ChargeRig, writes: list[dict[str, str]]) -> Callable[[], Awaitable[None]]:
-    # Model only the authorized native USER scalar and its runtime readback, leaving the independent zero intact.
-    async def patch() -> None:
+def native_writer(test: ChargeRig, writes: list[dict[str, str]]) -> Callable[[Callable[[], None]], Awaitable[None]]:
+    # The installation rehearsal also commissions with builds that call the writer without a guard.
+    async def patch(guard: Callable[[], None] | None = None) -> None:
+        if guard is not None:
+            guard()
         writes.append({"AmpLmt": "32"})
         test.rig.peer.configuration.update(writes[-1])
         test.rig.peer.runtime_user = 320

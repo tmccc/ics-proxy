@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +25,64 @@ inline ChargerButton charger_button_at(int x, int y) {
   if (x >= 248 && x < 460) return ChargerButton::STOP;
   return ChargerButton::NONE;
 }
+
+struct CanvasMarker {
+  uint32_t rendered_at{0};
+  std::string control;
+};
+
+// The server's clock supplies the age at download. Elapsed time keeps that
+// frame aging even if a cache response or clock correction arrives later.
+class CanvasFreshness {
+ public:
+  static constexpr uint32_t MAX_AGE_MS = 45000;
+
+  bool accepts(uint32_t rendered_at, uint32_t now, int64_t epoch) {
+    if (rendered_at == this->rendered_at_) return this->render_age_ms(now, epoch) < MAX_AGE_MS;
+    if (wall_age_ms_(rendered_at, epoch) >= MAX_AGE_MS) return false;
+    // A previous valid marker now in the future proves the clock moved back.
+    // A fresh, different marker can then establish a new render sequence.
+    return rendered_at > this->rendered_at_ || epoch < static_cast<int64_t>(this->rendered_at_) - 1;
+  }
+
+  // Call only after those exact image bytes have been committed.
+  void publish_render(uint32_t rendered_at, uint32_t now, int64_t epoch) {
+    if (rendered_at == this->rendered_at_) return;
+    this->rendered_at_ = rendered_at;
+    this->age_checked_ms_ = now;
+    this->render_age_ms_ = wall_age_ms_(rendered_at, epoch);
+  }
+
+  void note_fetch(uint32_t now) { this->last_fetch_ms_ = now; }
+
+  uint32_t render_age_ms(uint32_t now, int64_t epoch) {
+    if (this->render_age_ms_ >= MAX_AGE_MS) return MAX_AGE_MS;
+    const uint32_t elapsed = std::min(now - this->age_checked_ms_, MAX_AGE_MS);
+    const uint32_t wall_age = wall_age_ms_(this->rendered_at_, epoch);
+    // Each check carries the frame's age forward, including across clock corrections.
+    this->render_age_ms_ = std::min(std::max(wall_age, this->render_age_ms_ + elapsed), MAX_AGE_MS);
+    this->age_checked_ms_ = now;
+    return this->render_age_ms_;
+  }
+
+  bool fresh(uint32_t now, int64_t epoch) {
+    return this->render_age_ms(now, epoch) < MAX_AGE_MS && now - this->last_fetch_ms_ < MAX_AGE_MS;
+  }
+
+ private:
+  static uint32_t wall_age_ms_(uint32_t rendered_at, int64_t epoch) {
+    // Allow one second of clock rounding while keeping the age conservative.
+    const int64_t render_epoch = rendered_at;
+    if (rendered_at == 0 || epoch < render_epoch - 1 ||
+        epoch >= render_epoch + MAX_AGE_MS / 1000 - 1) return MAX_AGE_MS;
+    return static_cast<uint32_t>(epoch - render_epoch + 1) * 1000;
+  }
+
+  uint32_t rendered_at_{0};
+  uint32_t age_checked_ms_{0};
+  uint32_t render_age_ms_{MAX_AGE_MS};
+  uint32_t last_fetch_ms_{0};
+};
 
 // The downloader may repaint its decode buffer while the previous picture is
 // visible. Keep the displayed picture in independent PSRAM and publish it only
@@ -66,11 +125,7 @@ class StableCanvasFrame : public esphome::image::Image {
   CommitResult commit(const esphome::image::Image &source) {
     this->dirty_regions_.fill(DirtyRegion{});
     this->last_copy_bytes_ = 0;
-    if (source.get_width() != WIDTH || source.get_height() != HEIGHT ||
-        source.get_type() != esphome::image::IMAGE_TYPE_RGB565 || source.has_transparency() ||
-        source.get_data_start() == nullptr || source.get_width_stride() != static_cast<size_t>(WIDTH) * 2) {
-      return CommitResult::INVALID;
-    }
+    if (!valid_picture_(source)) return CommitResult::INVALID;
 
     const uint8_t *pixels = source.get_data_start();
     if (this->front_ != nullptr) {
@@ -114,36 +169,50 @@ class StableCanvasFrame : public esphome::image::Image {
     return CommitResult::CHANGED;
   }
 
-  // Decode the control data carried by this completed lossless image.
-  std::string control_marker() const {
-    if (!this->ready()) return {};
+  // Read the timestamp and control target from the same image before displaying it.
+  static CanvasMarker read_marker(const esphome::image::Image &source) {
+    if (!valid_picture_(source)) return {};
     constexpr char hex[]{"0123456789abcdef"};
     std::string marker;
-    int cells = 69;
+    constexpr int header_cells = 5;
+    constexpr int render_cells = header_cells + 8;
+    int cells = render_cells;
+    uint32_t rendered_at = 0;
     for (int i = 0; i < cells; ++i) {
-      const auto pixel = this->get_pixel(23 + 6 * i, 477);
+      const auto pixel = source.get_pixel(7 + 6 * i, 477);
       const int r = (pixel.r >> 6);
       const int g = (pixel.g >> 6);
       // The renderer resamples the PNG. Allow ringing around each cell's colour.
       if (pixel.b < 40 || pixel.b > 74 ||
           pixel.r < 8 + r * 64 || pixel.r > 56 + r * 64 ||
           pixel.g < 8 + g * 64 || pixel.g > 56 + g * 64) return {};
-      marker += hex[4 * r + g];
-      if (i == 3 && marker != "d519") return {};
+      const int digit = 4 * r + g;
+      marker += hex[digit];
+      if (i == 3 && marker != "d51a") return {};
       if (i == 4) {
-        if (marker == "d5191") cells = 19;
-        else if (marker != "d5192") return {};
+        if (marker == "d51a1") cells += 14;
+        else if (marker == "d51a2") cells += 64;
+        else if (marker != "d51a0") return {};
       }
+      if (header_cells <= i && i < render_cells) rendered_at = (rendered_at << 4) | digit;
     }
-    return (cells == 19 ? "start:" : "stop:") + marker.substr(5);
+    if (marker[4] == '0') return {rendered_at, {}};
+    return {rendered_at, (marker[4] == '1' ? "start:" : "stop:") + marker.substr(render_cells)};
   }
 
   bool ready() const { return this->front_ != nullptr; }
   uint32_t commit_count() const { return this->commit_count_; }
   size_t last_copy_bytes() const { return this->last_copy_bytes_; }
   const std::array<DirtyRegion, DIRTY_REGION_COUNT> &dirty_regions() const { return this->dirty_regions_; }
+  CanvasFreshness &freshness() { return this->freshness_; }
 
  protected:
+  static bool valid_picture_(const esphome::image::Image &source) {
+    return source.get_width() == WIDTH && source.get_height() == HEIGHT &&
+           source.get_type() == esphome::image::IMAGE_TYPE_RGB565 && !source.has_transparency() &&
+           source.get_data_start() != nullptr && source.get_width_stride() == static_cast<size_t>(WIDTH) * 2;
+  }
+
   bool find_dirty_regions_(const uint8_t *pixels) {
     constexpr size_t row_bytes = static_cast<size_t>(WIDTH) * 2;
     constexpr size_t band_bytes = row_bytes * BAND_HEIGHT;
@@ -187,6 +256,7 @@ class StableCanvasFrame : public esphome::image::Image {
   uint32_t commit_count_{0};
   size_t last_copy_bytes_{0};
   std::array<DirtyRegion, DIRTY_REGION_COUNT> dirty_regions_{};
+  CanvasFreshness freshness_{};
 };
 
 inline StableCanvasFrame &canvas_frame() {

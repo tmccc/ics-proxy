@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import re
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any
 
 import aiohttp
@@ -203,7 +205,9 @@ class ProxyClient:
                 await asyncio.sleep(1)
 
     # Send the control once and recover a lost first reply by reading the original request's receipt.
-    async def command(self, action: str, revision: int, **fields: Any) -> None:
+    async def command(
+        self, action: str, revision: int, *, report_reference: Callable[[str], None] | None = None, **fields: Any
+    ) -> None:
         supplied_id = "id" in fields
         identifier = fields.pop("id", uuid.uuid4().hex)
 
@@ -230,6 +234,9 @@ class ProxyClient:
                 return isinstance(receipt.get("target"), str) and receipt["target"] == fields.get("target")
             return True
 
+        if report_reference is not None:
+            # Match the operator report's redaction without exposing a usable receipt ID.
+            report_reference(sha256(identifier.encode("ascii")).hexdigest()[:32])
         try:
             receipt: dict[str, Any] | None = await self.request(action, id=identifier, revision=revision, **fields)
         except UnknownCommandOutcomeError:

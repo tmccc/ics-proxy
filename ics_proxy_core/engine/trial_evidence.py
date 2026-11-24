@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from ..constants import HUB_PROFILE_ID
@@ -242,6 +242,7 @@ class NativeObserver:
 
         async with asyncio.timeout(15):
             started = time.time()
+            elapsed_start = time.monotonic()
             config = await self._read("getConfig")
             if (
                 not isinstance(config, dict)
@@ -255,7 +256,7 @@ class NativeObserver:
             values["TRANSACTIONS"] = await self._read("getTransaction", {})
             if encoded(await self._read("getConfig")) != encoded(config):
                 raise StaleEvidenceError("native configuration changed during the connected audit")
-            return handover_evidence(config, values, started)
+            return replace(handover_evidence(config, values, started), observed_monotonic=elapsed_start)
 
     # Recheck native identity and configuration around one complete bounded physical snapshot.
     async def _observe(self, include_history: bool) -> Evidence:

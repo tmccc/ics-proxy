@@ -91,7 +91,8 @@ def test_preparation_consumes_the_worker_deadline(tmp_path, monkeypatch):
     # Stub only the child-process boundary to advance the deterministic clock between actual supervisor phases.
     def child(command, **kwargs):
         if not (timeout := kwargs.get("timeout")):
-            assert command[2].endswith("/audit_parallel_qualification.py")
+            assert command[1:4] == ["-B", "-X", f"pycache_prefix={tmp_path / 'supervisor-audit-bytecode'}"]
+            assert command[4].endswith("/audit_parallel_qualification.py")
             return subprocess.CompletedProcess(command, 1)
         budgets.append(timeout)
         if "--collect-only" in command:
@@ -101,6 +102,7 @@ def test_preparation_consumes_the_worker_deadline(tmp_path, monkeypatch):
             clock.seconds = 7
             return subprocess.CompletedProcess(command, 0)
         assert "manifest" in command[-2]
+        assert kwargs["env"]["PYTHONPYCACHEPREFIX"] == str(tmp_path / "tmp/python-bytecode")
         raise subprocess.TimeoutExpired(command[:1], timeout)
 
     # Any worker launch means the supervisor ignored its exhausted preparation budget.
@@ -190,7 +192,7 @@ def test_supervisor_grace_and_final_worker_outcomes(tmp_path, monkeypatch, outco
                 json.dumps({"event": "collection", "ids": ["tests_ha_proxy/test_sample.py::test_first"]}) + "\n"
             )
             return subprocess.CompletedProcess(command, 0)
-        assert command[2].endswith("/audit_parallel_qualification.py")
+        assert command[4].endswith("/audit_parallel_qualification.py")
         return subprocess.CompletedProcess(command, 1)
 
     # Create a work request only for the worker that will finish its test and drain its grants.

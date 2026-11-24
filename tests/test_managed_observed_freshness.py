@@ -17,6 +17,7 @@ from ics_proxy_core.engine import managed_view, native_bounded_handover, trial_e
 from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
 from ics_proxy_core.engine.store import RecoveryRequiredError
+from ics_proxy_core.engine.trial_evidence import profile_projection
 from tests.charge_rig import actual_stop, owner_start, positive_flow, ready, report_actual_stop
 from tests.current_rig import adjustable, commissioned
 from tests.managed_rig import healthy, starts
@@ -328,7 +329,9 @@ async def test_observed_recheck_expires_inside_supervision(tmp_path, tls, unused
                 escaped = status = None
                 # Scope only this module NAME; never patch the shared time.time function.
                 with monkeypatch.context() as clock_patch:
-                    clock_patch.setattr(trial_evidence, "time", SimpleNamespace(time=scoped_time))
+                    clock_patch.setattr(
+                        trial_evidence, "time", SimpleNamespace(time=scoped_time, monotonic=time.monotonic)
+                    )
                     try:
                         status = await c.tick()
                     except StaleEvidenceError as error:
@@ -542,3 +545,96 @@ async def test_daily_evidence_stays_expired_after_wall_rebase(tmp_path, tls, unu
         assert not c.charging.current_daily(local)
         await c.native.read()
         assert c.charging.current_daily(local)
+
+
+# Intent: Return with expired evidence remains unsent even after the wall clock makes the sample appear recent.
+# Why: approval at validation cannot outlive the physical evidence when the RPC is recorded and dispatched.
+async def test_return_send_rechecks_elapsed_lifetime(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as rig:
+        c, bench = rig.controller, rig.rig.bench
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        peer = rig.session.gateway.charger
+        validate = peer.validate_send
+        assert validate is not None
+        elapsed = 0
+
+        # Expire the sample between the genuine asynchronous validation and its synchronous final guard.
+        async def validate_before_clock_correction(action, payload):
+            nonlocal elapsed
+            guard = await validate(action, payload)
+            if action == "SetChargingProfile" and profile_projection(payload)["limit"] > 0:
+                assert callable(guard)
+                elapsed += 6
+            return guard
+
+        request, revision = uuid.uuid4().hex, c.requests.intent().revision
+        assert c.command(request, "app_control", revision)["state"] == "accepted"
+        first = len(bench.received_limits)
+        with monkeypatch.context() as clock_patch:
+            clock = SimpleNamespace(time=time.time, monotonic=lambda: time.monotonic() + elapsed)
+            for module in (native_bounded_handover, trial_handover_evidence):
+                clock_patch.setattr(module, "time", clock)
+            clock_patch.setattr(peer, "validate_send", validate_before_clock_correction)
+            await c.return_requested(request, revision)
+        assert elapsed == 6
+        assert all(limit == 0 for limit in bench.received_limits[first:])
+        assert bench.firmware.effective_limit() == 0
+        assert c.requests.receipt(request)["result"] == {"classification": "return_not_sent"}
+        assert not rig.session.journal.fault.latched()
+
+        fresh = uuid.uuid4().hex
+        assert c.command(fresh, "app_control", revision)["state"] == "accepted"
+        await c.return_requested(fresh, revision)
+        assert c.requests.receipt(fresh)["state"] == "completed" and bench.firmware.effective_limit() == 6
+
+
+# Intent: an unrelated daily session needs the latest fresh evidence to stay above zero when a timed test expires.
+# Why: a stale or withdrawn observation cannot authorize leaving a daily session at its old current.
+@pytest.mark.parametrize("lost_evidence", ["elapsed", "refused", "superseded"])
+async def test_timed_expiry_rechecks_daily_evidence(tmp_path, tls, unused_tcp_port, monkeypatch, lost_evidence):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, startup=60, duration=10) as rig:
+        c, bench = rig.controller, rig.rig.bench
+        elapsed = 0
+        clock = SimpleNamespace(time=time.time, monotonic=lambda: time.monotonic() + elapsed)
+        for module in (native_bounded_handover, trial_handover_evidence):
+            monkeypatch.setattr(module, "time", clock)
+
+        c.command(uuid.uuid4().hex, "arm_cloud_test", c.requests.intent().revision)
+        reply = await bench.call(rig.charger, "daily-test-expiry-authorize", "Authorize", {"idTag": "NATIVE_TIMER"})
+        assert reply[2]["idTagInfo"]["status"] == "Accepted"
+        local = await positive_flow(rig, "daily")
+        assert (await healthy(c))["power_w"] == 1440
+        charging = c.charging
+        assert charging.source is not None and charging.source[0].is_fresh(15)
+        cached = charging.source
+        if lost_evidence == "elapsed":
+            elapsed = 16
+            assert not cached[0].is_fresh(15)
+        elif lost_evidence == "refused":
+            with monkeypatch.context() as configuration:
+                configuration.setitem(rig.rig.peer.configuration, "maxOutCurrent0", "31")
+                with pytest.raises(SecurityError):
+                    await c.native.read()
+            assert c.native.last_verified_at == 0 and cached[0].is_fresh(15)
+        else:
+            with monkeypatch.context() as correction:
+                correction.setattr(
+                    trial_evidence,
+                    "time",
+                    SimpleNamespace(time=lambda: cached[0].physical.observed_at, monotonic=time.monotonic),
+                )
+                newer = await c.native.read(closing_local=local, stop_only=True)
+            assert newer is not cached[0] and c.native.last_verified_at == cached[0].physical.observed_at
+            assert cached[0].is_fresh(15)
+        assert charging.source is cached
+
+        lease = charging.lease
+        assert lease is not None and charging.timer is not None
+        lease.deadline = time.monotonic() - 1
+        charging.changed.set()
+        await asyncio.wait_for(charging.timer, 3)
+        assert c.pause_task is not None
+        await asyncio.wait_for(c.pause_task, 3)
+        assert c.requests.intent().mode == "paused" and bench.firmware.effective_limit() == 0
+        assert rig.session.journal.active() == local and not bench.remote_stop.is_set()

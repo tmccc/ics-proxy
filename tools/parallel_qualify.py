@@ -33,7 +33,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--worker-host", help="optional SSH alias; omitted means this machine")
     parser.add_argument("--worker-root", type=Path, help="absolute remote scratch root")
-    parser.add_argument("--worker-python", help="supervisor interpreter; required for SSH execution")
+    parser.add_argument("--worker-python", help="supervisor interpreter; absolute path required for SSH execution")
     parser.add_argument("--venv", type=Path, required=True)
     parser.add_argument("--image", required=True, help="full immutable sha256 Docker image ID")
     parser.add_argument("--runtime-mode", choices=("host", "image"), default="host")
@@ -51,8 +51,13 @@ def arguments() -> argparse.Namespace:
         parser.error("--image requires the full immutable image ID")
     if not args.output.is_absolute() or not args.venv.is_absolute() or not 1 <= args.timeout_seconds <= 10800:
         parser.error("scratch/runtime paths must be absolute and timeout must be between1and10800 seconds")
-    if args.worker_host and (args.worker_root is None or not args.worker_root.is_absolute() or not args.worker_python):
-        parser.error("SSH execution requires --worker-root and --worker-python")
+    if args.worker_host and (
+        args.worker_root is None
+        or not args.worker_root.is_absolute()
+        or not args.worker_python
+        or not Path(args.worker_python).is_absolute()
+    ):
+        parser.error("SSH execution requires absolute paths for --worker-root and --worker-python")
     if os.environ.get("PYTEST_ADDOPTS") or os.environ.get("PYTEST_PLUGINS"):
         parser.error("full qualification forbids inherited pytest filters/plugins")
     if os.environ.get("MODEL_SMOKE") or os.environ.get("MODEL_CASE_LIMIT"):
@@ -143,8 +148,16 @@ def main() -> int:
     if args.stage_only:
         return 0
     python = args.worker_python or sys.executable
+    # The batch is fresh on either host. Give the supervisor its own unused cache prefix.
+    supervisor = [
+        python,
+        "-B",
+        "-X",
+        f"pycache_prefix={batch_path / 'supervisor-bytecode'}",
+        str(batch_path / "parallel_worker.py"),
+    ]
     if args.worker_host:
-        remote = args.worker_root / "batches" / label
+        remote = batch_path
         ssh = [
             "ssh",
             "-o",
@@ -179,9 +192,7 @@ def main() -> int:
                         "nice",
                         "-n",
                         "10",
-                        python,
-                        "-B",
-                        str(remote / "parallel_worker.py"),
+                        *supervisor,
                     ]
                 ),
             ]
@@ -203,9 +214,7 @@ def main() -> int:
             return retrieval.returncode
     else:
         with (local / "worker.log").open("w") as output:
-            result = subprocess.run(
-                [python, "-B", str(local / "parallel_worker.py")], stdout=output, stderr=subprocess.STDOUT
-            )
+            result = subprocess.run(supervisor, stdout=output, stderr=subprocess.STDOUT)
     (local / "transport-result.json").write_text(json.dumps({"returncode": result.returncode}) + "\n")
     audit_executor_arguments = []
     if args.worker_host:
@@ -228,6 +237,8 @@ def main() -> int:
         [
             sys.executable,
             "-B",
+            "-X",
+            f"pycache_prefix={local / 'audit-bytecode'}",
             str(local / "audit_parallel_qualification.py"),
             str(local),
             "--expected-commit",

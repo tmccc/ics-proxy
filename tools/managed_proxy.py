@@ -27,7 +27,7 @@ from ics_proxy_core.engine.security import SecurityError  # noqa: E402
 from ics_proxy_core.engine.store import RecoveryRequiredError  # noqa: E402
 from ics_proxy_core.engine.trial_config import TrialConfig, file_identity, private_json  # noqa: E402
 from ics_proxy_core.engine.trial_session import TrialSession, preflight, save_private  # noqa: E402
-from tools.managed_incident import MAX_EVENT_BYTES, IncidentRecorder, incident_report  # noqa: E402
+from tools.managed_incident import MAX_EVENT_BYTES, IncidentRecorder, identifier, incident_report  # noqa: E402
 from tools.managed_reporting import Reporting, ReportWriter  # noqa: E402
 from tools.managed_stop_incident import stop_incident_report  # noqa: E402
 from tools.trial_proxy import native_spec  # noqa: E402
@@ -228,16 +228,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--native-bounded-spec", type=Path)
     parser.add_argument("--management-config", type=Path)
     parser.add_argument("--kind", choices=("start", "stop", "vendor-stop"), help="incident type (default: start)")
+    parser.add_argument("--request-reference", help="redacted reference for a specific local Stop incident")
     args = parser.parse_args(argv)
     if args.kind is not None and args.action != "incident":
         parser.error("--kind applies to incident")
+    if args.request_reference is not None and (args.kind != "stop" or identifier(args.request_reference) is None):
+        parser.error("--request-reference requires --kind stop and a 32-character lowercase hexadecimal reference")
     try:
         if args.action == "incident":
             config = TrialConfig.load(args.config)
             if args.kind in (None, "start"):
                 report = incident_report(config.journal, config.incident_events)
             else:
-                report = stop_incident_report(config.journal, config.incident_events, vendor=args.kind == "vendor-stop")
+                report = stop_incident_report(
+                    config.journal,
+                    config.incident_events,
+                    vendor=args.kind == "vendor-stop",
+                    request_reference=args.request_reference,
+                )
             print(json.dumps(report, sort_keys=True))
             return 0
         if args.action == "health":

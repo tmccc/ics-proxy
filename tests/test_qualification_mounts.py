@@ -119,8 +119,12 @@ def test_worker_builder_mounts_ram_only_for_engine_execution(tmp_path, monkeypat
     monkeypatch.setattr(parallel_worker, "ROOT", batch)
     monkeypatch.setattr(parallel_worker, "SOURCE", batch / "source")
     config = configuration(tmp_path) | {"suite": "engine-model"}
-    assert "--tmpfs" not in parallel_worker.container_command(config, batch / "collection", 0, "collect", {})
+    collection_dir = batch / "collection"
+    collect = parallel_worker.container_command(config, collection_dir, 0, "collect", {})
+    assert "--tmpfs" not in collect
+    assert f"PYTHONPYCACHEPREFIX={collection_dir / 'python-bytecode'}" in collect
     argv = parallel_worker.container_command(config, engine, 0, "engine", {}, True)
+    assert f"PYTHONPYCACHEPREFIX={engine / 'python-bytecode'}" in argv
     mount = argv[argv.index("--tmpfs") + 1]
     assert mount.startswith(f"{engine / 'start-recovery-ram'}:rw,noexec,nosuid,nodev,size=128m,mode=0700,")
     assert f"type=bind,src={engine},dst={engine}" in argv

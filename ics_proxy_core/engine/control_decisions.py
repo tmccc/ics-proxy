@@ -1892,7 +1892,7 @@ class ControlDecisions:
     def issue_vendor_start(self, gateway: Gateway, grant: str) -> None:
         gateway.authorisation.issue(grant)
 
-    # A native daily schedule can renew a cloud decision that expired or previously denied permission.
+    # A native daily schedule can ask for fresh authorization after an expiry, refusal or interrupted lookup.
     async def renew_reported_start(
         self,
         gateway: Gateway,
@@ -1920,7 +1920,9 @@ class ControlDecisions:
         ):
             return
         stored = gateway.auth_info.stored(tag)
-        if stored is None or gateway._tag_info(tag)["status"] == "Accepted":
+        if stored is None and gateway.auth_info.permits_local_fallback(tag):
+            return
+        if gateway._tag_info(tag)["status"] == "Accepted":
             return
         integer(payload.get("connectorId"), 1, 1)
         number(payload.get("meterStart"), 1e12)
@@ -1979,7 +1981,7 @@ class ControlDecisions:
             return None
         if charging.authorization_status() != "renewal_required":
             raise DeniedError("a current local Start approval is unavailable")
-        tag = next(tag for tag in sorted(g.policy.allowed_tags) if g.local_start_expired(tag))
+        tag = next(tag for tag in sorted(g.policy.allowed_tags) if g.local_start_needs_renewal(tag))
         authority, stored = c.authority(), g.auth_info.stored(tag)
         if authority is None:
             raise DeniedError("Start approval renewal requires current connection authority")

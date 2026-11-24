@@ -4,16 +4,18 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from ics_proxy_core.engine.auth_info import InfoBook, tag_key, validate_info
+from ics_proxy_core.engine import rpc
+from ics_proxy_core.engine.auth_info import DENIAL_FLOOR, InfoBook, tag_key, validate_info
 from ics_proxy_core.engine.gateway import decode
 from ics_proxy_core.engine.policy import DeniedError, Policy
-from ics_proxy_core.engine.rpc import RegistrationDeferredError
+from ics_proxy_core.engine.rpc import RegistrationDeferredError, UnavailableError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError
 from ics_proxy_core.frames import build_call, build_call_error, build_call_result
 from tests.prototype_rig import START, Rig
@@ -286,6 +288,154 @@ def test_metadata_capacity_protects_current_dynamic_grant(tmp_path: Path) -> Non
         journal.close()
 
 
+# Intent: retain the ordering of a refused tag when capacity evicts its exact record.
+# Why: a rollback must retain the refusal, and a committed eviction must keep older approvals ineligible.
+@pytest.mark.parametrize("source", ["cache", "checkpoint", "legacy"])
+def test_evicted_refusal_keeps_its_order_atomically(tmp_path: Path, source: str) -> None:
+    path = tmp_path / "state.db"
+    protected = frozenset({"LOCAL_TEST"})
+    journal = Journal(path, "OFFLINE001")
+    book = InfoBook(journal, capacity=3, protected_tags=protected)
+    approved, refused = info(), info(status="Blocked")
+    older = None if source == "legacy" else book.observe()
+    try:
+        book.put("LOCAL_TEST", approved)
+        book.put("CURRENT", refused)
+        journal.put("vendor_start_grant", {"digest": tag_key("CURRENT")})
+        if source == "legacy":
+            with journal.atomic():
+                book.put_delivery("HISTORICAL", refused, None, restored=True)
+        elif source == "checkpoint":
+            journal.db.execute(
+                "CREATE TEMP TRIGGER refuse_auth_cache BEFORE INSERT ON auth_info "
+                "BEGIN SELECT RAISE(ABORT,'synthetic authorization cache refusal'); END"
+            )
+            assert book.deny("HISTORICAL", refused) == refused
+            journal.db.execute("DROP TRIGGER refuse_auth_cache")
+        else:
+            book.put("HISTORICAL", refused)
+
+        fresh = book.observe()
+        with pytest.raises(RuntimeError, match="synthetic rollback"), journal.atomic():
+            book.put_delivery("NEW", approved, fresh, restored=False)
+            assert journal.get(DENIAL_FLOOR)["sequence"] < fresh.sequence
+            raise RuntimeError("synthetic rollback")
+        assert journal.get(DENIAL_FLOOR) is None
+        assert book.stored("HISTORICAL") == refused
+        assert book.put("NEW", approved, fresh) == approved
+        assert book.stored("HISTORICAL") is None
+        assert book.stored("LOCAL_TEST") == approved
+        assert book.stored("CURRENT") == refused
+        with journal.atomic():
+            book.put_delivery("HISTORICAL", approved, older, restored=True)
+        assert book.stored("HISTORICAL") is None
+    finally:
+        journal.close()
+
+    journal = Journal(path, "OFFLINE001")
+    try:
+        book = InfoBook(journal, capacity=3, protected_tags=protected)
+        with journal.atomic():
+            book.put_delivery("HISTORICAL", approved, older, restored=True)
+        assert book.stored("HISTORICAL") is None
+        assert book.stored("NEW") == approved
+        assert book.stored("LOCAL_TEST") == approved
+        assert book.stored("CURRENT") == refused
+        assert book.put("HISTORICAL", approved) == approved
+    finally:
+        journal.close()
+
+
+# Intent: an accumulation of interrupted lookups cannot block new vendor tags or restore stale approval.
+# Why: replacing an old marker needs durable ordering evidence while configured tags keep their own decisions.
+def test_interrupted_authorization_capacity_preserves_older_denial_risk(tmp_path: Path) -> None:
+    path = tmp_path / "state.db"
+    protected = frozenset({"LOCAL_TEST"})
+    journal = Journal(path, "OFFLINE001")
+    try:
+        book = InfoBook(journal, capacity=2, protected_tags=protected)
+        cached = info()
+        book.put("LOCAL_TEST", cached)
+        book.put("OLDER", cached)
+        book.begin_query("OLDER")
+        book.begin_query("UNANSWERED")
+        query, first = book.begin_query("NEW")
+        assert first
+        assert book.stored("LOCAL_TEST") == cached
+        assert book.stored("OLDER") is None
+        assert book.put("NEW", cached, query_sequence=query) == cached
+    finally:
+        journal.close()
+
+    journal = Journal(path, "OFFLINE001")
+    try:
+        book = InfoBook(journal, capacity=2, protected_tags=protected)
+        assert book.stored("LOCAL_TEST") == cached
+        assert not book.permits_local_fallback("OLDER")
+        assert book.stored("NEW") == cached
+    finally:
+        journal.close()
+
+
+# Intent: failed denial saves consume bounded memory and work while retaining exact configured-owner refusals.
+# Why: after storage recovers, replacing the process must still respect the discarded denial's order.
+def test_pending_denial_backlog_is_bounded_and_keeps_its_order(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "state.db"
+    journal = Journal(path, "OFFLINE001")
+    protected = frozenset({"LOCAL_TEST"})
+    blocked = info(status="Blocked")
+    try:
+        book = InfoBook(journal, capacity=4, protected_tags=protected)
+        book.put("LOCAL_TEST", info())
+        older_refusal = book.observe()
+        approval = book.observe()
+        book.put("DYNAMIC", info(), approval)
+        journal.put("vendor_start_grant", {"digest": tag_key("DYNAMIC")})
+        attempts = 0
+
+        # Simulate a journal connection whose write transactions temporarily cannot start.
+        def unavailable():
+            nonlocal attempts
+            attempts += 1
+            raise sqlite3.OperationalError("synthetic storage unavailable")
+
+        with monkeypatch.context() as storage:
+            storage.setattr(journal, "atomic", unavailable)
+            for tag in ("LOCAL_TEST", "DYNAMIC", *(f"OTHER_{i}" for i in range(12))):
+                before = attempts
+                assert book.deny(tag, blocked) == blocked
+                assert attempts - before <= 2
+                assert len(book._pending_denials) <= 5
+            assert book.stored("LOCAL_TEST") == blocked
+            assert book.stored("DYNAMIC") is None
+            before = attempts
+            book.retry_denials()
+            assert attempts - before <= 2
+
+        for _ in range(3):
+            book.retry_denials()
+        assert not book._pending_denials
+        assert journal.get(DENIAL_FLOOR)["sequence"] > approval.sequence
+    finally:
+        journal.close()
+
+    journal = Journal(path, "OFFLINE001")
+    try:
+        book = InfoBook(journal, capacity=4, protected_tags=protected | {"DYNAMIC"})
+        assert book.stored("LOCAL_TEST") == blocked
+        assert book.stored("DYNAMIC") is None
+        assert not book.permits_local_fallback("DYNAMIC")
+        with journal.atomic():
+            book.put_delivery("DYNAMIC", blocked, older_refusal, restored=True)
+        saved = journal.db.execute("SELECT sequence FROM auth_info_order WHERE digest=?", (tag_key("DYNAMIC"),))
+        assert saved.fetchone()["sequence"] == approval.sequence
+        with pytest.raises(RecoveryRequiredError, match="requires a fresh decision"):
+            book.put("DYNAMIC", info(), approval)
+        assert book.put("DYNAMIC", info())["status"] == "Accepted"
+    finally:
+        journal.close()
+
+
 # Intent: an explicitly approved owner can authorize without cloud, with only a fresh bounded local permission.
 # Why: local control must remain usable offline without inventing cloud metadata or an indefinite cached grant.
 async def test_local_owner_offline_authorization_has_bounded_local_expiry(tmp_path: Path) -> None:
@@ -380,10 +530,205 @@ async def test_registered_cloud_authorize_never_falls_back_after_dispatch(tmp_pa
             rig.authorization_release.set()
         await rig.close()
 
+    if outcome in ("timeout", "callerror"):
+        replacement = StrictRig(tmp_path / "state.db")
+        try:
+            assert replacement.gateway.auth_info.stored("LOCAL_TEST") == cached
+        finally:
+            await replacement.close()
+
+
+# Return the exact wire identifier only after the ordinary Authorize caller has timed out.
+async def unanswered_authorize(rig: StrictRig, tag: str) -> str:
+    rig.authorization_failure = "timeout"
+    with pytest.raises(UnavailableError, match="peer outcome is unconfirmed"):
+        await rig.gateway._cloud_authorize(tag)
+    return next(frame[1] for frame in reversed(rig.vendor_frames) if frame[:1] == [2] and frame[2] == "Authorize")
+
+
+# Intent: settle overlapping Authorize attempts by reply arrival, including a refusal after caller timeout.
+# Why: a later Start depends on the last actual decision for the tag even across a restart.
+@pytest.mark.parametrize("approval_first", [False, True])
+async def test_late_authorize_refusal_follows_wire_reply_order(tmp_path: Path, approval_first: bool) -> None:
+    path = tmp_path / "state.db"
+    rig = StrictRig(path)
+    tag = START["idTag"]
+    approved = info()
+    refused = {**info(status="Blocked"), "parentIdTag": "SYNTHETIC_PARENT"}
+    try:
+        await rig.boot()
+        await rig.cloud()
+        gateway = rig.gateway
+        gateway.use_command_processor()
+        gateway.auth_info.put(tag, approved)
+        wire = await unanswered_authorize(rig, tag)
+        rig.authorization_failure = None
+        rig.actual_info = approved
+        if approval_first:
+            assert await gateway._cloud_authorize(tag) == approved
+            assert gateway._local_start_allowed(tag)
+        await gateway.receive("vendor", build_call_result(wire, {"idTagInfo": refused}))
+        assert gateway.auth_info.stored(tag) == refused
+        assert not gateway._local_start_allowed(tag)
+        if not approval_first:
+            assert await gateway._cloud_authorize(tag) == approved
+            assert gateway._local_start_allowed(tag)
+    finally:
+        await rig.close()
+
+    replacement = StrictRig(path)
+    try:
+        assert replacement.gateway.auth_info.stored(tag) == (refused if approval_first else approved)
+        await replacement.boot()
+        result = await replacement.charger("after-late-reply", "StartTransaction", START)
+        assert result[0] == (4 if approval_first else 3)
+        assert (replacement.store.active() is None) == approval_first
+    finally:
+        await replacement.close()
+
+
+# Intent: retire a lookup with no decision when its reply window ends.
+# Why: silence must leave earlier permission usable once the exact vendor wire can no longer carry a reply.
+@pytest.mark.parametrize("retire", ["expiry", "connection"])
+async def test_unanswered_authorize_retires_after_late_window(tmp_path: Path, monkeypatch, retire: str) -> None:
+    monkeypatch.setattr(rpc, "LATE_REPLY_SECONDS", 0.04)
+    path = tmp_path / "state.db"
+    rig = StrictRig(path)
+    tag = START["idTag"]
+    cached = info()
+    try:
+        await rig.boot()
+        await rig.cloud()
+        rig.gateway.auth_info.put(tag, cached)
+        wire = await unanswered_authorize(rig, tag)
+        assert rig.store.db.execute("SELECT 1 FROM auth_pending_queries").fetchone() is not None
+        assert rig.gateway._local_start_allowed(tag)
+        if retire == "connection":
+            rig.gateway.attach_vendor(rig.vendor_send)
+        else:
+            await asyncio.sleep(0.08)
+        assert rig.store.db.execute("SELECT 1 FROM auth_pending_queries").fetchone() is None
+        await rig.gateway.receive("vendor", build_call_result(wire, {"idTagInfo": info(status="Blocked")}))
+        assert rig.gateway.auth_info.stored(tag) == cached
+    finally:
+        await rig.close()
+
+    replacement = StrictRig(path)
+    try:
+        assert replacement.gateway.auth_info.stored(tag) == cached
+    finally:
+        await replacement.close()
+
+
+# Intent: preserve a retained StartTransaction receipt when an Authorize lookup competes for the last slot.
+# Why: the actual Start acknowledgement is still needed to settle its durable transaction.
+async def test_authorize_window_pressure_preserves_the_late_start_receipt(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(rpc, "LATE_REPLY_CAPACITY", 1)
+    rig = StrictRig(tmp_path / "state.db")
+    try:
+        await rig.boot()
+        await rig.cloud()
+        local = (await rig.charger("start", "StartTransaction", START))[2]["transactionId"]
+        rig.drop_cloud_start = True
+        with pytest.raises(RecoveryRequiredError, match="awaiting its original reply"):
+            await rig.gateway.flush(can_send=lambda: True)
+        wire = next(frame[1] for frame in rig.vendor_frames if frame[:1] == [2] and frame[2] == "StartTransaction")
+        await unanswered_authorize(rig, START["idTag"])
+        assert rig.store.db.execute("SELECT 1 FROM auth_pending_queries").fetchone() is None
+        await rig.gateway.receive("vendor", build_call_result(wire, {"transactionId": 9001, "idTagInfo": info()}))
+        await rig.gateway.flush()
+        assert rig.store.vendor_id(local) == 9001
+    finally:
+        await rig.close()
+
+
+# Intent: retain exact uncertainty when the proxy exits after timeout or cannot write a late refusal.
+# Why: reopening committed state must require fresh evidence before it can use an older approval.
+@pytest.mark.parametrize("reply", ["pending", "write-failure"])
+async def test_late_authorize_marker_survives_interrupted_process(tmp_path: Path, reply: str) -> None:
+    rig = StrictRig(tmp_path / "state.db")
+    snapshot = tmp_path / "interrupted.db"
+    tag = START["idTag"]
+    try:
+        await rig.boot()
+        await rig.cloud()
+        gateway = rig.gateway
+        gateway.use_command_processor()
+        gateway.auth_info.put(tag, info())
+        wire = await unanswered_authorize(rig, tag)
+        rig.authorization_failure = None
+        assert await gateway._cloud_authorize(tag) == rig.actual_info
+        # The second decision settles its own attempt while the first exact reply can still arrive.
+        assert rig.store.db.execute("SELECT COUNT(*) FROM auth_pending_queries").fetchone()[0] == 1
+        if reply == "write-failure":
+            rig.store.db.execute(
+                "CREATE TEMP TRIGGER refuse_denial_receipt BEFORE INSERT ON auth_denial_replies "
+                "BEGIN SELECT RAISE(ABORT,'synthetic authorization receipt refusal'); END"
+            )
+            await gateway.receive("vendor", build_call_result(wire, {"idTagInfo": info(status="Blocked")}))
+            assert gateway.auth_info.stored(tag)["status"] == "Blocked"
+            assert not gateway._local_start_allowed(tag)
+        else:
+            assert await unanswered_authorize(rig, tag) != wire
+            assert rig.store.db.execute("SELECT COUNT(*) FROM auth_pending_queries").fetchone()[0] == 2
+
+        # Reopen the same committed SQLite state that an abrupt exit would leave behind.
+        copied = sqlite3.connect(snapshot)
+        try:
+            rig.store.db.backup(copied)
+        finally:
+            copied.close()
+    finally:
+        await rig.close()
+
+    replacement = StrictRig(snapshot)
+    try:
+        gateway = replacement.gateway
+        assert replacement.store.db.execute("SELECT COUNT(*) FROM auth_pending_queries").fetchone()[0] == 1
+        assert gateway.auth_info.stored(tag) is None
+        assert not gateway._local_start_allowed(tag)
+        assert gateway.local_start_needs_renewal(tag)
+        await replacement.boot()
+        await replacement.cloud()
+        assert await gateway._cloud_authorize(tag) == replacement.actual_info
+        assert gateway._local_start_allowed(tag)
+    finally:
+        await replacement.close()
+
+
+# Intent: retain uncertainty when an actual already-expired approval cannot be saved.
+# Why: an older approval with a future expiry must stay unusable on restart until the tag is renewed.
+async def test_valid_expired_authorize_survives_failed_save_as_uncertain(tmp_path: Path) -> None:
+    path = tmp_path / "state.db"
+    rig = StrictRig(path)
+    tag = START["idTag"]
+    try:
+        await rig.boot()
+        await rig.cloud()
+        rig.gateway.auth_info.put(tag, info())
+        rig.actual_info = info(expiryDate="2020-01-01T00:00:00Z")
+        rig.store.db.execute(
+            "CREATE TEMP TRIGGER refuse_auth_cache BEFORE INSERT ON auth_info "
+            "BEGIN SELECT RAISE(ABORT,'synthetic authorization cache refusal'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="synthetic authorization cache refusal"):
+            await rig.gateway._cloud_authorize(tag)
+    finally:
+        await rig.close()
+
+    replacement = StrictRig(path)
+    try:
+        assert replacement.gateway.auth_info.stored(tag) is None
+        assert not replacement.gateway._local_start_allowed(tag)
+    finally:
+        await replacement.close()
+
 
 # Intent: a real cloud denial remains current after a refused cache save, cancellation and process replacement.
 # Why: the old approval must never be usable for a new Start once the cloud has refused that tag.
-@pytest.mark.parametrize("exit_kind", ["completed", "cancelled", "checkpoint-refused"])
+@pytest.mark.parametrize(
+    "exit_kind", ["completed", "cancelled", "checkpoint-refused", "restart-before-save", "retry-before-restart"]
+)
 async def test_cloud_denial_survives_storage_refusal_and_sender_exit(tmp_path: Path, exit_kind: str) -> None:
     path = tmp_path / "state.db"
     rig = StrictRig(path)
@@ -396,12 +741,14 @@ async def test_cloud_denial_survives_storage_refusal_and_sender_exit(tmp_path: P
         await rig.cloud()
         tag = "LOCAL_TEST"
         rig.gateway.auth_info.put(tag, info())
+        rig.gateway.auth_info.put("OTHER_TAG", info())
         rig.actual_info = refused
         rig.store.db.execute(
             "CREATE TEMP TRIGGER refuse_auth_cache BEFORE INSERT ON auth_info "
             "BEGIN SELECT RAISE(ABORT,'synthetic authorization cache refusal'); END"
         )
-        if exit_kind == "checkpoint-refused":
+        needs_fresh_reply = exit_kind in ("restart-before-save", "retry-before-restart")
+        if exit_kind == "checkpoint-refused" or needs_fresh_reply:
             rig.store.db.execute(
                 "CREATE TEMP TRIGGER refuse_denial_receipt BEFORE INSERT ON auth_denial_replies "
                 "BEGIN SELECT RAISE(ABORT,'synthetic authorization receipt refusal'); END"
@@ -425,6 +772,10 @@ async def test_cloud_denial_survives_storage_refusal_and_sender_exit(tmp_path: P
             assert await rig.gateway._cloud_authorize(tag) == rig.actual_info
         assert rig.gateway.auth_info.stored(tag) == rig.actual_info
         assert not rig.gateway._local_start_allowed(tag)
+        if exit_kind == "retry-before-restart":
+            rig.authorization_failure = "timeout"
+            with pytest.raises(UnavailableError):
+                await rig.gateway._cloud_authorize(tag)
         if exit_kind == "checkpoint-refused":
             rig.store.db.execute("DROP TRIGGER refuse_denial_receipt")
             rig.gateway.retry_reply_writes()
@@ -437,10 +788,52 @@ async def test_cloud_denial_survives_storage_refusal_and_sender_exit(tmp_path: P
 
     replacement = StrictRig(path)
     try:
-        assert replacement.gateway.auth_info.stored("LOCAL_TEST") == refused
-        assert not replacement.gateway._local_start_allowed("LOCAL_TEST")
+        g = replacement.gateway
+        assert g.auth_info.stored("OTHER_TAG")["status"] == "Accepted"
+        assert not g._local_start_allowed(tag)
+        if needs_fresh_reply:
+            assert g.auth_info.stored(tag) is None
+            assert g.local_start_needs_renewal(tag)
+            await replacement.boot()
+            assert (await replacement.charger("offline-auth", "Authorize", {"idTag": tag}))[2] == {
+                "idTagInfo": {"status": "Invalid"}
+            }
+            await replacement.cloud()
+            assert await g._cloud_authorize(tag) == replacement.actual_info
+            assert g._local_start_allowed(tag)
+        else:
+            assert g.auth_info.stored(tag) == refused
     finally:
         await replacement.close()
+
+    if needs_fresh_reply:
+        reopened = StrictRig(path)
+        try:
+            assert reopened.gateway._local_start_allowed(tag)
+            assert reopened.gateway.auth_info.permits_local_fallback(tag)
+        finally:
+            await reopened.close()
+
+
+# Intent: a failed pre-send journal commit leaves the previous approval intact and sends no request.
+# Why: the proxy cannot safely send a lookup whose later refusal it could lose during replacement.
+async def test_authorize_requires_a_record_before_sending(tmp_path: Path) -> None:
+    rig = StrictRig(tmp_path / "state.db")
+    try:
+        await rig.boot()
+        await rig.cloud()
+        tag = "LOCAL_TEST"
+        approved = rig.gateway.auth_info.put(tag, info())
+        rig.store.db.execute(
+            "CREATE TEMP TRIGGER refuse_auth_lookup BEFORE INSERT ON auth_pending_queries "
+            "BEGIN SELECT RAISE(ABORT,'synthetic authorization lookup refusal'); END"
+        )
+        with pytest.raises(RecoveryRequiredError, match="recorded before sending"):
+            await rig.gateway._cloud_authorize(tag)
+        assert not rig.authorization_seen.is_set()
+        assert rig.gateway.auth_info.stored(tag) == approved
+    finally:
+        await rig.close()
 
 
 # Intent: an ordinary Authorize cannot return Accepted after a newer local Stop claimed the station.

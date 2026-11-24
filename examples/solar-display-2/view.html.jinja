@@ -66,12 +66,13 @@
   {% set hint = 'Waiting for charger status' %}
 {% endif %}
 <div style="position:relative;width:240px;height:240px;background:#0b1119;color:#f4f7fb;font-family:Nunito,Arial,sans-serif;line-height:1.1;box-sizing:border-box">
-  {# The touchscreen reads these cells from the same PNG as the buttons. #}
-  {% set marker = 'd5192' ~ stop_target if stop_ok else 'd5191' ~ ('%014x' | format(start_revision)) if start_ok else '' %}
+  {# The timestamp ages this exact PNG, including frames without charger buttons. #}
+  {% set timestamp = '%08x' | format(now_epoch | int) if now_epoch is not none and 0 < now_epoch < 2**32 else '' %}
+  {% set marker = ('d51a2' ~ timestamp ~ stop_target if stop_ok else 'd51a1' ~ timestamp ~ ('%014x' | format(start_revision)) if start_ok else 'd51a0' ~ timestamp) if timestamp else '' %}
   {% set levels = ['20', '60', 'a0', 'e0'] %}
   {% for digit in marker %}
     {% set value = digit | int(base=16) %}
-    <span style="position:absolute;left:{{ 10 + loop.index0 * 3 }}px;top:237px;width:3px;height:3px;background:#{{ levels[value // 4] }}{{ levels[value % 4] }}38"></span>
+    <span style="position:absolute;left:{{ 2 + loop.index0 * 3 }}px;top:237px;width:3px;height:3px;background:#{{ levels[value // 4] }}{{ levels[value % 4] }}38"></span>
   {% endfor %}
   <div style="position:absolute;left:10px;top:8px;font-size:10px;font-weight:800;letter-spacing:.6px;color:#c2d1e1">CARS &amp; CHARGER</div>
   <div style="position:absolute;right:10px;top:9px;font-size:9px;color:#91a8c1">{{ now.strftime('%H:%M') if now else '--:--' }}</div>

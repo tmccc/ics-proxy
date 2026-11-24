@@ -22,6 +22,8 @@ from tests.managed_rig import healthy
 from tests.runtime_rig import until
 from tests.test_managed_normal_start import natural_stop
 from tests.tls_support import tls as tls
+from tools.managed_incident import reference
+from tools.managed_stop_incident import stop_incident_report
 
 TOKEN = "a" * 64  # Synthetic loopback-only test credential.
 
@@ -158,6 +160,9 @@ async def peer():
                 await socket.close()
                 return socket
         elif command == "stop_session":
+            if control.get("pre_admission_close") is not None:
+                await socket.close(code=1013, message=control["pre_admission_close"].encode())
+                return socket
             if value["revision"] != state["control_revision"] or value["target"] != state.get("stop_target"):
                 await socket.send_json({"ok": False, "error": "not_ready"})
                 await socket.close()
@@ -166,6 +171,9 @@ async def peer():
             binding = {"id": value["id"], "action": command, "revision": value["revision"], "target": value["target"]}
             receipts[value["id"]] = {**binding, "state": "completed"}
             result = {**binding, "state": "accepted"} if control["pending_receipt"] else receipts[value["id"]]
+            if control["lose_reply"]:
+                await socket.close()
+                return socket
         elif command == "receipt":
             if control.get("close_first_receipt") and control["commands"].count("receipt") == 1:
                 await socket.close(code=1013, message=b"Busy")
@@ -271,6 +279,46 @@ async def test_session_action_can_start_then_stop_at_zero_watts(
     assert hass.states.get("sensor.ics_proxy_control_mode").state == "App / schedule"
 
 
+# Intent: return a Stop's redacted reference without relaxing receipt checks or changing the command sent on the wire.
+# Why: the result must identify the caller's attempt even if the proxy refuses it or the first reply is lost.
+@pytest.mark.parametrize("reply", ["current", "older", "pre_admission"])
+async def test_session_stop_reference_identifies_the_exact_attempt(actual_hass, peer, reply):
+    target = "b" * 64
+    peer["state"].update(charging_session_open=True, can_start=False, stop_target=target)
+    await setup(actual_hass, peer)
+    peer["lose_reply"] = reply == "older"
+    if reply == "pre_admission":
+        peer["pre_admission_close"] = "Busy"
+
+    # Older proxy receipts omit the revision for a client-generated request ID, but keep the exact target.
+    def old_receipt(command, _request, receipt):
+        return {key: value for key, value in receipt.items() if key != "revision"} if command == "receipt" else receipt
+
+    if reply == "older":
+        peer["result_filter"] = old_receipt
+
+    # Request the exact redacted reference through the actual HA service registry.
+    async def stop(session_target):
+        return await actual_hass.services.async_call(
+            "ics_proxy",
+            "session_command",
+            {"action": "stop_session", "target": session_target, "include_request_reference": True},
+            blocking=True,
+            return_response=True,
+        )
+
+    assert await stop("c" * 64) == {"confirmed": False, "request_reference": None}
+    assert "stop_session" not in peer["commands"]
+    response = await stop(target)
+    [request] = [request for request in peer["requests"] if request["command"] == "stop_session"]
+    assert request.keys() == {"command", "target", "revision", "id"}
+    assert request["target"] == target
+    assert response == {"confirmed": reply != "pre_admission", "request_reference": reference(request["id"])}
+    assert response["request_reference"] != request["id"]
+    receipt_requests = [request["request_id"] for request in peer["requests"] if request["command"] == "receipt"]
+    assert receipt_requests == ([request["id"]] if reply == "older" else [])
+
+
 # Intent: Home Assistant and the vendor can request Stop in either order for one genuine scheduled session.
 # Why: the shared physical acknowledgement cannot finish the Home Assistant request before verified closure.
 @pytest.mark.parametrize("first", ["local", "vendor"])
@@ -316,7 +364,7 @@ async def test_session_stop_shares_the_vendor_wire_in_either_order(
             hass.services.async_call(
                 "ics_proxy",
                 "session_command",
-                {"action": "stop_session", "target": target},
+                {"action": "stop_session", "target": target, "include_request_reference": True},
                 blocking=True,
                 return_response=True,
             )
@@ -350,7 +398,13 @@ async def test_session_stop_shares_the_vendor_wire_in_either_order(
             published = await healthy(controller)
             physical = controller.latest_native.physical
             assert physical.observed_at > open_observed_at and physical.transaction_open is False
-            assert await asyncio.wait_for(request, 3) == {"confirmed": True}
+            response = await asyncio.wait_for(request, 3)
+            assert response == {"confirmed": True, "request_reference": reference(identifier)}
+            incident = stop_incident_report(
+                journal.path, tmp_path / "no-events.jsonl", request_reference=response["request_reference"]
+            )
+            assert incident["journal"]["request"]["request"] == response["request_reference"]
+            assert incident["journal"]["request"]["state"] == "completed"
             receipt = await coordinator.client.request("receipt", request_id=identifier)
             assert (receipt["id"], receipt["action"], receipt["state"]) == (identifier, "stop_session", "completed")
             assert (receipt["target"], receipt["revision"]) == (target, revision)

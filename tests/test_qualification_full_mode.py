@@ -187,13 +187,14 @@ def test_full_validator_requires_complete_full_mode(tmp_path, monkeypatch, mode,
     # This is a structural validator unit: run the real auditor in-process with explicitly synthetic runtime records.
     def audited_step(name, command, results, *, cwd):
         assert command[-2:] == ["--collection-executors", str(executor_path)]
-        assert cwd == Path(command[2]).parent.parent and cwd != candidate
+        assert command[1:4] == ["-B", "-X", f"pycache_prefix={cwd.parent / 'qualification-audit-bytecode'}"]
+        assert cwd == Path(command[4]).parent.parent and cwd != candidate
         import contextlib
         import io
 
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            rc = audit.main(command[3:])
+            rc = audit.main(command[5:])
         results[name] = rc == 0
         return subprocess.CompletedProcess(command, rc, output.getvalue(), "")
 

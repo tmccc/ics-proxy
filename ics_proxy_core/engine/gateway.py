@@ -12,6 +12,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
@@ -781,7 +782,9 @@ class Gateway:
                 self.auth_info.require_dynamic(info)
             except RecoveryRequiredError:
                 return False
-        return (self._local_tag(tag) and info is None) or (info is not None and info["status"] == "Accepted")
+        if info is None:
+            return self._local_tag(tag) and self.auth_info.permits_local_fallback(tag)
+        return bool(info["status"] == "Accepted")
 
     # Lookup is case-insensitive while journal facts and outbound OCPP preserve their original tag text.
     def _local_tag(self, tag: str) -> bool:
@@ -792,23 +795,25 @@ class Gateway:
         if not self._local_tag(tag) or not self.journal.phase.read().legacy_active or self.journal.phase.starting:
             return False
         info = self.auth_info.get(tag)
-        return info is None or info["status"] == "Accepted"
+        return self.auth_info.permits_local_fallback(tag) if info is None else info["status"] == "Accepted"
 
-    # Only a locally aged Accepted decision is renewable by owner Start; explicit cloud denials remain binding.
-    def local_start_expired(self, tag: str) -> bool:
+    # Refresh an aged or uncertain approval online without treating a recorded refusal as renewable.
+    def local_start_needs_renewal(self, tag: str) -> bool:
         if not self._local_tag(tag) or not self.journal.phase.read().legacy_active or self.journal.phase.starting:
             return False
         info = self.auth_info.stored(tag)
-        return bool(
-            info and info["status"] == "Accepted" and "expiryDate" in info and expiry(info["expiryDate"]) <= time.time()
-        )
+        if info is None:
+            return not self.auth_info.permits_local_fallback(tag)
+        return bool(info["status"] == "Accepted" and "expiryDate" in info and expiry(info["expiryDate"]) <= time.time())
 
     # Owner-approved local permissions have explicit local expiry, distinct from actual cloud metadata.
     def _tag_info(self, tag: str) -> dict[str, Any]:
         info = self.auth_info.get(tag)
         if info is not None:
             return info
-        return self.auth_info.local() if self._local_tag(tag) else {"status": "Invalid"}
+        if self._local_tag(tag) and self.auth_info.permits_local_fallback(tag):
+            return self.auth_info.local()
+        return {"status": "Invalid"}
 
     # Preserve the actual correlated backend decision, checking generation after every await.
     async def _cloud_authorize(self, tag: str, guard: Callable[[], None] | None = None) -> dict[str, Any]:
@@ -823,7 +828,16 @@ class Gateway:
                 guard()
 
         info: dict[str, Any] | None = None
-        approval: AuthorizationObservation | None = None
+        observation: AuthorizationObservation | None = None
+        query_sequence: int | None = None
+
+        # Leave durable evidence of an unfinished lookup before any request reaches the vendor.
+        def begin() -> None:
+            nonlocal query_sequence
+            try:
+                query_sequence, _ = self.auth_info.begin_query(tag, hold_open=True)
+            except sqlite3.Error as error:
+                raise RecoveryRequiredError("authorization lookup could not be recorded before sending") from error
 
         # A complete authorization result contains only the validated decision.
         def decision(answer: Frame) -> dict[str, Any]:
@@ -833,17 +847,16 @@ class Gateway:
 
         # Order each reply when it arrives. An approval still needs the sender's current authority before use.
         def capture(_action: str, answer: Frame) -> None:
-            nonlocal info, approval
+            nonlocal info, observation
             if self._vendor_epoch != epoch:
                 return
             try:
                 actual = decision(answer)
             except UnavailableError, DeniedError:
                 return  # The caller still receives the ordinary validation failure.
-            if actual["status"] == "Accepted":
-                approval = self.auth_info.observe()
-            else:
-                info = self.auth_info.deny(tag, actual)
+            observation = self.auth_info.observe()
+            if actual["status"] != "Accepted":
+                info = self.auth_info.deny(tag, actual, observation, query_sequence=query_sequence)
 
         # Positive authorization still depends on the originating owner and connection.
         def received(_action: str, answer: Frame) -> None:
@@ -851,16 +864,29 @@ class Gateway:
             self._require_epoch("vendor", epoch)
             if info is None:
                 actual = decision(answer)
-                if actual["status"] == "Accepted":
-                    check()
-                    info = self.auth_info.put(tag, actual, approval)
-                else:
-                    info = self.auth_info.deny(tag, actual)
+                if observation is None or actual["status"] != "Accepted":
+                    raise RecoveryRequiredError("authorization reply could not be recorded")
+                check()
+                info = self.auth_info.put(tag, actual, observation, query_sequence=query_sequence)
             if info["status"] != "Accepted":
                 check()
 
+        # Keep the exact journal marker while this connection can still return a refusal.
+        def close_query() -> None:
+            if query_sequence is not None:
+                with suppress(sqlite3.Error):
+                    self.auth_info.close_query(query_sequence, observation)
+
         await self.vendor.call(
-            "Authorize", {"idTag": tag}, priority=5, check=check, on_receive=capture, on_reply=received
+            "Authorize",
+            {"idTag": tag},
+            priority=5,
+            check=check,
+            before_send=begin,
+            on_receive=capture,
+            on_reply=received,
+            keep_late_reply=True,
+            on_reply_window_closed=close_query,
         )
         assert info is not None
         return info

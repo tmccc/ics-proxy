@@ -14,26 +14,36 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from ics_proxy_core.engine.gateway import Gateway  # noqa: E402
 from ics_proxy_core.engine.managed_current import managed_current_ceiling  # noqa: E402
 from ics_proxy_core.engine.managed_recovery_zero import require_original_zero, require_station_zero  # noqa: E402
 from ics_proxy_core.engine.native_bounded import ROUTE_FIELDS, NativeBoundedSpec  # noqa: E402
+from ics_proxy_core.engine.native_bounded_handover import NativeBoundedHandover, NativePatch  # noqa: E402
 from ics_proxy_core.engine.native_history import audit_history  # noqa: E402
 from ics_proxy_core.engine.native_history_recovery import history_recovery_idle  # noqa: E402
 from ics_proxy_core.engine.native_http import read_native  # noqa: E402
-from ics_proxy_core.engine.security import SecurityError  # noqa: E402
+from ics_proxy_core.engine.policy import Policy  # noqa: E402
+from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError  # noqa: E402
+from ics_proxy_core.engine.station import StationChoice  # noqa: E402
 from ics_proxy_core.engine.store import RecoveryRequiredError  # noqa: E402
-from ics_proxy_core.engine.trial_handover_evidence import HandoverEvidence  # noqa: E402
+from ics_proxy_core.engine.trial_config import prepare_tls  # noqa: E402
+from ics_proxy_core.engine.trial_handover_evidence import HandoverEvidence, ObserveHandover  # noqa: E402
 from ics_proxy_core.engine.trial_resources import ResourceBook  # noqa: E402
-from ics_proxy_core.engine.trial_session import TrialSession, open_native_journal, preflight  # noqa: E402
+from ics_proxy_core.engine.trial_session import (  # noqa: E402
+    PreparedTrial,
+    TrialSession,
+    open_native_journal,
+    preflight_native,
+)
 from tools.trial_proxy import emit, native_spec  # noqa: E402
 
 _RESTORE_INTENT = "managed_vendor_restore"
-type Observe = Callable[[], Awaitable[HandoverEvidence]]
-type Patch = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 # Freeze managed operation before lowering the independently enforced USER limit or removing any profile.
-async def prepare_cleanup(book: ResourceBook, spec: NativeBoundedSpec, observe: Observe, patch: Patch) -> None:
+async def prepare_cleanup(
+    book: ResourceBook, spec: NativeBoundedSpec, observe: ObserveHandover, patch: NativePatch
+) -> None:
     journal = book.journal
     phase = journal.phase.read()
     intent = journal.get(_RESTORE_INTENT)
@@ -64,7 +74,7 @@ async def prepare_cleanup(book: ResourceBook, spec: NativeBoundedSpec, observe: 
             spec.require_managed(native, journal.identity, closed=True, allow_unplugged=True)
             audit_history(journal, spec.digest, list(native.history), False)
             require_station_zero(journal, book, book.owned_present(native.physical))
-            await patch({"AmpLmt": "6"})
+            await patch({"AmpLmt": "6"}, native)
             native = await observe()
         # A replacement process may find the write already applied. Confirm the saved and effective limits.
         spec.require(native, journal.identity, "trial", closed=True, allow_unplugged=True)
@@ -73,32 +83,23 @@ async def prepare_cleanup(book: ResourceBook, spec: NativeBoundedSpec, observe: 
         journal.db.execute("DELETE FROM meta WHERE key='managed_current_capability'")
 
 
-# While the maintenance listener owns the journal, the existing cleanup is the only available charger action.
-async def restore(session: TrialSession, observe: Observe, patch: Patch) -> dict[str, Any]:
-    handover, journal = session.native_bounded, session.journal
-    if journal.phase.read().value == "complete":
-        handover.require_normal_restoration(await observe())
+# A restart after profile cleanup can finish on native HTTP without loading either OCPP peer's TLS files.
+async def finish_restore(
+    handover: NativeBoundedHandover, patch: NativePatch, close_listener: Callable[[], Awaitable[None]] | None = None
+) -> dict[str, Any]:
+    journal = handover.gateway.journal
+    phase = journal.phase.read().value
+    if phase == "complete":
+        handover.require_normal_restoration(await handover.observe())
         return {"original_configuration_restored": True, "native_backend_connected": True, "complete": True}
-
-    if journal.phase.read().value == "rollback":
-        emit({"restore_stage": "verify_6_a_and_remove_proxy_profiles"})
-        async with asyncio.timeout(90):
-            await session.start()
-            connection = None
-            if session.started:
-                gateway = session.gateway
-                while session.runtime.introduction_pending or not gateway.current_boot_seen(gateway._charger_epoch):
-                    await asyncio.sleep(0.25)
-                boot = gateway.boot_observation
-                assert boot is not None
-                handover.spec.require_boot(journal.get("boot"))
-                connection = (gateway._charger_epoch, boot)
-            await handover.cleanup(session.runtime.stop_vendor, connection=connection)
+    if phase != "backend_restore_pending":
+        raise RecoveryRequiredError("restoration requires verified profile cleanup")
 
     # Retire the listener and wait for independent offline evidence before changing the route.
     async def retire() -> None:
-        await session.runtime.close()
-        while (await observe()).physical.upstream_connected:
+        if close_listener is not None:
+            await close_listener()
+        while (await handover.observe()).physical.upstream_connected:
             await asyncio.sleep(1)
 
     async with asyncio.timeout(90):
@@ -114,9 +115,26 @@ async def restore(session: TrialSession, observe: Observe, patch: Patch) -> dict
         return await handover.restore_settings(patch)
 
 
+# While the maintenance listener owns the journal, the existing cleanup is the only available charger action.
+async def cleanup_profiles(session: TrialSession) -> None:
+    emit({"restore_stage": "verify_6_a_and_remove_proxy_profiles"})
+    handover, gateway = session.native_bounded, session.gateway
+    async with asyncio.timeout(90):
+        await session.start()
+        connection = None
+        if session.started:
+            while session.runtime.introduction_pending or not gateway.current_boot_seen(gateway._charger_epoch):
+                await asyncio.sleep(0.25)
+            boot = gateway.boot_observation
+            assert boot is not None
+            handover.spec.require_boot(session.journal.get("boot"))
+            connection = (gateway._charger_epoch, boot)
+        await handover.cleanup(session.runtime.stop_vendor, connection=connection)
+
+
 # Both stages use one private installation, and a stopped journal remains exclusive during every write.
 async def run(action: str, config_path: Path, spec_path: Path, native_port: int = 80) -> int:
-    prepared = preflight(config_path)
+    prepared = preflight_native(config_path)
     spec = native_spec(spec_path, prepared)
     if action == "check":
         emit({"offline_only": True, "inputs_valid": True, "charger_changed": False})
@@ -127,35 +145,68 @@ async def run(action: str, config_path: Path, spec_path: Path, native_port: int 
     observer.port = native_port
 
     # Keep a physically unplugged charger throughout cleanup, routing, and current restoration.
-    async def observe() -> HandoverEvidence:
-        native = await observer.observe_handover()
+    def require_unplugged(native: HandoverEvidence) -> None:
+        if not native.is_fresh(5):
+            raise StaleEvidenceError("restoration requires fresh native evidence")
         native.physical.require_disconnected(config.identity, max_age=5)
         if native.physical.transaction_open or native.output_limit_a != 0:
             raise RecoveryRequiredError("restoration requires the charger unplugged with closed zero output")
+
+    # All restoration stages use the same unplugged and fresh zero checks.
+    async def observe() -> HandoverEvidence:
+        native = await observer.observe_handover()
+        require_unplugged(native)
         return native
 
     # Only the commissioned USER limit and original four route fields may be written by this tool.
-    async def patch(values: dict[str, Any]) -> None:
+    async def patch(values: dict[str, Any], native: HandoverEvidence) -> None:
         original_route = {key: spec.original_configuration[key] for key in ROUTE_FIELDS}
         if values not in ({"AmpLmt": "6"}, {"AmpLmt": "32"}, original_route):
             raise SecurityError("unexpected charger restoration settings")
-        await read_native(config.charger_ip, observer.port, observer.authorization, "setConfig", values)
+        await read_native(
+            config.charger_ip,
+            observer.port,
+            observer.authorization,
+            "setConfig",
+            values,
+            before_send=lambda: require_unplugged(native),
+        )
 
-    if not config.journal.is_file():
-        raise RecoveryRequiredError("restoration requires the existing managed journal")
     emit({"restore_stage": "verify_unplugged_managed_pause"})
-    with closing(open_native_journal(config.journal, config.identity, spec)) as journal:
-        await prepare_cleanup(ResourceBook(journal, prepared.baseline), spec, observe, patch)
+    with closing(open_native_journal(config.journal, config.identity, spec, require_existing=True)) as journal:
+        book = ResourceBook(journal, prepared.baseline)
+        if journal.phase.read().value in ("backend_restore_pending", "complete"):
+            if journal.get(_RESTORE_INTENT) != spec.digest:
+                raise RecoveryRequiredError("cleanup does not belong to this managed restoration")
+            gateway = Gateway(journal, Policy(allow_local_start=False))
+            handover = NativeBoundedHandover(
+                gateway,
+                book,
+                observe,
+                spec,
+                StationChoice(config.station_profile_kind, config.station_stack_level, config.station_profile_start),
+                observe_profiles=observer.observe_profiles,
+                allow_unplugged=True,
+            )
+            emit(await finish_restore(handover, patch))
+            return 0
+        tls = prepare_tls(config)
+        await prepare_cleanup(book, spec, observe, patch)
     # The durable cleanup phase also fences a service restart between the two exclusive journal opens.
     session = TrialSession(
-        prepared,
+        PreparedTrial(config, prepared.baseline, observer, tls),
         native_bounded=spec,
         handover_observe=observe,
         allow_local_start=False,
         allow_unplugged_native=True,
+        require_existing_journal=True,
     )
     try:
-        result = await restore(session, observe, patch)
+        if session.journal.get(_RESTORE_INTENT) != spec.digest:
+            raise RecoveryRequiredError("cleanup does not belong to this managed restoration")
+        if session.journal.phase.read().value == "rollback":
+            await cleanup_profiles(session)
+        result = await finish_restore(session.native_bounded, patch, session.runtime.close)
     finally:
         await session.close()
     emit(result)

@@ -9,12 +9,15 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import islice
 from typing import Any
 
 from .policy import DeniedError
 from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 
 STATUSES = frozenset({"Accepted", "Blocked", "Expired", "Invalid", "ConcurrentTx"})
+DENIAL_FLOOR = "auth_denial_sequence_floor"
+DENIAL_RETRY_BATCH = 4
 
 
 # Case-insensitive lookup never changes the tag actually sent on the OCPP wire or in a historical fact.
@@ -67,6 +70,7 @@ class AuthorizationRecord:
     info: str
     observed: float
     sequence: int | None
+    query_sequence: int | None = None
 
 
 class InfoBook:
@@ -77,6 +81,10 @@ class InfoBook:
         self.journal, self.capacity = journal, capacity
         self.protected = frozenset(tag_key(tag) for tag in protected_tags)
         self._pending_denials: dict[str, AuthorizationRecord] = {}
+        self._live_queries: set[int] = set()
+        self._query_replies: dict[int, int] = {}
+        self._unsaved_denial_floor = 0
+        self._denial_publish_cursor = 0
         journal.db.execute(
             "CREATE TABLE IF NOT EXISTS auth_info(digest TEXT PRIMARY KEY,info TEXT NOT NULL,observed REAL NOT NULL)"
         )
@@ -88,90 +96,288 @@ class InfoBook:
             "CREATE TABLE IF NOT EXISTS auth_denial_replies("
             "digest TEXT PRIMARY KEY,info TEXT NOT NULL,observed REAL NOT NULL,sequence INTEGER NOT NULL)"
         )
-        self._sequence = journal.db.execute(
+        self._open_pending_queries()
+        sequence = journal.db.execute(
             "SELECT COALESCE(MAX(sequence), 0) FROM ("
             "SELECT MAX(sequence) AS sequence FROM auth_info_order UNION ALL "
             "SELECT MAX(sequence) FROM delivery_reply_authorization UNION ALL "
-            "SELECT MAX(sequence) FROM auth_denial_replies)"
+            "SELECT MAX(sequence) FROM auth_denial_replies UNION ALL "
+            "SELECT MAX(sequence) FROM auth_pending_queries)"
         ).fetchone()[0]
+        # An unsequenced historical refusal could follow any previously saved acknowledgement.
+        self._sequence = self._legacy_sequence = max(1, sequence, self._saved_floor()[0])
+
+    # Upgrade the prior one-marker-per-tag journal without losing interrupted lookups.
+    def _open_pending_queries(self) -> None:
+        db = self.journal.db
+        with self.journal.atomic():
+            legacy = any(
+                row["name"] == "digest" and row["pk"] for row in db.execute("PRAGMA table_info(auth_pending_queries)")
+            )
+            if legacy:
+                db.execute("ALTER TABLE auth_pending_queries RENAME TO legacy_auth_pending_queries")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS auth_pending_queries("
+                "digest TEXT NOT NULL,sequence INTEGER PRIMARY KEY,must_refresh INTEGER NOT NULL DEFAULT 0)"
+            )
+            if legacy:
+                db.execute(
+                    "INSERT INTO auth_pending_queries SELECT digest,sequence,must_refresh "
+                    "FROM legacy_auth_pending_queries"
+                )
+                db.execute("DROP TABLE legacy_auth_pending_queries")
+            db.execute("CREATE INDEX IF NOT EXISTS auth_pending_query_digest ON auth_pending_queries(digest)")
+            # The previous process could have received a refusal while its journal could no longer record it.
+            db.execute(
+                "DELETE FROM auth_pending_queries WHERE sequence NOT IN "
+                "(SELECT MAX(sequence) FROM auth_pending_queries GROUP BY digest)"
+            )
+            db.execute("UPDATE auth_pending_queries SET must_refresh=1 WHERE must_refresh=0")
+
+    # Read committed ordering and any changes in the caller's current transaction.
+    def _saved_floor(self) -> tuple[int, frozenset[str]]:
+        floor = self.journal.get(DENIAL_FLOOR, {"sequence": 0, "protected": sorted(self.protected)})
+        if (
+            not isinstance(floor, dict)
+            or set(floor) != {"sequence", "protected"}
+            or type(floor["sequence"]) is not int
+            or floor["sequence"] < 0
+            or not isinstance(floor["protected"], list)
+            or any(not isinstance(digest, str) for digest in floor["protected"])
+        ):
+            raise RecoveryRequiredError("saved authorization ordering is invalid")
+        return floor["sequence"], frozenset(floor["protected"])
+
+    # The caller commits the loss of exact evidence and its conservative sequence bound together.
+    def _advance_floor(self, sequence: int) -> None:
+        current, protected = self._saved_floor()
+        retained = protected & self.protected
+        if sequence > current or retained != protected:
+            self.journal.put(DENIAL_FLOOR, {"sequence": max(current, sequence), "protected": sorted(retained)})
 
     # Order actual replies inside the wire gate while keeping expiry checks on wall time.
     def observe(self) -> AuthorizationObservation:
         self._sequence += 1
         return AuthorizationObservation(self._sequence, time.time())
 
+    # Record the uncertainty before sending so even a later storage outage cannot revive older approval on restart.
+    def begin_query(self, tag: str, *, hold_open: bool = False) -> tuple[int, bool]:
+        key = tag_key(tag)
+        j = self.journal
+        pending: set[int] | None = None
+        with j.atomic():
+            prior = j.db.execute(
+                "SELECT sequence FROM auth_pending_queries WHERE digest=? ORDER BY sequence", (key,)
+            ).fetchall()
+            retired = [row[0] for row in prior if row[0] not in self._live_queries]
+            j.db.executemany("DELETE FROM auth_pending_queries WHERE sequence=?", ((seq,) for seq in retired[:-1]))
+            current = j.get("vendor_start_grant", {}).get("digest")
+            if key not in self.protected and key != current:
+                outstanding = [
+                    row["sequence"]
+                    for row in j.db.execute("SELECT digest,sequence FROM auth_pending_queries ORDER BY sequence")
+                    if row["digest"] not in self.protected
+                    and row["digest"] != current
+                    and row["sequence"] not in self._live_queries
+                ]
+                overflow = len(outstanding) - max(1, self.capacity) + 1
+                if overflow > 0:
+                    # A durable ordering floor must cover an uncertainty before dropping its exact marker.
+                    self._advance_floor(self._sequence)
+                    j.db.executemany(
+                        "DELETE FROM auth_pending_queries WHERE sequence=?",
+                        ((seq,) for seq in outstanding[:overflow]),
+                    )
+            sequence = self.observe().sequence
+            j.db.execute("INSERT INTO auth_pending_queries(digest,sequence) VALUES(?,?)", (key, sequence))
+            if self._query_replies:
+                pending = {row[0] for row in j.db.execute("SELECT sequence FROM auth_pending_queries")}
+        if pending is not None:
+            self._query_replies = {query: reply for query, reply in self._query_replies.items() if query in pending}
+        if hold_open:
+            self._live_queries.add(sequence)
+        return sequence, not prior
+
+    # A saved decision settles this attempt and earlier uncertainty. Other live wires can still answer later.
+    def _finish_query(self, key: str, sequence: int | None, settled_through: int) -> None:
+        if sequence is None:
+            return
+        db = self.journal.db
+        prior = db.execute(
+            "SELECT sequence FROM auth_pending_queries WHERE digest=? AND sequence<=?", (key, settled_through)
+        )
+        resolved = [
+            (query,)
+            for (query,) in prior
+            if query == sequence
+            or query not in self._live_queries
+            and self._query_replies.get(query, query) <= settled_through
+        ]
+        db.executemany("DELETE FROM auth_pending_queries WHERE sequence=?", resolved)
+
+    # An unresolved lookup from a previous process requires a new decision for this tag.
+    def _query_requires_refresh(self, key: str) -> bool:
+        return (
+            self.journal.db.execute(
+                "SELECT 1 FROM auth_pending_queries WHERE digest=? AND must_refresh=1", (key,)
+            ).fetchone()
+            is not None
+        )
+
+    # Only this wire's marker can disappear without a decision. An unsaved result stays recoverable.
+    def close_query(self, sequence: int, decision: AuthorizationObservation | None) -> None:
+        self._live_queries.discard(sequence)
+        db = self.journal.db
+        if decision is None:
+            db.execute("DELETE FROM auth_pending_queries WHERE sequence=? AND must_refresh=0", (sequence,))
+        else:
+            self._query_replies[sequence] = decision.sequence
+            if db.execute("SELECT 1 FROM auth_pending_queries WHERE sequence=?", (sequence,)).fetchone() is None:
+                del self._query_replies[sequence]
+
     # Publish a checked authorization reply by when it arrived, returning the latest decision for that tag.
-    def put(self, tag: str, value: Any, observation: AuthorizationObservation | None = None) -> dict[str, Any]:
+    def put(
+        self,
+        tag: str,
+        value: Any,
+        observation: AuthorizationObservation | None = None,
+        *,
+        query_sequence: int | None = None,
+    ) -> dict[str, Any]:
         info = validate_info(value)
         observation = observation or self.observe()
         with nullcontext() if self.journal.db.in_transaction else self.journal.atomic():
             self.put_delivery(tag, info, observation, restored=False)
+            if query_sequence is not None:
+                key = tag_key(tag)
+                saved = self._saved(key)
+                if saved is not None and saved.sequence is not None and saved.sequence >= observation.sequence:
+                    pending = self._pending_denials.get(key)
+                    if pending is None or pending.sequence is not None and pending.sequence <= saved.sequence:
+                        self._finish_query(key, query_sequence, saved.sequence)
             latest = self.stored(tag)
-        assert latest is not None
+        if latest is None:
+            raise RecoveryRequiredError("an earlier authorization approval requires a fresh decision")
         return latest
 
     # A matched denial remains effective even if the older cache row cannot be replaced.
-    def deny(self, tag: str, info: dict[str, Any]) -> dict[str, Any]:
+    def deny(
+        self,
+        tag: str,
+        info: dict[str, Any],
+        observation: AuthorizationObservation | None = None,
+        *,
+        query_sequence: int | None = None,
+    ) -> dict[str, Any]:
         decision = validate_info(info)
         if decision["status"] == "Accepted":
             raise DeniedError("a positive reply requires the current owner check")
-        observation = self.observe()
+        observation = observation or self.observe()
         key = tag_key(tag)
-        self._pending_denials[key] = AuthorizationRecord(encoded(decision), observation.observed, observation.sequence)
-        self.retry_denials()
+        if key not in self._pending_denials and len(self._pending_denials) >= max(1, self.capacity) + len(
+            self.protected
+        ):
+            oldest = next(candidate for candidate in self._pending_denials if candidate not in self.protected)
+            evicted = self._pending_denials.pop(oldest)
+            assert evicted.sequence is not None
+            # The exact dynamic refusal can be evicted only while its side of the ordering fence remains blocked.
+            self._unsaved_denial_floor = max(self._unsaved_denial_floor, evicted.sequence)
+        self._pending_denials[key] = AuthorizationRecord(
+            encoded(decision), observation.observed, observation.sequence, query_sequence
+        )
+        self._save_denial_floor()
+        if self._checkpoint_denial(key):
+            self._publish_saved_denials(key)
         return decision
 
-    # Checkpoint only an actual latest denial. If storage is unavailable, reads still see the retained reply.
+    # Retry only a bounded amount of recovery work per supervisor turn, independently of new denials.
     def retry_denials(self) -> None:
-        j = self.journal
-        for key, reply in tuple(self._pending_denials.items()):
-            assert reply.sequence is not None
-            try:
-                with j.atomic():
-                    prior = self._saved(key)
-                    if prior is None or prior.sequence is None or prior.sequence < reply.sequence:
-                        self._make_room(key)
-                        j.db.execute(
-                            "INSERT OR REPLACE INTO auth_denial_replies VALUES(?,?,?,?)",
-                            (key, reply.info, reply.observed, reply.sequence),
-                        )
-            except sqlite3.Error, RecoveryRequiredError:
-                if j.db.in_transaction:
-                    raise
-                continue
-            self._pending_denials.pop(key, None)
+        self._save_denial_floor()
+        for key in tuple(islice(self._pending_denials, DENIAL_RETRY_BATCH)):
+            if not self._checkpoint_denial(key):
+                self._pending_denials[key] = self._pending_denials.pop(key)
+                break
         self._publish_saved_denials()
 
-    # Move a durable refusal into the ordinary cache once that cache is writable again.
-    def _publish_saved_denials(self) -> None:
+    # Checkpoint the active ordering fence once storage allows it, so it survives later process replacement.
+    def _save_denial_floor(self) -> None:
+        j = self.journal
+        if not self._unsaved_denial_floor:
+            return
+        try:
+            with j.atomic():
+                self._advance_floor(self._unsaved_denial_floor)
+        except sqlite3.Error:
+            if j.db.in_transaction:
+                raise
+            return
+        self._unsaved_denial_floor = 0
+
+    # Checkpoint only an actual latest denial. An unavailable journal leaves the known reply in memory.
+    def _checkpoint_denial(self, key: str) -> bool:
+        j, reply = self.journal, self._pending_denials[key]
+        assert reply.sequence is not None
+        try:
+            with j.atomic():
+                prior = self._saved(key)
+                if prior is None or prior.sequence is None or prior.sequence < reply.sequence:
+                    self._make_room(key)
+                    j.db.execute(
+                        "INSERT OR REPLACE INTO auth_denial_replies VALUES(?,?,?,?)",
+                        (key, reply.info, reply.observed, reply.sequence),
+                    )
+                self._finish_query(key, reply.query_sequence, reply.sequence)
+        except sqlite3.Error, RecoveryRequiredError:
+            if j.db.in_transaction:
+                raise
+            return False
+        del self._pending_denials[key]
+        return True
+
+    # Move durable refusals into the ordinary cache after either the new reply or periodic storage recovery.
+    def _publish_saved_denials(self, key: str | None = None) -> None:
         j = self.journal
         try:
-            rows = j.db.execute("SELECT digest,info,observed,sequence FROM auth_denial_replies").fetchall()
+            query = "SELECT digest,info,observed,sequence FROM auth_denial_replies"
+            rows = (
+                j.db.execute(query + " WHERE digest=?", (key,)).fetchall()
+                if key is not None
+                else j.db.execute(
+                    query + " ORDER BY sequence <= ?, sequence LIMIT ?",
+                    (self._denial_publish_cursor, DENIAL_RETRY_BATCH),
+                ).fetchall()
+            )
         except sqlite3.Error:
             if j.db.in_transaction:
                 raise
             return
         for row in rows:
-            key, sequence = row["digest"], row["sequence"]
+            digest, sequence = row["digest"], row["sequence"]
+            if key is None:
+                self._denial_publish_cursor = sequence
             try:
                 with j.atomic():
-                    ordinary = j.db.execute("SELECT sequence FROM auth_info_order WHERE digest=?", (key,)).fetchone()
+                    ordinary = j.db.execute("SELECT sequence FROM auth_info_order WHERE digest=?", (digest,)).fetchone()
                     if ordinary is None or ordinary["sequence"] < sequence:
                         self._put(
-                            key,
+                            digest,
                             validate_info(json.loads(row["info"])),
                             AuthorizationObservation(sequence, row["observed"]),
                         )
-                    j.db.execute("DELETE FROM auth_denial_replies WHERE digest=? AND sequence=?", (key, sequence))
+                    j.db.execute("DELETE FROM auth_denial_replies WHERE digest=? AND sequence=?", (digest, sequence))
             except sqlite3.Error:
                 if j.db.in_transaction:
                     raise
+                break
 
     # Keep the newest actual decision, whether it came from Authorize or a saved lifecycle acknowledgement.
     def put_delivery(
         self, tag: str, info: dict[str, Any], observation: AuthorizationObservation | None, *, restored: bool
     ) -> None:
         key = tag_key(tag)
+        sequence = None if observation is None else observation.sequence
+        if info["status"] == "Accepted" and self._approval_precedes_floor(key, sequence):
+            return
         latest = self._latest(key)
         if latest is not None:
             sequence = latest.sequence
@@ -181,6 +387,19 @@ class InfoBook:
             if sequence is not None and sequence >= observation.sequence:
                 return
         self._put(key, info, observation)
+
+    # Old approvals remain eligible only for tags whose exact refusals stayed protected throughout eviction.
+    def _approval_precedes_floor(self, key: str, sequence: int | None) -> bool:
+        floor, protected = self._saved_floor()
+        if self._unsaved_denial_floor:
+            floor = max(floor, self._unsaved_denial_floor)
+            protected &= self.protected
+        return floor > 0 and key not in protected and (sequence is None or sequence <= floor)
+
+    # The gateway owns local eligibility; the recorded order can still block a newly configured tag's fallback.
+    def permits_local_fallback(self, tag: str) -> bool:
+        key = tag_key(tag)
+        return not self._query_requires_refresh(key) and not self._approval_precedes_floor(key, None)
 
     # Keep the same bound across both ordinary decisions and independent refusal receipts.
     def _make_room(self, key: str) -> None:
@@ -205,6 +424,10 @@ class InfoBook:
         )
         if oldest is None:
             raise RecoveryRequiredError("authorization metadata capacity reached without an evictable historical tag")
+        decision = self._saved(oldest)
+        assert decision is not None
+        if validate_info(json.loads(decision.info))["status"] != "Accepted":
+            self._advance_floor(self._legacy_sequence if decision.sequence is None else decision.sequence)
         j.db.execute("DELETE FROM auth_info WHERE digest=?", (oldest,))
         j.db.execute("DELETE FROM auth_denial_replies WHERE digest=?", (oldest,))
 
@@ -240,8 +463,16 @@ class InfoBook:
 
     # Only metadata from an actual correlated response can be returned; an expired decision stays expired.
     def stored(self, tag: str) -> dict[str, Any] | None:
-        latest = self._latest(tag_key(tag))
-        return validate_info(json.loads(latest.info)) if latest is not None else None
+        key = tag_key(tag)
+        latest = self._latest(key)
+        if latest is None:
+            return None
+        info = validate_info(json.loads(latest.info))
+        if info["status"] == "Accepted" and (
+            self._query_requires_refresh(key) or self._approval_precedes_floor(key, latest.sequence)
+        ):
+            return None
+        return info
 
     # Apply the actual expiry at the moment of use, without losing the original cloud decision.
     def get(self, tag: str) -> dict[str, Any] | None:
@@ -254,8 +485,9 @@ class InfoBook:
 
     # Return the original decision and expiry for an already acknowledged event that occurred while both were valid.
     def accepted_for_delayed_report(self, tag: str, occurred: float, reported: str) -> dict[str, Any] | None:
-        record = self._latest(tag_key(tag))
-        if record is None:
+        key = tag_key(tag)
+        record = self._latest(key)
+        if record is None or self._query_requires_refresh(key) or self._approval_precedes_floor(key, record.sequence):
             return None
         info = validate_info(json.loads(record.info))
         if info["status"] != "Accepted" or "expiryDate" not in info:

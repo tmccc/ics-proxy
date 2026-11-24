@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,18 +27,19 @@ async def run(action: str, config_path: Path, spec_path: Path) -> int:
     if action == "check":
         emit({"offline_only": True, "native_ceiling_a": 32, "charger_changed": False})
         return 0
-    journal = open_native_journal(prepared.config.journal, prepared.config.identity, spec)
+    journal = open_native_journal(prepared.config.journal, prepared.config.identity, spec, require_existing=True)
     try:
         book = ResourceBook(journal, prepared.baseline)
 
         # This adapter permits exactly one previously approved USER change; it has no route, hardware or Start API.
-        async def patch_user32() -> None:
+        async def patch_user32(guard: Callable[[], None]) -> None:
             await read_native(
                 prepared.config.charger_ip,
                 prepared.observer.port,
                 prepared.observer.authorization,
                 "setConfig",
                 {"AmpLmt": "32"},
+                before_send=guard,
             )
 
         emit(await prepare_current_capability(journal, book, spec, prepared.observer.observe_handover, patch_user32))

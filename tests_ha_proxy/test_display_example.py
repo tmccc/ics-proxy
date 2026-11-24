@@ -2,7 +2,7 @@
 
 import asyncio
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -23,6 +23,21 @@ REVISION = 42
 START_MARKER = f"start:{REVISION:014x}"
 
 
+# Decode the produced cells at the firmware's sample locations after RGB565 conversion.
+def render_marker(html):
+    cells = re.findall(r"left:(\d+)px;top:237px;width:3px;height:3px;background:#([a-f0-9]{6})", html)
+    raw = ""
+    for index, (left, color) in enumerate(cells):
+        assert 2 * int(left) + 3 == 7 + 6 * index < 480
+        rgb = tuple(int(color[i : i + 2], 16) for i in (0, 2, 4))
+        r, g, b = (((value >> bits) * 255) // (255 >> bits) for value, bits in zip(rgb, (3, 2, 3)))
+        assert 40 <= b <= 74
+        assert 8 + (r >> 6) * 64 <= r <= 56 + (r >> 6) * 64
+        assert 8 + (g >> 6) * 64 <= g <= 56 + (g >> 6) * 64
+        raw += format((r >> 6) * 4 + (g >> 6), "x")
+    return raw
+
+
 # Intent: make the touch automation visible to the renderer's entity scan.
 # Why: without that state, the display greys out charger buttons even when the automation is enabled.
 def test_display_view_declares_touch_automation_to_renderer():
@@ -30,6 +45,16 @@ def test_display_view_declares_touch_automation_to_renderer():
     view = (PROJECT / "view.html.jinja").read_text()
     references = re.findall(r"""\b(?:states|state_attr|is_state)\(\s*['"]([^'"]+)['"]""", view)
     assert AUTOMATION in references
+
+
+# Intent: the display checks for Home Assistant clock corrections as often as it checks for images.
+# Why: a long time-sync interval would make fresh images look expired after Home Assistant's clock moves back.
+def test_display_resynchronizes_its_clock_at_the_download_interval():
+    package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
+    clock = next(source for source in package["time"] if source["id"] == "canvas_ha_time")
+    image = next(source for source in package["image"] if source["id"] == "canvas_image")
+    assert clock["platform"] == "homeassistant"
+    assert clock["update_interval"] == image["update_interval"] == "10s"
 
 
 # Intent: test the shipped display tap guards and exact Start/Stop feedback inside Home Assistant.
@@ -78,19 +103,15 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         }.items():
             hass.states.async_set(entity, state)
         hass.states.async_set(SESSION, "off", {"can_start": True, "control_revision": REVISION})
-        hass.states.async_set(
-            IMAGE,
-            datetime.now(UTC).isoformat(),
-            {
-                "assigned_views": [VIEW],
-                "current_view_id": VIEW,
-                "rendered_view_id": VIEW,
-                "notification_active": False,
-            },
-        )
+        image_attributes = {
+            "assigned_views": [VIEW],
+            "current_view_id": VIEW,
+            "rendered_view_id": VIEW,
+            "notification_active": False,
+        }
 
         # Send the same event shape and rendered marker as the touchscreen.
-        def tap(starting, marker=None):
+        def tap(starting, marker=None, *, age="1"):
             hass.bus.async_fire(
                 "esphome.general_display_touch",
                 {
@@ -98,7 +119,7 @@ async def test_public_display_example_with_actual_ha(tmp_path):
                     "device_id": config["triggers"][0]["event_data"]["device_id"],
                     "x": "120" if starting else "352",
                     "y": "396",
-                    "canvas_age_seconds": "1",
+                    "canvas_age_seconds": age,
                     "frame_control": (START_MARKER if starting else "stop:" + TARGET) if marker is None else marker,
                 },
             )
@@ -113,6 +134,13 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         def settled(result):
             return hass.states.get(PENDING).state == result and hass.states.get(AUTOMATION).attributes["current"] == 0
 
+        # The current renderer timestamp and the age of the physical frame both matter.
+        hass.states.async_set(IMAGE, (datetime.now(UTC) - timedelta(seconds=46)).isoformat(), image_attributes)
+        tap(True)
+        await asyncio.sleep(0.05)
+        assert calls == []
+        hass.states.async_set(IMAGE, datetime.now(UTC).isoformat(), image_attributes)
+        tap(True, age="45")
         tap(True, "")
         tap(True, f"start:{REVISION - 1:014x}")
         await asyncio.sleep(0.05)
@@ -137,20 +165,13 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         assert len(calls) == 1
         rendered = Template((PROJECT / "view.html.jinja").read_text(), hass)
         hass.states.async_set("sensor.ics_proxy_control_mode", "Local charging")
-        html = rendered.async_render({"now": datetime.now(UTC)}, parse_result=False)
+        render_time = datetime.now(UTC)
+        html = rendered.async_render({"now": render_time}, parse_result=False)
         assert "Paused locally" not in html and "Open session" in html
-        # Decode every produced CSS cell after simulating the panel's RGB565 conversion.
-        colors = re.findall(r"width:3px;height:3px;background:#([a-f0-9]{6})", html)
-        raw = ""
-        for color in colors:
-            rgb = tuple(int(color[i : i + 2], 16) for i in (0, 2, 4))
-            panel = tuple(((value >> bits) * 255) // (255 >> bits) for value, bits in zip(rgb, (3, 2, 3)))
-            r, g, b = panel
-            assert 40 <= b <= 74
-            assert 8 + (r >> 6) * 64 <= r <= 56 + (r >> 6) * 64
-            assert 8 + (g >> 6) * 64 <= g <= 56 + (g >> 6) * 64
-            raw += format((r >> 6) * 4 + (g >> 6), "x")
-        assert raw == "d5192" + TARGET
+        assert render_marker(html) == f"d51a2{int(render_time.timestamp()):08x}{TARGET}"
+        rerendered = render_time + timedelta(seconds=10)
+        html = rendered.async_render({"now": rerendered}, parse_result=False)
+        assert render_marker(html) == f"d51a2{int(rerendered.timestamp()):08x}{TARGET}"
         tap(False)
         await wait_for(lambda: len(calls) == 2)
         assert calls[-1] == {"action": "stop_session", "target": TARGET}
@@ -160,18 +181,17 @@ async def test_public_display_example_with_actual_ha(tmp_path):
 
         hass.states.async_set("sensor.ics_proxy_control_mode", "App / schedule (cloud offline)")
         hass.states.async_set("binary_sensor.ics_proxy_problem", "on")
-        html = Template((PROJECT / "view.html.jinja").read_text(), hass).async_render(
-            {"now": datetime.now(UTC)}, parse_result=False
-        )
-        assert "Ready to start" in html and html.count("width:3px;height:3px;background:#") == 19
         template = Template((PROJECT / "view.html.jinja").read_text(), hass)
+        html = template.async_render({"now": render_time}, parse_result=False)
+        assert "Ready to start" in html
+        assert render_marker(html) == f"d51a1{int(render_time.timestamp()):08x}{REVISION:014x}"
         # An unplugged charger in app/schedule mode can be locally healthy while the cloud is offline.
         hass.states.async_set("binary_sensor.ics_proxy_vehicle_connected", "off")
         hass.states.async_set(SESSION, "off", {"can_start": False, "control_revision": REVISION})
-        unplugged = template.async_render({"now": datetime.now(UTC)}, parse_result=False)
+        unplugged = template.async_render({"now": render_time}, parse_result=False)
         assert "Vendor connection unavailable" in unplugged
         assert "Charger control needs attention" not in unplugged
-        assert "width:3px;height:3px;background:#" not in unplugged
+        assert render_marker(unplugged) == f"d51a0{int(render_time.timestamp()):08x}"
         hass.states.async_set("sensor.ics_proxy_control_mode", "Needs attention")
         faulted = template.async_render({"now": datetime.now(UTC)}, parse_result=False)
         assert "Charger control needs attention" in faulted
@@ -218,9 +238,9 @@ async def test_public_display_example_with_actual_ha(tmp_path):
                 ("off", {"can_start": True, "control_revision": REVISION}),
             ):
                 hass.states.async_set(SESSION, session_state, attributes)
-                html = template.async_render({"now": datetime.now(UTC)}, parse_result=False)
+                html = template.async_render({"now": render_time}, parse_result=False)
                 assert "Charger buttons unavailable" in html
-                assert "width:3px;height:3px;background:#" not in html
+                assert render_marker(html) == f"d51a0{int(render_time.timestamp()):08x}"
 
         # A timed-out helper already present when automation starts can also expire.
         await hass.services.async_call(

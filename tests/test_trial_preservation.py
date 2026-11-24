@@ -113,7 +113,7 @@ async def test_preservation_fault_prevents_completion_after_inventory_returns(tm
         patches = []
 
         # A refused final proof must never reach even the independent fake USER writer.
-        async def patch(values):
+        async def patch(values, _evidence):
             patches.append(copy.deepcopy(values))
             rig.peer.configuration.update(values)
 
@@ -173,7 +173,7 @@ async def test_stop_after_clean_rollback_never_recreates_profile(tmp_path, tls, 
             await verify_original_backend(rig, session)
 
             # Change only the fake native USER setting after the real route/backend proofs.
-            async def patch(values):
+            async def patch(values, _evidence):
                 rig.peer.configuration.update(values)
                 rig.peer.runtime_user = int(rig.peer.configuration["AmpLmt"]) * 10
 

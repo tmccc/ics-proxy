@@ -23,3 +23,8 @@ session_command:
           min: 0
           max: 9007199254740991
           mode: box
+    include_request_reference:
+      name: Include request reference
+      description: Return a redacted reference for the attempted request. Use it to look up a local Stop incident.
+      selector:
+        boolean:

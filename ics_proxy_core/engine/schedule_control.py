@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import time
 from typing import TYPE_CHECKING, Any
 
 from ..constants import HUB_PROFILE_ID
@@ -162,8 +161,9 @@ class ScheduleControl:
 
     # Keep verified source evidence on its actual Boot; an ACK never identifies an unrelated native transaction.
     def record_start_source(self, charging: ManagedCharging, native: HandoverEvidence) -> None:
-        g = charging.controller.session.gateway
-        charging.source = (native, g.boot_observation, g.controls._revision)
+        c = charging.controller
+        g = c.session.gateway
+        charging.source = (native, g.boot_observation, g.controls._revision, c.native.last_resolved_read)
         state, lease = charging.state(), charging.lease
         if state.get("state") == "completed" or state.get("independent_seen"):
             return
@@ -209,11 +209,12 @@ class ScheduleControl:
         c, g = charging.controller, charging.controller.session.gateway
         if charging.source is None:
             return False
-        native, boot, revision = charging.source
+        native, boot, revision, sequence = charging.source
         return bool(
             boot is not None
             and boot == g.boot_observation
             and revision == g.controls._revision
+            and sequence == c.native.last_resolved_read
             and c.native.last_verified_at == native.physical.observed_at
             and native.is_fresh(5)
             and self.independent_daily(charging, native, local)
@@ -414,7 +415,7 @@ class ScheduleControl:
 
         return NativeStartReport(None, None, None, accepted)
 
-    # An independently identified daily remains with the app when an unrelated test expires.
+    # An independently identified daily remains with the app only while the latest native check still verifies it.
     def retire_test_beside_daily(
         self, charging: ManagedCharging, lease: ChargeLease, state: dict[str, Any], target: int | None
     ) -> bool:
@@ -430,11 +431,13 @@ class ScheduleControl:
             or j.get("vendor_start_grant")
         ):
             return False
-        native, boot, revision = current
+        native, boot, revision, sequence = current
         g = c.session.gateway
         if (
             (boot, revision) != (g.boot_observation, g.controls._revision)
-            or not 0 <= time.time() - native.physical.observed_at <= 15
+            or sequence != c.native.last_resolved_read
+            or c.native.last_verified_at != native.physical.observed_at
+            or not native.is_fresh(15)
             or (self.ordinary_source(c.ordinary, native) or {}).get("kind") != "daily"
         ):
             return False

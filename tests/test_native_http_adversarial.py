@@ -9,7 +9,7 @@ import pytest
 
 from ics_proxy_core.engine.native_faults import NativeContentError
 from ics_proxy_core.engine.native_http import NativeTransportUnavailableError, read_native, response_body
-from ics_proxy_core.engine.security import SecurityError
+from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
 
 BODY = json.dumps({"code": 200, "data": {"synthetic": "native-evidence"}}).encode()
 
@@ -119,3 +119,31 @@ async def test_invalid_native_reply_is_classified_over_real_http(name, raw):
     finally:
         server.close()
         await server.wait_closed()
+
+
+# Intent: the explicit current preparation write checks its evidence after connecting and before sending bytes.
+# Why: connecting can consume the available evidence lifetime even when the caller checked it before the await.
+async def test_native_write_guard_refuses_after_connection_without_sending():
+    received = asyncio.get_running_loop().create_future()
+
+    # Record everything the real client sends before closing the loopback connection.
+    async def peer(reader, writer):
+        received.set_result(await reader.read())
+        writer.close()
+        await writer.wait_closed()
+
+    # The caller's freshness guard runs only once a connection exists and can still withdraw permission.
+    def require_fresh():
+        raise StaleEvidenceError("prepared zero expired while connecting")
+
+    async with await asyncio.start_server(peer, "127.0.0.1", 0) as server:
+        with pytest.raises(StaleEvidenceError, match="expired while connecting"):
+            await read_native(
+                "127.0.0.1",
+                server.sockets[0].getsockname()[1],
+                "Basic synthetic",
+                "setConfig",
+                {"AmpLmt": "32"},
+                before_send=require_fresh,
+            )
+        assert await asyncio.wait_for(received, 1) == b""

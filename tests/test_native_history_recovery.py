@@ -25,6 +25,7 @@ from ics_proxy_core.engine.native_history import audit_history, history_policy
 from ics_proxy_core.engine.native_history_recovery import acknowledge_history_policy, matches_history_fault
 from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError, fingerprint
+from ics_proxy_core.engine.trial_handover_evidence import HandoverEvidence
 from ics_proxy_core.engine.trial_resources import ResourceBook
 from tests.charge_rig import ChargeRig, positive_flow
 from tests.connected_rig import ConnectedBench, strategy_file
@@ -205,24 +206,34 @@ async def test_history_acknowledgement_retains_pending_pause(
             await replacement.close()
 
 
-# Intent: an offline operator acknowledges precisely the missing bodies while keeping allocations, intent and zero.
-# Why: acknowledging rolling history is not permission to erase evidence, allocate ids, or initiate charging.
+# Intent: an offline operator acknowledges exact omissions or verifies their recovery while retaining the zero hold.
+# Why: returning unchanged history can clear the omission fault without authorizing future omissions or charging.
 @pytest.mark.parametrize("paused", [False, True], ids=["app-intent", "paused-intent"])
+@pytest.mark.parametrize("restored", [False, True], ids=["still-missing", "restored"])
 async def test_acknowledgement_archives_exact_bodies_and_preserves_authority(
     tmp_path: Path,
     tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
     unused_tcp_port: int,
     monkeypatch: pytest.MonkeyPatch,
     paused: bool,
+    restored: bool,
 ) -> None:
     async with missing_history(tmp_path, tls, unused_tcp_port, monkeypatch, paused=paused) as fault:
         rig, journal = fault.rig, fault.journal
+        if restored:
+            rig.bench.history = copy.deepcopy(fault.original)
         native = await rig.prepared.observer.observe_handover()
+        assert native.is_fresh(5)
         writes = copy.deepcopy(rig.bench.device_calls)
         native_requests = list(rig.peer.requests)
         old_fault, old_failure = journal.get("managed_control_fault"), journal.get("managed_native_failure")
         result = acknowledge_history_policy(journal, fault.book, rig.spec, native)
-        assert result == {"archived_records": 3, "missing_records": 2, "fault_cleared": True, "charging_started": False}
+        assert result == {
+            "archived_records": 3,
+            "missing_records": 0 if restored else 2,
+            "fault_cleared": True,
+            "charging_started": False,
+        }
         archive = [json.loads(row[0]) for row in journal.db.execute("SELECT body FROM native_history_records")]
         assert sorted(archive, key=lambda r: r["transactionId"]) == fault.original
         assert journal.get("native_bounded_handover")["original_history"] == fault.original
@@ -233,7 +244,7 @@ async def test_acknowledgement_archives_exact_bodies_and_preserves_authority(
         control = journal.get("control")
         assert control["owner"] == "local" and control["inhibit"] and control["uncertain"]
         receipt = journal.get("native_history_policy_acknowledgement")
-        assert receipt["policy"] == history_policy(journal, rig.spec.digest)
+        assert receipt["policy"] == (None if restored else history_policy(journal, rig.spec.digest))
         assert journal.get("native_history_policy") == receipt["policy"]
         assert receipt["prior_fault"] == old_fault and receipt["prior_failure"] == old_failure
         assert receipt["charging_started"] is False and receipt["summary"] == journal.get("native_history_summary")
@@ -576,8 +587,6 @@ def change_native(rig: ConnectedBench, guard: str) -> None:
         rig.peer.phase_fault = True
     elif guard == "original-body":
         rig.bench.history[0]["original_record"]["preserve"][0] = "changed"
-    elif guard == "no-missing":
-        raise AssertionError("handled with retained complete original bodies")
     else:
         raise AssertionError(guard)
 
@@ -595,7 +604,7 @@ def change_native(rig: ConnectedBench, guard: str) -> None:
         "other-phase-current",
         "original-body",
         "stale-observation",
-        "no-missing",
+        "unbound-restoration",
     ],
 )
 async def test_independent_native_guards_still_refuse_recovery(
@@ -606,8 +615,10 @@ async def test_independent_native_guards_still_refuse_recovery(
     guard: str,
 ) -> None:
     async with missing_history(tmp_path, tls, unused_tcp_port, monkeypatch) as fault:
-        if guard == "no-missing":
+        if guard == "unbound-restoration":
             fault.rig.bench.history = copy.deepcopy(fault.original)
+            failure = fault.journal.get("managed_native_failure")
+            fault.journal.put("managed_native_failure", {**failure, "at_epoch": failure["at_epoch"] - 1})
         elif guard != "stale-observation":
             change_native(fault.rig, guard)
         native = await fault.rig.prepared.observer.observe_handover()
@@ -689,7 +700,7 @@ async def test_managed_history_policy_allows_complete_original32_restoration(
                 writes = []
 
                 # Only the independent fake native peer receives the authorized original USER scalar.
-                async def patch(values: dict[str, Any]) -> None:
+                async def patch(values: dict[str, Any], _evidence: HandoverEvidence) -> None:
                     writes.append(copy.deepcopy(values))
                     rig.peer.configuration.update(values)
                     rig.peer.runtime_user = 320

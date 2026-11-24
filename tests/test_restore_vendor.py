@@ -7,14 +7,17 @@ import asyncio
 import copy
 import json
 import sqlite3
+import time
 import uuid
 from contextlib import closing
+from types import SimpleNamespace
 
 import pytest
 
+from ics_proxy_core.engine import trial_handover_evidence
 from ics_proxy_core.engine.native_bounded_handover import NativeBoundedHandover
-from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
-from ics_proxy_core.engine.security import SecurityError
+from ics_proxy_core.engine.native_http import NativeTransportUnavailableError, read_native
+from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
 from ics_proxy_core.engine.store import RecoveryRequiredError
 from ics_proxy_core.engine.trial_session import save_private
 from ics_proxy_core.frames import basic_auth_header
@@ -24,6 +27,7 @@ from tests.handover_helpers import NativeVehiclePeer
 from tests.managed_rig import starts
 from tests.prototype_rig import BOOT
 from tests.tls_support import tls as tls
+from tools import restore_vendor
 from tools.managed_proxy import serve
 from tools.restore_vendor import run
 
@@ -38,11 +42,17 @@ class RestorePeer(NativeVehiclePeer):
         self.lost_patch = None
         self.route_changed = False
         self.read_original_offline = asyncio.Event()
+        self.empty_connection = asyncio.Event()
 
     # Handle the ordinary observation protocol plus native saved-setting writes from the real restore tool.
     async def handle(self, reader, writer):
         try:
-            headers = await reader.readuntil(b"\r\n\r\n")
+            try:
+                headers = await reader.readuntil(b"\r\n\r\n")
+            except asyncio.IncompleteReadError as error:
+                assert not error.partial
+                self.empty_connection.set()
+                return
             fields = {
                 line.split(b":", 1)[0].lower(): line.split(b":", 1)[1].strip()
                 for line in headers.split(b"\r\n")[1:]
@@ -270,10 +280,47 @@ async def test_restore_refuses_a_profile_reappearing_after_cleanup(tmp_path, tls
         assert journal_facts(rig.prepared.config.journal)[1] == "backend_restore_pending"
 
 
-# Intent: verify managed32 handback and retry after the device applied any of the three writes with no reply.
-# Why: settings can return to 32 A only after the proxy has retired and the original backend is verified online.
-@pytest.mark.parametrize("lost_reply", [None, "lower", "route", "raise"])
-async def test_restore_from_managed32_keeps_history(tmp_path, tls, unused_tcp_port, monkeypatch, capsys, lost_reply):
+# Advance only the evidence clock after TCP opens for one specific settings write.
+def expire_evidence_on_connect(monkeypatch, target):
+    open_connection = asyncio.open_connection
+    expire = True
+
+    # Apply the clock change to the first matching write so a fresh retry can finish.
+    async def request(host, port, authorization, action, data, **kwargs):
+        nonlocal expire
+        if not expire or action != "setConfig" or data != target:
+            return await read_native(host, port, authorization, action, data, **kwargs)
+        expire = False
+        offset = 0
+
+        # Open a real loopback stream before making the last sample expire.
+        async def delayed_connection(*args, **kwargs):
+            nonlocal offset
+            streams = await open_connection(*args, **kwargs)
+            offset = 6
+            return streams
+
+        with monkeypatch.context() as timing:
+            timing.setattr(asyncio, "open_connection", delayed_connection)
+            timing.setattr(
+                trial_handover_evidence,
+                "time",
+                SimpleNamespace(time=time.time, monotonic=lambda: time.monotonic() + offset),
+            )
+            return await read_native(host, port, authorization, action, data, **kwargs)
+
+    monkeypatch.setattr(restore_vendor, "read_native", request)
+
+
+# Intent: verify managed32 handback and retry when any of the three writes is prevented or loses a reply.
+# Why: expired evidence must prevent transmission, and a lost reply must never duplicate an applied setting.
+@pytest.mark.parametrize(
+    ("interruption", "stage"),
+    [(None, None), *((kind, stage) for kind in ("reply", "connect") for stage in ("lower", "route", "raise"))],
+)
+async def test_restore_from_managed32_keeps_history(
+    tmp_path, tls, unused_tcp_port, monkeypatch, capsys, interruption, stage
+):
     async with commissioned(
         tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
     ) as test:
@@ -290,31 +337,54 @@ async def test_restore_from_managed32_keeps_history(tmp_path, tls, unused_tcp_po
         first_call = len(bench.device_calls)
         first_limit = len(bench.received_limits)
         route = {key: rig.spec.original_configuration[key] for key in rig.spec.trial_route}
-        peer.lost_patch = {"lower": {"AmpLmt": "6"}, "route": route, "raise": {"AmpLmt": "32"}}.get(lost_reply)
-        if lost_reply == "lower":
-            with pytest.raises(NativeTransportUnavailableError):
+        target = {"lower": {"AmpLmt": "6"}, "route": route, "raise": {"AmpLmt": "32"}}.get(stage)
+        failure = NativeTransportUnavailableError
+        if interruption == "reply":
+            peer.lost_patch = target
+        if interruption == "connect":
+            expire_evidence_on_connect(monkeypatch, target)
+            failure = StaleEvidenceError
+        if stage == "lower":
+            with pytest.raises(failure):
                 await asyncio.wait_for(run(*args), 5)
-            assert peer.runtime_user == 60 and bench.firmware.effective_limit() == 0 and not peer.route_changed
+            if interruption == "connect":
+                await asyncio.wait_for(peer.empty_connection.wait(), 1)
+                assert not peer.writes
+            assert peer.runtime_user == (60 if interruption == "reply" else 320)
+            assert bench.firmware.effective_limit() == 0 and not peer.route_changed
             with pytest.raises(RecoveryRequiredError, match="restoration has begun"):
                 await asyncio.wait_for(serve(config, spec), 3)
             assert not bench.online
         restore_task = asyncio.create_task(run(*args))
         charger_task = asyncio.create_task(cleanup_charger(test))
         try:
-            if lost_reply == "route":
-                with pytest.raises(NativeTransportUnavailableError):
+            if stage == "route":
+                with pytest.raises(failure):
                     await asyncio.wait_for(restore_task, 10)
-                assert peer.route_changed and peer.runtime_user == 60
+                if interruption == "connect":
+                    await asyncio.wait_for(peer.empty_connection.wait(), 1)
+                    assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}]
+                assert peer.route_changed == (interruption == "reply") and peer.runtime_user == 60
+                rig.prepared.config.certificate.unlink()
+                rig.prepared.config.private_key.unlink()
                 restore_task = asyncio.create_task(run(*args))
             await asyncio.wait_for(peer.read_original_offline.wait(), 10)
             assert not restore_task.done() and peer.runtime_user == 60
             assert not bench.firmware.profiles and not bench.online
             await asyncio.wait_for(charger_task, 3)
             bench.online = True
-            if lost_reply == "raise":
-                with pytest.raises(NativeTransportUnavailableError):
+            if stage == "raise":
+                with pytest.raises(failure):
                     await asyncio.wait_for(restore_task, 5)
-                assert peer.configuration == rig.spec.original_configuration and peer.runtime_user == 320
+                if interruption == "connect":
+                    await asyncio.wait_for(peer.empty_connection.wait(), 1)
+                    assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}, route]
+                    assert peer.configuration == rig.spec.configuration("original")
+                else:
+                    assert peer.configuration == rig.spec.original_configuration
+                assert peer.runtime_user == (320 if interruption == "reply" else 60)
+                rig.prepared.config.certificate.unlink()
+                rig.prepared.config.private_key.unlink()
                 restore_task = asyncio.create_task(run(*args))
             assert await asyncio.wait_for(restore_task, 5) == 0
         finally:

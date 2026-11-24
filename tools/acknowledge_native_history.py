@@ -28,7 +28,7 @@ async def run(action: str, config_path: Path, spec_path: Path) -> int:
     if action == "check":
         emit({"inputs_valid": True, "offline_only": True, "charger_changed": False})
         return 0
-    journal = open_native_journal(prepared.config.journal, prepared.config.identity, spec)
+    journal = open_native_journal(prepared.config.journal, prepared.config.identity, spec, require_existing=True)
     try:
         book = ResourceBook(journal, prepared.baseline)
         native = await prepared.observer.observe_handover()

@@ -59,6 +59,28 @@ def test_runtime_digest_covers_explicit_auxiliary_mounts(tmp_path, monkeypatch):
     assert before != runtime_digest(config)
 
 
+# Intent: include standalone bytecode modules in runtime identity while excluding redirected Python caches.
+# Why: changing the cache prefix does not affect Python's support for standalone compiled modules.
+def test_runtime_digest_covers_standalone_bytecode(tmp_path):
+    venv = tmp_path / "venv"
+    cache = venv / "__pycache__"
+    cache.mkdir(parents=True)
+    standalone = venv / "module.pyc"
+    standalone.write_bytes(b"first standalone version")
+    config = {
+        "image": "sha256:" + "1" * 64,
+        "runtime_mode": "image",
+        "container_python": "/venv/bin/python",
+        "venv_target": "/venv",
+        "venv": str(venv),
+    }
+    original = runtime_digest(config)
+    (cache / "unrelated.cpython-314.pyc").write_bytes(b"generated cache")
+    assert runtime_digest(config) == original
+    standalone.write_bytes(b"other standalone version")
+    assert runtime_digest(config) != original
+
+
 # Intent: qualify with expected permission denials in the host system tree while binding accessible runtime bytes.
 # Why: an unprivileged worker cannot read every system file, but its own runtime and auxiliary assets must be readable.
 def test_runtime_digest_handles_unreadable_host_system_files(tmp_path, monkeypatch):

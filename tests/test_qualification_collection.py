@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_qualification_evidence import project
-from tools.qualification_collection import replay
+from tools.qualification_collection import replay, runtime_digest
 from tools.qualification_snapshot import freeze
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -232,6 +232,52 @@ def test_collection_replay_refuses_unavailable_runtime(tmp_path):
         replay(batch, metadata["commit"], metadata["source_digest"])
 
 
+# Intent: a replay enters its pinned interpreter with a new scratch cache prefix on every invocation.
+# Why: -B prevents writes but imports can still read caches from the mounted runtime if no prefix is set.
+def test_collection_replay_relocates_python_cache(tmp_path, monkeypatch):
+    from tools import qualification_collection as collector
+
+    source = project(tmp_path / "repo", {"tests/test_one.py": "def test_one(): pass\n"})
+    batch = tmp_path / "batch"
+    batch.mkdir()
+    metadata = freeze(source, batch / "source")
+    (batch / "snapshot.json").write_text(json.dumps(metadata))
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    config = {
+        "venv": str(venv),
+        "venv_target": "/venv",
+        "container_python": "/venv/bin/python",
+        "runtime_mode": "image",
+        "readonly_mounts": [],
+        "image": "sha256:" + "a" * 64,
+        "suite": "engine-model",
+        "expected_packages": {},
+    }
+    (batch / "config.json").write_text(json.dumps(config))
+    (batch / "result.json").write_text(json.dumps({"runtime_digest_after": runtime_digest(config)}))
+    prefixes = []
+    ids = ["tests/test_one.py::test_one"]
+
+    # Capture the actual Docker arguments and produce collection output without starting a container.
+    def collect(command, **kwargs):
+        output = Path(command[command.index("--output") + 1])
+        scratch = output.parent
+        prefix = scratch / "python-bytecode"
+        assert scratch.parent == batch and not prefix.exists()
+        assert f"PYTHONPYCACHEPREFIX={prefix}" in command and "-B" in command
+        assert f"type=bind,src={scratch},dst={scratch}" in command
+        prefixes.append(prefix)
+        output.write_text(json.dumps({"ids": ids}))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(collector.subprocess, "run", collect)
+    monkeypatch.setattr(collector, "cleanup_collection_container", lambda *_: {})
+    for _ in range(2):
+        assert replay(batch, metadata["commit"], metadata["source_digest"])["ids"] == ids
+    assert len(set(prefixes)) == 2 and all(not prefix.parent.exists() for prefix in prefixes)
+
+
 # Intent: a trusted executor map cannot redirect source pins, suites or local batches before collection starts.
 # Why: executor availability must be explicit caller authority rather than executable instructions in raw evidence.
 @pytest.mark.parametrize("problem", ["pins", "suite", "host", "local-batch", "kind"])
@@ -285,6 +331,9 @@ def test_collection_does_not_use_raw_executor_or_cached_denominator(collector_pr
     with pytest.raises(ValueError, match="fresh pinned-runtime collection unavailable/failed"):
         audit.canonical_collection(batch, config, "a" * 40, "b" * 64)
     assert len(commands) == 1 and commands[0][0] == sys.executable and "ssh" not in commands[0]
+    assert commands[0][1:3] == ["-B", "-X"]
+    prefix = Path(commands[0][3].removeprefix("pycache_prefix="))
+    assert prefix.parent == batch and not prefix.exists()
 
 
 # Intent: full launch argument parsing rejects inherited pytest filter/plugin variables before any freeze or worker run.
@@ -310,6 +359,39 @@ def test_full_launcher_rejects_inherited_selection_environment(tmp_path, monkeyp
     with pytest.raises(SystemExit) as error:
         parallel_qualify.arguments()
     assert error.value.code == 2
+
+
+# Intent: an SSH qualification cannot start with a worker interpreter which its later audit would reject.
+# Why: checking at launch time saves the entire worker run and its retained reports.
+@pytest.mark.parametrize("worker_python", ["python3", "bin/python"])
+def test_ssh_launcher_rejects_relative_worker_python(tmp_path, monkeypatch, capsys, worker_python):
+    from tools import parallel_qualify
+
+    output = tmp_path / "output"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "parallel_qualify",
+            "--output",
+            str(output),
+            "--venv",
+            str(tmp_path / "venv"),
+            "--image",
+            "sha256:" + "a" * 64,
+            "--worker-host",
+            "worker-alias",
+            "--worker-root",
+            "/qualification/scratch",
+            "--worker-python",
+            worker_python,
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        parallel_qualify.main()
+    assert error.value.code == 2
+    assert "SSH execution requires absolute paths for --worker-root and --worker-python" in capsys.readouterr().err
+    assert not output.exists()
 
 
 # Intent: the coverage CLI passes the caller's explicit collection executor map to its fresh full validator.
@@ -374,9 +456,10 @@ def test_coverage_cli_reads_the_validated_evidence(tmp_path, monkeypatch, relati
 
     # Run the actual validator's path handling and represent only the auditor output, without launching workers.
     def audited_step(name, command, results, *, cwd):
-        assert Path(command[2]) == frozen / "tools/audit_parallel_qualification.py" and cwd == frozen
+        assert command[1:4] == ["-B", "-X", f"pycache_prefix={frozen.parent / 'qualification-audit-bytecode'}"]
+        assert Path(command[4]) == frozen / "tools/audit_parallel_qualification.py" and cwd == frozen
         assert command[-2:] == ["--collection-executors", str(chosen)]
-        batch = Path(command[3])
+        batch = Path(command[5])
         config = json.loads((batch / "config.json").read_text())
         audit = config | commit | {"full_qualification_passed": True, "synthetic_fresh_audit": True}
         path = batch / "audit.json"

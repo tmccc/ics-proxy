@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Any
 
 from ..constants import HUB_PROFILE_ID
 from .managed_current import capability_value, managed_current_ceiling
 from .native_bounded import NativeBoundedSpec
 from .native_history import audit_history
-from .security import SecurityError
+from .security import SecurityError, StaleEvidenceError
 from .station import StationChoice
 from .store import Journal, RecoveryRequiredError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
@@ -24,12 +25,18 @@ async def prepare_current_capability(
     book: ResourceBook,
     spec: NativeBoundedSpec,
     observe: Callable[[], Awaitable[HandoverEvidence]],
-    patch_user32: Callable[[], Awaitable[None]],
+    patch_user32: Callable[[Callable[[], None]], Awaitable[None]],
 ) -> dict[str, Any]:
     expected = capability_value(journal, spec)
 
+    # Closed zero authorizes only a recent observation on both clocks, including after persistence waits.
+    def require_fresh(native: HandoverEvidence) -> None:
+        if not native.is_fresh(5):
+            raise StaleEvidenceError("current preparation requires fresh native evidence")
+
     # Recheck before and after the sole possible native write; configuration and original records remain exact.
     def check(native: HandoverEvidence, user32: bool) -> None:
+        require_fresh(native)
         control = journal.get("control", {})
         selection = journal.get("station_selection", {})
         choice = selection.get("choice")
@@ -80,6 +87,7 @@ async def prepare_current_capability(
         station = [r for r in present if r.identifier == HUB_PROFILE_ID]
         if not book.confirmed_station_zero(station, row):
             raise SecurityError("current preparation requires independently verified owned station zero")
+        require_fresh(native)
 
     native = await observe()
     existing = journal.get("managed_current_capability")
@@ -97,10 +105,13 @@ async def prepare_current_capability(
             "managed_current_prepare_intent",
             {"capability": expected, "stage": "native_write_intent", "at_epoch": time.time()},
         )
-        await patch_user32()
+        guard = partial(require_fresh, native)
+        guard()
+        await patch_user32(guard)
     verification = await observe()
     check(verification, True)
     with journal.atomic():
+        require_fresh(verification)
         journal.put("managed_current_capability", expected)
         journal.put(
             "managed_current_prepare_intent",

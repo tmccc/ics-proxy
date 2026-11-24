@@ -6,17 +6,23 @@ from __future__ import annotations
 import copy
 import json
 import ssl
+import time
 import uuid
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from ics_proxy_core.engine import trial_handover_evidence
 from ics_proxy_core.engine.managed_current import capability_value, managed_current_ceiling
 from ics_proxy_core.engine.managed_current_prepare import prepare_current_capability
 from ics_proxy_core.engine.rpc import UnavailableError
-from ics_proxy_core.engine.security import SecurityError
+from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
 from ics_proxy_core.engine.store import RecoveryRequiredError
+from ics_proxy_core.engine.trial_handover_evidence import HandoverEvidence
 from tests.charge_rig import ChargeRig, actual_stop, positive_flow, ready
 from tests.current_rig import native_writer, paused_ready
 from tests.managed_rig import starts
@@ -96,6 +102,78 @@ async def test_explicit_preparation_changes_only_user_limit_and_binds_capability
         assert journal.get("control")["inhibit"] and journal.get("control")["owner"] == "local"
 
 
+# Intent: preparation rechecks both clocks after saving the native write intent.
+# Why: an otherwise exact zero observed before slow journal persistence cannot authorize the physical write.
+@pytest.mark.parametrize("clock", ["wall", "elapsed"])
+async def test_preparation_rechecks_zero_freshness_after_writing_intent(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: str,
+) -> None:
+    async with paused_ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        journal = test.session.journal
+        writes: list[dict[str, str]] = []
+        offset = 0
+        clock_view = SimpleNamespace(
+            time=lambda: time.time() + (offset if clock == "wall" else 0),
+            monotonic=lambda: time.monotonic() + (offset if clock == "elapsed" else 0),
+        )
+        put = journal.put
+
+        # Simulate time spent persisting the intent without sleeping or changing the actual charger state.
+        def slow_put(key: str, value: Any) -> None:
+            nonlocal offset
+            put(key, value)
+            if key == "managed_current_prepare_intent":
+                offset = 6
+
+        with monkeypatch.context() as delay:
+            delay.setattr(trial_handover_evidence, "time", clock_view)
+            delay.setattr(journal, "put", slow_put)
+            with pytest.raises(StaleEvidenceError, match="fresh native evidence"):
+                await prepare_current_capability(
+                    journal,
+                    test.session.book,
+                    test.rig.spec,
+                    test.rig.prepared.observer.observe_handover,
+                    native_writer(test, writes),
+                )
+        assert journal.get("managed_current_prepare_intent")["stage"] == "native_write_intent"
+        assert journal.get("managed_current_capability") is None
+        assert not writes and test.rig.peer.runtime_user == 60 and test.rig.bench.firmware.effective_limit() == 0
+
+
+# Intent: an aged verification cannot publish USER32 capability even when the native write succeeded.
+# Why: retrying with fresh evidence must reconcile the same durable intent without sending a second write.
+async def test_preparation_requires_fresh_elapsed_verification_after_the_native_write(
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with paused_ready(tmp_path, tls, unused_tcp_port, monkeypatch) as test:
+        journal = test.session.journal
+        writes: list[dict[str, str]] = []
+        observe = test.rig.prepared.observer.observe_handover
+        patch = native_writer(test, writes)
+
+        # Keep the real post-write snapshot and wall timestamp while expiring only its elapsed lifetime.
+        async def delayed_verification() -> HandoverEvidence:
+            native = await observe()
+            return replace(native, observed_monotonic=time.monotonic() - 6) if writes else native
+
+        with pytest.raises(StaleEvidenceError, match="fresh native evidence"):
+            await prepare_current_capability(journal, test.session.book, test.rig.spec, delayed_verification, patch)
+        assert test.rig.peer.runtime_user == 320 and journal.get("managed_current_capability") is None
+        assert journal.get("managed_current_prepare_intent")["stage"] == "native_write_intent"
+        assert managed_current_ceiling(journal, test.rig.spec) == 6
+        result = await prepare_current_capability(journal, test.session.book, test.rig.spec, observe, patch)
+        assert result["prepared"] and writes == [{"AmpLmt": "32"}]
+        assert test.rig.bench.firmware.effective_limit() == 0
+
+
 # Intent: a lost reply after actual USER32 is reconciled by another read and never repeats the native write.
 # Why: neither process loss nor an exception before capability commit proves that the original write did not apply.
 async def test_applied_user32_with_lost_reply_reconciles_without_another_patch(
@@ -111,8 +189,8 @@ async def test_applied_user32_with_lost_reply_reconciles_without_another_patch(
         actual = native_writer(test, writes)
 
         # Preserve the independently applied physical USER32 effect while withholding its successful acknowledgement.
-        async def lost_reply() -> None:
-            await actual()
+        async def lost_reply(guard: Callable[[], None]) -> None:
+            await actual(guard)
             raise UnavailableError("synthetic loss after actual native USER32")
 
         with pytest.raises(UnavailableError):

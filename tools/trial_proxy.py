@@ -59,7 +59,7 @@ def native_spec(path: Path, prepared: PreparedNative) -> NativeBoundedSpec:
 @contextmanager
 def operator_journal(config: TrialConfig, spec: NativeBoundedSpec, *, inspect: bool) -> Iterator[Journal]:
     if not inspect:
-        with closing(open_native_journal(config.journal, config.identity, spec)) as journal:
+        with closing(open_native_journal(config.journal, config.identity, spec, require_existing=True)) as journal:
             yield journal
         return
 

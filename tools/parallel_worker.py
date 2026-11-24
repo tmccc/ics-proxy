@@ -143,6 +143,9 @@ def container_command(config, directory, cpu, name, env, start_recovery_ram=Fals
         ):
             command += ["--env", key + "=" + value]
     return command + [
+        # -B stops writes, but imports must also ignore caches beside the pinned sources and dependencies.
+        "--env",
+        "PYTHONPYCACHEPREFIX=" + str(directory / "python-bytecode"),
         "--env",
         "PYTHONHOME=",
         "--env",
@@ -428,6 +431,7 @@ def main():
             "TMPDIR": str(ROOT / "tmp"),
             "PYTHONPATH": str(ROOT),
             "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": str(ROOT / "tmp" / "python-bytecode"),
             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
             "PYTEST_ADDOPTS": "",
             "PYTEST_PLUGINS": "",
@@ -664,6 +668,8 @@ def main():
         [
             sys.executable,
             "-B",
+            "-X",
+            f"pycache_prefix={ROOT / 'supervisor-audit-bytecode'}",
             str(ROOT / "audit_parallel_qualification.py"),
             str(ROOT),
             "--expected-commit",

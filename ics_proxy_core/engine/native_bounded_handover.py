@@ -45,7 +45,7 @@ from .trial_handover_evidence import HandoverEvidence, ObserveHandover
 from .trial_resources import ResourceBook
 from .trial_rollback import require_lifecycle_idle
 
-NativePatch = Callable[[dict[str, Any]], Awaitable[None]]
+NativePatch = Callable[[dict[str, Any], HandoverEvidence], Awaitable[None]]
 
 
 class AuditSupersededError(UnavailableError):
@@ -928,11 +928,14 @@ class NativeBoundedHandover:
         if isinstance(validated, Pending):
             return validated
 
-        # The transport can yield after validation. Recheck this sample before it records the send.
-        def require_current() -> None:
+        # The transport can yield after validation. Recheck authority and elapsed lifetime before it records the send.
+        def require_current() -> Pending | None:
             if self.last_verified_at == 0 or sequence != self.last_resolved_read or validated != self.authority():
                 raise AuditSupersededError("outgoing validation was superseded before dispatch")
             native.physical.require_fresh(self.gateway.journal.identity, 5)
+            if not native.is_fresh(5):
+                return Pending(Prerequisite.SUPERSEDED, "outgoing validation expired before dispatch")
+            return None
 
         return require_current
 
@@ -1167,7 +1170,7 @@ class NativeBoundedHandover:
         if self.gateway.charger.sender is not None or disconnected.physical.upstream_connected:
             raise UnavailableError("retired proxy's native connection must be observed offline before routing")
         self.save("route_intent", backend_outage_at=disconnected.physical.observed_at)
-        await patch({key: self.spec.original_configuration[key] for key in self.spec.trial_route})
+        await patch({key: self.spec.original_configuration[key] for key in self.spec.trial_route}, disconnected)
         self._require_route_cleanup(await self.read(route="original", closed=True))
         self.gateway.decide(self._confirm_restored_route)
 
@@ -1225,7 +1228,7 @@ class NativeBoundedHandover:
             self.save("settings_intent")
             idle = await self.read(route="original", closed=True)
             self.require_restore_idle(idle)
-            await patch({"AmpLmt": self.spec.original_configuration["AmpLmt"]})
+            await patch({"AmpLmt": self.spec.original_configuration["AmpLmt"]}, idle)
             native = await self.observe()
         self.gateway.decide(lambda: self._complete_settings_restoration(native), priority=CommandPriority.RESTRICT)
         return {"original_configuration_restored": True, "native_backend_connected": True, "complete": True}

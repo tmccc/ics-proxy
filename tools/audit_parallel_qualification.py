@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -33,7 +34,16 @@ def canonical_manifest(root, suite):
     with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as scratch:
         output = Path(scratch) / "manifest.jsonl"
         generated = subprocess.run(
-            [sys.executable, "-B", str(source / "tools/schedule_sequence_manifest.py"), str(output), "--suite", suite],
+            [
+                sys.executable,
+                "-B",
+                "-X",
+                f"pycache_prefix={Path(scratch) / 'python-bytecode'}",
+                str(source / "tools/schedule_sequence_manifest.py"),
+                str(output),
+                "--suite",
+                suite,
+            ],
             cwd=source,
             capture_output=True,
             text=True,
@@ -77,7 +87,9 @@ def canonical_collection(root, config, commit, checksum, executors=None):
     helper_sha = hashlib.sha256(helper.read_bytes()).hexdigest()
     arguments = ["--replay-batch", str(root), "--commit", commit, "--source-digest", checksum]
     expected_batch = str(root)
-    command = [sys.executable, "-B", str(helper), *arguments]
+    # Multiple audits may replay this batch. Each helper starts with a separate unused prefix on its own host.
+    cache = ".collection-reader-bytecode-" + secrets.token_hex(16)
+    command = [sys.executable, "-B", "-X", f"pycache_prefix={root / cache}", str(helper), *arguments]
     if executors is not None:
         selected = json.loads(executors.read_text())
         if selected.get("commit") != commit or selected.get("source_digest") != checksum:
@@ -103,6 +115,8 @@ def canonical_collection(root, config, commit, checksum, executors=None):
             remote = [
                 python,
                 "-B",
+                "-X",
+                f"pycache_prefix={Path(batch) / cache}",
                 "-c",
                 bootstrap,
                 remote_helper,
