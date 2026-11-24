@@ -110,13 +110,14 @@ def test_predeployment_runtime_identity_tracks_same_version_dependency_bytes(tmp
         assert not list(prefix.iterdir())
         return json.dumps({"import_paths": [str(site)], "runtime_roots": [str(site)]})
 
-    monkeypatch.setattr(checks.subprocess, "check_output", metadata)
-    before = checks.runtime_identity(sys.executable, tmp_path)
-    assert before["packages"] == [["fixture-dependency", "1.0"]]
-    (cache / "fixture_dependency.pyc").write_bytes(b"cache only")
-    assert checks.runtime_identity(sys.executable, tmp_path) == before
-    dependency.write_text("value = 2\n")
-    after = checks.runtime_identity(sys.executable, tmp_path)
+    with monkeypatch.context() as runtime:
+        runtime.setattr(checks.subprocess, "check_output", metadata)
+        before = checks.runtime_identity(sys.executable, tmp_path)
+        assert before["packages"] == [["fixture-dependency", "1.0"]]
+        (cache / "fixture_dependency.pyc").write_bytes(b"cache only")
+        assert checks.runtime_identity(sys.executable, tmp_path) == before
+        dependency.write_text("value = 2\n")
+        after = checks.runtime_identity(sys.executable, tmp_path)
     assert after["packages"] == before["packages"]
     assert after["runtime_sha256"] != before["runtime_sha256"]
 
@@ -139,11 +140,6 @@ def test_predeployment_runtime_rejects_editable_dependencies(tmp_path, monkeypat
     else:
         (site / "__editable__.fixture_dependency-1.0.pth").write_text("import editable_fixture_finder\n")
 
-    monkeypatch.setattr(
-        checks.subprocess,
-        "check_output",
-        lambda *args, **kwargs: json.dumps({"import_paths": [str(site)], "runtime_roots": [str(site)]}),
-    )
     walk = Path.walk
     open_file = Path.open
 
@@ -157,10 +153,16 @@ def test_predeployment_runtime_rejects_editable_dependencies(tmp_path, monkeypat
         assert path.is_relative_to(site)
         return open_file(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "walk", walk_installed)
-    monkeypatch.setattr(Path, "open", open_installed)
-    with pytest.raises(ValueError, match="editable Python installs are unsupported"):
-        checks.runtime_identity(sys.executable, tmp_path)
+    with monkeypatch.context() as runtime:
+        runtime.setattr(
+            checks.subprocess,
+            "check_output",
+            lambda *args, **kwargs: json.dumps({"import_paths": [str(site)], "runtime_roots": [str(site)]}),
+        )
+        runtime.setattr(Path, "walk", walk_installed)
+        runtime.setattr(Path, "open", open_installed)
+        with pytest.raises(ValueError, match="editable Python installs are unsupported"):
+            checks.runtime_identity(sys.executable, tmp_path)
 
 
 # Intent: reject an unexpected import location before scanning any directory, including one added through a link.
@@ -180,9 +182,10 @@ def test_predeployment_runtime_does_not_walk_outside_package_roots(tmp_path, mon
     def forbidden(*args, **kwargs):
         raise AssertionError("unexpected runtime directory traversal")
 
-    monkeypatch.setattr(Path, "walk", forbidden)
-    with pytest.raises(ValueError, match="unrecognized Python runtime import location"):
-        checks.runtime_content_digest([str(site), str(extra)], [str(site)])
+    with monkeypatch.context() as runtime:
+        runtime.setattr(Path, "walk", forbidden)
+        with pytest.raises(ValueError, match="unrecognized Python runtime import location"):
+            checks.runtime_content_digest([str(site), str(extra)], [str(site)])
 
 
 # Intent: hash within-runtime file links and refuse an escaping link before opening its target.
@@ -210,9 +213,10 @@ def test_predeployment_runtime_file_links_cannot_escape_package_roots(tmp_path, 
     def forbidden(*args, **kwargs):
         raise AssertionError("unexpected runtime file opened")
 
-    monkeypatch.setattr(Path, "open", forbidden)
-    with pytest.raises(ValueError, match="unrecognized Python runtime link"):
-        checks.runtime_content_digest(paths, roots)
+    with monkeypatch.context() as runtime:
+        runtime.setattr(Path, "open", forbidden)
+        with pytest.raises(ValueError, match="unrecognized Python runtime link"):
+            checks.runtime_content_digest(paths, roots)
 
 
 # Intent: bind the exact distribution startup and library link targets to the runtime fingerprint.
@@ -240,8 +244,6 @@ def test_predeployment_runtime_hashes_root_managed_distribution_links(tmp_path, 
         directory.chmod(0o755)
     target.write_bytes(b"installed")
     target.chmod(0o644)
-    monkeypatch.setattr(checks, "SYSTEM_PYTHON_LIB", lib)
-    monkeypatch.setattr(checks, "SYSTEM_PYTHON_CONFIG", config)
     lstat = Path.lstat
     walk = Path.walk
     untrusted = None
@@ -257,27 +259,30 @@ def test_predeployment_runtime_hashes_root_managed_distribution_links(tmp_path, 
         assert path == stdlib
         return walk(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "lstat", ownership)
-    monkeypatch.setattr(Path, "walk", walk_import_root)
-    paths = [str(stdlib)]
-    initial = checks.runtime_content_digest(paths, paths)
-    target.write_bytes(b"changed")
-    assert checks.runtime_content_digest(paths, paths) != initial
+    with monkeypatch.context() as runtime:
+        runtime.setattr(checks, "SYSTEM_PYTHON_LIB", lib)
+        runtime.setattr(checks, "SYSTEM_PYTHON_CONFIG", config)
+        runtime.setattr(Path, "lstat", ownership)
+        runtime.setattr(Path, "walk", walk_import_root)
+        paths = [str(stdlib)]
+        initial = checks.runtime_content_digest(paths, paths)
+        target.write_bytes(b"changed")
+        assert checks.runtime_content_digest(paths, paths) != initial
 
-    target.chmod(0o664)
-    with pytest.raises(ValueError, match="unrecognized Python runtime link"):
-        checks.runtime_content_digest(paths, paths)
-    target.chmod(0o644)
-    untrusted = module
-    with pytest.raises(ValueError, match="unrecognized Python runtime link"):
-        checks.runtime_content_digest(paths, paths)
-    untrusted = None
-    other = target.with_suffix(".other")
-    other.write_bytes(b"outside the recognized layout")
-    module.unlink()
-    module.symlink_to(other)
-    with pytest.raises(ValueError, match="unrecognized Python runtime link"):
-        checks.runtime_content_digest(paths, paths)
+        target.chmod(0o664)
+        with pytest.raises(ValueError, match="unrecognized Python runtime link"):
+            checks.runtime_content_digest(paths, paths)
+        target.chmod(0o644)
+        untrusted = module
+        with pytest.raises(ValueError, match="unrecognized Python runtime link"):
+            checks.runtime_content_digest(paths, paths)
+        untrusted = None
+        other = target.with_suffix(".other")
+        other.write_bytes(b"outside the recognized layout")
+        module.unlink()
+        module.symlink_to(other)
+        with pytest.raises(ValueError, match="unrecognized Python runtime link"):
+            checks.runtime_content_digest(paths, paths)
 
 
 # Intent: the interpreter that runs the installation week has every candidate standalone pin before it can pass.
