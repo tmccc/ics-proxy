@@ -36,18 +36,46 @@ flowchart LR
 - Use the same exact reply evidence during normal operation and recovery. The request, possible dispatch,
   definite charger reply, and verified physical outcome are separate facts. A refused reply write can leave an
   independent checkpoint for that attempt. Retrying publication uses that evidence without sending the command again.
-  Session Stop uses the [shared rejection and closure query](../ics_proxy_core/engine/stop_settlement.py)
-  when deciding whether to send, updating a receipt, or repairing native history.
-- Compare the session Stop and Pause paths. A session Stop closes the exact session while retaining app or schedule
-  mode. An uncertain ordinary Stop is tied to its original attempt. A protective Pause can hold at zero and stop the
-  exact session under the shared controller. With current independent zero evidence, Pause and the vendor app can
-  wait for the same unresolved Stop on their current charger connection. A newer Pause can act after reconnecting.
-  Lost zero or fresh draw still permits a separately authorized protective Stop.
 - Check recovery before allowing positive current again. The owner combines the saved intent, current charger Boot,
   native evidence, and the journal. Reconciliation can preserve reports for normal delivery without performing a
   new charging action.
 - Keep persisted keys and the reserved station profile ID stable across checkout layout changes. Historical
   rollback rehearsal still validates its known old layouts and builds.
+
+## Follow a session Stop
+
+1. `ManagedSessionStop.accept()` saves the Home Assistant request against the exact open session and current
+   control revision. A vendor-app Stop reaches the gateway, which maps its transaction ID to the same local session.
+   [Local request](../ics_proxy_core/engine/managed_session_stop.py) · [Vendor request](../ics_proxy_core/engine/gateway.py)
+2. Immediately before send, both paths use the shared Stop decision in `ControlDecisions`. The decision can allow
+   a send on the original charger Boot, reuse an exact acceptance, wait for an earlier attempt's report, or find
+   that the target is no longer open. Possible dispatch is recorded before the wire send.
+   [Shared decision](../ics_proxy_core/engine/control_decisions.py) · [Wire boundary](../ics_proxy_core/engine/rpc.py)
+3. The charger reply is recorded against that attempt. A matching `Accepted` lets the owner wait for closure.
+   An actual closing report establishes closure of the exact session. Receipt settlement still checks for an
+   exact rejection, including a rejection saved in a separate checkpoint.
+   [Command evidence](../ics_proxy_core/engine/command_outcomes.py) · [Stop settlement](../ics_proxy_core/engine/stop_settlement.py)
+
+Session Stop leaves app or schedule mode in place. Pause claims a zero hold and can also stop the exact session.
+With current independent zero evidence, Pause and the vendor app can wait for an unanswered Stop on the same
+charger connection. A newer Pause can act after reconnecting. Lost zero or fresh draw can require a separately
+authorized protective Stop. The [settlement checks](../tools/check_control_settlement.py) cover both local and
+vendor request orders, including lost replies and overlapping Pause.
+
+## Follow a Return to app or schedule
+
+1. `accept_return()` saves the request under the current Pause. `claim_restore_request()` can mark it running
+   before charger checks begin. The physical ticket is claimed later.
+   [Request and preflight](../ics_proxy_core/engine/control_decisions.py)
+2. The recovery coordinator reads the charger. `prepare_release_attempt()` checks the fresh zero evidence and
+   rechecks the original intent, connection, and ticket. It binds an explicit Return to that zero-hold ticket
+   and Boot.
+   [Recovery coordinator](../ics_proxy_core/engine/recovery_coordinator.py)
+3. `claim_release()` takes the physical ticket. The local executor rechecks the guard at the wire boundary.
+   A verified ceiling can publish shared control in `complete_release()`. Restoring zero uses the same release
+   ticket and still checks the original Boot. [Local executor](../ics_proxy_core/engine/local_control.py)
+4. `settle_release()` uses the attempt's actual send, reply, verification, and rollback evidence to decide
+   whether to finish, wait, or record a fault. [Release policy](../ics_proxy_core/engine/recovery_policy.py)
 
 The [developer guide](developer.md) describes the engine, model, Home Assistant, recovery discovery and installation
 rehearsal test suites.

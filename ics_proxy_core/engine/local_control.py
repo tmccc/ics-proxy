@@ -20,7 +20,7 @@ from .command_outcomes import transaction_reply_status
 from .command_processor import CommandPriority, CommandProcessor
 from .composite import ExcessiveCompositeError, FutureScheduleError, verify_composite
 from .connection_scope import CloudAttemptScope
-from .control_decisions import ControlDecisions, ProveStop, StopDecision, StopReplyUnconfirmedError, StopZeroEvidence
+from .control_decisions import ControlDecisions, ProveStop, StopReplyUnconfirmedError, StopZeroEvidence
 from .incident_observation import IncidentObservation, ObservationKind, ObservedReply
 from .managed_intent import decode_intent, read_pause_claim
 from .policy import DeniedError, Policy, number
@@ -671,7 +671,7 @@ class LocalControl:
                     boot,
                     ticket,
                     protective=protective(),
-                    join_unanswered=stop_zero is not None and stop_zero.stop_zero_verified(local),
+                    zero_verified=stop_zero is not None and stop_zero.stop_zero_verified(local),
                 ):
                     raise _StopAlreadyHandledError
 
@@ -709,16 +709,12 @@ class LocalControl:
                     proof = await prove_stop(local, cap_error is not None, awaiting_report)
                     stop_guard = proof.check
                     observed_flowing = proof.flowing
-                if (
-                    stop_zero is not None
-                    and not protective()
-                    and self.decisions.stop_decision(local, join_unanswered=True) is StopDecision.WAIT_FOR_REPORT
-                ):
+                if stop_zero is not None and not protective() and self.decisions.stop_wait_needs_zero_check(local):
                     await stop_zero.refresh_stop_zero(local)
             if local is not None and self.decisions.stop_needed(
                 local,
                 protective=protective(),
-                join_unanswered=stop_zero is not None and stop_zero.stop_zero_verified(local),
+                zero_verified=stop_zero is not None and stop_zero.stop_zero_verified(local),
             ):
                 try:
                     stop_answer = await call("RemoteStopTransaction", commands.remote_stop_transaction(local))
