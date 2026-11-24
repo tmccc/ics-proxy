@@ -40,8 +40,10 @@ async def cloud_lifecycle(rig, session, charger, identifier):
 
 # Intent: a genuine accepted/closed cloud lifecycle needs no evidence tool and leaves ordinary Pause available.
 # Why: repairing an unbound grant must preserve normal one-shot command binding and retirement.
-async def test_completed_vendor_start_needs_no_operator(tmp_path, tls, unused_tcp_port, monkeypatch):
+async def test_completed_vendor_start_needs_no_operator(tmp_path, tls, unused_tcp_port, monkeypatch, capsys):
     async with managed_bench(tmp_path, tls, unused_tcp_port) as rig:
+        strategy = strategy_file(rig, tmp_path)
+        config, native_port = tmp_path / "trial.json", rig.prepared.observer.port
         session = managed_session(rig)
         await session.start()
         c = ManagedController(session)
@@ -53,6 +55,13 @@ async def test_completed_vendor_start_needs_no_operator(tmp_path, tls, unused_tc
             c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
             assert (await healthy(c))["local_hold_verified"]
             assert len(starts(rig)) == 1 and not session.journal.get(KEY)
+            # Discovery cannot borrow the running proxy's journal ownership even when it appears paused.
+            with pytest.raises(RecoveryRequiredError, match="active owner"):
+                await operator.run("inspect", config, strategy, None, native_port)
+            await c.charging.close()
+            await crash(session)
+        assert await operator.run("inspect", config, strategy, None, native_port) == 0
+        assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {"candidates": [], "charging_started": False}
 
 
 # Intent: exact independent evidence retires only the accepted unbound cloud command, retaining zero and fresh intent.
@@ -96,9 +105,32 @@ async def test_unbound_vendor_start_requires_evidence_and_new_pause(
             await c.charging.close()
             await crash(session)
         before = list(rig.bench.device_calls)
+        journal_before = rig.prepared.config.journal.read_bytes()
         assert await operator.run("inspect", config, strategy, None, native_port, kind="vendor-start") == 0
         candidate = json.loads(capsys.readouterr().out.splitlines()[-1])["candidate"]
         assert candidate["mutation_token"] == mutation and candidate["grant_token"] == grant["token"]
+        assert await operator.run("inspect", config, strategy, None, native_port) == 0
+        # Discovery uses the same exact candidate as a named inspection and leaves attested facts to the operator.
+        discovered = json.loads(capsys.readouterr().out.splitlines()[-1])
+        assert discovered == {
+            "candidates": [
+                {
+                    "kind": "vendor-start",
+                    "candidate": candidate,
+                    "required_operator_fields": [
+                        "command_no_longer_pending",
+                        "evidence_sha256",
+                        "original_state_independently_verified",
+                        "verified_at_epoch",
+                    ],
+                },
+            ],
+            "charging_started": False,
+        }
+        assert rig.prepared.config.journal.read_bytes() == journal_before
+        assert rig.bench.device_calls == before
+        with pytest.raises(SecurityError, match="explicit debt kind"):
+            await operator.run("reconcile", config, strategy, None, native_port)
         evidence = candidate | {
             "command_no_longer_pending": True,
             "original_state_independently_verified": True,

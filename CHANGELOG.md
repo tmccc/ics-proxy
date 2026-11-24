@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a checked procedure to restore the original vendor route and current on an unplugged managed charger.
+- List eligible fault reconciliation candidates with one read-only inspection.
 - Fixed Solar Display 2 showing grey charger buttons when its Home Assistant touch automation was enabled.
 - Keep damaged saved Start and Stop replies for diagnosis while recovering from valid evidence.
 - Use stable recovery reasons for new current and history records while still reading older journals.

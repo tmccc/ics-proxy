@@ -48,6 +48,11 @@ proxy](../ics_proxy_core/engine/store.py#L40). Use the validated private evidenc
 The baseline capture supplies the original configuration. The native schedule, commissioning capability digest,
 and OCPP Boot evidence must be obtained separately before commissioning.
 
+Plan charger firmware updates with the installer. An update can change the Boot message, saved settings or
+schedule, or the format of readings the proxy checks. These changes can block charging or latch a fault.
+Keep the existing baseline and journal, and verify the updated firmware against the commissioning requirements
+before resuming proxy control.
+
 ## First handover
 
 1. After the preflight passes, use the authorized charger controls to set both the saved and effective user
@@ -84,6 +89,10 @@ protected state files, and systemd watchdog support. Adapt the executable, check
 Management settings use `host`, `port`, and `token_file` in a private JSON file. The host is `127.0.0.1`.
 The token file contains a JSON object with `token`, a private 64-character lowercase hexadecimal value.
 
+Choose an idle window to stop or restart the proxy. During a normal shutdown, it tries to stop any open session
+and verify both closure and zero output before exiting. If either check cannot be completed, the saved shutdown
+status reports `shutdown_uncertain`. Verify the actual charger state before assuming the session closed.
+
 Run `health` and `incident` as the service account that owns the private configuration and state files. Both
 commands read saved records. `incident` reports the most recent local Start by default.
 
@@ -102,39 +111,91 @@ A command can remain uncertain until the charger reports more evidence.
 
 ## Recover availability
 
-1. Check Home Assistant’s **Control mode** and run `health`. Use `health_blockers` to distinguish a vendor outage
-   from a stopped service, disconnected charger, stale native readings, or an unsettled command. Check the
-   service manager and restore the affected connection. Keep the private journal and baseline. Charging may
-   continue when readings are unavailable. Verify session closure independently before treating it as stopped.
-2. The proxy retries the vendor connection while keeping its charger listener open. During a vendor outage, fresh
-   charger evidence can still make local controls available, and a local Start requires valid cached authorization.
-   After a restart or charger reconnect, the proxy needs a fresh charger Boot and independent evidence before it
-   enables positive charging actions. A clean automatic Pause caused by a failed vendor connection can release
-   when the vendor returns and recovery checks pass. A Pause you requested stays in effect until you request
-   Return or deliberately start a new local session.
-3. If the proxy remains at **Needs attention**, use `health` and, for a Start or Stop, the relevant `incident`
-   report. Where Pause is available, request it and wait for **Paused locally** and independently verified zero
-   and session closure. Use **Return to app / schedule** when it becomes available and you are ready for the app
-   and schedule to control charging again. If the proxy still awaits evidence, leave the hold in effect.
+Start with Home Assistant’s **Control mode** and the `health` command above. Keep the private journal and
+baseline so the proxy can recover the original session and commands. Use `health_blockers` and `fault` in the
+saved status to identify what needs attention.
 
-For an outcome that needs operator reconciliation, use the tool for the exact recorded issue. Start with `--help`
-and `check`. The command reconciliation tools also have an `inspect` action. Reconciliation requires a stopped
-service, exclusive access to its journal, verified closed zero, and the evidence required for the specific issue.
-Keep a private state backup before writing reconciliation records. The tools cover
-[native history](../tools/acknowledge_native_history.py),
-[a cloud-accepted Start awaiting a mapping](../tools/reconcile_managed_delivery.py), and
-[other specific unsettled commands or reports](../tools/reconcile_managed_debt.py).
+| What you see | What to do |
+| --- | --- |
+| `service_not_running` or `status_stale` | Check the service manager. If shutdown was uncertain, check whether the charger still has an open session. |
+| `charger_disconnected` or `boot_unverified` | Check the charger connection. After a restart or reconnect, the proxy needs a fresh charger Boot and independent readings before it permits charging again. |
+| `cloud_disconnected` | Check the vendor connection. The proxy retries it while keeping the charger listener open. Fresh charger evidence can make local controls available, and local Start requires valid cached authorization. A clean automatic Pause can release when the vendor returns and recovery checks pass. |
+| `native_stale` or `native_observation_unavailable` | Check the charger’s local network connection and HTTP readings. Charging may continue while readings are missing. |
+| `command_outcome_unknown` or **Needs attention** after Start or Stop | Read the matching `incident` report above. For a Stop, choose `stop` for a local request or `vendor-stop` for a vendor-app request. Verify the charger’s actual state before acting on an uncertain result. |
 
-## Roll back software or restore the original setup
+In normal app or schedule operation, three unavailable or stale full supervision checks trigger a request for
+a 0 A hold. Timing depends on how long the checks take. A session can stay open at 0 A and resume when the
+recovery checks pass.
+
+Three refused supervision checks can latch a fault when the charger returns conflicting or unsupported data.
+A missing reading leaves that refusal count in place. A valid, accepted check clears the count. A strict refusal
+while verifying a new charger connection can latch immediately. If the fault persists, verify the configured
+charger, its firmware and settings against the commissioned baseline and review the recorded fault before proceeding.
+
+If you need charging to stop and **Pause charger** is available, request it and wait for **Paused locally**.
+Independently verify zero output and session closure. If the proxy still awaits evidence, leave the hold in
+effect. A Pause you requested stays in effect until you deliberately start a new local session or use
+**Return to app / schedule** when it becomes available.
+
+### Reconcile a recorded outcome
+
+Choose the tool that matches the recorded issue. Start with `--help` and `check` to verify the inputs. For a
+command or report, `inspect` shows the exact candidate after the service has stopped.
+
+| Recorded issue | Tool |
+| --- | --- |
+| Missing native history or unconfirmed timed Start attempts tied to history recovery | [`acknowledge_native_history.py`](../tools/acknowledge_native_history.py) |
+| A vendor-accepted Start is awaiting a transaction mapping | [`reconcile_managed_delivery.py`](../tools/reconcile_managed_delivery.py) |
+| A specific unsettled command or report needs independent evidence | [`reconcile_managed_debt.py`](../tools/reconcile_managed_debt.py) |
+
+To see which unsettled commands or reports are eligible for reconciliation, run the read-only inspection as
+the service account with the proxy stopped. Each result lists the candidate and the fields you must verify
+independently.
+
+```bash
+python -B tools/reconcile_managed_debt.py inspect --config /etc/ics-proxy/proxy.json \
+  --native-bounded-spec /etc/ics-proxy/native-spec.json
+```
+
+Reconciliation requires a stopped service, exclusive access to its journal, a verified closed session at zero
+output, and independent evidence for the specific issue. Keep a private state backup before writing
+reconciliation records.
+
+## Roll back software
 
 [Software rollback](release-process.md) concerns the proxy build and its journal while the charger stays on the
 proxy route. Keep the state directory across upgrades. The rollback checker covers specific historical build
 and journal combinations. The release rehearsal tests the candidate and its verified predecessor on a simulated
 installation with the same journal.
 
-Direct operation on the original vendor backend requires restoring the charger route and settings after verified
-cleanup. The managed service has no supported procedure for that operation. The 6 A commissioning trial has a
-profile cleanup command that leaves the charger at the verified 6 A limit and leaves route restoration pending.
-Selecting 6 A in Home Assistant leaves the commissioned 32 A capability in place, and the trial cleanup refuses
-that capability. Arrange an installation-specific restoration procedure with the installer before disconnecting
-the proxy or changing the saved route or current settings.
+## Restore direct vendor control
+
+Use the restoration tool for an authorized removal of the managed proxy. It uses the original route, saved
+current, and charger identity from the same private commissioning files. The loopback tests exercise a full
+restoration and interrupted writes. Verify the installation's firmware and original vendor access with its
+installer before using the procedure on the charger.
+
+1. In Home Assistant, select 6 A while the charger is idle. Request **Pause charger** and wait for **Paused locally**.
+   Check session closure and zero output, then unplug the car. Keep it unplugged until the tool reports completion.
+2. Stop the proxy service and keep it stopped. Keep the charger powered and reachable. Back up the private
+   journal, commissioning files and charger settings.
+3. Run the offline check as the proxy service account. Run the explicit restore action from the same checkout.
+
+```bash
+python -B tools/restore_vendor.py check --config /etc/ics-proxy/proxy.json \
+  --native-bounded-spec /etc/ics-proxy/native-spec.json
+python -B tools/restore_vendor.py restore --config /etc/ics-proxy/proxy.json \
+  --native-bounded-spec /etc/ics-proxy/native-spec.json
+```
+
+The tool verifies the original settings, closed session, and proxy-owned 0 A hold. It records that restoration
+has begun before lowering the charger’s saved and effective limit to 6 A. A temporary listener uses the proxy’s
+existing cleanup code to clear only its recorded profiles. It clears the station profile last and checks the
+charger’s inventory before closing the listener. The tool restores the four saved route fields and verifies the
+vendor connection before restoring and independently checking the original current limit.
+
+If the tool stops partway through, keep the service stopped and the car unplugged. Retain the journal and rerun
+the same restore action after correcting the reported problem. It uses the recorded stage and the charger’s
+actual settings to pick up where it stopped. If the settings conflict with the commissioned record or the
+charger reports an open session, resolve the issue with the installer before proceeding. When the tool reports
+`complete: true`, keep the proxy retired and confirm direct vendor-app access before reconnecting the car.

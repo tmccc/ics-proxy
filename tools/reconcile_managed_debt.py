@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Modified for the standalone iCS proxy repository.
-"""Reconcile one independently attested debt under exclusive offline ownership and verified zero."""
+"""Inspect recorded debts or reconcile one independently attested debt under offline ownership and verified zero."""
 
 from __future__ import annotations
 
@@ -8,12 +8,17 @@ import argparse
 import asyncio
 import os
 import sys
+from dataclasses import fields
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from ics_proxy_core.engine.managed_debt_evidence import ATTESTATIONS  # noqa: E402
-from ics_proxy_core.engine.managed_debt_recovery import debt_candidate, reconcile_debt  # noqa: E402
+from ics_proxy_core.engine.managed_debt_recovery import (  # noqa: E402
+    debt_candidate,
+    inspect_debt_candidates,
+    reconcile_debt,
+)
 from ics_proxy_core.engine.security import SecurityError  # noqa: E402
 from ics_proxy_core.engine.trial_config import private_json  # noqa: E402
 from ics_proxy_core.engine.trial_resources import ResourceBook  # noqa: E402
@@ -23,16 +28,25 @@ from tools.trial_proxy import emit, native_spec, operator_journal  # noqa: E402
 
 # The explicit actions have a read-only native observer and journal owner; none has a charger writer or listener.
 async def run(
-    action: str, config: Path, strategy: Path, evidence_path: Path | None, native_port: int = 80, *, kind: str
+    action: str,
+    config: Path,
+    strategy: Path,
+    evidence_path: Path | None,
+    native_port: int = 80,
+    *,
+    kind: str | None = None,
 ) -> int:
     if type(native_port) is not int or not 1 <= native_port <= 65535:
         raise SecurityError("native HTTP port is invalid")
-    if kind not in ATTESTATIONS:
+    if kind is None and (action != "inspect" or evidence_path is not None):
+        raise SecurityError("select an explicit debt kind to check or reconcile evidence")
+    if kind is not None and kind not in ATTESTATIONS:
         raise SecurityError("operator debt kind is invalid")
     prepared = preflight_native(config)
     spec = native_spec(strategy, prepared)
     evidence = None
     if evidence_path is not None:
+        assert kind is not None
         forbidden = [
             config,
             strategy,
@@ -58,7 +72,25 @@ async def run(
     with operator_journal(prepared.config, spec, inspect=action == "inspect") as journal:
         book = ResourceBook(journal, prepared.baseline)
         native = await prepared.observer.observe_handover()
-        if action == "inspect":
+        if kind is None:
+            # Show the independent fields still needed without asserting their values or approving a recovery.
+            candidates = inspect_debt_candidates(journal, book, spec, native)
+            emit(
+                {
+                    "candidates": [
+                        {
+                            "kind": candidate_kind,
+                            "candidate": candidate,
+                            "required_operator_fields": sorted(
+                                {field.name for field in fields(ATTESTATIONS[candidate_kind])} - candidate.keys()
+                            ),
+                        }
+                        for candidate_kind, candidate in candidates.items()
+                    ],
+                    "charging_started": False,
+                }
+            )
+        elif action == "inspect":
             emit({"candidate": debt_candidate(journal, book, spec, native, kind), "charging_started": False})
         else:
             assert evidence is not None
@@ -72,7 +104,11 @@ def main() -> int:
     parser.add_argument("action", nargs="?", choices=("check", "inspect", "reconcile"), default="check")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--native-bounded-spec", type=Path, required=True)
-    parser.add_argument("--kind", choices=tuple(ATTESTATIONS), required=True)
+    parser.add_argument(
+        "--kind",
+        choices=tuple(ATTESTATIONS),
+        help="omit with inspect to list candidates. Required for check, reconcile, or --evidence.",
+    )
     parser.add_argument("--evidence", type=Path)
     parser.add_argument("--native-port", type=int, default=80)
     args = parser.parse_args()

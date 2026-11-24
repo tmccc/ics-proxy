@@ -131,6 +131,8 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
     api: ManagementServer | None = None
     incident: IncidentRecorder | None = None
     try:
+        if session.journal.phase.read().cleanup:
+            raise RecoveryRequiredError("managed service cannot start after charger restoration has begun")
         ownership = None
         try:
             ownership = session.journal.retain_ownership()

@@ -29,8 +29,8 @@ plan and transaction history. Commissioning uses 6 A. After native current prepa
 the service supports whole-amp selections from 6 A to 32 A.
 
 The saved charger schedule stays fixed while the proxy is installed. **Return to app / schedule** restores
-vendor-app and schedule control through the proxy. The managed service has no supported procedure to restore
-direct operation on the original vendor backend. See [commissioning and operation](docs/commissioning.md).
+vendor-app and schedule control through the proxy. See [restore direct vendor control](docs/commissioning.md#restore-direct-vendor-control)
+to remove the proxy from a commissioned installation.
 
 Native charger readings use authenticated plain HTTP. Keep that traffic on a trusted, isolated local
 network segment. See [security](SECURITY.md) for the OCPP connection settings.

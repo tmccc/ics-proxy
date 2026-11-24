@@ -55,3 +55,7 @@ Confirm the installed source fingerprint, current setting, state, vendor availab
 The rollback checker accepts only exact historical build and journal pairs with rehearsed compatibility. It refuses
 unsupported pairs. Preserve the verified installation and private journal backup across an update. A pending or
 uncertain charger outcome must be reconciled before a rollback can safely use a previous journal.
+
+Builds from before stable recovery reasons can reject a newer failure record for an unsettled current change.
+Reconcile that change with the build that recorded it before considering a downgrade. The installation
+rehearsal covers a settled journal and does not establish downgrade compatibility for every failure state.

@@ -552,6 +552,25 @@ def debt_candidate(
     if kind not in ATTESTATIONS:
         raise RecoveryRequiredError("unknown operator reconciliation kind")
     require_original_zero(j, book, spec, n)
+    return _debt_candidate(j, spec, kind)
+
+
+# Audit the shared installation and zero proof once before listing any exact debts on the inspection copy.
+def inspect_debt_candidates(
+    j: Journal, book: ResourceBook, spec: NativeBoundedSpec, n: HandoverEvidence
+) -> dict[str, dict[str, Any]]:
+    require_original_zero(j, book, spec, n)
+    candidates = {}
+    for kind in ATTESTATIONS:
+        try:
+            candidates[kind] = _debt_candidate(j, spec, kind)
+        except RecoveryRequiredError:
+            continue
+    return candidates
+
+
+# Select a particular debt only after the caller establishes the common physical and commissioned proof.
+def _debt_candidate(j: Journal, spec: NativeBoundedSpec, kind: str) -> dict[str, Any]:
     snapshot = debt_snapshot(j, spec, kind)
     require_common_debt_idle(j, kind, snapshot)
     if kind == COMBINED_KIND:

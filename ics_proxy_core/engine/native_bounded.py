@@ -305,7 +305,7 @@ class NativeBoundedSpec:
             raise SecurityError("native bounded specification belongs to another charger")
         measured = self._inspect(native, identity, route, user_a, allow_unplugged=allow_unplugged)
         measured.require()
-        _require_ready(native, closed or user_a == 32, allow_unplugged and route == "trial" and user_a == 6)
+        _require_ready(native, closed or user_a == 32, allow_unplugged and user_a == 6)
 
     # Full configuration equality must win even when the independent measured current is excessive.
     def _inspect(
@@ -326,7 +326,7 @@ class NativeBoundedSpec:
             self.hardware_identity,
             user_a,
             False,
-            allow_unplugged=allow_unplugged and route == "trial" and user_a == 6,
+            allow_unplugged=allow_unplugged and user_a == 6,
         )
         if (
             encoded(native.configuration) != encoded(expected)
@@ -390,11 +390,19 @@ class NativeBoundedSpec:
             raise SecurityError("existing native profiles block a fresh connected trial")
 
     # Only a separately authorized completed release may observe normal32A activity without claiming a paused car.
-    def require_normal(self, native: HandoverEvidence, identity: str) -> None:
+    def require_normal(self, native: HandoverEvidence, identity: str, *, allow_unplugged: bool = False) -> None:
         expected = self.configuration("original", 32)
         if identity != expected["Id"]:
             raise SecurityError("normal native restoration belongs to another charger")
-        require_native(native, identity, self.hardware_identity, 32, False)
+        require_native(
+            native,
+            identity,
+            self.hardware_identity,
+            32,
+            False,
+            allow_unplugged=allow_unplugged,
+            allow_full_current=allow_unplugged,
+        )
         if (
             encoded(native.configuration) != encoded(expected)
             or native.saved_schedule_digest != self.saved_schedule_digest

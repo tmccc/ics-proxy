@@ -435,12 +435,16 @@ class NativeBoundedHandover:
                 j.identity,
                 allow_unplugged=self.allow_unplugged,
             )
-        return self.spec._inspect(native, j.identity, route, allow_unplugged=self.allow_unplugged)
+        return self.spec._inspect(native, j.identity, route, allow_unplugged=self._allow_unplugged(route))
+
+    # Only a retired installation may verify original-route settings while the vehicle is unplugged.
+    def _allow_unplugged(self, route: str) -> bool:
+        return self.allow_unplugged and (route == "trial" or self.gateway.journal.phase.read().cleanup)
 
     # Every public native validator still enforces all bounds and its original closed-zero readiness.
     def require(self, native: HandoverEvidence, *, route: str = "trial", closed: bool = False) -> None:
         self._inspect(native, route=route).require()
-        _require_ready(native, closed, self.allow_unplugged, None)
+        _require_ready(native, closed, self._allow_unplugged(route), None)
 
     # A private verdict retains selected-meter facts while the controller completes nonmeasurement checks.
     def _selected_measurements(self, native: HandoverEvidence, measured: MeasuredValues) -> MeasuredValues:
@@ -974,13 +978,17 @@ class NativeBoundedHandover:
             identifier = payload.get("id")
             if set(payload) != {"id"}:
                 raise SecurityError("native bounded clear requires an exact owned profile")
-            if self.gateway.journal.phase.read().active:
+            phase = self.gateway.journal.phase.read()
+            if phase.active:
                 if identifier == HUB_PROFILE_ID or not any(
                     resource.kind == "profile" and resource.identifier == identifier for resource in present
                 ):
                     raise SecurityError("native bounded clear requires an exact cloud-owned profile")
-            elif not present or present[0].identifier != identifier:
-                raise SecurityError("native bounded cleanup requires the exact next owned resource")
+            else:
+                if phase.value == "rollback":
+                    self.book.require_zero_station(present)
+                if not present or present[0].identifier != identifier:
+                    raise SecurityError("native bounded cleanup requires the exact next owned resource")
         else:
             self.require_known_session(native)
             if (
@@ -1028,7 +1036,9 @@ class NativeBoundedHandover:
         )
 
     # Stop actual known work, drain real lifecycle delivery, then clear exact owned profiles with station last.
-    async def cleanup(self, quiesce: Callable[[], Awaitable[None]]) -> dict[str, Any]:
+    async def cleanup(
+        self, quiesce: Callable[[], Awaitable[None]], *, connection: tuple[int, str] | None = None
+    ) -> dict[str, Any]:
         if managed_current_ceiling(self.gateway.journal, self.spec) != 6:
             raise SecurityError("retire the managed current capability before legacy cleanup")
         async with self.lock:
@@ -1081,7 +1091,16 @@ class NativeBoundedHandover:
             gateway.decide(begin_cleanup, priority=CommandPriority.RESTRICT)
             await quiesce()
             epoch = gateway._charger_epoch
-            async with gateway.charger.sequence(0, lambda: gateway._require_epoch("charger", epoch)) as call:
+
+            # Managed retirement clears profiles only on the exact connection and Boot it commissioned for cleanup.
+            def require_connection() -> None:
+                gateway._require_epoch("charger", epoch)
+                if connection is not None:
+                    if connection != (epoch, gateway.boot_observation) or not gateway.current_boot_seen(epoch):
+                        raise RecoveryRequiredError("cleanup connection or Boot changed")
+                    self.spec.require_boot(journal.get("boot"))
+
+            async with gateway.charger.sequence(0, require_connection) as call:
                 while True:
                     native = await self.read(closed=True)
 
@@ -1137,25 +1156,31 @@ class NativeBoundedHandover:
         state = journal.get("native_bounded_handover", {})
         current = await self.observe()
         if state.get("stage") == "route_intent" and current.configuration == self.spec.configuration("original"):
-            await self.read(route="original", closed=True)
+            self._require_route_cleanup(await self.read(route="original", closed=True))
             self.gateway.decide(self._confirm_restored_route)
             return
-        native = await self.read(closed=True)
-        require_lifecycle_idle(self.gateway)
-        if self.book.owned_present(native.physical):
-            raise SecurityError("native bounded resources remain installed")
+        self._require_route_cleanup(await self.read(closed=True))
         self.save("route_intent")
         await retire()
         disconnected = await self.read(closed=True)
-        if disconnected.physical.upstream_connected:
+        self._require_route_cleanup(disconnected)
+        if self.gateway.charger.sender is not None or disconnected.physical.upstream_connected:
             raise UnavailableError("retired proxy's native connection must be observed offline before routing")
         self.save("route_intent", backend_outage_at=disconnected.physical.observed_at)
         await patch({key: self.spec.original_configuration[key] for key in self.spec.trial_route})
-        await self.read(route="original", closed=True)
+        self._require_route_cleanup(await self.read(route="original", closed=True))
         self.gateway.decide(self._confirm_restored_route)
+
+    # Recheck that teardown or a lost reply did not leave any proxy-owned resource installed.
+    def _require_route_cleanup(self, native: HandoverEvidence) -> None:
+        require_lifecycle_idle(self.gateway)
+        if self.book.owned_present(native.physical):
+            raise SecurityError("native bounded resources remain installed")
 
     # The original route is confirmed only by an actual post-change read.
     def _confirm_restored_route(self) -> None:
+        if self.gateway.charger.sender is not None:
+            raise RecoveryRequiredError("proxy transport remains attached during original route verification")
         self.save("awaiting_backend", route_restored=True)
 
     # Reconnection requires an actual fresh offline view followed by online, after the original route was restored.
@@ -1219,7 +1244,7 @@ class NativeBoundedHandover:
 
     # No unknown native profile or newly active session may release the independent limit during restoration.
     def require_restore_idle(self, native: HandoverEvidence) -> None:
-        self.spec.require(native, self.gateway.journal.identity, "original", closed=True)
+        self.require(native, route="original", closed=True)
         require_lifecycle_idle(self.gateway)
         if not native.physical.upstream_connected:
             raise UnavailableError("original backend disconnected before native current restoration")
@@ -1230,7 +1255,7 @@ class NativeBoundedHandover:
     # Ordinary manufacturer charging may begin after the authorized restore; retain its real session and history.
     def require_normal_restoration(self, native: HandoverEvidence) -> None:
         journal = self.gateway.journal
-        self.spec.require_normal(native, journal.identity)
+        self.spec.require_normal(native, journal.identity, allow_unplugged=self._allow_unplugged("original"))
         if not native.physical.upstream_connected:
             raise SecurityError("normal manufacturer settings and native connection remain unverified")
         self.book.check_originals(native.physical)
