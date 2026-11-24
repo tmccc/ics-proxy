@@ -16,8 +16,13 @@ display, touch and brightness components, its fallback dashboard, and the render
 3. Adapt [esphome-canvas.yaml.example](esphome-canvas.yaml.example) to the board package and include
    [canvas_frame.h](canvas_frame.h). Keep the image URL and image-scoped authorization in local ESPHome secrets.
 4. Confirm that the automation entity ID used by the view and firmware matches the installed automation.
-   Enable the automation in Home Assistant for the charger buttons to become available.
+   In the view, write the quoted entity ID directly in both `is_state()` and `state_attr()` so GeekMagic
+   loads the automation’s state. Enable the automation in Home Assistant.
 
 Start calls `ics_proxy.session_command` with `action: start` and the displayed revision. Stop calls it with
 `action: stop_session` and the displayed session target. The client returns confirmation for the exact request.
 The example leaves charging decisions, retries, and recovery with the proxy.
+
+If Home Assistant offers Start but the display says **Charger buttons unavailable**, check that the touch
+automation is enabled, its entity ID matches both calls in the template, and the request helper is available.
+Once the frame refreshes, the display should say **Ready to start** when the proxy allows Start and no request is pending.

@@ -1,6 +1,7 @@
 """Exercise the real display automation in offline Home Assistant Core."""
 
 import asyncio
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,6 +21,13 @@ VIEW = "replace-with-editor-view-id"
 TARGET = "b" * 64
 REVISION = 42
 START_MARKER = f"start:{REVISION:014x}"
+
+
+def test_display_view_declares_touch_automation_to_renderer():
+    # GeekMagic prefetches only entity IDs it can read directly from these template calls.
+    view = (PROJECT / "view.html.jinja").read_text()
+    references = re.findall(r"""\b(?:states|state_attr|is_state)\(\s*['"]([^'"]+)['"]""", view)
+    assert AUTOMATION in references
 
 
 # Intent: test the shipped display tap guards and exact Start/Stop feedback inside Home Assistant.
@@ -130,8 +138,6 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         html = rendered.async_render({"now": datetime.now(UTC)}, parse_result=False)
         assert "Paused locally" not in html and "Open session" in html
         # Decode every produced CSS cell after simulating the panel's RGB565 conversion.
-        import re
-
         colors = re.findall(r"width:3px;height:3px;background:#([a-f0-9]{6})", html)
         raw = ""
         for color in colors:
