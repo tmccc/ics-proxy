@@ -1187,14 +1187,15 @@ class NativeBoundedHandover:
         require_lifecycle_idle(gateway)
         state = journal.get("native_bounded_handover", {})
         fault = journal.get("trial_inventory_fault", {})
-        # A recorded direct-vendor route retry can independently verify that a reappeared profile is gone.
+        # After verified cleanup, a route retry can independently verify that a reappeared profile is gone.
         if (
             isinstance(fault, dict)
             and fault.get("reason") == "resource_reappeared"
             and isinstance(resource := fault.get("resource"), str)
             and resource.startswith("profile:")
             and journal.phase.read().value == "backend_restore_pending"
-            and state.get("stage") == "route_intent"
+            and state.get("stage") in ("awaiting_backend", "route_intent")
+            and not state.get("route_restored")
             and journal.get(MANAGED_RESTORE_INTENT) == self.spec.digest
             and self.allow_unplugged
             and gateway.charger.sender is None

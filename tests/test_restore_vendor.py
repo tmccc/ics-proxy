@@ -248,9 +248,12 @@ async def test_restore_refuses_a_cleanup_connection_replacement(tmp_path, tls, u
         assert 7001 in rig.bench.firmware.profiles and rig.bench.firmware.effective_limit() == 0
 
 
-# Intent: refuse a profile that reappears during listener retirement, then resume after independent cleanup.
+# Intent: refuse a profile that reappears before routing, then resume after independent cleanup.
 # Why: the route change requires verified absence even after a previously confirmed clear.
-async def test_restore_refuses_a_profile_reappearing_after_cleanup(tmp_path, tls, unused_tcp_port, monkeypatch):
+@pytest.mark.parametrize(
+    "stage", ["awaiting_backend", "route_intent"], ids=["before-route-check", "listener-retirement"]
+)
+async def test_restore_refuses_a_profile_reappearing_after_cleanup(tmp_path, tls, unused_tcp_port, monkeypatch, stage):
     async with commissioned(
         tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
     ) as test:
@@ -259,10 +262,20 @@ async def test_restore_refuses_a_profile_reappearing_after_cleanup(tmp_path, tls
         await stop_paused(test)
         saved_profile = copy.deepcopy(bench.firmware.profiles[7001])
 
-        # Model the charger independently resurrecting that profile as its proxy connection goes offline.
+        # Model the charger independently resurrecting a previously cleared profile.
         def reappear():
             assert 7001 not in bench.firmware.profiles
             bench.firmware.profiles[7001] = saved_profile
+
+        if stage == "awaiting_backend":
+            complete_cleanup = NativeBoundedHandover._complete_cleanup
+
+            # The cleanup journal commits before the first route check can observe the profile again.
+            def complete_and_reappear(handover):
+                complete_cleanup(handover)
+                reappear()
+
+            monkeypatch.setattr(NativeBoundedHandover, "_complete_cleanup", complete_and_reappear)
 
         # Inspect the saved fault after the restoration tool closes its journal.
         def inventory_fault():
@@ -273,7 +286,8 @@ async def test_restore_refuses_a_profile_reappearing_after_cleanup(tmp_path, tls
         config, spec = tmp_path / "trial.json", spec_file(tmp_path, rig)
         args = ("restore", config, spec, rig.prepared.observer.port)
         restore = asyncio.create_task(run(*args))
-        charger = asyncio.create_task(cleanup_charger(test, on_disconnect=reappear))
+        on_disconnect = reappear if stage == "route_intent" else None
+        charger = asyncio.create_task(cleanup_charger(test, on_disconnect=on_disconnect))
         try:
             with pytest.raises(SecurityError, match="resource_reappeared"):
                 await asyncio.wait_for(restore, 8)
@@ -285,6 +299,10 @@ async def test_restore_refuses_a_profile_reappearing_after_cleanup(tmp_path, tls
 
         records, phase = journal_facts(rig.prepared.config.journal)
         assert phase == "backend_restore_pending"
+        with closing(sqlite3.connect(rig.prepared.config.journal)) as db:
+            row = db.execute("SELECT value FROM meta WHERE key='native_bounded_handover'").fetchone()
+            handover = json.loads(row[0])
+        assert handover["stage"] == stage and not handover.get("route_restored")
         fault = {"reason": "resource_reappeared", "resource": "profile:7001"}
         assert inventory_fault() == fault
         rig.prepared.config.certificate.unlink()

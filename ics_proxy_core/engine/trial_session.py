@@ -501,11 +501,15 @@ class TrialSession:
                     self.journal.get("managed_mode")
                     and self.journal.get("trial_binding")
                     and not self.journal.fault.latched()
-                    and history_recovery_idle(self.journal, retain_queued_reports=True, allow_closed_stop_receipts=True)
                 ):
-                    refusal = self._native_refusal(error)
-                    diagnostic = {**refusal.diagnostic, "source": STARTUP_HISTORY_OMISSION}
-                    self.gateway.controls.decisions.latch_fault(refusal.classification, diagnostic=diagnostic)
+                    # An exact saved Stop ACK can finish locally before history recovery checks the queue.
+                    head = self.journal.next_delivery() if not self.started else None
+                    if head is not None and head.action == "StopTransaction":
+                        self.gateway.decide(self.runtime.settle_saved_lifecycle)
+                    if history_recovery_idle(self.journal, retain_queued_reports=True, allow_closed_stop_receipts=True):
+                        refusal = self._native_refusal(error)
+                        diagnostic = {**refusal.diagnostic, "source": STARTUP_HISTORY_OMISSION}
+                        self.gateway.controls.decisions.latch_fault(refusal.classification, diagnostic=diagnostic)
                 raise
             else:
                 self.gateway.decide(lambda: self._accept_startup_observation(native), priority=CommandPriority.RESTRICT)

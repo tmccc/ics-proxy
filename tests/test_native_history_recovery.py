@@ -21,18 +21,20 @@ from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_current import capability_value
 from ics_proxy_core.engine.managed_intent import OWNER_PAUSE, ManagedRequests
 from ics_proxy_core.engine.native_faults import NativeContentError, diagnostic_type
-from ics_proxy_core.engine.native_history import audit_history, history_policy
+from ics_proxy_core.engine.native_history import MissingOriginalHistoryError, audit_history, history_policy
 from ics_proxy_core.engine.native_history_recovery import acknowledge_history_policy, matches_history_fault
 from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError, fingerprint
 from ics_proxy_core.engine.trial_handover_evidence import HandoverEvidence
 from ics_proxy_core.engine.trial_resources import ResourceBook
-from tests.charge_rig import ChargeRig, positive_flow
+from tests.charge_rig import ChargeRig, positive_flow, ready
 from tests.connected_rig import ConnectedBench, strategy_file
+from tests.handover_helpers import crash
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
 from tests.prototype_rig import START
 from tests.recovery_barriers import completed_control
 from tests.runtime_rig import until
+from tests.test_cloud_ack_storage import SqlFault, StorageBench, assert_retained, enqueue, wire_count
 from tests.test_managed_normal_start import natural_stop
 from tests.test_native_bounded_handover import restore_original_route, verify_original_backend
 from tests.test_native_history_archive import unassigned
@@ -934,8 +936,6 @@ async def test_history_acknowledgment_settles_exact_closed_stop(tmp_path, tls, u
 async def test_cold_history_acknowledgement_keeps_queued_exact_stop(
     tmp_path, tls, unused_tcp_port, vendor_id, queued_sample
 ):
-    from ics_proxy_core.engine.native_history import MissingOriginalHistoryError
-
     originals = closed_records()
     async with managed_bench(tmp_path, tls, unused_tcp_port, initial_history=originals) as rig:
         first = managed_session(rig)
@@ -1035,4 +1035,113 @@ async def test_cold_history_acknowledgement_keeps_queued_exact_stop(
                 ]
                 assert not starts(rig)
         finally:
+            await recovered.close()
+
+
+# Intent: a saved positive Stop reply can unblock history repair without reopening either OCPP link.
+# Why: the original history may have rolled off while the proxy was stopped with its ACK write unfinished.
+@pytest.mark.parametrize(
+    ("action", "response"),
+    [
+        ("StopTransaction", "accepted"),
+        ("StopTransaction", "error"),
+        ("StopTransaction", "bad-info"),
+        ("StartTransaction", "accepted"),
+    ],
+)
+async def test_cold_history_omission_with_saved_lifecycle_reply(
+    tmp_path, tls, unused_tcp_port, monkeypatch, capsys, action, response
+):
+    originals = closed_records()
+    async with ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, initial_history=originals, bench_type=StorageBench, cli_route=True
+    ) as b:
+        rig, journal = b.rig, b.session.journal
+        strategy = strategy_file(rig, tmp_path)
+        if action == "StopTransaction":
+            rig.bench.stop_replies = [response]
+        held, local = await enqueue(b, action, 0)
+
+        # Complete the owner's separate Pause before the held cloud response can change delivery health.
+        request, revision = uuid.uuid4().hex, b.controller.requests.intent().revision
+        b.controller.command(request, "pause", revision)
+        await completed_control(b, request, mode="paused", revision=revision + 1, ceiling=0)
+
+        if response == "accepted":
+            fault = SqlFault("delete", held.token)
+            fault.install(journal.db)
+        else:
+            journal.db.execute(
+                "CREATE TRIGGER refuse_stop_rejection BEFORE UPDATE OF state ON outbox WHEN NEW.state='rejected' "
+                "BEGIN SELECT RAISE(ABORT,'synthetic Stop rejection storage refusal'); END"
+            )
+        held.release.set()
+        await until(lambda: b.session.runtime.status.delivery_blocked_cause == "storage")
+        assert_retained(journal, held, saved=True)
+        await b.controller.charging.close()
+        await crash(b.session)
+
+        rig.bench.history = copy.deepcopy(originals[1:])
+        before = list(rig.bench.device_calls), list(rig.bench.calls)
+        accepted_stop = action == "StopTransaction" and response == "accepted"
+        refused = managed_session(rig)
+        try:
+            if action == "StartTransaction":
+                fault.remove(refused.journal.db)
+            elif response != "accepted":
+                refused.journal.db.execute("DROP TRIGGER refuse_stop_rejection")
+            with pytest.raises(MissingOriginalHistoryError):
+                await refused.start()
+            assert not refused.started and not refused.journal.fault.latched()
+            assert_retained(refused.journal, held, saved=True)
+            assert before == (rig.bench.device_calls, rig.bench.calls)
+            if not accepted_stop:
+                assert refused.journal.get("managed_stop_reply_rejection") is None
+                if action == "StartTransaction":
+                    assert refused.journal.vendor_id(local) is None
+                return
+            assert refused.runtime.status.delivery_blocked_cause == "storage"
+            fault.remove(refused.journal.db)
+        finally:
+            await refused.close()
+
+        refused = managed_session(rig)
+        try:
+            with pytest.raises(MissingOriginalHistoryError):
+                await refused.start()
+            assert not refused.started and refused.journal.next_delivery() is None
+            assert refused.journal.outcomes.session(local).closed
+            assert refused.journal.get("managed_native_failure")["source"] == "startup_history_omission"
+            assert refused.journal.fault.classification() == "native_authority_or_preservation_failed"
+        finally:
+            await refused.close()
+
+        preflight = history_tool.preflight_native
+
+        # The operator still reads the actual HTTP fixture using its local test port.
+        def synthetic_native_port(path):
+            prepared = preflight(path)
+            prepared.observer.port = rig.prepared.observer.port
+            return prepared
+
+        monkeypatch.setattr(history_tool, "preflight_native", synthetic_native_port)
+        assert await history_tool.run("acknowledge", tmp_path / "trial.json", strategy) == 0
+        report = json.loads(capsys.readouterr().out.splitlines()[-1])
+        assert report["fault_cleared"] and report["missing_records"] == 1 and not report["charging_started"]
+        assert before == (rig.bench.device_calls, rig.bench.calls)
+
+        recovered = managed_session(rig)
+        await recovered.start()
+        controller = ManagedController(recovered)
+        try:
+            async with rig.charger(recovered) as charger:
+                await introduced(rig, recovered, charger, "after-saved-stop-history-repair")
+                status = await healthy(controller)
+                assert status["local_hold_verified"] and status["history_warning"] == "records_absent_from_charger"
+                assert controller.requests.receipt(request)["state"] == "completed"
+                assert recovered.journal.next_delivery() is None
+                assert wire_count(rig, held.token) == 1 and not starts(rig)
+                await recovered.close()
+        finally:
+            await controller.charging.close()
             await recovered.close()

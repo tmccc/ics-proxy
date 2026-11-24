@@ -411,11 +411,19 @@ def test_coverage_cli_forwards_chosen_collection_executors(tmp_path, monkeypatch
         commands.append(command)
         receipt = Path(command[command.index("--qualification-audit-output") + 1])
         phases = dict.fromkeys(recovery_coverage.QUALIFICATION_ROOTS, {})
-        receipt.write_text(json.dumps({"commit": "synthetic", "source_digest": "synthetic", "phases": phases}))
+        receipt.write_text(
+            json.dumps(
+                {
+                    "commit": "synthetic",
+                    "source_digest": "synthetic",
+                    "phases": phases,
+                    "coverage": {"schema": 2, "families": [], "risks": [], "scope": "synthetic matrix"},
+                }
+            )
+        )
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(recovery_coverage.subprocess, "run", capture)
-    monkeypatch.setattr(recovery_coverage, "matrix", lambda: {"SYNTHETIC_NOT_QUALIFICATION": True})
     monkeypatch.setattr(
         sys,
         "argv",
@@ -431,6 +439,7 @@ def test_coverage_cli_forwards_chosen_collection_executors(tmp_path, monkeypatch
     )
     assert recovery_coverage.main() == 0
     assert len(commands) == 1 and commands[0][-2:] == ["--collection-executors", str(chosen)]
+    assert "--include-coverage" in commands[0]
 
 
 # Intent: the coverage CLI retains the validator's exact source and audit output when launched outside the checkout.
@@ -467,6 +476,14 @@ def test_coverage_cli_reads_the_validated_evidence(tmp_path, monkeypatch, relati
     # Run the actual validator's path handling and represent only the auditor output, without launching workers.
     def audited_step(name, command, results, *, cwd):
         (frozen,) = frozen_sources
+        if name == "recovery coverage matrix":
+            assert command[1:5] == ["-I", "-B", "-X", f"pycache_prefix={frozen.parent / 'coverage-bytecode'}"]
+            assert Path(command[5]) == frozen / "tools/recovery_coverage.py" and cwd == frozen
+            Path(command[7]).write_text(
+                json.dumps({"schema": 2, "families": [], "risks": [], "scope": "synthetic matrix"})
+            )
+            results[name] = True
+            return subprocess.CompletedProcess(command, 0)
         assert command[1:4] == ["-B", "-X", f"pycache_prefix={frozen.parent / 'qualification-audit-bytecode'}"]
         assert Path(command[4]) == frozen / "tools/audit_parallel_qualification.py" and cwd == frozen
         assert command[-2:] == ["--collection-executors", str(chosen)]
@@ -501,7 +518,6 @@ def test_coverage_cli_reads_the_validated_evidence(tmp_path, monkeypatch, relati
 
     monkeypatch.chdir(caller)
     monkeypatch.setattr(recovery_coverage, "ROOT", source)
-    monkeypatch.setattr(recovery_coverage, "matrix", lambda: {"SYNTHETIC_NOT_QUALIFICATION": True})
     monkeypatch.setattr(recovery_coverage.subprocess, "run", run_validator)
     monkeypatch.setattr(validate, "ROOT", source)
     monkeypatch.setattr(validate, "freeze", freeze_candidate)
@@ -523,6 +539,7 @@ def test_coverage_cli_reads_the_validated_evidence(tmp_path, monkeypatch, relati
     assert written == {suite: source / phase / "audit.json" for suite, phase in phases.items()}
     report = json.loads((caller / "coverage.json").read_text())
     assert report["qualification"] == commit | {"phases": verified}
+    assert report["scope"] == "synthetic matrix"
     assert report["execution_status"] == "all three complete 20-worker suites freshly re-audited"
     (receipt,) = receipts
     assert not receipt.parent.exists()

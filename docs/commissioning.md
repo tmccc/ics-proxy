@@ -177,7 +177,9 @@ output, and independent evidence for the specific issue. Keep a private state ba
 reconciliation records.
 
 If a recorded history fault was caused only by missing records and those records have all returned unchanged,
-the history tool can clear that exact fault while keeping strict history checking in place.
+the history tool can clear that exact fault while keeping strict history checking in place. If startup finds
+missing history and a saved vendor acknowledgement for a Stop report, the proxy can finish recording that
+report as acknowledged before checking whether history repair is available.
 
 ## Roll back software
 
@@ -217,8 +219,8 @@ vendor connection before restoring and independently checking the original curre
 If the tool stops partway through, keep the service stopped and the car unplugged. Retain the journal and rerun
 the same restore action after correcting the reported problem. It uses the recorded stage and the charger’s
 actual settings to pick up where it stopped. Once the tool has recorded profile cleanup, the remaining steps use
-the charger’s local interface. If a cleared proxy profile reappears during listener retirement, the tool stops
-before changing the route. After the installer removes the reappeared profile, rerun the same restore action.
+the charger’s local interface. If a cleared proxy profile reappears after cleanup is recorded and before the
+route change, the tool stops. After the installer removes the reappeared profile, rerun the same restore action.
 The tool verifies that the inventory matches the commissioned original resources and retains the recorded fault
 in the journal. If the settings conflict with the commissioned record or the charger reports an open session,
 resolve the issue with the installer before proceeding. When the tool reports

@@ -225,6 +225,32 @@ def publish_snapshot(source: Path, destination: Path, metadata: dict) -> None:
         raise
 
 
+# Generate the declared matrix from the same snapshot as the audit, even if the checkout has moved.
+def frozen_coverage_matrix(python: str, source: Path, scratch: Path, results: dict[str, bool]) -> dict:
+    output = scratch / "recovery-coverage.json"
+    completed = run_step(
+        "recovery coverage matrix",
+        [
+            python,
+            "-I",
+            "-B",
+            "-X",
+            f"pycache_prefix={scratch / 'coverage-bytecode'}",
+            str(source / "tools/recovery_coverage.py"),
+            "--output",
+            str(output),
+        ],
+        results,
+        cwd=source,
+    )
+    if completed.returncode != 0:
+        raise ValueError("could not generate the recovery coverage matrix")
+    matrix = json.loads(output.read_text())
+    if not isinstance(matrix, dict):
+        raise ValueError("invalid recovery coverage matrix")
+    return matrix
+
+
 # Finish the normal gate and the focused iCS checks before publishing a deployable snapshot.
 def run_full_qualification(
     path: Path | None,
@@ -235,6 +261,7 @@ def run_full_qualification(
     validated_snapshot: Path | None = None,
     deployment: Deployment | None = None,
     include_static: bool = True,
+    include_coverage: bool = False,
 ) -> dict | None:
     if path is None:
         print("Full qualification requires --qualification-report from tools/parallel_qualify.py (20 workers).")
@@ -288,13 +315,16 @@ def run_full_qualification(
                     )
                     results["installation week"] = True
             if all(results.values()):
-                if destination is not None:
-                    publish_snapshot(source, destination, metadata)
-                return {
+                qualification = {
                     "commit": metadata["commit"],
                     "source_digest": metadata["source_digest"],
                     "phases": phase_audits,
                 }
+                if include_coverage:
+                    qualification["coverage"] = frozen_coverage_matrix(python, source, scratch, results)
+                if destination is not None:
+                    publish_snapshot(source, destination, metadata)
+                return qualification
     except (
         OSError,
         ValueError,
@@ -329,6 +359,11 @@ def main() -> int:
         type=Path,
         help="write fresh, successful phase audits as JSON for a qualification-only run",
     )
+    parser.add_argument(
+        "--include-coverage",
+        action="store_true",
+        help="include the frozen source's declared coverage matrix in --qualification-audit-output",
+    )
     parser.add_argument("--validated-snapshot", type=Path, help="retain the source that passed full qualification")
     parser.add_argument(
         "--deployment-target",
@@ -362,6 +397,8 @@ def main() -> int:
         args.quick or args.expression or args.deployment_target != "qualification-only"
     ):
         parser.error("--qualification-audit-output requires a full qualification-only audit")
+    if args.include_coverage and args.qualification_audit_output is None:
+        parser.error("--include-coverage requires --qualification-audit-output")
     python = venv_python()
     results: dict[str, bool] = {}
 
@@ -390,6 +427,7 @@ def main() -> int:
                 args.deployment_target, args.installed_proxy_commit, args.ics_ha_python, args.ics_installed_python
             ),
             include_static=not args.tests_only,
+            include_coverage=args.include_coverage,
         )
         if qualification is not None and args.qualification_audit_output is not None:
             try:

@@ -13,13 +13,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tests_model.catalog import FAMILIES, SCHEMA  # noqa: E402
-from tests_model.coverage import RISKS  # noqa: E402
 from tools.qualification_collection import ROOTS as QUALIFICATION_ROOTS  # noqa: E402
 
 
 # Declared coverage never masquerades as execution; finite denominators and focused-only areas remain distinct.
 def matrix():
+    from tests_model.catalog import FAMILIES, SCHEMA
+    from tests_model.coverage import RISKS
+
     risks = {risk.identifier: asdict(risk) | {"families": []} for risk in RISKS}
     families = []
     for family in FAMILIES:
@@ -66,7 +67,6 @@ def main():
         "--collection-executors", type=Path, help="explicit trusted source-pinned collection executor map"
     )
     args = parser.parse_args()
-    report = matrix()
     if args.qualification_report:
         bundle_path = args.qualification_report.resolve()
         executors = args.collection_executors.resolve() if args.collection_executors else None
@@ -84,6 +84,7 @@ def main():
                     str(bundle_path),
                     "--qualification-audit-output",
                     str(audited),
+                    "--include-coverage",
                     *(["--collection-executors", str(executors)] if executors else []),
                 ],
                 cwd=ROOT,
@@ -98,8 +99,19 @@ def main():
                 or qualification["phases"].keys() != QUALIFICATION_ROOTS.keys()
             ):
                 raise ValueError("invalid qualification audit output")
+            report = qualification.pop("coverage", None)
+            if (
+                not isinstance(report, dict)
+                or type(report.get("schema")) is not int
+                or not isinstance(report.get("families"), list)
+                or not isinstance(report.get("risks"), list)
+                or not isinstance(report.get("scope"), str)
+            ):
+                raise ValueError("invalid qualification coverage matrix")
             report["qualification"] = qualification
         report["execution_status"] = "all three complete 20-worker suites freshly re-audited"
+    else:
+        report = matrix()
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     return 0
 
