@@ -75,6 +75,7 @@ from .rpc import UnavailableError
 from .schedule_control import ScheduleControl
 from .security import SecurityError, StaleEvidenceError
 from .start_handoff import NativeStartReport, OwnedStartResult, StartHandoff, StartHandoffContext, StartPublication
+from .start_policy import ACTIVE, start_refusal
 from .start_settlement import RetirementCandidate, StartFailureAction, StartFailureFacts, settle_start
 from .store import RecoveryRequiredError, StationZeroStorageError, encoded, fingerprint
 from .trial_evidence import Resource, profile_projection
@@ -93,7 +94,6 @@ if TYPE_CHECKING:
 
 
 type ProveStop = Callable[[int, bool, bool], Awaitable[StopProof]]
-ACTIVE = frozenset({"armed", "starting", "awaiting_power", "charging", "running", "stopping"})
 
 
 @dataclass(frozen=True)
@@ -150,11 +150,17 @@ class StopDecision(Enum):
 
 
 class _StopReuse(Enum):
-    """Prior evidence to consider after checking a session-only Stop's possible dispatch."""
+    """Ordinary reuse after checking the open target and any session-only possible dispatch.
 
+    A protective Stop can reuse only an acknowledgement bound to its exact protective claim.
+    """
+
+    # A vendor Stop without verified zero skips further reuse after the possible-dispatch check.
     NO_ADDITIONAL_REUSE = auto()
-    # Includes acknowledgements retained in memory and pending shutdown attempts.
+    # The default considers known acknowledgements, including those in memory, and pending shutdown Stops.
     RECORDED = auto()
+    # Also consider unanswered owner or vendor Stops on this Boot. Probe before refreshing zero and require verified
+    # zero when using this mode to authorize a send or join.
     INCLUDE_CURRENT_BOOT_UNANSWERED = auto()
 
 
@@ -167,7 +173,24 @@ class StopReplyUnconfirmedError(UnavailableError):
 
 
 class ControlDecisions:
-    """Make charging decisions while the existing executors own device and cloud work."""
+    """Make charging decisions while the existing executors own device and cloud work.
+
+    These are the main decision points in each path. Executors call them as work progresses.
+
+    - Managed local Start uses ``accept_start``, ``require_start_lease`` and ``require_local_start``.
+      ``issue_local_start`` records possible dispatch and ``publish_start`` publishes the owned result.
+      Vendor Start checks approval and scope in ``authorize_vendor_start`` and ``require_vendor_start``.
+    - Current changes use ``accept_current``, ``require_current_selection`` and ``complete_current``.
+    - Session Stop, vendor Stop and the local executor enter through ``session_stop_send_decision``,
+      ``require_vendor_stop`` and ``authorize_local_send``. All three lead to ``_stop_decision``.
+    - Pause uses ``accept_pause`` and ``prepare_pause_stop``. ``require_pause_stop`` checks authority
+      before the claim and at send. ``bind_pause_stop`` saves the claim, and ``complete_pause`` requires
+      verified zero.
+    - Return starts at ``accept_return``. Follow ``prepare_release_attempt`` and ``claim_release``
+      through to ``complete_release`` and ``settle_release``.
+    - Shutdown uses ``begin_shutdown`` to revoke positive authority, ``stop_for_shutdown`` for the
+      final protected Stop, and ``record_shutdown_outcome`` to record the result.
+    """
 
     # Attach the decision owner to the local executor's existing journal and peer.
     def __init__(self, control: LocalControl) -> None:
@@ -383,6 +406,8 @@ class ControlDecisions:
     ) -> str | None:
         s, g, j = controller.session, controller.session.gateway, self.journal
         facts = ManagedFacts(controller)
+
+        # Check that the installation and current connections can support release.
         if not j.phase.read().operating:
             return "installation is not operating"
         if j.get("native_bounded_handover", {}).get("stage") != "admitted":
@@ -399,10 +424,14 @@ class ControlDecisions:
             g.vendor.sender is None or g.vendor_registration != "Accepted" or not s.runtime.status.vendor_connected
         ):
             return "cloud registration is unavailable"
+
+        # Verify the exact owned zero hold before examining outstanding work.
         if not j.get("control", {}).get("inhibit"):
             return "local inhibit is missing"
         if (refusal := controller.native.station_zero_refusal(present)) is not None:
             return refusal
+
+        # Any earlier operation or unresolved write can still affect the release.
         if not allow_offline and not pending_delivery and not facts.cloud_queue_empty():
             return "cloud delivery is pending"
         if g.controls._operations:
@@ -1232,73 +1261,7 @@ class ControlDecisions:
         local: bool = True,
         normal: bool = False,
     ) -> str | None:
-        c, j = charging.controller, self.journal
-        g = c.session.gateway
-        facts = ManagedFacts(c)
-
-        # First establish that the installation and current intent allow a Start.
-        if c.stopping:
-            return "service_stopping"
-        if not (c.requests.intent().mode == "app" or normal and c.requests.intent().mode == "paused"):
-            return "intent_not_startable"
-        if j.fault.latched():
-            return "fault_latched"
-        if not j.phase.read().active:
-            return "installation_not_active"
-        if not g.controls.ready:
-            return "station_ceiling_unconfirmed"
-        desired_ceiling = g.controls.desired()
-        expected_ceiling = 0 if c.requests.intent().mode == "paused" else c.current.selected()
-        if desired_ceiling != expected_ceiling:
-            return "station_ceiling_differs_from_selection"
-        if not normal and c.current.selected() != 6:
-            return "timed_test_requires_six_amperes"
-        if c.current.pending():
-            return "current_update_pending"
-
-        # A normal Start may request fresh approval online before doing any charger work.
-        if g.policy.allow_local_start:
-            return "legacy_start_enabled"
-        if local and not any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags):
-            if not normal or charging.authorization_status() != "renewal_required":
-                return "start_authorization_unavailable"
-
-        # Outstanding commands and lifecycle reports can still change the session.
-        if j.get("control", {}).get("uncertain"):
-            return "control_uncertain"
-        if j.get("control", {}).get("start_pending"):
-            return "start_pending"
-        if j.active() is not None:
-            return "transaction_open"
-        if j.get("vendor_start_grant"):
-            return "vendor_start_pending"
-        if not facts.cloud_queue_empty(lifecycle_only=normal):
-            return "cloud_delivery_pending"
-        if not facts.mutations_confirmed():
-            return "mutation_unconfirmed"
-        if c.requests.return_in_progress():
-            return "return_pending"
-        if not c.requests.has_capacity():
-            return "request_capacity_exhausted"
-        if charging.state().get("state") in ACTIVE:
-            return "managed_start_active"
-
-        # With a native sample, also require a freshly observed plugged-in, idle charger.
-        if not facts.boot_current():
-            return "boot_unconfirmed"
-        if not normal and not (c.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted"):
-            return "timed_test_requires_cloud"
-        if native is None:
-            return None
-        if c.native.last_verified_at == 0 or not native.is_fresh(15):
-            return "native_observation_stale"
-        if native.physical.connection != "Plug":
-            return "vehicle_not_plugged_in"
-        if native.physical.transaction_open:
-            return "native_transaction_open"
-        if native.physical.power_w != 0:
-            return "native_power_nonzero"
-        return None
+        return start_refusal(self.journal, charging, native, local=local, normal=normal)
 
     # Acceptance and its one-shot deadline commit before any positive effect; duplicate identifiers return receipts.
     def accept_start(
@@ -2211,18 +2174,20 @@ class ControlDecisions:
                 return StopDecision.ACCEPTED
             if self.journal.outcomes.unanswered_shutdown_stop(session.local):
                 return StopDecision.WAIT_FOR_REPORT
-            if (
-                reuse is _StopReuse.INCLUDE_CURRENT_BOOT_UNANSWERED
-                and (boot := self.control.boot()) is not None
-                and (
-                    self.journal.outcomes.unanswered_vendor_stop(session.local, boot=boot)
-                    or self.journal.outcomes.unanswered_owner_stop(session.local, boot)
-                )
+            if reuse is _StopReuse.INCLUDE_CURRENT_BOOT_UNANSWERED and self._has_unanswered_stop_on_current_boot(
+                session.local
             ):
                 return StopDecision.WAIT_FOR_REPORT
             return StopDecision.SEND
 
         return self.peer.decide(decide, priority=CommandPriority.RESTRICT)
+
+    def _has_unanswered_stop_on_current_boot(self, local: int) -> bool:
+        boot = self.control.boot()
+        return boot is not None and (
+            self.journal.outcomes.unanswered_vendor_stop(local, boot=boot)
+            or self.journal.outcomes.unanswered_owner_stop(local, boot)
+        )
 
     # A local Stop rechecks zero before waiting for the report from an unanswered attempt.
     def stop_wait_needs_zero_check(self, local: int) -> bool:
