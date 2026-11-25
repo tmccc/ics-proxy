@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Let a Home Assistant session Stop join an unanswered Pause Stop for the same session when the charger is
+  verified at zero. A queued vendor Stop can use the recorded replies for its original session after closure.
+- Keep verified closure separate from the charger’s Stop reply. Save closure when the receipt write fails and
+  settle pending receipts through graceful shutdown and restart. Reconcile unresolved Stop outcomes before
+  using an older build with the journal. See [Release and rollback](docs/release-process.md).
+- Use the same saved Stop reply checks in the proxy and incident reports. Settle exact saved Stop refusals
+  and vendor acknowledgements during recovery from a matching charger-history fault.
+- Require a live vendor connection for the current charger before sending a queued vendor Start or Return.
+  Resume interrupted current recovery once the current connection and zero hold are verified again.
+- Discard stale Solar Display 2 charger taps and wait for fresh Home Assistant feedback after reconnects or
+  overlapping connections. The deployed display firmware was built with ESPHome 2026.10.1.
 - Refuse hard-linked journal state files so each journal has one owner lock.
 - Finish exact saved vendor acknowledgements during startup when they would block repair of missing charger history.
 - Report the Home Assistant client build captured during setup and recover display feedback after an interrupted action.
