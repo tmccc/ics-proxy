@@ -30,7 +30,7 @@ from .command_outcomes import (
 )
 from .command_processor import CommandPriority, CommandProcessor
 from .connection_scope import ControlScope, control_scope_matches, current_control_scope
-from .control_decisions import StopZeroEvidence, VendorStopAlreadyAcceptedError
+from .control_decisions import StopPredecessors, StopZeroEvidence, VendorStopAlreadyAnsweredError
 from .delivery_reply import DeliveryReply, stop_result_shape_supported
 from .events import OBSERVATION_ACTIONS, validate_observation
 from .ics import TransactionQuery, is_transaction_query, unique_object
@@ -164,6 +164,7 @@ class Gateway:
         self.plans = PlanBook(journal)
         self.policy = policy or Policy()
         self.retiring: Callable[[], bool] = lambda: False
+        self.vendor_connection_current: Callable[[], bool] = lambda: True
         self.command_processor: CommandProcessor | None = None
         self.charger = Peer("local", timeout)
         self.vendor = Peer("vendor", timeout)
@@ -818,6 +819,13 @@ class Gateway:
     # Preserve the actual correlated backend decision, checking generation after every await.
     async def _cloud_authorize(self, tag: str, guard: Callable[[], None] | None = None) -> dict[str, Any]:
         epoch = self._vendor_epoch
+
+        # Use only the vendor link bound to the current charger connection and Boot details.
+        def require_current_connection() -> None:
+            if not self.vendor_connection_current():
+                raise UnavailableError("cloud authorization awaits the current charger's vendor connection")
+
+        require_current_connection()
         await self._ensure_vendor_boot()
         self._require_epoch("vendor", epoch)
 
@@ -826,6 +834,11 @@ class Gateway:
             self._require_epoch("vendor", epoch)
             if guard is not None:
                 guard()
+
+        # Sending a lookup or using an approval requires both the request and the connection to remain current.
+        def require_current_authority() -> None:
+            check()
+            require_current_connection()
 
         info: dict[str, Any] | None = None
         observation: AuthorizationObservation | None = None
@@ -866,7 +879,7 @@ class Gateway:
                 actual = decision(answer)
                 if observation is None or actual["status"] != "Accepted":
                     raise RecoveryRequiredError("authorization reply could not be recorded")
-                check()
+                require_current_authority()
                 info = self.auth_info.put(tag, actual, observation, query_sequence=query_sequence)
             if info["status"] != "Accepted":
                 check()
@@ -881,7 +894,7 @@ class Gateway:
             "Authorize",
             {"idTag": tag},
             priority=5,
-            check=check,
+            check=require_current_authority,
             before_send=begin,
             on_receive=capture,
             on_reply=received,
@@ -907,7 +920,11 @@ class Gateway:
             return self._tag_info(tag)
         if not self._local_tag(tag):
             return {"status": "Invalid"}
-        if self.vendor.sender is not None and self.vendor_registration == "Accepted":
+        if (
+            self.vendor.sender is not None
+            and self.vendor_registration == "Accepted"
+            and self.vendor_connection_current()
+        ):
             return await self._cloud_authorize(tag)
         return self._tag_info(tag)
 
@@ -917,7 +934,7 @@ class Gateway:
         if kind == "write" and self.journal.get("control", {}).get("owner") == "local":
             raise DeniedError("local owner blocks vendor extension writes")
 
-    # Forward the vendor request or return an exact previous Stop acceptance when zero still holds.
+    # Forward the vendor request or return the acceptance of an earlier Stop for that session.
     async def _vendor_call(
         self, frame: Frame, epoch: int, charger_epoch: int, charger_scope: ControlScope | None
     ) -> str:
@@ -1027,11 +1044,21 @@ class Gateway:
                 if local_transaction is None:
                     raise DeniedError("cloud command does not name an active transaction")
             stop_evidence = self.stop_zero_evidence if supervised and action == "RemoteStopTransaction" else None
+            stop_predecessors: StopPredecessors | None = None
 
             # A cloud number can be reassigned while this command waits for the charger or native evidence.
             def require_transaction() -> None:
-                if vendor_transaction is not None and self.journal.local_id(vendor_transaction) != local_transaction:
-                    raise DeniedError("cloud command no longer names its original local transaction")
+                if vendor_transaction is not None:
+                    active = self.journal.local_id(vendor_transaction)
+                    if active != local_transaction:
+                        if (
+                            active is None
+                            and stop_predecessors is not None
+                            and local_transaction is not None
+                            and self.journal.vendor_id(local_transaction) == vendor_transaction
+                        ):
+                            self.controls.decisions.require_closed_vendor_stop(local_transaction, stop_predecessors)
+                        raise DeniedError("cloud command no longer names its original local transaction")
                 if clear_key is not None and self.journal.get("vendor_profiles", {}).get(clear_key) != clear_target:
                     raise DeniedError("cloud clear no longer owns its original profile")
 
@@ -1041,6 +1068,8 @@ class Gateway:
                 self._require_epoch("charger", charger_epoch)
                 if supervised and not control_scope_matches(self, connection):
                     raise UnavailableError("cloud command belongs to a retired charger Boot")
+                if positive and not self.vendor_connection_current():
+                    raise UnavailableError("cloud command belongs to a retired vendor connection")
                 if positive and (
                     self.retiring()
                     or self.journal.get("managed_control_intent") != intent
@@ -1048,6 +1077,14 @@ class Gateway:
                 ):
                     raise DeniedError("cloud command no longer owns its original control scope")
                 require_transaction()
+
+            # Bind any earlier Stop attempts before queued work can outlast this session.
+            def admit() -> StopPredecessors | None:
+                require_origin()
+                if stop_evidence is None:
+                    return None
+                assert local_transaction is not None and connection is not None
+                return self.controls.decisions.vendor_stop_predecessors(local_transaction, connection[0].boot)
 
             # The existing mutation owns the bound request and its translated physical target.
             def prepare_mutation(profile: int | None) -> str:
@@ -1065,7 +1102,9 @@ class Gateway:
                 return token_id
 
             if supervised and self.command_processor is not None:
-                await self.command_processor.run(require_origin, priority=priority)
+                stop_predecessors = await self.command_processor.run(admit, priority=priority)
+            elif stop_evidence is not None:
+                stop_predecessors = self.decide(admit, priority=priority)
             if write and action != "RemoteStopTransaction":
                 await self.controls.ensure_ceiling(guard=require_origin)
             if action == "RemoteStartTransaction":
@@ -1168,8 +1207,8 @@ class Gateway:
 
                 return reply_as(self.decide(project_history, priority=priority), token)
             return reply_as(answer, token)
-        except VendorStopAlreadyAcceptedError:
-            return build_call_result(token, {"status": "Accepted"})
+        except VendorStopAlreadyAnsweredError as answered:
+            return build_call_result(token, {"status": answered.status})
         except DeniedError, ConflictError:
             text = build_call_error(token, "SecurityError", "request is not allowed by current local policy")
         except UnavailableError, RecoveryRequiredError, SecurityError, sqlite3.Error:

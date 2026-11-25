@@ -12,7 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..constants import HUB_PROFILE_ID
 from .command_processor import CommandPriority
@@ -30,7 +30,7 @@ from .native_faults import (
     diagnostic_type,
 )
 from .native_history import ORIGINAL_HISTORY_OMISSION, STARTUP_HISTORY_OMISSION, MissingOriginalHistoryError
-from .native_history_recovery import history_recovery_idle
+from .native_history_recovery import history_recovery_idle, matches_history_fault
 from .native_http import NativeTransportUnavailableError
 from .policy import Policy
 from .recovery_contracts import require_allowed
@@ -38,12 +38,16 @@ from .rpc import IntroductionDeferredError, UnavailableError
 from .runtime import ConnectionRuntime, RuntimeSettings
 from .security import SecurityError, StaleEvidenceError
 from .station import StationChoice, StationDiscovery
+from .stop_settlement import settle_saved_stop_rejections
 from .store import Journal, RecoveryRequiredError, encoded, fingerprint
 from .trial_config import PreparedTLS, TrialConfig, prepare_tls, private_json
 from .trial_evidence import NativeObserver
 from .trial_handover_evidence import HandoverEvidence, ObserveHandover
 from .trial_resources import Baseline, ResourceBook
 from .trial_transport import TrialTransport
+
+if TYPE_CHECKING:
+    from .managed_session_stop import ManagedSessionStop
 
 
 @dataclass(frozen=True)
@@ -303,6 +307,7 @@ class TrialSession:
         self.closing = False
         self._closing_task: asyncio.Task[None] | None = None
         self.final_status: dict[str, Any] | None = None
+        self.managed_session_stop: ManagedSessionStop | None = None
 
     # Never classify native profile bytes while their actual outgoing Set/Clear response is still unresolved.
     def _resource_mutation_inflight(self) -> bool:
@@ -503,15 +508,23 @@ class TrialSession:
                 refusal = self._measured_refusal(error, selected)
                 self.gateway.controls.decisions.latch_fault(refusal.classification, diagnostic=refusal.diagnostic)
             except MissingOriginalHistoryError as error:
-                if (
-                    self.journal.get("managed_mode")
-                    and self.journal.get("trial_binding")
-                    and not self.journal.fault.latched()
-                ):
-                    # Finish a saved acknowledgement locally before history recovery checks the remaining queue.
-                    if not self.started:
+                j = self.journal
+                if j.get("managed_mode") and j.get("trial_binding"):
+                    fault = j.fault.read({})
+                    if not self.started and (
+                        not fault or matches_history_fault(fault, j.get("managed_native_failure", {}))
+                    ):
+                        # Finish a saved acknowledgement locally before history recovery checks the remaining queue.
                         self.gateway.decide(lambda: self.runtime.settle_saved_delivery(cold_history=True))
-                    if history_recovery_idle(self.journal, retain_queued_reports=True, allow_closed_stop_receipts=True):
+                        try:
+                            self.gateway.decide(lambda: settle_saved_stop_rejections(j))
+                        except sqlite3.Error:
+                            if j.db.in_transaction:
+                                raise
+                            raise error from None  # The unresolved receipt still prevents a history-only repair.
+                    if not fault and history_recovery_idle(
+                        j, retain_queued_reports=True, allow_closed_stop_receipts=True
+                    ):
                         refusal = self._native_refusal(error)
                         diagnostic = {**refusal.diagnostic, "source": STARTUP_HISTORY_OMISSION}
                         self.gateway.controls.decisions.latch_fault(refusal.classification, diagnostic=diagnostic)
@@ -549,7 +562,7 @@ class TrialSession:
                 "native_bounded_handover": self.native_bounded.status(),
                 "station_capabilities": self.station.snapshot(),
                 "boot_observed": self.gateway.current_boot_seen(self.gateway._charger_epoch),
-                "vendor_registered": self.gateway.vendor_registration == "Accepted",
+                "vendor_registered": self.runtime.vendor_registered,
                 "delivery_blocked": self.runtime.status.delivery_blocked,
                 "failure_classification": self.runtime.status.last_failure,
                 "protocol_diagnostics": {
@@ -630,6 +643,7 @@ class TrialSession:
                 await self.runtime.close()
             finally:
                 try:
+                    self.gateway.decide(self._settle_shutdown_receipts, priority=CommandPriority.SHUTDOWN)
                     self.final_status = await self.command({"command": "status"})
                     self.final_status.update(
                         running=False,
@@ -699,5 +713,23 @@ class TrialSession:
             ):
                 await asyncio.sleep(0.05)
                 continue
-            self.gateway.controls.decisions.require_shutdown_zero(self.native_bounded, native, local)
+
+            # Checkpoint the independent observation while a matching charger reply can still arrive.
+            def verify() -> None:
+                self.gateway.controls.decisions.require_shutdown_zero(self.native_bounded, native, local)
+                self._settle_shutdown_receipts(native)
+
+            self.gateway.decide(verify, priority=CommandPriority.SHUTDOWN)
             return
+
+    # The final pass uses the retained observation once the charger has retired all reply windows.
+    def _settle_shutdown_receipts(self, native: HandoverEvidence | None = None) -> None:
+        if self.managed_session_stop is None:
+            return
+        try:
+            if native is None:
+                self.managed_session_stop.expire()
+            else:
+                self.managed_session_stop.observed(native)
+        except sqlite3.Error:
+            pass  # Keep the result of the independently verified shutdown even if a receipt write failed.

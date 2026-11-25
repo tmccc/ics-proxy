@@ -156,11 +156,7 @@ class ManagedCharging:
             return "ready"
         if any(g.local_start_needs_renewal(tag) for tag in g.policy.allowed_tags):
             return (
-                "renewal_required"
-                if self.controller.session.runtime.status.vendor_connected
-                and g.vendor.sender is not None
-                and g.vendor_registration == "Accepted"
-                else "expired_cloud_unavailable"
+                "renewal_required" if self.controller.session.runtime.vendor_registered else "expired_cloud_unavailable"
             )
         return "denied" if g.policy.allowed_tags else "no_approved_tag"
 

@@ -78,7 +78,7 @@ def start_refusal(
     # With a native sample, also require a freshly observed plugged-in, idle charger.
     if not facts.boot_current():
         return "boot_unconfirmed"
-    if not normal and not (c.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted"):
+    if not normal and not c.session.runtime.vendor_registered:
         return "timed_test_requires_cloud"
     if native is None:
         return None

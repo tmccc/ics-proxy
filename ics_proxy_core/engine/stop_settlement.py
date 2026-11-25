@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -14,6 +15,7 @@ STOP_SESSION = "stop_session"
 STOP_NONTERMINAL_CLASSIFICATIONS = ("stop_not_confirmed", "process_replaced")
 STOP_CLOSURE_VERIFIED = "json_type(result,'$._session_stop.closure_verified') IS 'true'"
 STOP_CLOSURE_FIELDS = "result=json_set(result,'$._session_stop.closure_verified',json('true'))"
+STOP_REJECTION_FIELDS = "state='failed',result=json_set(result,'$.classification','stop_rejected')"
 STOP_COMPLETION_FIELDS = (
     "state='completed',result=json_set(json_remove(result,'$.classification'),"
     "'$.session_stopped',json('true'),'$._session_stop.closure_verified',json('true'))"
@@ -30,10 +32,13 @@ _OPEN_REPLY = (
     "WHERE a.value=json_extract(windows.value,'$[1]')))) OR "
     "(json_extract(windows.value,'$[0]')='vendor' AND EXISTS ("
     "SELECT 1 FROM json_each(managed_requests.result,'$._session_stop.vendor_attempts') a "
+    "WHERE a.value=json_extract(windows.value,'$[1]'))) OR "
+    "(json_extract(windows.value,'$[0]')='owner_wire' AND EXISTS ("
+    "SELECT 1 FROM json_each(managed_requests.result,'$._session_stop.owner_wire_attempts') a "
     "WHERE a.value=json_extract(windows.value,'$[1]')))))"
 )
 _OWNER_REJECTIONS = (
-    "SELECT request,local FROM owner_command_wires WHERE action='RemoteStopTransaction' AND reply='Rejected'"
+    "SELECT request,local,wire FROM owner_command_wires WHERE action='RemoteStopTransaction' AND reply='Rejected'"
 )
 _VENDOR_STOP_SCOPE = (
     "SELECT v.mutation,v.local FROM vendor_command_scope v JOIN mutations m ON m.token=v.mutation "
@@ -41,8 +46,8 @@ _VENDOR_STOP_SCOPE = (
 )
 _VENDOR_REJECTIONS = f"{_VENDOR_STOP_SCOPE} AND v.wire_result='Rejected'"
 _EFFECTIVE_REJECTIONS = (
-    f"WITH owner_rejections(request,local) AS ({_OWNER_REJECTIONS} UNION ALL "
-    "SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?)), "
+    f"WITH owner_rejections(request,local,wire) AS ({_OWNER_REJECTIONS} UNION ALL "
+    "SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]'),json_extract(value,'$[2]') FROM json_each(?)), "
     f"vendor_rejections(mutation,local) AS ({_VENDOR_REJECTIONS} UNION ALL {_VENDOR_STOP_SCOPE} "
     "AND EXISTS (SELECT 1 FROM json_each(?) WHERE json_extract(value,'$[0]')=v.mutation "
     "AND json_extract(value,'$[1]')=v.wire_request)) "
@@ -77,6 +82,10 @@ class StopRejections:
     def owner_refusal(self, request: str, local: str) -> str:
         return f"EXISTS (SELECT 1 FROM {self.owner} w WHERE w.request={request} AND w.local={local})"
 
+    # An owner Stop can have multiple charger calls under the same request.
+    def owner_wire_refusal(self, wire: str, local: str) -> str:
+        return f"EXISTS (SELECT 1 FROM {self.owner} w WHERE w.wire={wire} AND w.local={local})"
+
     # A vendor refusal belongs to the recorded mutation and its translated local session.
     def vendor_refusal(self, mutation: str, local: str) -> str:
         return f"EXISTS (SELECT 1 FROM {self.vendor} v WHERE v.mutation={mutation} AND v.local={local})"
@@ -87,13 +96,22 @@ class StopRejections:
         local = "json_extract(managed_requests.result,'$._session_stop.local')"
         return (
             f"({self.owner_refusal('managed_requests.id', local)} OR "
-            "COALESCE(json_array_length(result,'$._session_stop.local_attempts') "
-            "+ json_array_length(result,'$._session_stop.vendor_attempts'),0) > 0 "
+            "NOT COALESCE(json_extract(result,'$._session_stop.unidentified_shutdown_stop'),0) AND "
+            "(COALESCE(json_array_length(result,'$._session_stop.local_attempts'),0) "
+            "+ COALESCE(json_array_length(result,'$._session_stop.vendor_attempts'),0) "
+            "+ COALESCE(json_array_length(result,'$._session_stop.owner_wire_attempts'),0)) > 0 "
             "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.local_attempts') a "
             f"WHERE NOT {self.owner_refusal('a.value', local)}) "
             "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.vendor_attempts') a "
-            f"WHERE NOT {self.vendor_refusal('a.value', local)}))"
+            f"WHERE NOT {self.vendor_refusal('a.value', local)}) "
+            "AND NOT EXISTS (SELECT 1 FROM json_each(result,'$._session_stop.owner_wire_attempts') a "
+            f"WHERE NOT {self.owner_wire_refusal('a.value', local)}))"
         )
+
+    # A definite Stop rejection settles receipts that have begun and still await a result.
+    @property
+    def rejected_receipts(self) -> str:
+        return f"action=? AND state IN ('running','uncertain') AND {self.receipts}"
 
     # A genuine closure settles the waiting request when its exact Stop attempts still permit it.
     @property
@@ -116,3 +134,18 @@ def stop_rejections(journal: Journal) -> StopRejections:
     return StopRejections(
         _EFFECTIVE_REJECTIONS, (encoded(owner), encoded(vendor)), "owner_rejections", "vendor_rejections"
     )
+
+
+# Publish Stop rejections already proved by their exact charger replies in the caller's transaction if present.
+def settle_saved_stop_rejections(journal: Journal) -> None:
+    db = journal.db
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='managed_requests'").fetchone():
+        return
+    rejections = stop_rejections(journal)
+    where = rejections.rejected_receipts
+    bindings = (*rejections.bindings, STOP_SESSION)
+    if db.execute(f"{rejections.prefix}SELECT 1 FROM managed_requests WHERE {where} LIMIT 1", bindings).fetchone():
+        with nullcontext() if db.in_transaction else journal.atomic():
+            db.execute(
+                f"{rejections.prefix}UPDATE managed_requests SET {STOP_REJECTION_FIELDS} WHERE {where}", bindings
+            )

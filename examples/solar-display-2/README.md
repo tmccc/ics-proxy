@@ -12,9 +12,15 @@ a request. Start also requires the current control revision and permission to st
 match the current open session. The touchscreen shows pending and unconfirmed feedback for the exact request from
 the live Home Assistant helper, including between image downloads. While the automation is enabled, an
 unconfirmed message clears on the first five-second cleanup tick after 20 seconds, or when a new request
-replaces it. If the automation becomes unavailable, the touchscreen immediately greys out both charger buttons
-and ignores taps on them, even while the previous image is still showing. The offline dashboard hides request
-feedback.
+replaces it. A charger tap must begin and end while the button is available and no request is pending.
+When Home Assistant reports the automation as off or unavailable, the touchscreen immediately greys out both
+charger buttons and ignores taps on them. If Home Assistant removes the automation without sending a state
+update, the previous button image can remain until the next render or the offline timeout. Home Assistant
+requires the automation to be installed and enabled to handle the tap. After reconnecting, the touchscreen
+waits for fresh request feedback before accepting a charger tap. If two Home Assistant connections overlap,
+the dashboard stays visible while its charger buttons are unavailable. After one connection closes, both
+buttons wait for the request helper, automation state and active-run count from the remaining connection.
+The offline dashboard hides request feedback.
 
 If disabling the automation interrupts its wait for a Start or Stop, the first cleanup tick after re-enabling
 it marks the request unconfirmed. The charger buttons wait for that feedback to update before accepting another
@@ -34,7 +40,8 @@ display, touch and brightness components, its fallback dashboard, and the render
    update every 25 seconds or less with the example's 10-second download interval and 5-second HTTP timeout.
    This leaves time for clock rounding and processing before the picture expires. Update the firmware, preview
    template and touch automation together. You can keep the existing request helper with the same options.
-4. Confirm that the automation entity ID used by the view and firmware matches the installed automation.
+4. Confirm that the automation entity ID used by the view and the firmware's `canvas_ics_automation_entity`
+   substitution matches the installed automation.
    In the view, write the quoted entity ID directly in both `is_state()` and `state_attr()` so GeekMagic
    loads the automation’s state. Enable the automation in Home Assistant.
 

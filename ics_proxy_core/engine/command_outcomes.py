@@ -230,6 +230,95 @@ class DeliveryOutcome:
     uncertain: bool
 
 
+# Validate a retained local reply against the stored wire or its original claim.
+def decode_retained_owner_reply(db: sqlite3.Connection, saved: dict[str, Any]) -> OwnerWire | None:
+    if saved.keys() != {"wire", "request", "ticket", "boot", "action", "local", "limit_a", "reply"}:
+        return None
+    action, local = saved["action"], saved["local"]
+    if (
+        action not in ("RemoteStartTransaction", "RemoteStopTransaction")
+        or saved["reply"] not in ("Accepted", "Rejected")
+        or not _reply_identifier(saved["wire"])
+        or len(saved["wire"]) > 36
+        or not _reply_identifier(saved["ticket"])
+        or any(value is not None and not _reply_identifier(value) for value in (saved["request"], saved["boot"]))
+        or saved["limit_a"] is not None
+        or (action == "RemoteStartTransaction" and local is not None)
+        or (action == "RemoteStopTransaction" and (type(local) is not int or not 0 < local < 2**63))
+    ):
+        return None
+    reply = OwnerWire(**saved)
+    primary = db.execute(
+        "SELECT wire,request,ticket,boot,action,local,limit_a,reply FROM owner_command_wires WHERE wire=?",
+        (reply.wire,),
+    ).fetchone()
+    # Both primary writes can fail. An existing primary row must agree with the checkpoint.
+    if primary is not None:
+        return reply if OwnerWire(*primary) in (reply, replace(reply, reply=None)) else None
+    if action == "RemoteStopTransaction" and not _owner_stop_claim_matches(db, reply):
+        return None
+    return reply
+
+
+# A pending session Stop and the latest shutdown retain independent dispatch claims.
+def _owner_stop_claim_matches(db: sqlite3.Connection, reply: OwnerWire) -> bool:
+    if db.execute("SELECT 1 FROM sqlite_schema WHERE name='managed_requests'").fetchone():
+        claims = db.execute(
+            "SELECT id,action,CAST(result AS BLOB) FROM managed_requests WHERE id=? OR (id=? AND action=?)",
+            (reply.request, reply.ticket, STOP_SESSION),
+        ).fetchall()
+        for request, action, raw in claims:
+            try:
+                result = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+            except ValueError, RecursionError:
+                return False
+            if not isinstance(result, dict):
+                return False
+            if action == STOP_SESSION:
+                bound = result.get("_session_stop")
+                if (
+                    reply.request != request
+                    or reply.ticket != request
+                    or not isinstance(bound, dict)
+                    or type(bound.get("local")) is not int
+                    or bound["local"] != reply.local
+                    or type(bound.get("dispatched")) not in (int, bool)
+                    or bound["dispatched"] != 1
+                    or db.execute(
+                        "SELECT 1 FROM owner_command_wires WHERE request=? AND ticket=? "
+                        "AND action='RemoteStopTransaction' LIMIT 1",
+                        (request, request),
+                    ).fetchone()
+                    is not None
+                ):
+                    return False
+                return True
+            elif action == "pause":
+                bound = result.get("_stop")
+                if (
+                    isinstance(bound, dict)
+                    and bound.get("ticket") == reply.ticket
+                    and (bound.get("local"), bound.get("boot")) != (reply.local, reply.boot)
+                ):
+                    return False
+            else:
+                return False
+    if reply.request is None:
+        row = db.execute("SELECT CAST(value AS BLOB) FROM meta WHERE key='trial_shutdown_attempt'").fetchone()
+        try:
+            shutdown = json.loads(row[0].decode("utf-8"), object_pairs_hook=unique_object) if row is not None else {}
+        except ValueError, RecursionError:
+            return False
+        if isinstance(shutdown, dict) and shutdown.get("ticket") == reply.ticket and "stop_wire" in shutdown:
+            return (shutdown["stop_wire"], shutdown.get("boot"), shutdown.get("local")) == (
+                reply.wire,
+                reply.boot,
+                reply.local,
+            )
+    # Session-only Stops use the request ID as their ticket and require the claim above.
+    return reply.request != reply.ticket
+
+
 class CommandOutcomes:
     """Own saved and received command evidence independently of present charging permission."""
 
@@ -318,7 +407,7 @@ class CommandOutcomes:
         return OwnerCommand(identifier, row["action"], row["revision"], row["state"], result, wires, sessions)
 
     # Merge only buffered evidence for the exact saved call or logical owner ID, including a failed first write.
-    def owner_wires(self, key: Literal["request", "ticket"], identifier: str) -> tuple[OwnerWire, ...]:
+    def owner_wires(self, key: Literal["request", "ticket", "wire"], identifier: str) -> tuple[OwnerWire, ...]:
         rows = self.journal.db.execute(
             "SELECT w.wire,w.request,w.ticket,w.boot,w.action,COALESCE(s.local,w.local),w.limit_a,w.reply "
             "FROM owner_command_wires w LEFT JOIN owner_start_sessions s "
@@ -328,7 +417,7 @@ class CommandOutcomes:
         )
         wires = {row["wire"]: OwnerWire(*row) for row in rows}
         for wire in (*self._retained_owner_replies(), *self._owner_writes.values()):
-            if (wire.request if key == "request" else wire.ticket) == identifier:
+            if getattr(wire, key) == identifier:
                 previous = wires.get(wire.wire)
                 if previous is None or (
                     (previous.request, previous.ticket, previous.boot, previous.action)
@@ -468,7 +557,7 @@ class CommandOutcomes:
 
     # Owner checkpoints retain the bound request, ticket, Boot, and exact wire.
     def _retained_owner_replies(self) -> tuple[OwnerWire, ...]:
-        replies = self._retained_replies("owner", self._decode_owner_reply)
+        replies = self._retained_replies("owner", lambda saved: decode_retained_owner_reply(self.journal.db, saved))
         session_stops = Counter(
             reply.ticket
             for reply in replies
@@ -485,88 +574,6 @@ class CommandOutcomes:
             else:
                 valid.append(reply)
         return tuple(valid)
-
-    # Validate a retained local reply against the stored wire or its original claim.
-    def _decode_owner_reply(self, saved: dict[str, Any]) -> OwnerWire | None:
-        if saved.keys() != {"wire", "request", "ticket", "boot", "action", "local", "limit_a", "reply"}:
-            return None
-        action, local = saved["action"], saved["local"]
-        if (
-            action not in ("RemoteStartTransaction", "RemoteStopTransaction")
-            or saved["reply"] not in ("Accepted", "Rejected")
-            or not _reply_identifier(saved["ticket"])
-            or any(value is not None and not _reply_identifier(value) for value in (saved["request"], saved["boot"]))
-            or saved["limit_a"] is not None
-            or (action == "RemoteStartTransaction" and local is not None)
-            or (action == "RemoteStopTransaction" and (type(local) is not int or not 0 < local < 2**63))
-        ):
-            return None
-        reply = OwnerWire(**saved)
-        primary = self.journal.db.execute(
-            "SELECT wire,request,ticket,boot,action,local,limit_a,reply FROM owner_command_wires WHERE wire=?",
-            (reply.wire,),
-        ).fetchone()
-        # Both primary writes can fail. An existing primary row must agree with the checkpoint.
-        if primary is not None:
-            return reply if OwnerWire(*primary) in (reply, replace(reply, reply=None)) else None
-        if action == "RemoteStopTransaction" and not self._owner_stop_claim_matches(reply):
-            return None
-        return reply
-
-    # A pending session Stop and the latest shutdown retain independent dispatch claims.
-    def _owner_stop_claim_matches(self, reply: OwnerWire) -> bool:
-        j = self.journal
-        if j.db.execute("SELECT 1 FROM sqlite_schema WHERE name='managed_requests'").fetchone():
-            claims = j.db.execute(
-                "SELECT id,action,CAST(result AS BLOB) FROM managed_requests WHERE id=? OR (id=? AND action=?)",
-                (reply.request, reply.ticket, STOP_SESSION),
-            ).fetchall()
-            for request, action, raw in claims:
-                try:
-                    result = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
-                except ValueError, RecursionError:
-                    return False
-                if not isinstance(result, dict):
-                    return False
-                if action == STOP_SESSION:
-                    bound = result.get("_session_stop")
-                    if (
-                        reply.request != request
-                        or reply.ticket != request
-                        or not isinstance(bound, dict)
-                        or type(bound.get("local")) is not int
-                        or bound["local"] != reply.local
-                        or type(bound.get("dispatched")) not in (int, bool)
-                        or bound["dispatched"] != 1
-                        or j.db.execute(
-                            "SELECT 1 FROM owner_command_wires WHERE request=? AND ticket=? "
-                            "AND action='RemoteStopTransaction' LIMIT 1",
-                            (request, request),
-                        ).fetchone()
-                        is not None
-                    ):
-                        return False
-                    return True
-                elif action == "pause":
-                    bound = result.get("_stop")
-                    if (
-                        isinstance(bound, dict)
-                        and bound.get("ticket") == reply.ticket
-                        and (bound.get("local"), bound.get("boot")) != (reply.local, reply.boot)
-                    ):
-                        return False
-                else:
-                    return False
-        if reply.request is None:
-            shutdown = j.get("trial_shutdown_attempt", {})
-            if isinstance(shutdown, dict) and shutdown.get("ticket") == reply.ticket and "stop_wire" in shutdown:
-                return (shutdown["stop_wire"], shutdown.get("boot"), shutdown.get("local")) == (
-                    reply.wire,
-                    reply.boot,
-                    reply.local,
-                )
-        # Session-only Stops use the request ID as their ticket and require the claim above.
-        return reply.request != reply.ticket
 
     # A forwarded checkpoint still belongs to the original vendor mutation and exact charger call.
     def _retained_vendor_replies(self) -> tuple[ForwardedReply, ...]:
@@ -630,14 +637,11 @@ class CommandOutcomes:
         self._publish_owner_start_reply()
 
     # Receipt settlement sees a refusal while its exact wire reply awaits promotion from memory or the checkpoint.
-    def buffered_stop_rejections(self) -> tuple[list[tuple[str, int]], list[tuple[str, str]]]:
+    def buffered_stop_rejections(self) -> tuple[list[tuple[str | None, int, str]], list[tuple[str, str]]]:
         owner = [
-            (wire.request, wire.local)
+            (wire.request, wire.local, wire.wire)
             for wire in (*self._retained_owner_replies(), *self._owner_writes.values())
-            if wire.action == "RemoteStopTransaction"
-            and wire.reply == "Rejected"
-            and wire.request is not None
-            and wire.local is not None
+            if wire.action == "RemoteStopTransaction" and wire.reply == "Rejected" and wire.local is not None
         ]
         vendor = [
             (reply.mutation, reply.wire)
@@ -741,22 +745,21 @@ class CommandOutcomes:
     # Bind live reply windows to the exact local or vendor request and allocated session.
     def open_stop_replies(self, windows: tuple[str, ...]) -> tuple[tuple[str, str, int], ...]:
         wires = encoded(windows)
-        attempts = {
-            ("local", wire.request, wire.local)
+        owner_wires = {
+            (wire.wire, wire.request, wire.local)
             for wire in self._owner_writes.values()
-            if wire.wire in windows
-            and wire.action == "RemoteStopTransaction"
-            and wire.request is not None
-            and wire.local is not None
+            if wire.wire in windows and wire.action == "RemoteStopTransaction" and wire.local is not None
         }
-        attempts.update(
-            ("local", row["request"], row["local"])
+        owner_wires.update(
+            (row["wire"], row["request"], row["local"])
             for row in self.journal.db.execute(
-                "SELECT request,local FROM owner_command_wires WHERE action='RemoteStopTransaction' "
-                "AND request IS NOT NULL AND local IS NOT NULL AND wire IN (SELECT value FROM json_each(?))",
+                "SELECT wire,request,local FROM owner_command_wires WHERE action='RemoteStopTransaction' "
+                "AND local IS NOT NULL AND wire IN (SELECT value FROM json_each(?))",
                 (wires,),
             )
         )
+        attempts = {("owner_wire", wire, local) for wire, _, local in owner_wires}
+        attempts.update(("local", request, local) for _, request, local in owner_wires if request is not None)
         attempts.update(
             ("vendor", row["mutation"], row["local"])
             for row in self.journal.db.execute(
@@ -820,7 +823,9 @@ class CommandOutcomes:
     def awaits_stop_report(self, local: int | None) -> bool:
         if local is None or self.journal.active() != local:
             return False
-        return self.accepted_stop(local) or self.unanswered_shutdown_stop(local) or self.session_stop_dispatched(local)
+        return (
+            self.accepted_stop(local) or self.unanswered_shutdown_stop(local) or self.session_stop_tracks_closure(local)
+        )
 
     # Session-only Stop owns a possible dispatch even if its separate wire record could not be saved.
     def session_stop_dispatches(self, local: int) -> tuple[str, ...]:
@@ -846,14 +851,20 @@ class CommandOutcomes:
             return True
         if self.journal.get("managed_mode") is None:
             return False
-        joined = self.journal.db.execute(
-            "SELECT 1 FROM managed_requests WHERE action='stop_session' AND state IN ('running','uncertain') "
+        rejections = stop_rejections(self.journal)
+        count = self.journal.db.execute(
+            f"{rejections.prefix}"
+            "SELECT MAX(COALESCE(json_array_length(result,'$._session_stop.owner_wire_attempts'),0)) "
+            "FROM managed_requests WHERE action='stop_session' AND state IN ('running','uncertain') "
             "AND json_extract(result,'$._session_stop.local')=? AND json_extract(result,'$._session_stop.joined')=1 "
-            "LIMIT 1",
-            (local,),
-        ).fetchone()
-        return joined is not None and (
-            self.accepted_stop(local) or self.unanswered_vendor_stop(local) or self.unanswered_shutdown_stop(local)
+            f"AND NOT {rejections.receipts}",
+            (*rejections.bindings, local),
+        ).fetchone()[0]
+        return count is not None and (
+            count > 0
+            or self.accepted_stop(local)
+            or self.unanswered_vendor_stop(local)
+            or self.unanswered_shutdown_stop(local)
         )
 
     # A closed session can retain a Stop wait only until the next connector lifecycle.
@@ -889,6 +900,12 @@ class CommandOutcomes:
 
     # A pending owner wire can cover this session during the same authenticated charger Boot.
     def unanswered_owner_stop(self, local: int, boot: str) -> bool:
+        return bool(self.unanswered_owner_stop_wires(local, boot))
+
+    # A single Pause may have several sends, so a joining Stop binds the actual wire IDs.
+    def unanswered_owner_stop_wires(
+        self, local: int, boot: str, *, represented_requests: tuple[str, ...] = ()
+    ) -> tuple[str, ...]:
         tickets = {
             row[0]
             for row in self.journal.db.execute(
@@ -903,13 +920,17 @@ class CommandOutcomes:
             for wire in self._owner_writes.values()
             if wire.action == "RemoteStopTransaction" and wire.local == local and wire.boot == boot
         )
-        return any(
-            wire.action == "RemoteStopTransaction"
-            and wire.local == local
-            and wire.boot == boot
-            and wire.reply not in ("Accepted", "Rejected")
-            for ticket in tickets
-            for wire in self.owner_wires("ticket", ticket)
+        return tuple(
+            sorted(
+                wire.wire
+                for ticket in tickets
+                for wire in self.owner_wires("ticket", ticket)
+                if wire.action == "RemoteStopTransaction"
+                and wire.local == local
+                and wire.boot == boot
+                and wire.request not in represented_requests
+                and wire.reply not in ("Accepted", "Rejected")
+            )
         )
 
     # This is evidence to wait, without an Accepted reply that can be sent to another caller.

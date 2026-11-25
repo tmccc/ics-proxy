@@ -5,7 +5,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
+#include <string_view>
 
 #include "esphome/components/image/image.h"
 #include "esphome/core/helpers.h"
@@ -18,12 +20,33 @@ namespace solar_display {
 
 enum class ChargerButton { NONE, START, STOP };
 
+enum ChargerFeedback : uint8_t {
+  REQUEST_STATE = 1 << 0,
+  AUTOMATION_STATE = 1 << 1,
+  ACTIVE_RUNS = 1 << 2,
+  ALL_FEEDBACK = REQUEST_STATE | AUTOMATION_STATE | ACTIVE_RUNS,
+};
+
 // A deliberate tap starts and ends inside the same charger button.
 inline ChargerButton charger_button_at(int x, int y) {
   if (y < 366 || y >= 428) return ChargerButton::NONE;
   if (x >= 20 && x < 232) return ChargerButton::START;
   if (x >= 248 && x < 460) return ChargerButton::STOP;
   return ChargerButton::NONE;
+}
+
+inline bool is_home_assistant_client(std::string_view name) {
+  return name.starts_with("Home Assistant");
+}
+
+// Match the Home Assistant touch automation's eligible feedback states.
+inline bool charger_request_idle(const std::string &request, float active_runs) {
+  return active_runs == 0 &&
+         (request == "idle" || request == "starting_timeout" || request == "stopping_timeout");
+}
+
+inline bool charger_request_known(const std::string &request) {
+  return charger_request_idle(request, 0) || request == "starting" || request == "stopping";
 }
 
 struct CanvasMarker {

@@ -64,20 +64,33 @@ def test_display_feedback_follows_live_home_assistant_subscriptions():
     helper = next(sensor for sensor in package["text_sensor"] if sensor["id"] == "canvas_ics_request_state")
     automation = next(sensor for sensor in package["text_sensor"] if sensor["id"] == "canvas_ics_touch_automation")
     busy = next(sensor for sensor in package["sensor"] if sensor["id"] == "canvas_ics_pending_runs")
+    substitutions = package["substitutions"]
     assert helper["platform"] == automation["platform"] == busy["platform"] == "homeassistant"
-    assert helper["entity_id"] == PENDING
-    assert automation["entity_id"] == AUTOMATION and "attribute" not in automation
-    assert busy["entity_id"] == AUTOMATION and busy["attribute"] == "current"
-    assert helper["on_value"] == automation["on_value"] == [{"script.execute": "show_ics_request_feedback"}]
+    assert helper["entity_id"] == "${canvas_ics_request_entity}"
+    assert substitutions["canvas_ics_request_entity"] == PENDING
+    assert automation["entity_id"] == busy["entity_id"] == "${canvas_ics_automation_entity}"
+    assert substitutions["canvas_ics_automation_entity"] == AUTOMATION
+    assert "attribute" not in automation and busy["attribute"] == "current"
+    for source, valid, reading in (
+        (helper, "solar_display::charger_request_known(x)", "REQUEST_STATE"),
+        (automation, "!x.empty()", "AUTOMATION_STATE"),
+        (busy, "x >= 0", "ACTIVE_RUNS"),
+    ):
+        record = source["on_value"][0]["lambda"]
+        assert f"if (id(canvas_ha_connections) == 1 && {valid})" in record
+        assert f"id(canvas_ics_feedback_missing) &= ~solar_display::{reading};" in record
+        assert source["on_value"][1] == {"script.execute": "show_ics_request_feedback"}
     scripts = {script["id"]: script["then"] for script in package["script"]}
     feedback = scripts["show_ics_request_feedback"][0]["lambda"]
     assert 'const bool enabled = id(canvas_ics_touch_automation).state == "on";' in feedback
-    assert 'const bool unavailable = showing && !enabled;' in feedback
+    assert "const bool ready = id(canvas_ha_connections) == 1 && id(canvas_ics_feedback_missing) == 0;" in feedback
+    assert "!ready || !enabled || !solar_display::charger_request_known(request) || !(active_runs >= 0)" in feedback
     assert re.search(r'if \(unavailable\)\s*\{\s*feedback = "Charger buttons unavailable";', feedback)
-    assert "if (!enabled) id(canvas_pressed_control).clear();" in feedback
+    assert "!solar_display::charger_request_idle(request, active_runs)" in feedback
+    assert "id(canvas_pressed_control).clear();" in feedback
     assert "if (!pending && !unavailable)" in feedback
-    assert 'const bool starting = showing && enabled && request == "starting";' in feedback
-    assert 'const bool stopping = showing && enabled && request == "stopping";' in feedback
+    assert 'const bool starting = showing && !unavailable && request == "starting";' in feedback
+    assert 'const bool stopping = showing && !unavailable && request == "stopping";' in feedback
     for state, message in (("starting_timeout", "Start not confirmed"), ("stopping_timeout", "Stop not confirmed")):
         assert re.search(rf'request == "{state}"\)\s*\{{\s*feedback = "{message}";', feedback)
     assert {"script.execute": "show_ics_request_feedback"} in scripts["check_canvas_freshness"][0]["if"]["then"]
@@ -85,10 +98,72 @@ def test_display_feedback_follows_live_home_assistant_subscriptions():
     touch = next(
         widget["button"] for widget in page["widgets"] if widget.get("button", {}).get("id") == "canvas_touch_button"
     )
-    assert 'id(canvas_ics_touch_automation).state == "on"' in touch["on_press"][0]["lambda"]
+    press = touch["on_press"][0]["lambda"]
+    assert 'id(canvas_ics_touch_automation).state == "on"' in press
+    assert "id(canvas_ha_connections) == 1 && id(canvas_ics_feedback_missing) == 0" in press
+    assert re.search(
+        r"charger_request_idle\(id\(canvas_ics_request_state\)\.state,\s+id\(canvas_ics_pending_runs\)\.state\)",
+        press,
+    )
+    assert "fresh(now, clock.timestamp)" in press
     click = touch["on_click"][0]["if"]["condition"]["lambda"]
     assert 'id(canvas_ics_touch_automation).state != "on"' in click
-    assert 'request == "starting" || request == "stopping"' in click
+    assert re.search(
+        r"if \(charger_button &&\s*\([^\n]*\n\s*id\(canvas_ha_connections\) != 1 "
+        r"\|\| id\(canvas_ics_feedback_missing\) != 0",
+        click,
+    )
+    assert "!solar_display::charger_request_idle(request, id(canvas_ics_pending_runs).state)" in click
+
+
+# Intent: a held tap is retired when Home Assistant disconnects or the old frame expires before a new download.
+# Why: the release of that same tap must not submit a request from a stale frame.
+def test_display_retires_held_tap_before_a_reconnect_or_frame_refresh():
+    package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
+    connect = package["api"]["on_client_connected"][0]["lambda"]
+    disconnect = package["api"]["on_client_disconnected"][0]["lambda"]
+    assert "solar_display::is_home_assistant_client(client_info)" in connect
+    assert "solar_display::is_home_assistant_client(client_info)" in disconnect
+    assert "++id(canvas_ha_connections);" in connect
+    assert "id(canvas_ics_feedback_missing) = solar_display::ALL_FEEDBACK;" in connect
+    assert "id(canvas_pressed_control).clear();" in connect
+    assert "--id(canvas_ha_connections);" in disconnect
+    assert re.search(
+        r"if \(id\(canvas_ha_connections\) == 0\) \{[^}]*\bid\(canvas_pressed_control\).clear\(\);", disconnect
+    )
+    assert 'id(canvas_ics_touch_automation).publish_state("");' in connect
+    assert 'id(canvas_ics_request_state).publish_state("");' in connect
+    assert "id(canvas_ics_pending_runs).publish_state(std::numeric_limits<float>::quiet_NaN());" in connect
+    assert "publish_state" not in disconnect
+    download = package["image"][0]["on_download_finished"][0]["lambda"]
+    assert re.search(
+        r"!frame.freshness\(\).fresh\(now_ms, now.timestamp\)\) \{\s+id\(canvas_pressed_control\).clear\(\);",
+        download,
+    )
+    assert download.index("!frame.freshness().fresh(") < download.index("if (!cached)")
+
+
+# Intent: charger controls wait for the surviving client's values after a connection overlap.
+# Why: a sample received during overlap may belong to the connection that has just closed.
+def test_display_waits_for_feedback_after_an_overlapping_disconnect():
+    package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
+    disconnect = package["api"]["on_client_disconnected"][0]["lambda"]
+    surviving_connection = re.search(r"else if \(id\(canvas_ha_connections\) == 1\) \{([^}]*)\}", disconnect)[1]
+    assert "id(canvas_ics_feedback_missing) = solar_display::ALL_FEEDBACK;" in surviving_connection
+    assert "id(canvas_ics_feedback_reads) = solar_display::ALL_FEEDBACK;" in surviving_connection
+    assert "id(refresh_canvas_ics_feedback).execute();" in surviving_connection
+    script = next(script for script in package["script"] if script["id"] == "refresh_canvas_ics_feedback")
+    refresh = script["then"][0]["lambda"]
+    assert re.findall(r'\{"(\$\{[a-z_]+\})", "([a-z]*)", solar_display::([A-Z_]+)\}', refresh) == [
+        ("${canvas_ics_request_entity}", "", "REQUEST_STATE"),
+        ("${canvas_ics_automation_entity}", "", "AUTOMATION_STATE"),
+        ("${canvas_ics_automation_entity}", "current", "ACTIVE_RUNS"),
+    ]
+    assert "read.once = true;" in refresh
+    assert "if (client->send_message(read)) pending &= ~reading.bit;" in refresh
+    assert "canvas_ics_feedback_missing" not in refresh
+    interval = next(interval for interval in package["interval"] if interval["interval"] == "1s")
+    assert {"script.execute": "refresh_canvas_ics_feedback"} in interval["then"]
 
 
 # Intent: test the shipped display tap guards and exact Start/Stop feedback inside Home Assistant.
@@ -329,4 +404,5 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         assert len(calls) == 6
     finally:
         gate.set()
+        await hass.services.async_call("automation", "turn_off", {"entity_id": AUTOMATION}, blocking=True)
         await hass.async_stop(force=True)

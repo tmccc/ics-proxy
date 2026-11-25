@@ -132,6 +132,43 @@ async def test_open_daily_introduction_rechecks_zero_after_new_boot(
             assert not any(frame[2] in ("RemoteStartTransaction", "RemoteStopTransaction") for frame in fresh)
 
 
+# Intent: a commissioned Boot can recover on the same socket after changed metadata supersedes its first zero.
+# Why: the ordinary owner can verify current zero and source after the audited introduction worker retires.
+async def test_open_introduction_recovers_when_commissioned_boot_returns(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 16) as b:
+        c, g, rig, j = b.controller, b.session.gateway, b.rig, b.session.journal
+        local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
+        await healthy(c)
+        intent, vendor = c.requests.intent(), j.vendor_id(local)
+        await b.charger.close()
+        await until(lambda: g.charger.sender is None)
+        async with rig.charger(b.session) as charger:
+            send, held, entered = delay_reply(monkeypatch, rig, charger, "SetChargingProfile")
+            assert (await rig.bench.call(charger, "first-commissioned-boot", "BootNotification", BOOT))[0] == 3
+            await asyncio.wait_for(entered.wait(), 3)
+            epoch = g._charger_epoch
+            assert c.native.audited_epoch == epoch and c.native.introduced_epoch != epoch
+            changed = BOOT | {"firmwareVersion": "unverified firmware"}
+            assert (await rig.bench.call(charger, "different-boot", "BootNotification", changed))[0] == 3
+            mark = len(rig.bench.device_calls)
+            await send(held[0])
+            await until(lambda: not b.session.runtime.introduction_pending)
+            assert not (await c.tick())["owner_control_enabled"]
+            assert c.native.introduced_epoch != epoch and not g.controls.ready
+            assert rig.bench.firmware.effective_limit() == 0 and not rig.bench.device_calls[mark:]
+
+            assert (await rig.bench.call(charger, "restored-commissioned-boot", "BootNotification", BOOT))[0] == 3
+            status = await healthy(c)
+            assert status["owner_control_enabled"] and status["station_ceiling_a"] == 16
+            assert g._charger_epoch == c.native.introduced_epoch == epoch
+            assert c.native.introduced_revision == g.controls._revision
+            assert c.requests.intent() == intent and j.active() == local and j.vendor_id(local) == vendor
+            fresh = rig.bench.device_calls[mark:]
+            assert [frame[2] for frame in fresh[:2]] == ["SetChargingProfile", "GetCompositeSchedule"]
+            assert fresh[0][3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0
+            assert not any(frame[2] in ("RemoteStartTransaction", "RemoteStopTransaction") for frame in fresh)
+
+
 # Intent: after a failed Boot, the open-session zero retry cannot attach to changed metadata.
 # Why: waiting for a saved observation cannot turn a different Boot body into the one already audited.
 async def test_open_introduction_does_not_retry_zero_under_changed_boot(tmp_path, tls, unused_tcp_port, monkeypatch):

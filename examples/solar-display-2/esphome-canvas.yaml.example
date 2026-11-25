@@ -1,6 +1,10 @@
 # Editable Home Assistant screen with generic touch coordinates.
 # Only an image-scoped credential is sent to Home Assistant. Normal layout
 # changes happen in the GeekMagic editor and need no firmware update.
+substitutions:
+  canvas_ics_request_entity: input_select.general_display_2_ics_request
+  canvas_ics_automation_entity: automation.general_display_2_ics_charger_buttons
+
 http_request:
   id: canvas_http
   timeout: 5s
@@ -10,6 +14,34 @@ time:
   - platform: homeassistant
     id: canvas_ha_time
     update_interval: 10s
+
+api:
+  on_client_connected:
+    - lambda: |-
+        if (solar_display::is_home_assistant_client(client_info)) {
+          ++id(canvas_ha_connections);
+          id(canvas_ics_feedback_reads) = 0;
+          id(canvas_ics_feedback_missing) = solar_display::ALL_FEEDBACK;
+          id(canvas_pressed_control).clear();
+          id(canvas_ics_touch_automation).publish_state("");
+          id(canvas_ics_request_state).publish_state("");
+          id(canvas_ics_pending_runs).publish_state(std::numeric_limits<float>::quiet_NaN());
+        }
+  on_client_disconnected:
+    - lambda: |-
+        if (solar_display::is_home_assistant_client(client_info)) {
+          if (id(canvas_ha_connections) != 0) --id(canvas_ha_connections);
+          if (id(canvas_ha_connections) == 0) {
+            id(canvas_ics_feedback_reads) = 0;
+            id(canvas_ics_feedback_missing) = solar_display::ALL_FEEDBACK;
+            id(canvas_pressed_control).clear();
+            id(check_canvas_freshness).execute();
+          } else if (id(canvas_ha_connections) == 1) {
+            id(canvas_ics_feedback_missing) = solar_display::ALL_FEEDBACK;
+            id(canvas_ics_feedback_reads) = solar_display::ALL_FEEDBACK;
+            id(refresh_canvas_ics_feedback).execute();
+          }
+        }
 
 image:
   - platform: online_image
@@ -31,10 +63,13 @@ image:
           // working buffer. A 304 validates the fetch without refreshing the render time.
           auto &frame = solar_display::canvas_frame();
           const uint32_t now_ms = millis();
+          const auto now = id(canvas_ha_time).now();
+          if (!now.is_valid() || !frame.freshness().fresh(now_ms, now.timestamp)) {
+            id(canvas_pressed_control).clear();
+          }
           if (!cached) {
             const auto &download = *id(canvas_image);
             const auto marker = solar_display::StableCanvasFrame::read_marker(download);
-            const auto now = id(canvas_ha_time).now();
             if (!now.is_valid() || !frame.freshness().accepts(marker.rendered_at, now_ms, now.timestamp)) {
               id(reset_canvas_image).execute();
               return;
@@ -83,6 +118,18 @@ image:
       - script.execute: reset_canvas_image
 
 globals:
+  - id: canvas_ha_connections
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: canvas_ics_feedback_reads
+    type: uint8_t
+    restore_value: false
+    initial_value: "0"
+  - id: canvas_ics_feedback_missing
+    type: uint8_t
+    restore_value: false
+    initial_value: solar_display::ALL_FEEDBACK
   - id: canvas_image_ready
     type: bool
     restore_value: false
@@ -132,15 +179,23 @@ globals:
 text_sensor:
   - platform: homeassistant
     id: canvas_ics_request_state
-    entity_id: input_select.general_display_2_ics_request
+    entity_id: ${canvas_ics_request_entity}
     internal: true
     on_value:
+      - lambda: |-
+          if (id(canvas_ha_connections) == 1 && solar_display::charger_request_known(x)) {
+            id(canvas_ics_feedback_missing) &= ~solar_display::REQUEST_STATE;
+          }
       - script.execute: show_ics_request_feedback
   - platform: homeassistant
     id: canvas_ics_touch_automation
-    entity_id: automation.general_display_2_ics_charger_buttons
+    entity_id: ${canvas_ics_automation_entity}
     internal: true
     on_value:
+      - lambda: |-
+          if (id(canvas_ha_connections) == 1 && !x.empty()) {
+            id(canvas_ics_feedback_missing) &= ~solar_display::AUTOMATION_STATE;
+          }
       - script.execute: show_ics_request_feedback
   - platform: template
     id: canvas_screen_source
@@ -153,11 +208,51 @@ text_sensor:
 sensor:
   - platform: homeassistant
     id: canvas_ics_pending_runs
-    entity_id: automation.general_display_2_ics_charger_buttons
+    entity_id: ${canvas_ics_automation_entity}
     attribute: current
     internal: true
+    on_value:
+      - lambda: |-
+          if (id(canvas_ha_connections) == 1 && x >= 0) {
+            id(canvas_ics_feedback_missing) &= ~solar_display::ACTIVE_RUNS;
+          }
+      - script.execute: show_ics_request_feedback
 
 script:
+  - id: refresh_canvas_ics_feedback
+    mode: restart
+    then:
+      - lambda: |-
+          auto &pending = id(canvas_ics_feedback_reads);
+          auto *server = api::global_api_server;
+          if (pending == 0 || id(canvas_ha_connections) != 1 ||
+              !server->is_connected_with_state_subscription()) return;
+
+          // An old socket can deliver queued state after the replacement's initial state.
+          // Request the surviving client's values once. The sensors track the values received.
+          constexpr struct {
+            const char *entity;
+            const char *attribute;
+            uint8_t bit;
+          } reads[] = {
+            {"${canvas_ics_request_entity}", "", solar_display::REQUEST_STATE},
+            {"${canvas_ics_automation_entity}", "", solar_display::AUTOMATION_STATE},
+            {"${canvas_ics_automation_entity}", "current", solar_display::ACTIVE_RUNS},
+          };
+          for (const auto &client : server->active_clients()) {
+            if (!client->is_authenticated() || client->is_marked_for_removal() ||
+                !solar_display::is_home_assistant_client(client->get_name())) continue;
+
+            for (const auto &reading : reads) {
+              if ((pending & reading.bit) == 0) continue;
+              api::SubscribeHomeAssistantStateResponse read;
+              read.entity_id = StringRef(reading.entity);
+              read.attribute = StringRef(reading.attribute);
+              read.once = true;
+              if (client->send_message(read)) pending &= ~reading.bit;
+            }
+            return;
+          }
   - id: show_ics_request_feedback
     mode: restart
     then:
@@ -166,11 +261,16 @@ script:
           const auto &request = id(canvas_ics_request_state).state;
           const bool enabled = id(canvas_ics_touch_automation).state == "on";
           const bool showing = id(canvas_showing);
-          const bool unavailable = showing && !enabled;
-          const bool starting = showing && enabled && request == "starting";
-          const bool stopping = showing && enabled && request == "stopping";
+          const auto active_runs = id(canvas_ics_pending_runs).state;
+          const bool ready = id(canvas_ha_connections) == 1 && id(canvas_ics_feedback_missing) == 0;
+          const bool unavailable = showing &&
+              (!ready || !enabled || !solar_display::charger_request_known(request) || !(active_runs >= 0));
+          const bool starting = showing && !unavailable && request == "starting";
+          const bool stopping = showing && !unavailable && request == "stopping";
           const bool pending = starting || stopping;
-          if (!enabled) id(canvas_pressed_control).clear();
+          if (!showing || unavailable || !solar_display::charger_request_idle(request, active_runs)) {
+            id(canvas_pressed_control).clear();
+          }
           const char *feedback = nullptr;
           if (unavailable) {
             feedback = "Charger buttons unavailable";
@@ -223,7 +323,7 @@ script:
           condition:
             lambda: |-
               const auto now = id(canvas_ha_time).now();
-              return id(dashboard_ha_connected) &&
+              return id(canvas_ha_connections) != 0 &&
                   api::global_api_server->is_connected_with_state_subscription() &&
                   id(canvas_image_ready) &&
                   now.is_valid() &&
@@ -249,7 +349,7 @@ script:
             lambda: |-
               const auto now = id(canvas_ha_time).now();
               return id(canvas_showing) &&
-                  (!id(dashboard_ha_connected) ||
+                  (id(canvas_ha_connections) == 0 ||
                    !api::global_api_server->is_connected_with_state_subscription() ||
                    !id(canvas_image_ready) || !now.is_valid() ||
                    !solar_display::canvas_frame().freshness().fresh(millis(), now.timestamp));
@@ -268,6 +368,7 @@ interval:
   - interval: 1s
     then:
       - script.execute: check_canvas_freshness
+      - script.execute: refresh_canvas_ics_feedback
 
 lvgl:
   pages:
@@ -369,8 +470,16 @@ lvgl:
                   const auto button = solar_display::charger_button_at(press_point.x, press_point.y);
                   id(canvas_pressed_button) = static_cast<int>(button);
                   id(canvas_pressed_control).clear();
+                  const auto clock = id(canvas_ha_time).now();
+                  const uint32_t now = millis();
                   if (button != solar_display::ChargerButton::NONE && id(canvas_ics_touch_automation).state == "on" &&
-                      uint32_t(millis() - id(canvas_frame_control_changed_ms)) >= 100) {
+                      id(canvas_ha_connections) == 1 && id(canvas_ics_feedback_missing) == 0 &&
+                      solar_display::charger_request_idle(id(canvas_ics_request_state).state,
+                                                         id(canvas_ics_pending_runs).state) &&
+                      id(canvas_showing) && id(canvas_image_ready) && clock.is_valid() &&
+                      api::global_api_server->is_connected_with_state_subscription() &&
+                      solar_display::canvas_frame().freshness().fresh(now, clock.timestamp) &&
+                      uint32_t(now - id(canvas_frame_control_changed_ms)) >= 100) {
                     id(canvas_pressed_control) = id(canvas_frame_control);
                   }
             on_click:
@@ -388,6 +497,8 @@ lvgl:
                       const auto &request = id(canvas_ics_request_state).state;
                       if (charger_button &&
                           (id(canvas_ics_touch_automation).state != "on" ||
+                           id(canvas_ha_connections) != 1 || id(canvas_ics_feedback_missing) != 0 ||
+                           !solar_display::charger_request_idle(request, id(canvas_ics_pending_runs).state) ||
                            static_cast<int>(button) != id(canvas_pressed_button) ||
                            id(canvas_pressed_control) != id(canvas_frame_control) ||
                            (button == ChargerButton::START && !id(canvas_pressed_control).starts_with("start:")) ||
@@ -395,12 +506,10 @@ lvgl:
                         return false;
                       }
                       if (point.x < 0 || point.x >= 480 || point.y < 0 || point.y >= 442 ||
-                          (charger_button && (id(canvas_ics_pending_runs).state > 0 ||
-                                             request == "starting" || request == "stopping")) ||
                           !id(canvas_showing) || !id(canvas_image_ready) ||
                           !frame.ready() || !clock.is_valid() ||
                           !frame.freshness().fresh(now, clock.timestamp) ||
-                          !id(dashboard_ha_connected) ||
+                          id(canvas_ha_connections) == 0 ||
                           !api::global_api_server->is_connected_with_state_subscription() ||
                           (id(canvas_touch_event_count) != 0 &&
                            uint32_t(now - id(canvas_last_touch_ms)) < 500)) return false;

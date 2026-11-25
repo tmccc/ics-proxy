@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import sqlite3
@@ -17,16 +18,23 @@ from typing import Any
 
 import pytest
 
+from ics_proxy_core.engine.gateway import decode
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_current import capability_value
 from ics_proxy_core.engine.managed_intent import OWNER_PAUSE, ManagedRequests
 from ics_proxy_core.engine.native_faults import NativeContentError, diagnostic_type
-from ics_proxy_core.engine.native_history import MissingOriginalHistoryError, audit_history, history_policy
+from ics_proxy_core.engine.native_history import (
+    ORIGINAL_HISTORY_OMISSION,
+    MissingOriginalHistoryError,
+    audit_history,
+    history_policy,
+)
 from ics_proxy_core.engine.native_history_recovery import acknowledge_history_policy, matches_history_fault
 from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError, fingerprint
 from ics_proxy_core.engine.trial_handover_evidence import HandoverEvidence
 from ics_proxy_core.engine.trial_resources import ResourceBook
+from ics_proxy_core.frames import build_call_result
 from tests.charge_rig import ChargeRig, positive_flow, ready
 from tests.connected_rig import ConnectedBench, strategy_file
 from tests.handover_helpers import crash
@@ -35,6 +43,7 @@ from tests.prototype_rig import START
 from tests.recovery_barriers import completed_control
 from tests.runtime_rig import until
 from tests.test_cloud_ack_storage import SqlFault, StorageBench, assert_retained, close_local, enqueue, wire_count
+from tests.test_managed_boot_supersession import delay_reply
 from tests.test_managed_normal_start import natural_stop
 from tests.test_native_bounded_handover import restore_original_route, verify_original_backend
 from tests.test_native_history_archive import unassigned
@@ -415,6 +424,222 @@ async def test_cold_start_transient_history_omission_preserves_pending_owner(tmp
             row = recovered.journal.db.execute("SELECT state FROM mutations WHERE token=?", (request,)).fetchone()
             assert row["state"] == "pending"
         assert not starts(rig)
+
+
+_REFUSE_STOP_REJECTION = (
+    "CREATE TEMP TRIGGER refuse_stop_rejection BEFORE UPDATE ON managed_requests "
+    "WHEN json_extract(NEW.result,'$.classification')='stop_rejected' "
+    "BEGIN SELECT RAISE(ABORT,'synthetic Stop receipt refusal'); END"
+)
+
+
+# Intent: settle a saved Stop rejection before cold history repair checks for unfinished requests.
+# Why: a refused receipt write before replacement must not hide a definite charger reply.
+async def test_cold_history_settles_saved_session_stop_rejection(tmp_path, tls, unused_tcp_port, monkeypatch):
+    originals = closed_records()
+    async with managed_bench(tmp_path, tls, unused_tcp_port, initial_history=originals) as rig:
+        first = managed_session(rig)
+        await first.start()
+        c, journal = ManagedController(first), first.journal
+        path, identity = journal.path, journal.identity
+        rig.route_to_trial()
+        request = uuid.uuid4().hex
+        async with rig.charger(first) as charger:
+            await introduced(rig, first, charger, "before-rejected-stop")
+            await healthy(c)
+            b = ChargeRig(rig, first, c, charger)
+            local = await positive_flow(b, "daily")
+            await healthy(c)
+            send, held, sent = delay_reply(monkeypatch, rig, charger, "RemoteStopTransaction")
+            journal.db.execute(_REFUSE_STOP_REJECTION)
+            c.command(request, "stop_session", c.requests.intent().revision, target=c.session_stop.target())
+            await asyncio.wait_for(sent.wait(), 3)
+            wire = decode(held[0])[1]
+            await send(build_call_result(wire, {"status": "Rejected"}))
+            await c.session_stop.worker
+            assert journal.outcomes.owner_wires("request", request)[0].reply == "Rejected"
+            assert c.requests.receipt(request)["state"] == "running"
+            await natural_stop(b, local)
+            pause, revision = uuid.uuid4().hex, c.requests.intent().revision
+            c.command(pause, "pause", revision)
+            await completed_control(b, pause, mode="paused", revision=revision + 1, ceiling=0)
+            assert journal.outcomes.session(local).closed and journal.next_delivery() is None
+            await first.close()
+            assert first.final_status["shutdown_attempt_uncertain"] is False
+
+        rig.bench.history = copy.deepcopy(originals[1:])
+        traffic = list(rig.bench.device_calls), list(rig.bench.calls)
+        replacement = managed_session(rig)
+        try:
+            journal = replacement.journal
+            journal.db.execute(_REFUSE_STOP_REJECTION)
+            with pytest.raises(MissingOriginalHistoryError):
+                await replacement.start()
+            assert not replacement.started and not journal.fault.latched()
+            assert journal.outcomes.owner(request).state == "running"
+
+            journal.db.execute("DROP TRIGGER refuse_stop_rejection")
+            with pytest.raises(MissingOriginalHistoryError):
+                await replacement.start()
+            assert not replacement.started
+            assert journal.get("managed_native_failure")["source"] == "startup_history_omission"
+            rejected = journal.outcomes.owner(request)
+            assert rejected.state == "failed" and rejected.result["classification"] == "stop_rejected"
+            assert journal.outcomes.owner_wires("request", request)[0].reply == "Rejected"
+        finally:
+            await replacement.close()
+
+        with closing(Journal(path, identity)) as journal:
+            book = ResourceBook(journal, rig.prepared.baseline)
+            native = await rig.prepared.observer.observe_handover()
+            assert acknowledge_history_policy(journal, book, rig.spec, native)["fault_cleared"] is True
+            assert journal.outcomes.owner(request) == rejected
+            assert journal.outcomes.session(local).closed and journal.next_delivery() is None
+        assert traffic == (rig.bench.device_calls, rig.bench.calls)
+        assert rig.bench.history == originals[1:] and rig.bench.firmware.effective_limit() == 0
+
+
+# Intent: settle a definite Stop rejection when an existing history-omission fault survives replacement.
+# Why: the saved reply can be published as part of recovery without sending the Stop again.
+@pytest.mark.parametrize("cold_start", [False, True], ids=["offline-ack", "cold-start"])
+async def test_latched_history_settles_saved_session_stop_rejection(
+    tmp_path, tls, unused_tcp_port, monkeypatch, cold_start
+):
+    originals = closed_records()
+    request = uuid.uuid4().hex
+    async with managed_bench(tmp_path, tls, unused_tcp_port, initial_history=originals) as rig:
+        first = managed_session(rig)
+        await first.start()
+        c, journal = ManagedController(first), first.journal
+        path, identity = journal.path, journal.identity
+        rig.route_to_trial()
+        async with rig.charger(first) as charger:
+            await introduced(rig, first, charger, "before-online-history-loss")
+            await healthy(c)
+            b = ChargeRig(rig, first, c, charger)
+            local = await positive_flow(b, "daily")
+            await healthy(c)
+            send, held, sent = delay_reply(monkeypatch, rig, charger, "RemoteStopTransaction")
+            journal.db.execute(_REFUSE_STOP_REJECTION)
+            c.command(request, "stop_session", c.requests.intent().revision, target=c.session_stop.target())
+            await asyncio.wait_for(sent.wait(), 3)
+            await send(build_call_result(decode(held[0])[1], {"status": "Rejected"}))
+            await c.session_stop.worker
+            assert journal.outcomes.owner_wires("request", request)[0].reply == "Rejected"
+            assert c.requests.receipt(request)["state"] == "running"
+            rig.bench.history = copy.deepcopy(originals[1:])
+            await natural_stop(b, local)
+            for _ in range(4):
+                await c.tick()
+            fault = journal.fault.read()
+            assert fault and journal.get("managed_native_failure")["source"] == ORIGINAL_HISTORY_OMISSION
+            assert journal.outcomes.session(local).closed and journal.next_delivery() is None
+            await first.close()
+
+        traffic = list(rig.bench.device_calls), list(rig.bench.calls)
+        if cold_start:
+            replacement = managed_session(rig)
+            try:
+                with pytest.raises(MissingOriginalHistoryError):
+                    await replacement.start()
+                assert not replacement.started and replacement.journal.fault.read() == fault
+                result = replacement.journal.outcomes.owner(request)
+                assert result.state == "failed" and result.result["classification"] == "stop_rejected"
+            finally:
+                await replacement.close()
+
+        with closing(Journal(path, identity)) as journal:
+            book = ResourceBook(journal, rig.prepared.baseline)
+            native = await rig.prepared.observer.observe_handover()
+            if not cold_start:
+                assert journal.outcomes.owner(request).state == "running"
+                journal.db.execute(
+                    "CREATE TEMP TRIGGER refuse_history_ack BEFORE INSERT ON meta "
+                    "WHEN NEW.key='native_history_policy_acknowledgement' "
+                    "BEGIN SELECT RAISE(ABORT,'synthetic history receipt refusal'); END"
+                )
+                with pytest.raises(sqlite3.IntegrityError, match="synthetic history receipt refusal"):
+                    acknowledge_history_policy(journal, book, rig.spec, native)
+                assert journal.outcomes.owner(request).state == "running" and journal.fault.read() == fault
+                journal.db.execute("DROP TRIGGER refuse_history_ack")
+            assert acknowledge_history_policy(journal, book, rig.spec, native)["fault_cleared"] is True
+            assert not journal.fault.latched()
+            result = journal.outcomes.owner(request)
+            assert result.state == "failed" and result.result["classification"] == "stop_rejected"
+            assert journal.outcomes.owner_wires("request", request)[0].reply == "Rejected"
+            assert journal.outcomes.session(local).closed and journal.next_delivery() is None
+        assert traffic == (rig.bench.device_calls, rig.bench.calls)
+        assert rig.bench.firmware.effective_limit() == 0
+
+
+# Intent: settle a saved vendor Stop acknowledgement under a matching history fault after replacement.
+# Why: the history repair can proceed once known delivery settles, while unrelated faults still block it.
+@pytest.mark.parametrize("mixed", [False, True], ids=["history-only", "mixed-native-fault"])
+async def test_latched_history_omission_with_saved_stop_delivery_reply(
+    tmp_path, tls, unused_tcp_port, monkeypatch, mixed
+):
+    originals = closed_records()
+    async with ready(
+        tmp_path, tls, unused_tcp_port, monkeypatch, initial_history=originals, bench_type=StorageBench, cli_route=True
+    ) as b:
+        c, rig, journal = b.controller, b.rig, b.session.journal
+        path, identity = journal.path, journal.identity
+        held, local = await enqueue(b, "StopTransaction", 0)
+        request, revision = uuid.uuid4().hex, c.requests.intent().revision
+        c.command(request, "pause", revision)
+        await completed_control(b, request, mode="paused", revision=revision + 1, ceiling=0)
+
+        storage = SqlFault("delete", held.token)
+        storage.install(journal.db)
+        held.release.set()
+        await until(lambda: b.session.runtime.status.delivery_blocked_cause == "storage")
+        assert_retained(journal, held, saved=True)
+        if mixed:
+            with monkeypatch.context() as config:
+                config.setitem(rig.peer.configuration, "maxOutCurrent0", "31")
+                assert (await c.tick())["state"] == "degraded"
+        rig.bench.history = copy.deepcopy(originals[1:])
+        for _ in range(2 if mixed else 3):
+            await c.tick()
+        fault, failure = journal.fault.read(), journal.get("managed_native_failure")
+        assert fault and matches_history_fault(fault, failure) == (not mixed)
+        assert_retained(journal, held, saved=True)
+        await c.charging.close()
+        await crash(b.session)
+
+        traffic = list(rig.bench.device_calls), list(rig.bench.calls)
+        replacement = managed_session(rig)
+        try:
+            journal = replacement.journal
+            storage.remove(journal.db)
+            with pytest.raises(MissingOriginalHistoryError):
+                await replacement.start()
+            assert not replacement.started
+            assert journal.fault.read() == fault and journal.get("managed_native_failure") == failure
+            assert journal.outcomes.session(local).closed
+            if mixed:
+                assert_retained(journal, held, saved=True)
+            else:
+                assert journal.next_delivery() is None
+                saved = journal.db.execute("SELECT 1 FROM delivery_replies WHERE token=?", (held.token,)).fetchone()
+                assert saved is None
+        finally:
+            await replacement.close()
+
+        with closing(Journal(path, identity)) as journal:
+            book = ResourceBook(journal, rig.prepared.baseline)
+            native = await rig.prepared.observer.observe_handover()
+            if mixed:
+                with pytest.raises(RecoveryRequiredError, match="matching native fault"):
+                    acknowledge_history_policy(journal, book, rig.spec, native)
+                assert journal.fault.read() == fault
+                assert_retained(journal, held, saved=True)
+            else:
+                assert acknowledge_history_policy(journal, book, rig.spec, native)["fault_cleared"] is True
+                assert not journal.fault.latched()
+        assert traffic == (rig.bench.device_calls, rig.bench.calls)
+        assert wire_count(rig, held.token) == 1 and not starts(rig)
+        assert rig.bench.firmware.effective_limit() == 0
 
 
 # Intent: the persisted decision permits fresh real Boot/reconciliation and later retention loss without Start.

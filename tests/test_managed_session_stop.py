@@ -8,7 +8,7 @@ import json
 import time
 import uuid
 from contextlib import closing
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
@@ -25,7 +25,7 @@ from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError
 from ics_proxy_core.frames import build_call_error, build_call_result
-from tests.charge_rig import ChargeRig, owner_rig, positive_flow, report_actual_stop
+from tests.charge_rig import ChargeRig, owner_rig, positive_flow, ready, report_actual_stop
 from tests.current_rig import adjustable, locally_ready, select
 from tests.handover_helpers import crash
 from tests.managed_rig import healthy, introduced, managed_session
@@ -610,6 +610,204 @@ async def test_joined_session_stop_settles_from_late_rejection(
         assert sum(frame[2] == "RemoteStopTransaction" for frame in bench.device_calls) == 1
 
 
+# Intent: a session Stop at verified zero joins the exact unanswered Stop that Pause already sent.
+# Why: the two requests share the physical Stop, but only the real closure can complete the session receipt.
+@pytest.mark.parametrize("outcome", ["Accepted", "Rejected", "rejected_first", "rejected_checkpoint", "expired"])
+async def test_session_stop_joins_unanswered_pause(tmp_path, tls, unused_tcp_port, monkeypatch, outcome):
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        await select(t, 32)
+        assert (await healthy(c))["station_ceiling_a"] == 32
+        local = await positive_flow(t, "daily")
+        await healthy(c)
+        peer = t.session.gateway.charger
+        monkeypatch.setattr(peer, "timeout", 0.25)
+        send, held, entered = delay_reply(monkeypatch, t.rig, t.charger, "RemoteStopTransaction")
+        pause = uuid.uuid4().hex
+        c.command(pause, "pause", c.requests.intent().revision)
+        await asyncio.wait_for(entered.wait(), 3)
+        await asyncio.wait_for(c.pause_task, 3)
+        wire = decode(held[0])[1]
+        assert wire in peer.reply_windows()
+        await c.native.read(closing_local=local, stop_only=True)
+        assert c.native.stop_zero_verified(local)
+        assert j.outcomes.unanswered_owner_stop(local, t.session.gateway.controls.boot())
+        target = c.session_stop.target()
+        assert target is not None
+        request = uuid.uuid4().hex
+        c.command(request, "stop_session", c.requests.intent().revision, target=target)
+        assert c.session_stop.worker is None
+        assert c.requests.receipt(request)["state"] == "running"
+        binding = j.outcomes.owner(request).result["_session_stop"]
+        assert binding["owner_wire_attempts"] == [wire]
+        assert j.outcomes.awaits_stop_report(local)
+        if outcome == "rejected_first":
+            await send(build_call_result(wire, {"status": "Rejected"}))
+            await until(lambda: wire not in peer.reply_windows())
+            c.session_stop.expire()
+            assert c.requests.receipt(request)["result"]["classification"] == "stop_rejected"
+        await natural_stop(t, local)
+        await c.session_stop.confirm_while_blocked()
+        if outcome != "rejected_first":
+            assert j.outcomes.owner(request).result["_session_stop"]["closure_verified"] is True
+            assert c.requests.receipt(request)["state"] == "running"
+            if outcome == "expired":
+                peer._finish_late_receiver(wire)
+            else:
+                if outcome == "rejected_checkpoint":
+                    j.db.execute(
+                        "CREATE TEMP TRIGGER refuse_pause_reply BEFORE INSERT ON owner_command_wires "
+                        "WHEN NEW.reply='Rejected' BEGIN SELECT RAISE(ABORT, 'Stop reply unavailable'); END"
+                    )
+                await send(build_call_result(wire, {"status": "Accepted" if outcome == "Accepted" else "Rejected"}))
+                await until(lambda: wire not in peer.reply_windows())
+            c.session_stop.expire()
+        receipt = c.requests.receipt(request)
+        if outcome.startswith("rejected") or outcome == "Rejected":
+            assert receipt["state"] == "failed" and receipt["result"]["classification"] == "stop_rejected"
+        else:
+            assert receipt["state"] == "completed" and receipt["result"]["session_stopped"] is True
+        report = stop_incident_report(
+            j.path, t.session.prepared.config.incident_events, request_reference=reference(request)
+        )
+        expected_reply = "accepted" if outcome == "Accepted" else "missing" if outcome == "expired" else "rejected"
+        reply_source = {"expired": None, "rejected_checkpoint": "retained_checkpoint"}.get(outcome, "wire_journal")
+        assert report["wire"]["joined_attempts"] == [
+            {
+                "origin": "local",
+                "request": reference(pause),
+                "reply": expected_reply,
+                "reply_source": reply_source,
+            }
+        ]
+        if outcome == "rejected_checkpoint":
+            j.db.execute("DROP TRIGGER refuse_pause_reply")
+        assert c.requests.intent().mode == "paused"
+        assert c.current.selected() == 32 and bench.firmware.effective_limit() == 0
+        assert sum(frame[2] == "RemoteStopTransaction" for frame in bench.device_calls) == 1
+
+
+# Intent: retain a protective Pause's reply alongside the ordinary Stop or older shutdown it overlapped.
+# Why: a late refusal cannot erase an acceptance or complete the join while an exact reply can still arrive.
+@pytest.mark.parametrize(
+    ("earlier", "pause_reply", "state", "age_zero"),
+    [
+        ("session_stop", "Accepted", "completed", False),
+        ("session_stop", "Accepted", "completed", True),
+        ("session_stop", "Rejected", "failed", False),
+        ("vendor_stop", "Accepted", "completed", False),
+        ("shutdown", "Rejected", "completed", False),
+        ("legacy_shutdown", "Rejected", "completed", False),
+    ],
+)
+async def test_session_stop_joins_protective_pause_and_earlier_stop(
+    tmp_path, tls, unused_tcp_port, monkeypatch, earlier, pause_reply, state, age_zero
+):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, peer = t.controller, t.session.journal, t.session.gateway.charger
+        local = await positive_flow(t, "daily")
+        await healthy(c)
+        monkeypatch.setattr(peer, "timeout", 0.25)
+        first = first_wire = None
+        if earlier in ("session_stop", "vendor_stop"):
+            send, held, entered = delay_reply(monkeypatch, t.rig, t.charger, "RemoteStopTransaction")
+            if earlier == "session_stop":
+                first = uuid.uuid4().hex
+                c.command(first, "stop_session", c.requests.intent().revision, target=c.session_stop.target())
+                await asyncio.wait_for(c.session_stop.worker, 3)
+            else:
+                result = await t.rig.bench.cloud_call(
+                    "earlier-vendor-stop", "RemoteStopTransaction", {"transactionId": j.vendor_id(local)}
+                )
+                assert result[:3] == [4, "earlier-vendor-stop", "InternalError"]
+                (first,) = j.outcomes.vendor_stop_dispatches(local)
+            assert entered.is_set()
+            first_wire = decode(held[0])[1]
+            assert first_wire in peer.reply_windows()
+            monkeypatch.setattr(t.charger, "send", send)
+        else:
+            # These are the possible dispatch shapes left by older processes that lost their Stop reply.
+            j.put(
+                "trial_shutdown_attempt",
+                {
+                    "id": "earlier-shutdown",
+                    "local": local,
+                    "ticket": "earlier-ticket",
+                    "boot": "earlier-boot",
+                    "state": "pending",
+                    "prior_pending_stop": False,
+                    **({"stop_wire": "earlier-wire"} if earlier == "shutdown" else {}),
+                },
+            )
+            assert j.outcomes.unanswered_shutdown_stop(local)
+
+        native = t.rig.peer.native
+
+        # Renewed draw authorizes Pause's separate Stop despite the earlier possible dispatch.
+        def drawing(key):
+            value = native(key)
+            if key == "METER":
+                value[0]["meterData"].update(cur=[15, 0, 0], power=[360, 0, 0, 360])
+            return value
+
+        monkeypatch.setattr(t.rig.peer, "native", drawing)
+        send, held, entered = delay_reply(monkeypatch, t.rig, t.charger, "RemoteStopTransaction")
+        pause = uuid.uuid4().hex
+        c.command(pause, "pause", c.requests.intent().revision)
+        await asyncio.wait_for(entered.wait(), 3)
+        pause_wire = decode(held[0])[1]
+        monkeypatch.setattr(t.rig.peer, "native", native)
+        await c.native.read(closing_local=local, stop_only=True)
+        assert c.native.stop_zero_verified(local)
+        if age_zero:
+            sequence, scope, sample = c.native._stop_sample
+            aged = replace(sample, observed_monotonic=time.monotonic() - 6)
+            monkeypatch.setattr(c.native, "_stop_sample", (sequence, scope, aged))
+            assert not c.native.stop_zero_verified(local)
+
+        target = c.session_stop.target()
+        assert target is not None
+        request = uuid.uuid4().hex
+        c.command(request, "stop_session", c.requests.intent().revision, target=target)
+        binding = j.outcomes.owner(request).result["_session_stop"]
+        assert binding["local_attempts"] == ([first] if earlier == "session_stop" else [])
+        assert binding["vendor_attempts"] == ([first] if earlier == "vendor_stop" else [])
+        expected_wires = [pause_wire, "earlier-wire"] if earlier == "shutdown" else [pause_wire]
+        assert binding["owner_wire_attempts"] == expected_wires
+        assert binding.get("unidentified_shutdown_stop", False) is (earlier == "legacy_shutdown")
+
+        await natural_stop(t, local)
+        await c.session_stop.confirm_while_blocked()
+        assert j.outcomes.owner(request).result["_session_stop"]["closure_verified"] is True
+        assert c.requests.receipt(request)["state"] == "running"
+        if first_wire is not None:
+            await send(build_call_result(first_wire, {"status": "Rejected"}))
+            await until(lambda: first_wire not in peer.reply_windows())
+            c.session_stop.expire()
+            if earlier == "session_stop":
+                assert c.requests.receipt(first)["result"]["classification"] == "stop_rejected"
+            assert c.requests.receipt(request)["state"] == "running"
+
+        await send(build_call_result(pause_wire, {"status": pause_reply}))
+        await until(lambda: pause_wire not in peer.reply_windows())
+        c.session_stop.expire()
+        receipt = c.requests.receipt(request)
+        assert receipt["state"] == state
+        if state == "failed":
+            assert receipt["result"]["classification"] == "stop_rejected"
+        else:
+            assert receipt["result"]["session_stopped"] is True
+        report = stop_incident_report(
+            j.path, t.session.prepared.config.incident_events, request_reference=reference(request)
+        )
+        expected = [(reference(first), "rejected")] if first is not None else []
+        expected.append((reference(pause), pause_reply.lower()))
+        assert [(item["request"], item["reply"]) for item in report["wire"]["joined_attempts"]] == expected
+        assert [frame[3] for frame in t.rig.bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ] * (1 if first_wire is None else 2)
+
+
 # Intent: settle a verified closure when its original live reply is accepted, rejected, or can no longer arrive.
 # Why: a completed receipt must remain stable and should not depend on a second local reading after closure.
 @pytest.mark.parametrize("outcome", ["Accepted", "Rejected", "expired", "disconnected"])
@@ -824,7 +1022,7 @@ async def test_buffered_late_stop_rejection_fences_receipts(tmp_path, tls, unuse
 
 # Intent: retain an exact Stop rejection across process replacement and a refused receipt write.
 # Why: physical closure must not complete the rejected request while the original wire record awaits storage.
-@pytest.mark.parametrize("source", ["owner", "vendor"])
+@pytest.mark.parametrize("source", ["owner", "vendor", "pause"])
 def test_exact_stop_rejection_fences_receipt_after_replacement(tmp_path, source):
     path = tmp_path / "stop-journal.sqlite"
     with closing(Journal(path, "synthetic-charger")) as journal:
@@ -833,12 +1031,7 @@ def test_exact_stop_rejection_fences_receipt_after_replacement(tmp_path, source)
         journal.put("managed_mode", {"mode": "app_schedule"})
         local = journal.start("start-report", START)["transactionId"]
         answer = [3, "stop-wire", {"status": "Rejected"}]
-        if source == "owner":
-            binding = {"local": local, "dispatched": True}
-            wire = OwnerWire("stop-wire", "stop-request", "stop-request", "boot", "RemoteStopTransaction", local, None)
-            journal.outcomes.record_owner_wire(wire)
-            refusal = "BEFORE INSERT ON owner_command_wires WHEN NEW.reply='Rejected'"
-        else:
+        if source == "vendor":
             action = "RemoteStopTransaction"
             token = journal.mutation_intent("vendor", action, {"transactionId": 42})
             journal.bind_vendor_command(
@@ -847,7 +1040,31 @@ def test_exact_stop_rejection_fences_receipt_after_replacement(tmp_path, source)
             journal.record_vendor_result(token, "dispatched")
             binding = {"local": local, "joined": True, "local_attempts": [], "vendor_attempts": [token]}
             refusal = "BEFORE UPDATE OF wire_result ON vendor_command_scope WHEN NEW.wire_result='Rejected'"
+        else:
+            request, ticket = "stop-request", "stop-request"
+            binding = {"local": local, "dispatched": True}
+            if source == "pause":
+                request, ticket = "pause-request", "pause-ticket"
+                insert_request(
+                    journal,
+                    request,
+                    "pause",
+                    0,
+                    {"_stop": {"ticket": ticket, "boot": "boot", "local": local}},
+                    state="running",
+                )
+                binding = {"local": local, "joined": 1, "owner_wire_attempts": ["stop-wire"]}
+                sibling = OwnerWire(
+                    "other-wire", request, ticket, "boot", "RemoteStopTransaction", local, None, "Rejected"
+                )
+                journal.outcomes.record_owner_wire(sibling)
+            wire = OwnerWire("stop-wire", request, ticket, "boot", "RemoteStopTransaction", local, None)
+            journal.outcomes.record_owner_wire(wire)
+            refusal = "BEFORE INSERT ON owner_command_wires WHEN NEW.reply='Rejected'"
         insert_request(journal, "stop-request", "stop_session", 0, {"_session_stop": binding}, state="running")
+        if source == "pause":
+            stop.expire()
+            assert requests.receipt("stop-request")["state"] == "running"
         journal.db.execute(
             f"CREATE TEMP TRIGGER refuse_primary_reply {refusal} BEGIN SELECT RAISE(ABORT, 'reply unavailable'); END"
         )
@@ -855,13 +1072,13 @@ def test_exact_stop_rejection_fences_receipt_after_replacement(tmp_path, source)
             "CREATE TRIGGER refuse_stop_receipt BEFORE UPDATE ON managed_requests WHEN NEW.state='failed' "
             "BEGIN SELECT RAISE(ABORT, 'receipt unavailable'); END"
         )
-        if source == "owner":
-            journal.outcomes.record_owner_reply(wire, answer)
-            assert not journal.outcomes.session_stop_dispatched(local)
-        else:
+        if source == "vendor":
             reply = journal.outcomes.capture(token, action, "stop-wire", answer)
             assert reply is not None and not journal.outcomes.publish(reply)
             assert not journal.outcomes.unanswered_vendor_stop(local)
+        else:
+            journal.outcomes.record_owner_reply(wire, answer)
+            assert not journal.outcomes.session_stop_tracks_closure(local)
         journal.stop("stop-report", {"transactionId": local, "meterStop": 1200, "timestamp": "2026-01-01T00:01:00Z"})
         journal.db.execute(
             "UPDATE managed_requests SET result=json_set(result,'$._session_stop.closure_verified',json('true'))"
@@ -1231,6 +1448,220 @@ async def test_service_retries_session_stop_receipt_updates(
         assert [frame[3] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
             {"transactionId": local}
         ]
+
+
+# Intent: a vendor Stop queued while the session is open follows the reply of the earlier Stop after closure.
+# Why: the exact Stop report can arrive while the vendor request waits for the charger without proving acceptance.
+@pytest.mark.parametrize(
+    ("first", "reply"),
+    [
+        ("local", "already_accepted"),
+        ("local", "Accepted"),
+        ("vendor", "Accepted"),
+        ("local", "Rejected"),
+        ("local", None),
+    ],
+)
+async def test_vendor_stop_keeps_its_predecessor_after_closure(
+    tmp_path, tls, unused_tcp_port, monkeypatch, first, reply
+):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        peer = t.session.gateway.charger
+        c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await zero_power_session(t)
+        await healthy(c)
+        target, vendor = c.session_stop.target(), j.vendor_id(local)
+        assert isinstance(target, str) and vendor is not None
+        payload = {"transactionId": vendor}
+        if reply != "already_accepted":
+            send, held, entered = delay_reply(monkeypatch, t.rig, t.charger, "RemoteStopTransaction")
+        first_call = None
+        if first == "local":
+            c.command(uuid.uuid4().hex, "stop_session", c.requests.intent().revision, target=target)
+        else:
+            first_call = asyncio.create_task(bench.cloud_call("first-vendor-stop", "RemoteStopTransaction", payload))
+
+        # Queue the vendor Stop on the open session, then deliver the closure while it waits.
+        async def close_with_vendor_waiting():
+            task = asyncio.create_task(bench.cloud_call("queued-vendor-stop", "RemoteStopTransaction", payload))
+            await until(lambda: bool(peer.gate._waiting))
+            assert j.local_id(vendor) == local
+            await natural_stop(t, local)
+            return task
+
+        if reply == "already_accepted":
+            await until(lambda: j.outcomes.accepted_stop(local))
+            async with peer.gate.enter(0):
+                pending = await close_with_vendor_waiting()
+        else:
+            await asyncio.wait_for(entered.wait(), 3)
+            wire = decode(held[0])[1]
+            assert peer.has_pending_call(wire)
+            pending = await close_with_vendor_waiting()
+            if reply is None:
+                await send(build_call_error(wire, "InternalError", "no definite Stop result"))
+            else:
+                await send(build_call_result(wire, {"status": reply}))
+
+        response = await pending
+        if reply is None:
+            assert response[:3] == [4, "queued-vendor-stop", "InternalError"]
+        else:
+            assert response == [3, "queued-vendor-stop", {"status": "Rejected" if reply == "Rejected" else "Accepted"}]
+        if first_call is not None:
+            assert await first_call == [3, "first-vendor-stop", {"status": "Accepted"}]
+        # A new request cannot acquire the closed transaction just because an older Stop was accepted.
+        closed = await bench.cloud_call("after-closure", "RemoteStopTransaction", payload)
+        assert closed[:2] == [4, "after-closure"]
+        assert [frame[3] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
+
+
+# Intent: a queued vendor Stop can return its earlier Pause's exact reply when the session closes with an aged sample.
+# Why: an open session needs current zero evidence before reusing a Stop, and the closed path uses the saved reply.
+@pytest.mark.parametrize("close_in_gate", [False, True], ids=["refresh-open", "closed-before-refresh"])
+async def test_queued_vendor_stop_keeps_pause_reply_with_aged_zero(
+    tmp_path, tls, unused_tcp_port, monkeypatch, close_in_gate
+):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench, peer = t.controller, t.session.journal, t.rig.bench, t.session.gateway.charger
+        local = await positive_flow(t, "daily")
+        await healthy(c)
+        pause = uuid.uuid4().hex
+        c.command(pause, "pause", c.requests.intent().revision)
+        await asyncio.wait_for(c.pause_task, 3)
+        earlier = j.outcomes.accepted_stop_attempt(local)
+        assert earlier is not None and earlier.identifier == pause
+        await c.native.read(closing_local=local, stop_only=True)
+        assert c.native.stop_zero_verified(local)
+        sequence, scope, sample = c.native._stop_sample
+        aged = replace(sample, observed_monotonic=time.monotonic() - 6)
+        monkeypatch.setattr(c.native, "_stop_sample", (sequence, scope, aged))
+        assert not c.native.stop_zero_verified(local)
+
+        vendor = j.vendor_id(local)
+        assert vendor is not None
+        request = "vendor-stop-with-aged-zero"
+        payload = {"transactionId": vendor}
+        async with peer.gate.enter(0):
+            pending = asyncio.create_task(bench.cloud_call(request, "RemoteStopTransaction", payload))
+            await until(lambda: bool(peer.gate._waiting))
+            if close_in_gate:
+                await natural_stop(t, local)
+        assert await pending == [3, request, {"status": "Accepted"}]
+        if close_in_gate:
+            closed = await bench.cloud_call("new-after-stop", "RemoteStopTransaction", payload)
+            assert closed[:3] == [4, "new-after-stop", "SecurityError"]
+        else:
+            assert c.native.stop_zero_verified(local)
+        assert not j.db.execute("SELECT 1 FROM vendor_command_scope WHERE request=?", (request,)).fetchone()
+        assert [frame[3] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
+
+
+# Intent: keep the exact outcomes of the earlier Stop and the new shutdown Stop while a vendor Stop waits.
+# Why: closure alone cannot establish which Stop the charger accepted or refused.
+@pytest.mark.parametrize(
+    ("prior", "prior_reply", "reply", "expected"),
+    [
+        ("older-shutdown", None, "Accepted", "Accepted"),
+        ("older-shutdown", None, "Rejected", None),
+        ("session-stop", None, "Accepted", "Accepted"),
+        ("session-stop", None, "Rejected", None),
+        ("session-stop", "Rejected", "Rejected", "Rejected"),
+    ],
+)
+async def test_vendor_stop_keeps_new_shutdown_reply_with_older_stop(
+    tmp_path, tls, unused_tcp_port, monkeypatch, prior, prior_reply, reply, expected
+):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        peer = t.session.gateway.charger
+        c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await zero_power_session(t)
+        await healthy(c)
+        vendor = j.vendor_id(local)
+        assert vendor is not None
+
+        earlier_wire = None
+        if prior == "older-shutdown":
+            # A shutdown claim can survive process death with just a possible dispatch marker.
+            j.put(
+                "trial_shutdown_attempt",
+                {
+                    "id": "older-shutdown",
+                    "local": local,
+                    "ticket": "older-ticket",
+                    "boot": "older-boot",
+                    "state": "pending",
+                    "prior_pending_stop": False,
+                    "stop_wire": "older-wire",
+                },
+            )
+            assert j.outcomes.unanswered_shutdown_stop(local)
+        else:
+            target = c.session_stop.target()
+            assert target is not None
+            request = uuid.uuid4().hex
+            timeout = peer.timeout
+            monkeypatch.setattr(peer, "timeout", 0.25)
+            send, held, entered = delay_reply(monkeypatch, t.rig, t.charger, "RemoteStopTransaction")
+            c.command(request, "stop_session", c.requests.intent().revision, target=target)
+            await asyncio.wait_for(entered.wait(), 3)
+            await asyncio.wait_for(c.session_stop.worker, 3)
+            earlier_wire = decode(held[0])[1]
+            assert earlier_wire in peer.reply_windows()
+            assert j.outcomes.session_stop_dispatches(local) == (request,)
+            monkeypatch.setattr(t.charger, "send", send)
+            monkeypatch.setattr(peer, "timeout", timeout)
+        native = t.rig.peer.native
+
+        # Renewed draw gives shutdown a reason to send a separately authorized Stop.
+        def still_drawing(key):
+            value = native(key)
+            if key == "METER":
+                value[0]["meterData"].update(cur=[15, 0, 0], power=[360, 0, 0, 360])
+            return value
+
+        monkeypatch.setattr(t.rig.peer, "native", still_drawing)
+        send, held, entered = delay_reply(monkeypatch, t.rig, t.charger, "RemoteStopTransaction")
+        c.request_stop()
+        shutdown = asyncio.create_task(t.session.close())
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            wire = decode(held[0])[1]
+            claim = j.get("trial_shutdown_attempt")
+            assert claim["prior_pending_stop"] and claim["stop_wire"] == wire
+            if earlier_wire is not None:
+                assert claim["prior_local_attempts"] == [request]
+            monkeypatch.setattr(t.rig.peer, "native", native)
+            await c.native.read(closing_local=local, stop_only=True)
+            assert c.native.stop_zero_verified(local)
+
+            queued = asyncio.create_task(
+                bench.cloud_call("queued-shutdown-stop", "RemoteStopTransaction", {"transactionId": vendor})
+            )
+            await until(lambda: bool(peer.gate._waiting))
+            await natural_stop(t, local)
+            if prior_reply is not None:
+                assert earlier_wire is not None
+                await send(build_call_result(earlier_wire, {"status": prior_reply}))
+                await until(lambda: earlier_wire not in peer.reply_windows())
+            await send(build_call_result(wire, {"status": reply}))
+            response = await queued
+        finally:
+            await shutdown
+        if expected is not None:
+            assert response == [3, "queued-shutdown-stop", {"status": expected}]
+        else:
+            assert response[:3] == [4, "queued-shutdown-stop", "InternalError"]
+        stop_calls = [frame[3] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"]
+        assert stop_calls == [{"transactionId": local}] * (1 if earlier_wire is None else 2)
 
 
 # Intent: a vendor Stop whose device response was an error still covers the same possible physical effect.

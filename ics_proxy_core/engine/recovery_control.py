@@ -79,7 +79,7 @@ class RecoveryControl:
 
     # Registration and a live cloud connection must refer to the current gateway.
     def cloud_ready(self, c: ManagedController) -> bool:
-        return c.session.runtime.status.vendor_connected and c.session.gateway.vendor_registration == "Accepted"
+        return c.session.runtime.vendor_registered
 
     # Only a current revision-bound outage Pause can automatically request release.
     def offline_restore_intent(self, c: ManagedController) -> ControlIntent | None:
@@ -99,7 +99,7 @@ class RecoveryControl:
         scope = current_scope(g)
         if (
             j.phase.read().value == "recovering"
-            and not (c.session.runtime.status.vendor_connected and g.vendor_registration == "Accepted")
+            and not self.cloud_ready(c)
             and scope is not None
             and c.session.runtime.status.vendor_failed_scope == scope
             and c.native.introduction_lineage == scope.lineage
@@ -317,9 +317,7 @@ class RecoveryControl:
             or source.get("boot") != g.boot_observation
             or source.get("epoch") != g._charger_epoch
             or not g.current_boot_seen(g._charger_epoch)
-            or g.vendor.sender is None
-            or g.vendor_registration != "Accepted"
-            or not c.session.runtime.status.vendor_connected
+            or not self.cloud_ready(c)
             or local is not None
             and j.vendor_id(local) is None
             or introduced
@@ -414,8 +412,9 @@ class RecoveryControl:
         self, ordinary: OrdinaryRecovery, native: HandoverEvidence, local: int | None
     ) -> GateDecision:
         c, j, g = ordinary.c, self.journal, ordinary.c.session.gateway
-        if c.native.introduction_pending or c.native.introduced_epoch != g._charger_epoch:
-            return Pending(Prerequisite.ZERO_PROOF, "ordinary recovery awaits completed charger introduction")
+        # A superseded zero proof can leave the audit complete without publishing its introduction.
+        if c.native.introduction_pending or c.native.audited_epoch != g._charger_epoch:
+            return Pending(Prerequisite.ZERO_PROOF, "ordinary recovery awaits a completed charger audit")
         decision = ordinary.authority_decision(local, introduced=False)
         if isinstance(decision, Pending):
             return decision
@@ -726,9 +725,9 @@ class RecoveryControl:
             raise UnavailableError("the verified charger introduction was superseded")
         if recovering:
             journal.phase.recover()
-        handover.audited_epoch = epoch
         revision = gateway.controls._revision
         journal.phase.introduced()
+        handover.audited_epoch = epoch
         return revision
 
     # Select the restrictive work for an already open session after reconnect.
@@ -757,6 +756,32 @@ class RecoveryControl:
         if verified_revision != gateway.controls._revision:
             raise UnavailableError("the verified charger introduction was superseded")
         handover.introduced_epoch, handover.introduced_revision = epoch, verified_revision
+
+    # A current recovery with matching source and lifecycle can reprove a superseded zero introduction.
+    def confirm_current_introduction(self, c: ManagedController, native: HandoverEvidence) -> GateDecision:
+        g, j = c.session.gateway, self.journal
+        scope = current_scope(g)
+        if (
+            scope is None
+            or c.native.introduction_pending
+            or c.native.audited_epoch != scope.epoch
+            or not j.phase.read().operating
+            or j.fault.latched()
+            or not c.native.commissioned_binding_matches(native)
+            or not j.control.read().explicit_local_hold
+            or native.output_limit_a != 0
+            or any(value != 0 for value in native.currents_a + native.powers_w)
+            or g.controls._operations
+            or g.charger._pending
+        ):
+            return Pending(Prerequisite.ZERO_PROOF, "current recovery awaits its audited zero introduction")
+        if not self.cloud_ready(c):
+            return Pending(Prerequisite.CLOUD, "current recovery awaits the current registered cloud connection")
+        present = c.session.book.owned_present(native.physical)
+        if (refusal := c.native.station_zero_refusal(present)) is not None:
+            return Pending(Prerequisite.ZERO_PROOF, refusal)
+        self.publish_introduction(c.native, scope.epoch, g.controls._revision)
+        return ALLOW
 
     # Record the Boot, metadata and zero ticket from the runtime's current connection.
     def introduction_zero_claim(self, gateway: Gateway, epoch: int) -> IntroductionZeroClaim:

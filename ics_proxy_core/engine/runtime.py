@@ -14,8 +14,9 @@ from typing import Protocol, Self
 from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.server import Server, ServerConnection
 from websockets.exceptions import ConnectionClosed, InvalidHandshake
+from websockets.protocol import State
 
-from .connection_scope import CloudAttemptScope, current_scope
+from .connection_scope import CloudAttemptScope, ConnectionLineage, current_scope
 from .diagnostics import FaultDiagnostics
 from .gateway import Gateway
 from .policy import DeniedError
@@ -76,6 +77,13 @@ class RuntimeStatus:
     vendor_fault: FaultDiagnostics = field(default_factory=FaultDiagnostics)
 
 
+@dataclass(frozen=True)
+class _VendorBinding:
+    epoch: int
+    lineage: ConnectionLineage
+    connection: ClientConnection
+
+
 class Transport(Protocol):
     # Bind only the transport's already validated endpoint.
     def listen(self, handler: Callable[[ServerConnection], Awaitable[None]]) -> Awaitable[Server]: ...
@@ -102,6 +110,7 @@ class ConnectionRuntime:
         self.status = RuntimeStatus()
         self._server: Server | None = None
         self._runner: asyncio.Task[None] | None = None
+        self._vendor_binding: _VendorBinding | None = None
         self._session_tasks: set[asyncio.Task[None]] = set()
         self._introductions: set[object] = set()
         self._charger: ServerConnection | None = None
@@ -110,11 +119,32 @@ class ConnectionRuntime:
         self.vendor_enabled: Callable[[], bool] = lambda: True
         self.vendor_session_enabled: Callable[[], bool] = lambda: self.vendor_enabled()
         self.ceiling_enabled: Callable[[], bool] = lambda: True
+        self.gateway.vendor_connection_current = self._vendor_connection_current
 
     # Introduction owns future restrictive work through retry sleeps and until its actual probe retires.
     @property
     def introduction_pending(self) -> bool:
         return bool(self._introductions)
+
+    # The old socket can still receive replies after its registration loses authority over the charger.
+    @property
+    def vendor_registered(self) -> bool:
+        return self._vendor_connection_current() and self.gateway.vendor_registration == "Accepted"
+
+    # On-demand authorization registration uses the current charger's cloud connection.
+    def _vendor_connection_current(self) -> bool:
+        gateway = self.gateway
+        scope = current_scope(gateway)
+        binding = self._vendor_binding
+        return (
+            scope is not None
+            and binding is not None
+            and binding.epoch == gateway._vendor_epoch
+            and binding.lineage == scope.lineage
+            and binding.connection.state is State.OPEN
+            and self.status.vendor_connected
+            and gateway.vendor.sender is not None
+        )
 
     # Expose only the ephemeral test port after startup.
     @property
@@ -384,13 +414,12 @@ class ConnectionRuntime:
                 if (
                     not self.vendor_enabled()
                     or self._charger is None
-                    or not self.gateway.current_boot_seen(self.gateway._charger_epoch)
+                    or (attempted_scope := current_scope(self.gateway)) is None
                 ):
                     await asyncio.sleep(self.settings.pump_interval)
                     continue
                 attempted_boot = self.gateway.journal.get("boot")
                 attempted_boot_revision = self.gateway.boot_metadata_revision
-                attempted_scope = current_scope(self.gateway)
                 self.status.vendor_attempts += 1
                 async with self.transport.connect() as connection:
                     if (
@@ -404,9 +433,11 @@ class ConnectionRuntime:
                     epoch = self.gateway._vendor_epoch + 1
                     try:
                         epoch = self.gateway.attach_vendor(self._sender(connection))
+                        binding = _VendorBinding(epoch, attempted_scope.lineage, connection)
+                        self._vendor_binding = binding
                         self.status.vendor_connected = True
                         self.status.reconnects += 1
-                        await self._vendor_session(connection, epoch)
+                        await self._vendor_session(binding)
                     finally:
                         stage = self._vendor_stage()
                         if self.gateway.vendor_registration == "Accepted":
@@ -415,6 +446,7 @@ class ConnectionRuntime:
                             self.gateway.detach_vendor(epoch)
                         finally:
                             self.status.vendor_connected = False
+                            self._vendor_binding = None
             except sqlite3.Error as error:
                 # Local storage refusal is not evidence of a failed cloud introduction or response.
                 self.status.last_failure = type(error).__name__
@@ -439,11 +471,17 @@ class ConnectionRuntime:
                 delay = min(self.settings.retry_max, delay * 2)
 
     # Stop all session children when any transport/heartbeat child ends; quarantine leaves the pump alive.
-    async def _vendor_session(self, connection: ClientConnection, epoch: int) -> None:
+    async def _vendor_session(self, binding: _VendorBinding) -> None:
+        connection, epoch = binding.connection, binding.epoch
         charger_epoch = self.gateway._charger_epoch
         boot = self.gateway.journal.get("boot")
         boot_revision = self.gateway.boot_metadata_revision
         fault_count = self.status.vendor_fault.count
+
+        # The sender remains attached during cleanup so correlated replies retain their normal path.
+        def revoke_registration() -> None:
+            if self._vendor_binding is binding:
+                self._vendor_binding = None
 
         # An unchanged Boot may briefly withdraw control proof while its response is sent on the same connection.
         def charger_present() -> bool:
@@ -457,7 +495,7 @@ class ConnectionRuntime:
 
         # New work still needs the currently verified Boot on that connection.
         def charger_current() -> bool:
-            return charger_present() and self.gateway.current_boot_seen(charger_epoch)
+            return charger_present() and self._vendor_connection_current()
 
         # Keep the vendor receive path free while outgoing RPCs await their correlated responses.
         async def receive() -> None:
@@ -469,6 +507,8 @@ class ConnectionRuntime:
                 raise
             else:
                 self._vendor_close(connection, fault_count)
+            finally:
+                revoke_registration()
 
         # A virtual charge point must not stay online after its physical connection has gone away or changed.
         async def charger_presence() -> None:
@@ -490,6 +530,7 @@ class ConnectionRuntime:
             for task in done:
                 await task
         finally:
+            revoke_registration()
             self._vendor_close(connection, fault_count)
             await self._retire(tasks)
 

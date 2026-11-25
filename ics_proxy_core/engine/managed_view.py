@@ -277,7 +277,7 @@ def poll_base(c: ManagedController, *, pending: bool = False) -> dict[str, Any]:
         "control_revision": intent.revision,
         "local_start_disabled": not g.policy.allow_local_start,
         "charger_connected": runtime.charger_connected,
-        "cloud_connected": runtime.vendor_connected and g.vendor_registration == "Accepted",
+        "cloud_connected": c.session.runtime.vendor_registered,
         "boot_verified": g.current_boot_seen(g._charger_epoch),
         "cloud_start_pending": g.authorisation.pending(),
         "owner_control_enabled": False,
@@ -300,11 +300,7 @@ def poll_status(
     value = poll_base(c, pending=pending) if base is None else dict(base)
     gateway = c.session.gateway
     c.status_vendor_epoch = gateway._vendor_epoch
-    value["cloud_connected"] = (
-        c.session.runtime.status.vendor_connected
-        and gateway.vendor.sender is not None
-        and gateway.vendor_registration == "Accepted"
-    )
+    value["cloud_connected"] = c.session.runtime.vendor_registered
     value["state"] = result.state
     if result.fault is not None:
         value["fault"] = result.fault
@@ -536,12 +532,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         result["charger_connected"] = False
     if not g.current_boot_seen(g._charger_epoch):
         result["boot_verified"] = False
-    if (
-        not runtime.vendor_connected
-        or g.vendor.sender is None
-        or g.vendor_registration != "Accepted"
-        or c.status_vendor_epoch != g._vendor_epoch
-    ):
+    if not c.session.runtime.vendor_registered or c.status_vendor_epoch != g._vendor_epoch:
         result["cloud_connected"] = False
     current, observed = c.authority(), c.status_authority
     current_worker, start_worker = c.current.worker, c.charging.worker

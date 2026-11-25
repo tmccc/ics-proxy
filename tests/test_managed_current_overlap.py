@@ -18,8 +18,9 @@ from ics_proxy_core.engine.rpc import UnavailableError
 from tests.handover_helpers import crash
 from tests.managed_rig import healthy, introduced, managed_session, starts
 from tests.native_schedule_support import ZONE, timer_bench
-from tests.prototype_rig import START
+from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
+from tests.test_managed_boot_supersession import delay_reply
 from tests.test_managed_schedule_unnumbered import unnumbered
 from tests.tls_support import tls as tls
 
@@ -96,6 +97,50 @@ async def test_daily_interrupts_increase(tmp_path, tls, unused_tcp_port, monkeyp
         assert b.c.current.selected() == 6 and b.device.effective_limit() == 0 and not b.stops()
         assert b.c.requests.receipt(request)["state"] == "failed"
         await assert_daily_recovery(b, local, original, demand)
+
+
+# Intent: an interrupted current selection can return to its previous limit when the commissioned Boot returns.
+# Why: a changed Boot can retire the introduction revision after the audit, leaving current recovery in charge.
+async def test_daily_current_recovery_reproves_introduction(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        c, g, j = b.c, b.session.gateway, b.session.journal
+        async with interrupted_increase(b, True) as (request, release):
+            local = await b.start_plan(9)
+            await c.native.read()
+            release.set()
+        receipt = c.requests.receipt(request)
+        intent = c.requests.intent()
+        assert receipt["state"] == "failed" and j.current_change.read().recovering
+        await until(lambda: j.vendor_id(local) is not None)
+        vendor = j.vendor_id(local)
+
+        await b.sock.close()
+        await until(lambda: g.charger.sender is None)
+        async with b.rig.charger(b.session) as charger:
+            send, held, entered = delay_reply(monkeypatch, b.rig, charger, "SetChargingProfile")
+            assert (await b.rig.bench.call(charger, "audited-boot", "BootNotification", BOOT))[0] == 3
+            await asyncio.wait_for(entered.wait(), 3)
+            epoch = g._charger_epoch
+            assert c.native.audited_epoch == c.native.introduced_epoch == epoch
+            assert c.native.introduced_revision == g.controls._revision
+
+            changed = BOOT | {"firmwareVersion": "unapproved replacement"}
+            assert (await b.rig.bench.call(charger, "unapproved-boot", "BootNotification", changed))[0] == 3
+            mark = len(b.rig.bench.device_calls)
+            await send(held[0])
+            await until(lambda: not b.session.runtime.introduction_pending)
+            status = await c.tick()
+            assert not status["owner_control_enabled"] and not status["cloud_connected"]
+            assert c.native.introduced_revision != g.controls._revision
+            assert b.device.effective_limit() == 0 and not b.rig.bench.device_calls[mark:]
+
+            assert (await b.rig.bench.call(charger, "restored-boot", "BootNotification", BOOT))[0] == 3
+            status = await healthy(c)
+            assert status["owner_control_enabled"] and status["station_ceiling_a"] == c.current.selected() == 6
+            assert b.device.effective_limit() == b.device.current == 6
+            assert c.native.introduced_epoch == epoch and c.native.introduced_revision == g.controls._revision
+            assert c.requests.receipt(request) == receipt and c.requests.intent() == intent
+            assert j.active() == local and j.vendor_id(local) == vendor and not starts(b.rig) and not b.stops()
 
 
 # Intent: a cloud Start waits until the already applied current has been independently verified.
@@ -263,6 +308,54 @@ async def test_unnumbered_daily_interrupts_current_selection(tmp_path, tls, unus
             b.rig.peer.plan_session = (local, 9)
             await assert_daily_recovery(b, local, original, demand=False)
             assert b.c.requests.receipt(request)["state"] == "failed"
+
+
+# Intent: renew expired daily approval through the replacement charger's own cloud registration.
+# Why: a retiring vendor connection can collect old replies while it no longer grants new authority.
+async def test_current_recovery_waits_for_current_cloud_authorization(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        g, j, runtime = b.session.gateway, b.session.journal, b.session.runtime
+        cloud_epoch = g._vendor_epoch
+        async with interrupted_increase(b, False) as (_, release):
+            midnight = int(datetime(2026, 11, 12, tzinfo=ZONE).timestamp())
+            body, _ = unnumbered(b, midnight, "current-recovery-unnumbered.json")
+            b.device.requested_current = 0
+            await b.c.native.read()
+            release.set()
+        assert j.current_change.read().recovering and b.device.effective_limit() == 0
+
+        draining, retire = asyncio.Event(), asyncio.Event()
+        finish = g.finish_sent_start
+
+        # Keep the old vendor connection open while the replacement charger completes Boot.
+        async def drain():
+            draining.set()
+            await retire.wait()
+            await finish()
+
+        monkeypatch.setattr(g, "finish_sent_start", drain)
+        async with b.rig.charger(b.session) as charger:
+            try:
+                assert (await b.rig.bench.call(charger, "replacement-boot", "BootNotification", BOOT))[0] == 3
+                await asyncio.wait_for(draining.wait(), 3)
+                await until(lambda: g.controls.ready and not runtime.introduction_pending)
+                assert g._vendor_epoch == cloud_epoch and not runtime.vendor_registered
+                g.auth_info.put(body["idTag"], {"status": "Expired"})
+                mark = len(b.rig.bench.calls)
+                refused = await b.rig.bench.call(charger, "expired-daily-while-cloud-retires", "StartTransaction", body)
+                assert refused[:3] == [4, "expired-daily-while-cloud-retires", "InternalError"]
+                assert j.active() is None and g.auth_info.stored(body["idTag"]) == {"status": "Expired"}
+                assert not any(frame[0] == 2 and frame[2] == "Authorize" for frame in b.rig.bench.calls[mark:])
+            finally:
+                retire.set()
+
+            await until(lambda: runtime.vendor_registered)
+            assert g._vendor_epoch != cloud_epoch
+            accepted = await b.rig.bench.call(charger, "daily-after-cloud-registration", "StartTransaction", body)
+            assert accepted[0] == 3 and accepted[2]["idTagInfo"]["status"] == "Accepted"
+            assert j.active() == j.current_change.read().value["reported_local"] == accepted[2]["transactionId"]
+            assert sum(frame[0] == 2 and frame[2] == "Authorize" for frame in b.rig.bench.calls[mark:]) == 1
+            assert b.device.effective_limit() == 0 and not b.stops() and not starts(b.rig)
 
 
 # Intent: process loss before a pending increase completes cannot turn it into Pause or Stop an independent daily.

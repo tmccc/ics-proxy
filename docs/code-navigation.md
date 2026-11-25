@@ -64,10 +64,10 @@ flowchart LR
    [Command evidence](../ics_proxy_core/engine/command_outcomes.py) · [Stop settlement](../ics_proxy_core/engine/stop_settlement.py)
 
 Session Stop leaves app or schedule mode in place. Pause claims a zero hold and can also stop the exact session.
-With current independent zero evidence, Pause and the vendor app can wait for an unanswered Stop on the same
-charger connection. A newer Pause can act after reconnecting. Lost zero or fresh draw can require a separately
-authorized protective Stop. A distinct vendor request for a still-open session can send another Stop if the
-proxy lacks a verified zero hold and no unresolved Stop already covers it. The
+With current independent zero evidence, Pause, the vendor app and Home Assistant session Stop can wait for an
+unanswered Stop on the same charger connection. A newer Pause can act after reconnecting. Lost zero or fresh
+draw can require a separately authorized protective Stop. A distinct vendor request for a still-open session can
+send another Stop if the proxy lacks a verified zero hold and no unresolved Stop already covers it. The
 [settlement checks](../tools/check_control_settlement.py) cover both local and vendor request orders, including
 lost replies and overlapping Pause.
 
@@ -78,7 +78,7 @@ lost replies and overlapping Pause.
    [Request and preflight](../ics_proxy_core/engine/control_decisions.py)
 2. The recovery coordinator reads the charger. `prepare_release_attempt()` checks the fresh zero evidence and
    rechecks the original intent, connection, and ticket. It binds an explicit Return to that zero-hold ticket
-   and Boot.
+   and Boot. The vendor registration must belong to the current charger connection and commissioned Boot details.
    [Recovery coordinator](../ics_proxy_core/engine/recovery_coordinator.py)
 3. `claim_release()` takes the physical ticket. The local executor rechecks the guard at the wire boundary.
    A verified ceiling can publish shared control in `complete_release()`. Restoring zero uses the same release

@@ -24,6 +24,7 @@ from .stop_settlement import (
     STOP_CLOSURE_FIELDS,
     STOP_CLOSURE_VERIFIED,
     STOP_COMPLETION_FIELDS,
+    STOP_REJECTION_FIELDS,
     STOP_SESSION,
     StopRejections,
     stop_rejections,
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
     from .trial_handover_evidence import HandoverEvidence
 
 CONFIRMATION_SECONDS = 20
+_RETAINED_STOP_CLOSURES = "retained_session_stop_closures"
 
 
 @dataclass(frozen=True)
@@ -57,7 +59,16 @@ class ManagedSessionStop:
     def __init__(self, controller: ManagedController) -> None:
         self.controller = controller
         self.worker: asyncio.Task[None] | None = None
-        self._verified_closures: dict[str, int] = {}
+        try:
+            saved = controller.session.journal.get(_RETAINED_STOP_CLOSURES, {})
+        except ValueError, RecursionError:
+            saved = {}
+        self._retained_closures = (
+            {request: local for request, local in saved.items() if type(local) is int and 0 < local < 2**63}
+            if isinstance(saved, dict)
+            else {}
+        )
+        self._verified_closures = self._retained_closures.copy()
         self.expire(replaced=True)
 
     # Expose an opaque target only for a verified sample of the exact current open session.
@@ -101,7 +112,7 @@ class ManagedSessionStop:
         accepted = time.time()
         confirmation_deadline = time.monotonic() + CONFIRMATION_SECONDS
         with j.atomic():
-            decision, binding = g.controls.decisions.session_stop_decision(local, connection[0].boot)
+            decision, binding = g.controls.decisions.session_stop_decision(local, connection[0].boot, c.native)
             if decision is StopDecision.CLOSED:
                 raise RecoveryRequiredError("Stop requires the current verified session")
             needs_dispatch = decision is StopDecision.SEND
@@ -153,7 +164,7 @@ class ManagedSessionStop:
 
         # Commit possible dispatch before the sender can write, including when the wire reply is lost.
         def dispatch(_action: str) -> None:
-            decision, binding = g.controls.decisions.session_stop_decision(scope.local, boot)
+            decision, binding = g.controls.decisions.session_stop_decision(scope.local, boot, c.native)
             if decision is StopDecision.CLOSED:
                 raise StopAlreadyHandledError
             with j.atomic():
@@ -199,9 +210,9 @@ class ManagedSessionStop:
     # Use the same rejection evidence for replies that arrive immediately, late, or before a restart.
     def _publish_rejections(self, rejections: StopRejections) -> None:
         self._update_receipts(
-            "state='failed',result=json_set(result,'$.classification','stop_rejected')",
+            STOP_REJECTION_FIELDS,
             (),
-            f"action=? AND state IN ('running','uncertain') AND {rejections.receipts}",
+            rejections.rejected_receipts,
             (STOP_SESSION,),
             rejections=rejections,
             retry_after_rollback=True,
@@ -280,15 +291,32 @@ class ManagedSessionStop:
             return
         self._settle_closure(stop_rejections(j), observed=True)
 
-    # A refused database write can leave the same exact closure available in memory.
+    # A refused receipt write can leave the same exact closure in memory or in the separate checkpoint.
     def _closure_proof(self) -> tuple[str, tuple[str, ...]]:
         if self._verified_closures:
             return f"({STOP_CLOSURE_VERIFIED} OR {STOP_BUFFERED_CLOSURE})", (encoded(self._verified_closures),)
         return STOP_CLOSURE_VERIFIED, ()
 
+    # Only unfinished receipt writes need a separate proof across process replacement.
+    def _retain_closures(self) -> None:
+        if self._verified_closures == self._retained_closures:
+            return
+        j = self.controller.session.journal
+        try:
+            if self._verified_closures:
+                j.put(_RETAINED_STOP_CLOSURES, self._verified_closures)
+            else:
+                j.db.execute("DELETE FROM meta WHERE key=?", (_RETAINED_STOP_CLOSURES,))
+        except sqlite3.Error:
+            if j.db.in_transaction:
+                raise
+        else:
+            self._retained_closures = self._verified_closures.copy()
+
     # Save verified closure separately so a refused completion cannot roll back the observation.
     def _checkpoint_closure(self, rejections: StopRejections, *, observed: bool) -> None:
         if not observed and not self._verified_closures:
+            self._retain_closures()
             return
         where = f"{rejections.closed_receipts} AND NOT {STOP_CLOSURE_VERIFIED}"
         bindings: tuple[str, ...] = (STOP_SESSION,)
@@ -314,6 +342,7 @@ class ManagedSessionStop:
             retry_after_rollback=True,
         ):
             self._verified_closures.clear()
+        self._retain_closures()
 
     # Keep verified closure when an exact normal or late receiver can still deliver a refusal.
     def _settle_closure(self, rejections: StopRejections, *, observed: bool = False) -> None:

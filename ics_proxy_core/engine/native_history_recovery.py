@@ -34,7 +34,13 @@ from .native_history import (
     inspect_history,
 )
 from .native_start_attempts import split_attempts
-from .stop_settlement import STOP_COMPLETION_FIELDS, STOP_SESSION, StopRejections, stop_rejections
+from .stop_settlement import (
+    STOP_COMPLETION_FIELDS,
+    STOP_SESSION,
+    StopRejections,
+    settle_saved_stop_rejections,
+    stop_rejections,
+)
 from .store import Journal, RecoveryRequiredError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 from .trial_resources import ResourceBook
@@ -190,6 +196,8 @@ def acknowledge_history_policy(
         )
         with journal.atomic():
             revocations = retire_history_omission_revocations(journal, fault)
+            if owns_fault:
+                settle_saved_stop_rejections(journal)
             rejections = stop_rejections(journal)
             closed_stops = (
                 journal.db.execute("SELECT 1 FROM sqlite_master WHERE name='managed_requests'").fetchone()
@@ -382,8 +390,9 @@ def _reconcile(
                 },
             )
         else:
-            # The exact Stop report and fresh local zero may already agree while the history fault blocks polling.
+            # Publish saved rejection before considering physical closure or testing for unrelated requests.
             if journal.db.execute("SELECT 1 FROM sqlite_master WHERE name='managed_requests'").fetchone():
+                settle_saved_stop_rejections(journal)
                 _complete_history_stops(journal, stop_rejections(journal))
                 if not _history_pause_is_only_pending_request(journal):
                     raise RecoveryRequiredError(

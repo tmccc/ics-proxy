@@ -77,10 +77,12 @@ from .security import SecurityError, StaleEvidenceError
 from .start_handoff import NativeStartReport, OwnedStartResult, StartHandoff, StartHandoffContext, StartPublication
 from .start_policy import ACTIVE, start_refusal
 from .start_settlement import RetirementCandidate, StartFailureAction, StartFailureFacts, settle_start
+from .stop_settlement import StopAcceptance
 from .store import RecoveryRequiredError, StationZeroStorageError, encoded, fingerprint
 from .trial_evidence import Resource, profile_projection
 
 if TYPE_CHECKING:
+    from .command_outcomes import OwnerWire, TransactionReplyStatus
     from .gateway import Gateway
     from .local_control import LocalControl
     from .managed import ManagedController
@@ -140,6 +142,17 @@ class StopZeroEvidence(Protocol):
     def stop_zero_verified(self, local: int) -> bool: ...
 
 
+@dataclass(frozen=True)
+class StopPredecessors:
+    """The earlier Stop attempts that could cover this request at admission."""
+
+    accepted: StopAcceptance | None = None
+    local_requests: tuple[str, ...] = ()
+    owner_wires: tuple[str, ...] = ()
+    vendor_mutations: tuple[str, ...] = ()
+    unidentified_shutdown_stop: bool = False
+
+
 class StopDecision(Enum):
     """A Stop can send, use an acknowledgement, wait, or find the target no longer active."""
 
@@ -164,8 +177,12 @@ class _StopReuse(Enum):
     INCLUDE_CURRENT_BOOT_UNANSWERED = auto()
 
 
-class VendorStopAlreadyAcceptedError(Exception):
-    """The exact Stop is already accepted and the same session still has verified zero."""
+class VendorStopAlreadyAnsweredError(Exception):
+    """An earlier Stop supplies the definite outcome for this exact session."""
+
+    # Let the gateway return the recorded status under the current vendor request ID.
+    def __init__(self, status: TransactionReplyStatus) -> None:
+        self.status = status
 
 
 class StopReplyUnconfirmedError(UnavailableError):
@@ -298,12 +315,7 @@ class ControlDecisions:
 
         # A replacement vendor connection cannot authorize a release prepared under the previous one.
         def cloud_current() -> bool:
-            return (
-                g._vendor_epoch == vendor_epoch
-                and g.vendor.sender is not None
-                and g.vendor_registration == "Accepted"
-                and c.session.runtime.status.vendor_connected
-            )
+            return g._vendor_epoch == vendor_epoch and self.recovery.cloud_ready(c)
 
         can_wait_for_cloud = cloud_current() or (
             return_request is not None and c.requests.return_awaiting_cloud(return_request, expected_intent)
@@ -404,7 +416,7 @@ class ControlDecisions:
         allow_offline: bool,
         pending_delivery: bool,
     ) -> str | None:
-        s, g, j = controller.session, controller.session.gateway, self.journal
+        g, j = controller.session.gateway, self.journal
         facts = ManagedFacts(controller)
 
         # Check that the installation and current connections can support release.
@@ -420,9 +432,7 @@ class ControlDecisions:
             return "current introduction is unconfirmed"
         if g.charger.sender is None:
             return "charger sender is unavailable"
-        if not allow_offline and (
-            g.vendor.sender is None or g.vendor_registration != "Accepted" or not s.runtime.status.vendor_connected
-        ):
+        if not allow_offline and not self.recovery.cloud_ready(controller):
             return "cloud registration is unavailable"
 
         # Verify the exact owned zero hold before examining outstanding work.
@@ -1038,8 +1048,17 @@ class ControlDecisions:
                 j.current_change.replace({**current.value, "state": "interrupted"})
             return False, None
         local = j.active()
+        g = c.session.gateway
         if local is not None:
-            decision = current_session_decision(c.session.gateway, native, local)
+            decision = current_session_decision(g, native, local)
+            if isinstance(decision, Pending):
+                return False, decision
+        if not ManagedFacts(c).introduction_current():
+            if local is None:
+                decision = current_source_decision(g, None)
+                if isinstance(decision, Pending):
+                    return False, decision
+            decision = self.recovery.confirm_current_introduction(c, native)
             if isinstance(decision, Pending):
                 return False, decision
         return True, local
@@ -2251,16 +2270,94 @@ class ControlDecisions:
         if self.peer.decide(may_reuse, priority=CommandPriority.RESTRICT):
             await evidence.refresh_stop_zero(local)
 
-    # The gateway renders this decision with its own request ID and keeps any unsent mutation separate.
-    def require_vendor_stop(self, local: int, boot: str, evidence: StopZeroEvidence) -> None:
-        reuse = (
+    # Capture evidence for a possible closed-session reply. The open-session send decision checks zero separately.
+    def vendor_stop_predecessors(self, local: int, boot: str) -> StopPredecessors | None:
+        outcomes = self.journal.outcomes
+        decision = self._stop_send_decision(
+            local, boot, reuse=_StopReuse.INCLUDE_CURRENT_BOOT_UNANSWERED, session_only=True
+        )
+        if decision is StopDecision.ACCEPTED:
+            return StopPredecessors(accepted=outcomes.accepted_stop_attempt(local))
+        if decision is StopDecision.WAIT_FOR_REPORT:
+            return self._waiting_stop_predecessors(local, boot)
+        return None
+
+    # An ordinary Stop can coexist with a protective one. Keep the exact outcomes of both paths.
+    def _waiting_stop_predecessors(self, local: int, boot: str) -> StopPredecessors:
+        outcomes = self.journal.outcomes
+        local_requests = outcomes.session_stop_dispatches(local)
+        vendor_mutations = outcomes.vendor_stop_dispatches(local)
+        shutdown_wires: tuple[str, ...] = ()
+        unidentified_shutdown_stop = False
+        if outcomes.unanswered_shutdown_stop(local):
+            shutdown = self.journal.get("trial_shutdown_attempt", {})
+            wire = shutdown.get("stop_wire")
+            if isinstance(wire, str):
+                shutdown_wires = (wire,)
+            elif "stop_wire" not in shutdown and not shutdown.get("unsent"):
+                # Older claims might have sent a Stop without leaving its wire identity.
+                shutdown_wires = tuple(
+                    owner.wire
+                    for owner in outcomes.owner_wires("ticket", shutdown["ticket"])
+                    if owner.action == "RemoteStopTransaction" and owner.local == local
+                )
+                unidentified_shutdown_stop = not shutdown_wires
+            if shutdown.get("prior_pending_stop"):
+                prior = shutdown.get("prior_local_attempts")
+                if isinstance(prior, list) and prior and all(isinstance(item, str) and item for item in prior):
+                    local_requests = tuple(dict.fromkeys((*local_requests, *prior)))
+                else:
+                    unidentified_shutdown_stop = True
+        owner_wires = outcomes.unanswered_owner_stop_wires(local, boot, represented_requests=local_requests)
+        return StopPredecessors(
+            local_requests=local_requests,
+            owner_wires=tuple(dict.fromkeys((*owner_wires, *shutdown_wires))),
+            vendor_mutations=vendor_mutations,
+            unidentified_shutdown_stop=unidentified_shutdown_stop,
+        )
+
+    # Closure cannot establish the answer to a Stop. Follow only the recorded earlier attempts.
+    def require_closed_vendor_stop(self, local: int, earlier: StopPredecessors) -> None:
+        outcomes = self.journal.outcomes
+        session = outcomes.session(local)
+        if session is None or not session.closed:
+            raise DeniedError("cloud Stop lost its original open session")
+        if earlier.accepted is not None:
+            raise VendorStopAlreadyAnsweredError("Accepted")
+
+        # One acceptance settles this attempt. A refusal needs a reply from every represented wire.
+        def owner_status(wires: tuple[OwnerWire, ...]) -> TransactionReplyStatus | None:
+            replies = {wire.reply for wire in wires if wire.action == "RemoteStopTransaction" and wire.local == local}
+            if "Accepted" in replies:
+                return "Accepted"
+            return "Rejected" if replies == {"Rejected"} else None
+
+        replies = [
+            *(owner_status(outcomes.owner_wires("request", request)) for request in earlier.local_requests),
+            *(owner_status(outcomes.owner_wires("wire", wire)) for wire in earlier.owner_wires),
+            *(outcomes.status(mutation) for mutation in earlier.vendor_mutations),
+        ]
+        if "Accepted" in replies:
+            raise VendorStopAlreadyAnsweredError("Accepted")
+        if replies and not earlier.unidentified_shutdown_stop and all(status == "Rejected" for status in replies):
+            raise VendorStopAlreadyAnsweredError("Rejected")
+        raise RecoveryRequiredError("cloud Stop awaits the charger's original reply")
+
+    # Additional reuse requires verified zero for this session.
+    def _vendor_stop_reuse(self, local: int, evidence: StopZeroEvidence) -> _StopReuse:
+        return (
             _StopReuse.INCLUDE_CURRENT_BOOT_UNANSWERED
             if evidence.stop_zero_verified(local)
             else _StopReuse.NO_ADDITIONAL_REUSE
         )
-        decision = self._stop_send_decision(local, boot, reuse=reuse, session_only=True)
+
+    # The gateway renders this decision with its own request ID and keeps any unsent mutation separate.
+    def require_vendor_stop(self, local: int, boot: str, evidence: StopZeroEvidence) -> None:
+        decision = self._stop_send_decision(
+            local, boot, reuse=self._vendor_stop_reuse(local, evidence), session_only=True
+        )
         if decision is StopDecision.ACCEPTED:
-            raise VendorStopAlreadyAcceptedError
+            raise VendorStopAlreadyAnsweredError("Accepted")
         if decision is StopDecision.WAIT_FOR_REPORT:
             raise RecoveryRequiredError("cloud Stop awaits the charger's original report")
         if decision is StopDecision.CLOSED:
@@ -2293,19 +2390,32 @@ class ControlDecisions:
         return True
 
     # Use the same predecessors at admission and when reconsidering an unbound request at the wire.
-    def session_stop_decision(self, local: int, boot: str) -> tuple[StopDecision, dict[str, Any]]:
+    def session_stop_decision(
+        self, local: int, boot: str, evidence: StopZeroEvidence | None
+    ) -> tuple[StopDecision, dict[str, Any]]:
         outcomes = self.journal.outcomes
         decision = self._stop_send_decision(local, boot, session_only=True)
-        if decision is StopDecision.SEND or decision is StopDecision.CLOSED:
+        if decision is StopDecision.SEND:
+            if evidence is not None and evidence.stop_zero_verified(local):
+                wires = outcomes.unanswered_owner_stop_wires(local, boot)
+                if wires:
+                    return StopDecision.WAIT_FOR_REPORT, {"joined": 1, "owner_wire_attempts": wires}
+            return decision, {}
+        if decision is StopDecision.CLOSED:
             return decision, {}
         binding: dict[str, Any] = {"joined": 1}
         if decision is StopDecision.ACCEPTED:
             acceptance = outcomes.accepted_stop_attempt(local)
             if acceptance is not None and acceptance.wire is not None:
                 binding["accepted_attempt"] = asdict(acceptance)
-        elif not outcomes.unanswered_shutdown_stop(local):
-            binding["local_attempts"] = outcomes.session_stop_dispatches(local)
-            binding["vendor_attempts"] = outcomes.vendor_stop_dispatches(local)
+        else:
+            earlier = self._waiting_stop_predecessors(local, boot)
+            binding["local_attempts"] = earlier.local_requests
+            binding["vendor_attempts"] = earlier.vendor_mutations
+            if earlier.owner_wires:
+                binding["owner_wire_attempts"] = earlier.owner_wires
+            if earlier.unidentified_shutdown_stop:
+                binding["unidentified_shutdown_stop"] = True
         return decision, binding
 
     # Pause

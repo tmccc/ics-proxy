@@ -547,13 +547,26 @@ async def test_late_return_reply_keeps_the_newer_pause(tmp_path, tls, unused_tcp
 
 # Intent: a cloud loss after claim but before dispatch can end Return at reverified zero without faulting.
 # Why: the owner may retry directly once cloud returns, without a second Pause or a replay of this request.
-async def test_claimed_return_cloud_loss_before_positive_dispatch(tmp_path, tls, unused_tcp_port, monkeypatch):
+@pytest.mark.parametrize("retiring", [False, True], ids=["detached", "retiring"])
+async def test_claimed_return_cloud_loss_before_positive_dispatch(
+    tmp_path, tls, unused_tcp_port, monkeypatch, retiring
+):
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         c, g, j = b.controller, b.session.gateway, b.session.journal
         before = await pause_prefix(b)
         runtime, validate = b.session.runtime, g.charger.validate_send
         assert validate is not None
+        vendor_epoch = g._vendor_epoch
         interrupted = []
+        retirement_entered, finish_retirement = asyncio.Event(), asyncio.Event()
+        retire = runtime._retire
+
+        # Hold the real vendor session cleanup after the proxy has observed its socket closing.
+        async def hold_retirement(tasks):
+            if any(task.get_coro().__qualname__.endswith("._vendor_session.<locals>.receive") for task in tasks):
+                retirement_entered.set()
+                await finish_retirement.wait()
+            await retire(tasks)
 
         # Drop the genuine fake-cloud socket during the owned positive profile validation.
         async def drop_cloud(action, payload):
@@ -565,21 +578,34 @@ async def test_claimed_return_cloud_loss_before_positive_dispatch(tmp_path, tls,
                 attempt = g.controls.release_attempt
                 assert attempt is not None and attempt.ticket is not None and not attempt.positive_may_have_dispatched
                 interrupted.append(attempt)
+                fault_count = runtime.status.vendor_fault.count
                 await b.rig.bench.cloud.close()
-                await until(lambda: not runtime.status.vendor_connected)
+                if retiring:
+                    await asyncio.wait_for(retirement_entered.wait(), 3)
+                    assert runtime.status.vendor_fault.count > fault_count
+                    assert g._vendor_epoch == vendor_epoch and g.vendor_registration == "Accepted"
+                    assert runtime.status.vendor_connected
+                else:
+                    await until(lambda: not runtime.status.vendor_connected)
             return await validate(action, payload)
 
         returning = accepted_return(b, before)
         with monkeypatch.context() as pause_cloud:
             pause_cloud.setattr(runtime, "vendor_enabled", lambda: False)
             pause_cloud.setattr(g.charger, "validate_send", drop_cloud)
-            progress = await c.recovery.restore(before["intent"], return_request=returning, claim_return=True)
+            if retiring:
+                pause_cloud.setattr(runtime, "_retire", hold_retirement)
+            try:
+                progress = await c.recovery.restore(before["intent"], return_request=returning, claim_return=True)
+            finally:
+                finish_retirement.set()
+                await until(lambda: not runtime.status.vendor_connected)
         assert interrupted and progress.state is RestoreState.REQUEST_NOT_SENT
         assert progress.operation is not None and progress.operation.effects.zero_verified
         assert not positive_calls(b, before["wire"]) and not j.fault.latched()
         assert c.requests.receipt(returning)["result"] == {"classification": "return_not_sent"}
         assert c.requests.intent() == before["intent"] and b.rig.bench.firmware.effective_limit() == 0
-        await until(lambda: g.vendor_registration == "Accepted" and runtime.status.vendor_connected)
+        await until(lambda: runtime.vendor_registered)
         retry = accepted_return(b, before)
         await completed_control(b, retry, mode="app", revision=before["intent"].revision + 1, ceiling=6)
         assert len(positive_calls(b, before["wire"])) == 1

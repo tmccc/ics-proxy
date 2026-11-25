@@ -83,13 +83,26 @@ class CorrelatedOwnerBench(managed_helpers.OwnerBench):
 
 # Intent: expiry, a retired originating vendor and a newer Pause revoke a Start while real native HTTP is awaited.
 # Why: fresh physical evidence does not preserve time-dependent or connection-specific permission to dispatch.
-@pytest.mark.parametrize("crossed", ["expiry", "vendor", "pause"])
+@pytest.mark.parametrize("crossed", ["expiry", "vendor", "vendor_closing", "pause"])
 async def test_vendor_start_rechecks_authority_after_native_http(tmp_path, tls, unused_tcp_port, monkeypatch, crossed):
     async with managed_bench(tmp_path, tls, unused_tcp_port, native_peer=GatedNativePeer) as rig:
         session = managed_session(rig)
         await session.start()
         c = ManagedController(session)
         rig.route_to_trial()
+        retirement_entered, finish_retirement = asyncio.Event(), asyncio.Event()
+        runtime = session.runtime
+        retire = runtime._retire
+
+        # Keep the original epoch attached after the reader has observed the real vendor socket closing.
+        async def hold_retirement(tasks):
+            if any(task.get_coro().__qualname__.endswith("._vendor_session.<locals>.receive") for task in tasks):
+                retirement_entered.set()
+                await finish_retirement.wait()
+            await retire(tasks)
+
+        if crossed == "vendor_closing":
+            monkeypatch.setattr(runtime, "_retire", hold_retirement)
         try:
             async with rig.charger(session) as charger:
                 await introduced(rig, session, charger, "final-authority-boot")
@@ -115,10 +128,15 @@ async def test_vendor_start_rechecks_authority_after_native_http(tmp_path, tls, 
                 if crossed == "expiry":
                     await asyncio.sleep(0.25)
                     assert g.auth_info.get("CLOUD_OWNER")["status"] == "Expired"
-                elif crossed == "vendor":
+                elif crossed in ("vendor", "vendor_closing"):
                     await old_socket.close()
-                    await until(lambda: rig.bench.cloud is not old_socket and g.vendor_registration == "Accepted")
-                    assert g._vendor_epoch != old_epoch
+                    if crossed == "vendor_closing":
+                        await asyncio.wait_for(retirement_entered.wait(), 3)
+                        assert g._vendor_epoch == old_epoch and runtime.status.vendor_connected
+                        assert not runtime.vendor_registered
+                    else:
+                        await until(lambda: rig.bench.cloud is not old_socket and runtime.vendor_registered)
+                        assert g._vendor_epoch != old_epoch
                 else:
                     c.command("a" * 32, "pause", c.requests.intent().revision)
                 rig.peer.gate_enabled = False
@@ -129,7 +147,9 @@ async def test_vendor_start_rechecks_authority_after_native_http(tmp_path, tls, 
                 assert not starts(rig)
                 assert not j.get("vendor_start_grant")
                 assert not j.db.execute("SELECT 1 FROM mutations WHERE origin='vendor'").fetchone()
-                if crossed == "vendor":
+                if crossed in ("vendor", "vendor_closing"):
+                    finish_retirement.set()
+                    await until(lambda: rig.bench.cloud is not old_socket and runtime.vendor_registered)
                     assert not any(f[0] != 2 and f[1] == token for f in rig.bench.calls)
                 else:
                     await until(lambda: any(f[0] == 4 and f[1] == token for f in rig.bench.calls))
@@ -150,6 +170,7 @@ async def test_vendor_start_rechecks_authority_after_native_http(tmp_path, tls, 
                     assert result[0] == 3 and result[2] == {"status": "Accepted"}
                     assert len(starts(rig)) == 1
         finally:
+            finish_retirement.set()
             rig.peer.gate_enabled = False
             rig.peer.release.set()
             await session.close()

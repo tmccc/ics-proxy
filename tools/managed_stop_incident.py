@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from ics_proxy_core.engine.command_outcomes import decode_retained_owner_reply
 from ics_proxy_core.engine.gateway import timestamp as charger_timestamp
 from ics_proxy_core.engine.ics import unique_object
 from ics_proxy_core.engine.managed_diagnostics import timestamp as receipt_timestamp
@@ -121,7 +122,8 @@ def owner_reply(db: sqlite3.Connection, tables: set[str], request: str, local: i
             or local_id(row.get("local")) != local
         ):
             continue
-        if key not in checkpoint_keys("owner", wire) or key.startswith("retained_stop_") and reply != "Accepted":
+        legacy, current = checkpoint_keys("owner", wire)
+        if key != (legacy if reply == "Accepted" else current):
             continue
         if primary and (wire, boot) != tuple(primary[0][:2]):
             continue
@@ -162,7 +164,7 @@ def vendor_reply(db: sqlite3.Connection, tables: set[str], token: str, wire: obj
                 and (saved["mutation"], saved["action"], saved["wire"]) == (token, STOP_ACTION, exact_wire)
                 and isinstance(status, str)
                 and status in DEFINITE_REPLIES
-                and (key == current or status == "Accepted")
+                and key == (legacy if status == "Accepted" else current)
             ):
                 matches.add(status)
         if len(matches) == 1:
@@ -181,6 +183,49 @@ def vendor_scope(db: sqlite3.Connection, tables: set[str], token: str) -> tuple[
         if row is not None:
             return row[0], row[1], row[2]
     return None, None, None
+
+
+# A Pause's request can own several sends. Its incident evidence must name the exact charger call.
+def joined_owner_wire(db: sqlite3.Connection, tables: set[str], wire: str, local: int) -> dict[str, Any] | None:
+    if "owner_command_wires" not in tables:
+        return None
+    primary = db.execute(
+        "SELECT request,ticket,action,local,reply FROM owner_command_wires WHERE wire=?", (wire,)
+    ).fetchone()
+    token = None
+    if primary is not None:
+        request, ticket, action, target, reply = primary
+        if action != STOP_ACTION or target != local:
+            return None
+        token = identifier(request) or identifier(ticket)
+        if reply is not None:
+            result = REPLIES.get(reply, UNKNOWN)
+            return {
+                "request": reference(token),
+                "reply": result,
+                "reply_source": "wire_journal" if result != UNKNOWN else None,
+            }
+    matches: set[tuple[str, str]] = set()
+    legacy, current = checkpoint_keys("owner", wire)
+    if "meta" in tables:
+        for key, value in db.execute(
+            "SELECT key,CAST(value AS BLOB) FROM meta WHERE key IN (?,?) AND length(value)<=8192", (legacy, current)
+        ):
+            saved = decode_retained_owner_reply(db, object_fields(value))
+            if (
+                saved is not None
+                and (saved.wire, saved.action, saved.local) == (wire, STOP_ACTION, local)
+                and saved.reply in DEFINITE_REPLIES
+                and key == (legacy if saved.reply == "Accepted" else current)
+                and (retained := (identifier(saved.request) or identifier(saved.ticket))) is not None
+            ):
+                matches.add((retained, saved.reply))
+    if len(matches) == 1:
+        token, reply = matches.pop()
+        return {"request": reference(token), "reply": DEFINITE_REPLIES[reply], "reply_source": "retained_checkpoint"}
+    if token is not None:
+        return {"request": reference(token), "reply": UNKNOWN if matches else "missing", "reply_source": None}
+    return None
 
 
 # An overlap borrows evidence only from attempts explicitly named in this receipt and bound to the same session.
@@ -231,6 +276,13 @@ def joined_attempts(
                     "reply_source": wire["reply_source"],
                 }
             )
+    wires = binding.get("owner_wire_attempts")
+    if isinstance(wires, list):
+        unique_wires = dict.fromkeys(wire for item in wires if (wire := wire_id(item)) is not None)
+        for wire in tuple(unique_wires)[:MAX_REPORT_EVENTS]:
+            evidence = joined_owner_wire(db, tables, wire, local)
+            if evidence is not None:
+                attempts.append({"origin": "local", **evidence})
     return attempts
 
 

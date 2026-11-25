@@ -101,6 +101,7 @@ class ManagedController:
         self.current = ManagedCurrentLimits(self)
         self.charging = ManagedCharging(self)
         self.session_stop = ManagedSessionStop(self)
+        session.managed_session_stop = self.session_stop
         self.ordinary = OrdinaryRecovery(self)
         self.recovery = RecoveryCoordinator(self)
         session.gateway.retiring = lambda: self.stopping
@@ -760,9 +761,7 @@ class ManagedController:
             proof = ControlProof()
         if proof.shared and not g.controls.ready:
             return PollStatus("reconciling")
-        cloud = (
-            s.runtime.status.vendor_connected and g.vendor.sender is not None and g.vendor_registration == "Accepted"
-        )
+        cloud = s.runtime.vendor_registered
         local_ready = proof.locally_ready(
             active=proof.available and j.phase.read().active,
             control_uncertain=bool(control.values.get("uncertain")),

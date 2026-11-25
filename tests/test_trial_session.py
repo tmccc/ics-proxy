@@ -11,17 +11,20 @@ from contextlib import closing
 
 import pytest
 
+from ics_proxy_core.engine.gateway import decode
+from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
 from ics_proxy_core.engine.rpc import UnavailableError
 from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError
 from ics_proxy_core.engine.trial_session import TrialSession
-from ics_proxy_core.frames import build_call
+from ics_proxy_core.frames import build_call, build_call_result
 from tests.charge_rig import owner_rig, positive_flow, ready
-from tests.managed_rig import healthy, managed_bench, starts
+from tests.managed_rig import healthy, managed_bench, managed_session, starts
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.test_managed_boot_supersession import delay_reply
+from tests.test_managed_normal_start import zero_power_session
 from tests.test_rpc_validation_deadlines import NativeAuditPeer
 from tests.tls_support import tls as tls
 
@@ -270,6 +273,93 @@ async def test_shutdown_verifies_real_closure_when_only_the_stop_reply_is_lost(
             row = reader.execute("SELECT value FROM meta WHERE key='trial_shutdown_attempt'").fetchone()
             saved = json.loads(row[0])
             assert saved["local"] == local and saved["state"] == "verified" and saved["boot"]
+
+
+# Intent: persist the exact session Stop result when graceful shutdown is the first to verify its closure.
+# Why: retiring the charger connection must preserve both the observed closure and any exact refusal.
+@pytest.mark.parametrize(
+    "outcome", ["accepted", "lost", "rejected", "retry_write", "refused_write", "refused_rejection"]
+)
+async def test_shutdown_settles_pending_session_stop_receipt(tmp_path, tls, unused_tcp_port, monkeypatch, outcome):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j, bench = b.controller, b.session.journal, b.rig.bench
+        peer = b.session.gateway.charger
+        c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await zero_power_session(b)
+        await healthy(c)
+        request = uuid.uuid4().hex
+        rejection = outcome in ("rejected", "refused_rejection")
+        waiting_for_reply = outcome == "lost" or rejection
+        if waiting_for_reply:
+            send, held, entered = delay_reply(monkeypatch, b.rig, b.charger, "RemoteStopTransaction")
+        c.command(request, "stop_session", c.requests.intent().revision, target=c.session_stop.target())
+        if waiting_for_reply:
+            await asyncio.wait_for(entered.wait(), 3)
+            wire = decode(held[0])[1]
+        else:
+            await c.session_stop.worker
+            assert j.outcomes.accepted_stop(local)
+        assert c.requests.receipt(request)["state"] == "running"
+
+        replace_after_refusal = outcome in ("refused_write", "refused_rejection")
+        refuse_write = outcome == "retry_write" or replace_after_refusal
+        if refuse_write:
+            j.db.create_function("shutdown_stop_request", 0, lambda: request)
+            j.db.execute(
+                "CREATE TEMP TRIGGER refuse_shutdown_stop_receipt BEFORE UPDATE ON managed_requests "
+                "WHEN NEW.id=shutdown_stop_request() "
+                "AND (json_type(NEW.result,'$._session_stop.closure_verified')='true' OR NEW.state='failed') "
+                "BEGIN SELECT RAISE(ABORT,'receipt unavailable'); END"
+            )
+
+        close_runtime = b.session.runtime.close
+
+        # Confirm the independent observation happened while the exact reply window was still alive.
+        async def retire_runtime():
+            receipt = j.outcomes.owner(request)
+            if waiting_for_reply:
+                assert receipt.state == "running"
+                assert receipt.result["_session_stop"].get("closure_verified") is (None if refuse_write else True)
+                assert wire in peer.reply_windows()
+                if rejection:
+                    await send(build_call_result(wire, {"status": "Rejected"}))
+                    await until(lambda: wire not in peer.reply_windows())
+            if refuse_write:
+                assert receipt.state == "running" and "closure_verified" not in receipt.result["_session_stop"]
+                if outcome == "retry_write":
+                    j.db.execute("DROP TRIGGER refuse_shutdown_stop_receipt")
+            await close_runtime()
+
+        monkeypatch.setattr(b.session.runtime, "close", retire_runtime)
+        c.request_stop()
+        await c.session_stop.close()
+        shutdown = asyncio.create_task(b.session.close())
+        try:
+            await until(lambda: j.get("trial_shutdown_attempt", {}).get("local") == local)
+            report = {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100}
+            assert (await bench.call(b.charger, "shutdown-session-stop", "StopTransaction", report))[0] == 3
+            b.rig.peer.permission_enabled = False
+        finally:
+            await shutdown
+        assert b.session.final_status["shutdown_attempt_uncertain"] is False
+        with closing(sqlite3.connect(j.path.as_uri() + "?mode=ro", uri=True)) as reader:
+            state, raw = reader.execute("SELECT state,result FROM managed_requests WHERE id=?", (request,)).fetchone()
+        receipt = json.loads(raw)
+        if replace_after_refusal:
+            assert state == "running" and "closure_verified" not in receipt["_session_stop"]
+            replacement = managed_session(b.rig)
+            try:
+                # The preceding shutdown supplied the only native closure reading.
+                recovered = ManagedController(replacement).requests.receipt(request)
+                state, receipt = recovered["state"], recovered["result"]
+            finally:
+                await replacement.close()
+        if rejection:
+            assert state == "failed" and receipt["classification"] == "stop_rejected"
+        else:
+            assert state == "completed" and receipt["session_stopped"] is True
+        assert [f[3] for f in bench.device_calls if f[2] == "RemoteStopTransaction"] == [{"transactionId": local}]
 
 
 # Intent: shutdown shares prior Stop evidence and takes fresh protection if the same session still draws.

@@ -182,9 +182,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             or g.controls._revision != revision
             or not g.current_boot_seen(epoch)
             or g.charger.sender is None
-            or g.vendor.sender is None
-            or g.vendor_registration != "Accepted"
-            or not s.runtime.status.vendor_connected
+            or not s.runtime.vendor_registered
             or not j.phase.read().supervised
             or j.get("native_bounded_handover", {}).get("stage") != "admitted"
             or j.get("native_bounded_handover", {}).get("fault")
