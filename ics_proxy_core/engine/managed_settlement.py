@@ -57,7 +57,7 @@ def require_settled_debt(c: ManagedController) -> None:
         or receipt.get("local") is None
         and receipt.get("stage") in ("prepared", "issued", "accepted")
         or j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-        or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1").fetchone()
+        or j.has_unsettled_sessions()
     ):
         raise RecoveryRequiredError("terminal settlement awaits actual Start and lifecycle reconciliation")
 

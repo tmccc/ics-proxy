@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +25,7 @@ from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, requ
 from .rpc import UnavailableError
 from .security import SecurityError
 from .start_handoff import StartHandoff, StartHandoffContext, StartPublication
+from .start_policy import offline_owner_tag
 from .store import Journal, RecoveryRequiredError, StationZeroStorageError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 
@@ -67,6 +68,7 @@ class ChargeLease:
     start_scope: CloudAttemptScope | None = None
     first_flow: TestFlow | None = None
     accepted_boot: str | None = None
+    owner_start_tag: str | None = field(default=None, repr=False)
 
 
 class ManagedCharging:
@@ -152,6 +154,8 @@ class ManagedCharging:
         g = self.controller.session.gateway
         if not self.journal.phase.read().legacy_active or self.journal.phase.starting:
             return "not_ready"
+        if offline_owner_tag(self) is not None:
+            return "ready"
         if any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags):
             return "ready"
         if any(g.local_start_needs_renewal(tag) for tag in g.policy.allowed_tags):
@@ -199,6 +203,7 @@ class ManagedCharging:
             normal=action == "start",
             current_a=c.current.selected(),
             accepted_boot=g.boot_observation,
+            owner_start_tag=offline_owner_tag(self) if action == "start" else None,
         )
 
     # The worker and deadline keep their existing lifetimes after the request is recorded.
@@ -222,7 +227,9 @@ class ManagedCharging:
             previous_current = current_candidate(c) if lease.normal else None
             self.guard(lease)
             decisions = c.session.gateway.controls.decisions
-            renewed_tag = await decisions.renew_local_start(self, lease) if lease.normal else None
+            renewed_tag = None
+            if lease.normal and lease.owner_start_tag is None:
+                renewed_tag = await decisions.renew_local_start(self, lease)
             self.guard(lease)
             initial = await c.settled_native()
             decisions.require_idle_start(self, lease, initial)
@@ -251,7 +258,7 @@ class ManagedCharging:
             if native.physical.connection != "Plug":
                 raise DeniedError("test requires a connected vehicle")
             self.guard(lease)
-            tag = decisions.choose_start_tag(c.session.gateway, renewed_tag)
+            tag = lease.owner_start_tag or decisions.choose_start_tag(c.session.gateway, renewed_tag)
 
             # Commit the attempt marker with LocalControl's receipt, never before its owned task first executes.
             def prepared() -> None:

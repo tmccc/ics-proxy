@@ -199,7 +199,7 @@ def require_common_debt_idle(j: Journal, kind: str, snapshot: dict[str, Any]) ->
         or (snapshot["fault"] or {}).get("classification") not in (None, "owner_control_or_delivery_uncertain")
         or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL LIMIT 1").fetchone()
         or kind not in ("observation", "stop-delivery", START_KIND, COMBINED_KIND)
-        and j.db.execute("SELECT 1 FROM transactions WHERE vendor IS NULL LIMIT 1").fetchone()
+        and j.unmapped_cloud_sessions().fetchone() is not None
         or not j.current_change.read().settled_or_missing
         or j.get("managed_current_prepare_intent", {}).get("stage") not in (None, "complete")
         or kind != "local-start"
@@ -223,7 +223,7 @@ def require_common_debt_idle(j: Journal, kind: str, snapshot: dict[str, Any]) ->
 
 # Removing a legacy report may unblock exact queued closed lifecycle pairs; orphan or ambiguous tails stay quarantined.
 def require_observation_tail(j: Journal) -> None:
-    for row in j.db.execute("SELECT local,start,stop FROM transactions WHERE vendor IS NULL"):
+    for row in j.unmapped_cloud_sessions():
         pair = j.db.execute(
             "SELECT action,payload,state FROM outbox WHERE local=? "
             "AND action IN ('StartTransaction','StopTransaction') "
@@ -341,7 +341,7 @@ def require_stop_tail(j: Journal, head: Delivery) -> None:
     rows = j.db.execute("SELECT * FROM outbox ORDER BY seq").fetchall()
     if not rows or rows[0]["token"] != head.token:
         raise RecoveryRequiredError("Stop recovery no longer identifies its exact outbox head")
-    for row in j.db.execute("SELECT local,start,stop FROM transactions WHERE vendor IS NULL"):
+    for row in j.unmapped_cloud_sessions():
         pair = [
             item
             for item in rows[1:]
@@ -506,7 +506,7 @@ def start_retry_candidate(j: Journal, snapshot: dict[str, Any]) -> dict[str, Any
     rows = snapshot["outbox"]
     if row is None or row["stop"] is None or row["vendor"] is not None or json.loads(row["start"]) != head.payload:
         raise RecoveryRequiredError("Start retry requires its genuine closed unmapped lifecycle")
-    for transaction in j.db.execute("SELECT local,start,stop FROM transactions WHERE vendor IS NULL"):
+    for transaction in j.unmapped_cloud_sessions():
         pair = [
             r
             for r in rows
@@ -925,7 +925,7 @@ def settled_operator_recovery(j: Journal, spec: NativeBoundedSpec, fault: dict[s
         or proof["resolved"] != resolved_debt(j, proof["kind"], proof)
         or j.next_delivery() is not None
         or j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-        or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1").fetchone()
+        or j.has_unsettled_sessions()
         or j.get("managed_control_intent", {}).get("mode") != "paused"
     ):
         return None

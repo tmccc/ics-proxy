@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from .start_policy import owner_start_seconds
+
 if TYPE_CHECKING:
     from .gateway import NativeStartReport
     from .managed_charging import ManagedCharging
@@ -16,6 +18,10 @@ class ManagedStartReports:
     # Use the existing managed charging worker and its controller.
     def __init__(self, charging: ManagedCharging) -> None:
         self.charging = charging
+
+    # Authorization belongs to the existing managed lease rather than the charger's tag alone.
+    def owner_start_seconds(self, tag: str, request_id: str | None, *, issued: bool) -> int | None:
+        return owner_start_seconds(self.charging, tag, request_id=request_id, issued=issued)
 
     # A protected owner Start may first need a zero hold.
     async def prepare_hold(self, payload: dict[str, Any]) -> None:

@@ -70,10 +70,8 @@ def validate_observation(action: str, payload: dict[str, Any], journal: Journal,
             ).fetchone()
             if transaction is None:
                 raise ConflictError("meter names an unknown local transaction")
-            if transaction["stop"] is not None:
-                if journal.db.execute(
-                    "SELECT 1 FROM transactions WHERE local>? AND vendor IS NULL LIMIT 1", (local,)
-                ).fetchone():
+            if transaction["stop"] is not None and not journal.is_owner_session(local):
+                if journal.unmapped_cloud_sessions(after_local=local).fetchone() is not None:
                     raise RecoveryRequiredError("historical meter awaits the later session's cloud identity")
                 if (
                     transaction["vendor"] is not None

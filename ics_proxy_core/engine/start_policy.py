@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
+from .connection_scope import control_scope_matches
 from .managed_facts import ManagedFacts
+from .policy import DeniedError
 
 if TYPE_CHECKING:
     from .managed_charging import ManagedCharging
@@ -13,6 +16,57 @@ if TYPE_CHECKING:
 
 
 ACTIVE = frozenset({"armed", "starting", "awaiting_power", "charging", "running", "stopping"})
+
+
+def offline_owner_tag(charging: ManagedCharging) -> str | None:
+    session = charging.controller.session
+    return None if session.runtime.vendor_registered else session.gateway.policy.owner_start_tag
+
+
+def owner_tag_separate(native: HandoverEvidence, tag: str) -> bool:
+    plans = None if native.saved_schedule is None else native.saved_schedule.get("planList")
+    return isinstance(plans, list) and all(
+        isinstance(plan, dict) and str(plan.get("idTag", "")).casefold() != tag.casefold() for plan in plans
+    )
+
+
+# Check the same lease at the charger boundary and in its nested authorization or lifecycle report.
+def owner_start_seconds(
+    charging: ManagedCharging, tag: str, *, request_id: str | None = None, issued: bool = False
+) -> int | None:
+    lease, journal = charging.lease, charging.journal
+    gateway = charging.controller.session.gateway
+    if (
+        lease is None
+        or not lease.normal
+        or lease.source != "local"
+        or lease.owner_start_tag is None
+        or lease.owner_start_tag.casefold() != tag.casefold()
+        or not gateway.policy.is_owner_start_tag(tag)
+        or not issued
+        and request_id != lease.identifier
+    ):
+        return None
+    try:
+        charging.guard(lease)
+    except DeniedError:
+        return None
+    if issued:
+        receipt, control = journal.starts.receipt(), journal.get("control", {})
+        if (
+            lease.start_scope is None
+            or not control_scope_matches(gateway, (lease.start_scope, lease.control_revision))
+            or journal.active() is not None
+            or not gateway.controls.ready
+            or gateway.controls.desired() != lease.current_a
+            or control.get("start_pending") is not True
+            or not journal.starts.pending_owner_tag(tag)
+            or receipt.get("request_id") != lease.identifier
+            or receipt.get("ticket") != control.get("ticket")
+        ):
+            return None
+    remaining = int(lease.deadline - time.monotonic())
+    return remaining if remaining > 0 else None
 
 
 def start_refusal(
@@ -51,7 +105,10 @@ def start_refusal(
     # A normal Start may request fresh approval online before doing any charger work.
     if g.policy.allow_local_start:
         return "legacy_start_enabled"
-    if local and not any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags):
+    owner_tag = offline_owner_tag(charging) if normal and local else None
+    if owner_tag is not None and native is not None and not owner_tag_separate(native, owner_tag):
+        return "owner_tag_conflicts_with_schedule"
+    if owner_tag is None and local and not any(g._local_start_allowed(tag) for tag in g.policy.allowed_tags):
         if not normal or charging.authorization_status() != "renewal_required":
             return "start_authorization_unavailable"
 

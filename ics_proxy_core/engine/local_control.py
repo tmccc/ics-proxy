@@ -139,6 +139,7 @@ class LocalControl:
         self._unsent_release: tuple[str, dict[str, Any]] | None = None
         self.release_attempt: ReleaseAttempt | None = None
         self.authorize: Callable[[str], bool] | None = None
+        self.owner_start_seconds: Callable[[str, str | None], int | None] = lambda _tag, _request: None
         self.prepare_station: Callable[[ResultCall, int], Awaitable[StationChoice | NotSent]] | None = None
         self.require_retained_station: Callable[[float], Awaitable[None]] | None = None
         self.retained_ceiling_exceeded: Callable[[], None] | None = None
@@ -824,7 +825,7 @@ class LocalControl:
             if scope_guard is not None:
                 scope_guard()
             if not restoring_zero:
-                self.decisions.require_local_start(tag, boot, guard)
+                self.decisions.require_local_start(tag, boot, guard, request_id)
 
         # The wire witness is marked before the transport can send this Start.
         def dispatch(action: str) -> None:

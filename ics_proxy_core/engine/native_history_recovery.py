@@ -358,9 +358,7 @@ def _reconcile(
                 or intent.get("mode") not in ("app", "paused")
                 or type(intent.get("revision")) is not int
                 or not 0 <= intent["revision"] < 2**53 - 1
-                or journal.db.execute(
-                    "SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1"
-                ).fetchone()
+                or journal.has_unsettled_sessions()
                 or not any(
                     row["idTagStart"] in plans
                     and 0 <= failure["at_epoch"] - row["startTime"] <= 30

@@ -150,6 +150,11 @@ class Journal:
                 local INTEGER PRIMARY KEY, connector INTEGER NOT NULL, start TEXT UNIQUE NOT NULL,
                 stop TEXT, vendor INTEGER, live INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS one_open_connector ON transactions(connector) WHERE stop IS NULL;
+            CREATE TABLE IF NOT EXISTS owner_sessions(
+                local INTEGER PRIMARY KEY REFERENCES transactions(local));
+            CREATE TABLE IF NOT EXISTS owner_meter_values(
+                local INTEGER NOT NULL REFERENCES owner_sessions(local), sequence INTEGER NOT NULL,
+                token TEXT UNIQUE NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(local,sequence));
             CREATE TABLE IF NOT EXISTS receipts(
                 token TEXT PRIMARY KEY, action TEXT NOT NULL, digest TEXT NOT NULL, response TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox(
@@ -375,6 +380,10 @@ class Journal:
     def enqueue(
         self, action: str, payload: dict[str, Any], local: int | None = None, *, _reserved_stop: bool = False
     ) -> str:
+        if local is not None and self.is_owner_session(local):
+            if action != "MeterValues" or payload.get("transactionId") != local:
+                raise ConflictError("owner-authorized session reports cannot enter vendor delivery")
+            return self._retain_owner_meter(local, payload)
         if _reserved_stop:
             row = self.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()
             if (
@@ -403,6 +412,20 @@ class Journal:
         token = "e-" + uuid.uuid4().hex
         self.db.execute(
             "INSERT INTO outbox(token,action,payload,local) VALUES(?,?,?,?)", (token, action, encoded(payload), local)
+        )
+        return token
+
+    # Observations keep their normal publication identity and commit with their receipt.
+    def _retain_owner_meter(self, local: int, payload: dict[str, Any]) -> str:
+        sequence = self.db.execute(
+            "SELECT COALESCE(MAX(sequence),0)+1 FROM owner_meter_values WHERE local=?", (local,)
+        ).fetchone()[0]
+        if sequence > self.capacity:
+            raise RecoveryRequiredError("local session observation capacity reached; event was not accepted")
+        token = "e-" + uuid.uuid4().hex
+        self.db.execute(
+            "INSERT INTO owner_meter_values(local,sequence,token,payload) VALUES(?,?,?,?)",
+            (local, sequence, token, encoded(payload)),
         )
         return token
 
@@ -541,6 +564,8 @@ class Journal:
         payload: dict[str, Any],
         accepted: Callable[[int], None] | None = None,
         info: dict[str, Any] | None = None,
+        *,
+        owner_authorized: bool = False,
     ) -> dict[str, Any]:
         with self.atomic():
             cached = self.receipt(token, "StartTransaction", payload)
@@ -567,7 +592,10 @@ class Journal:
                     "INSERT INTO transactions(local,connector,start,live,start_info) VALUES(?,?,?,0,?)",
                     (local, payload["connectorId"], encoded(payload), encoded(info or {"status": "Accepted"})),
                 )
-                self.enqueue("StartTransaction", payload, local)
+                if owner_authorized:
+                    self.db.execute("INSERT INTO owner_sessions(local) VALUES(?)", (local,))
+                else:
+                    self.enqueue("StartTransaction", payload, local)
                 if accepted is not None:
                     accepted(local)
             answer = {"transactionId": local, "idTagInfo": info or {"status": "Accepted"}}
@@ -607,7 +635,8 @@ class Journal:
                         "INSERT INTO transaction_clock_discontinuities VALUES(?,?,?,?)",
                         (local, start["timestamp"], payload["timestamp"], time.time()),
                     )
-                self.enqueue("StopTransaction", payload, local, _reserved_stop=True)
+                if not self.is_owner_session(local):
+                    self.enqueue("StopTransaction", payload, local, _reserved_stop=True)
                 profiles = self.get("vendor_profiles", {})
                 transactions = self.get("vendor_profile_transactions", {})
                 retired = [key for key, value in transactions.items() if value == local]
@@ -628,6 +657,30 @@ class Journal:
             "SELECT local FROM transactions WHERE connector=? AND stop IS NULL", (connector,)
         ).fetchone()
         return int(row[0]) if row else None
+
+    # A local owner session has no vendor ID because none was requested.
+    def is_owner_session(self, local: int | None) -> bool:
+        return (
+            type(local) is int
+            and self.db.execute("SELECT 1 FROM owner_sessions WHERE local=?", (local,)).fetchone() is not None
+        )
+
+    # Reconciliation tools inspect only transactions that can have a vendor mapping.
+    def unmapped_cloud_sessions(self, *, after_local: int | None = None) -> sqlite3.Cursor:
+        return self.db.execute(
+            "SELECT local,start,stop FROM transactions WHERE vendor IS NULL "
+            "AND local NOT IN (SELECT local FROM owner_sessions) AND (? IS NULL OR local>?)",
+            (after_local, after_local),
+        )
+
+    # Open ledger rows still require settlement. Only cloud-bound sessions need a mapping.
+    def has_unsettled_sessions(self, *, continuing_local: int | None = None) -> bool:
+        row = self.db.execute(
+            "SELECT 1 FROM transactions WHERE (stop IS NULL AND local IS NOT ?) "
+            "OR (vendor IS NULL AND local NOT IN (SELECT local FROM owner_sessions)) LIMIT 1",
+            (continuing_local,),
+        ).fetchone()
+        return row is not None
 
     # Only the latest mapped Stop can explain a native report that still carries a closed session's ID.
     def latest_mapped_stop(self, local: int | None) -> bool:
@@ -666,6 +719,8 @@ class Journal:
         row = self.db.execute("SELECT * FROM outbox ORDER BY seq LIMIT 1").fetchone()
         if row is None:
             return None
+        if self.is_owner_session(row["local"]):
+            raise RecoveryRequiredError("owner-authorized session appeared in vendor delivery")
         return Delivery(row["token"], row["action"], json.loads(row["payload"]), row["local"], row["state"])
 
     # Record possible delivery before putting a Start onto the wire.
@@ -746,6 +801,8 @@ class Journal:
         if item.action == "StartTransaction":
             if item.transaction is None:
                 raise RecoveryRequiredError("start is missing its local transaction")
+            if self.is_owner_session(item.transaction):
+                raise RecoveryRequiredError("owner-authorized session cannot acquire a vendor mapping")
             vendor = result.get("transactionId")
             if (
                 type(vendor) is not int

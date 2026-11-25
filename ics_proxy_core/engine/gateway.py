@@ -135,6 +135,8 @@ def timestamp(value: Any) -> datetime:
 class StartReports(Protocol):
     """Managed hooks for this one charger lifecycle report, in gateway dispatch order."""
 
+    def owner_start_seconds(self, tag: str, request_id: str | None, *, issued: bool) -> int | None: ...
+
     # Establish any required owner hold before the gateway pins its ticket.
     async def prepare_hold(self, payload: dict[str, Any]) -> None: ...
 
@@ -177,6 +179,7 @@ class Gateway:
         self.stop_zero_evidence: StopZeroEvidence | None = None
         if self.policy.strict_cloud_authorization:
             self.controls.authorize = self._local_start_allowed
+        self.controls.owner_start_seconds = self.owner_start_seconds
         self._tasks: set[asyncio.Task[None]] = set()
         self._boot_response: asyncio.Task[None] | None = None
         self._reserved_stops: dict[str, asyncio.Task[None]] = {}
@@ -584,6 +587,11 @@ class Gateway:
                     self.decide(lambda: self.journal.mutation_finished(exact_mutation, True))
                 text = reply_as(answer, token)
             else:
+                if action == "Authorize" and self.policy.is_owner_start_tag(payload.get("idTag")):
+                    return build_call_result(
+                        token,
+                        {"idTagInfo": self.decide(lambda: self._owner_tag_info(payload["idTag"], epoch, boot))},
+                    )
                 if action == "Authorize" and self.policy.strict_cloud_authorization:
                     info = await self._authorize_tag(payload.get("idTag"))
                     self._require_epoch("charger", epoch)
@@ -697,12 +705,16 @@ class Gateway:
             allowed = self._tag_allowed(tag)
             return {"idTagInfo": {"status": "Accepted" if allowed else "Invalid"}}
         if action == "StopTransaction":
-            integer(payload.get("transactionId"))
+            local = integer(payload.get("transactionId"))
             number(payload.get("meterStop"), 1e12)
             timestamp(payload.get("timestamp"))
             tag = payload.get("idTag")
             info = None
-            if self.policy.strict_cloud_authorization and isinstance(tag, str):
+            if (
+                self.policy.strict_cloud_authorization
+                and isinstance(tag, str)
+                and not self.journal.is_owner_session(local)
+            ):
                 try:
                     info = self.auth_info.get(tag)
                 except sqlite3.Error:
@@ -790,6 +802,17 @@ class Gateway:
     # Lookup is case-insensitive while journal facts and outbound OCPP preserve their original tag text.
     def _local_tag(self, tag: str) -> bool:
         return any(tag.casefold() == approved.casefold() for approved in self.policy.allowed_tags)
+
+    # The local executor and charger reports consult the same managed Start lease.
+    def owner_start_seconds(self, tag: str, request_id: str | None = None, *, issued: bool = False) -> int | None:
+        if self.start_reports is None or not self.policy.is_owner_start_tag(tag):
+            return None
+        return self.start_reports.owner_start_seconds(tag, request_id, issued=issued)
+
+    def _owner_tag_info(self, tag: str, epoch: int, boot: str | None) -> dict[str, Any]:
+        self._require_epoch("charger", epoch)
+        remaining = self.owner_start_seconds(tag, issued=True) if self.boot_observation == boot else None
+        return self.auth_info.local(remaining) if remaining is not None else {"status": "Invalid"}
 
     # An explicit owner Start may release a completed hold, but cannot bypass revocation or recovery mode.
     def _local_start_allowed(self, tag: str) -> bool:

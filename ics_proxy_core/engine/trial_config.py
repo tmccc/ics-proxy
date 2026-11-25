@@ -141,6 +141,7 @@ class TrialConfig:
     evidence: Path
     max_current_a: float = 6
     local_tags: frozenset[str] = field(default_factory=frozenset)
+    owner_start_tag: str | None = None
 
     # Name the optional incident file alongside the private journal.
     @property
@@ -244,6 +245,12 @@ class TrialConfig:
             re.fullmatch(r"[A-Za-z0-9_-]{1,20}", tag) is None for tag in self.local_tags
         ):
             raise SecurityError("trial local tags must be explicit and bounded")
+        if self.owner_start_tag is not None and (
+            not isinstance(self.owner_start_tag, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,20}", self.owner_start_tag) is None
+            or any(self.owner_start_tag.casefold() == tag.casefold() for tag in self.local_tags)
+        ):
+            raise SecurityError("the owner Start tag must be separate from the app and schedule tags")
         self.check_paths()
 
     # Load only an explicit private configuration; do not discover household files or infer credentials.
@@ -251,7 +258,7 @@ class TrialConfig:
     def load(cls, path: Path) -> TrialConfig:
         value = private_json(path)
         keys = set(cls.__dataclass_fields__)
-        if set(value) != keys:
+        if not (keys - {"owner_start_tag"} <= value.keys() <= keys):
             raise SecurityError("trial configuration fields are incomplete or unknown")
         paths = {
             "native_secret",

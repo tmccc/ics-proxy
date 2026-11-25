@@ -87,6 +87,22 @@ before editing charger settings. A changed schedule or configuration can block o
 **Return to app / schedule** releases a verified local Pause and gives control back to the app and the commissioned
 schedule while the charger still connects through the proxy. The selected proxy current limit continues to apply.
 
+### Local Start during a vendor outage
+
+An installation can opt in by setting `owner_start_tag` in the private service configuration. Choose a dedicated
+local identity of 1–20 letters, numbers, hyphens, or underscores. It must be distinct from `local_tags` and the
+identities used by the commissioned schedule. Keep this setting private with the rest of the charger configuration.
+
+When iCS is disconnected, a normal Start through authenticated management can use that identity for one request.
+The proxy verifies the current charger connection, idle state, selected ceiling, and existing command outcomes
+before issuing the Start. Use **Stop** to close that exact session, or **Pause charger** to keep a zero hold after
+closure. Cloud availability and charging readiness are reported separately. The saved timer, timed tests, and
+Return to app control follow their existing authorization and recovery rules.
+
+Sessions started under this local authorization stay in the proxy journal with their charger reports and are
+available through the proxy's history. Keep the journal when updating the service. A downgrade involving locally
+authorized sessions needs a rehearsed build and journal pair that supports those records.
+
 ## Run the service
 
 The [systemd example](../packaging/ics-proxy.service.example) runs the persistent service with a dedicated user,

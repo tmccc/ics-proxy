@@ -32,7 +32,7 @@ def local_recovery_binding(gateway: Gateway, spec_digest: str) -> str:
             "SELECT 1 FROM managed_requests WHERE state IN ('accepted','running') AND action!='pause' LIMIT 1"
         ).fetchone()
         or journal.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-        or journal.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1").fetchone()
+        or journal.has_unsettled_sessions()
         or journal.db.execute(
             "SELECT 1 FROM outbox WHERE state!='queued' OR action NOT IN "
             "('StatusNotification','MeterValues','FirmwareStatusNotification','DiagnosticsStatusNotification') LIMIT 1"

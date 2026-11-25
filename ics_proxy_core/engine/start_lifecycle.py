@@ -599,10 +599,30 @@ class StartLifecycle:
         return True
 
     # The surrounding Start claim transaction supplies atomicity and keeps preparation distinct from admission.
-    def prepare(self, ticket: str, digest: str, request_id: str | None) -> None:
+    def prepare(self, ticket: str, digest: str, request_id: str | None, *, owner_authorized: bool = False) -> None:
         self.journal.put(
             "local_start_receipt",
-            {"ticket": ticket, "digest": digest, "stage": "prepared", "local": None, "request_id": request_id},
+            {
+                "ticket": ticket,
+                "digest": digest,
+                "stage": "prepared",
+                "local": None,
+                "request_id": request_id,
+                **({"owner_authorized": True} if owner_authorized else {}),
+            },
+        )
+
+    # An issued owner Start can still report under verified zero after positive authority was revoked.
+    def pending_owner_tag(self, tag: str) -> bool:
+        receipt = self.receipt()
+        return (
+            receipt.get("owner_authorized") is True
+            and receipt.get("stage") in ("issued", "accepted")
+            and receipt.get("local") is None
+            and isinstance(receipt.get("request_id"), str)
+            and isinstance(receipt.get("ticket"), str)
+            and receipt.get("digest") == fingerprint(tag.casefold())
+            and self.pending_reply != (receipt["ticket"], receipt["request_id"], "Rejected")
         )
 
     # Issue once and settle only the original issued Start, independently of any newer Pause.

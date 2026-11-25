@@ -157,7 +157,7 @@ def require_delivery_zero(j: Journal, book: ResourceBook, spec: NativeBoundedSpe
 
 # Check that the ambiguous head owns an exact closed pair and later reports have no separate delivery uncertainty.
 def require_queued_backlog(j: Journal, head: Delivery) -> None:
-    unmapped = {row["local"] for row in j.db.execute("SELECT local FROM transactions WHERE vendor IS NULL")}
+    unmapped = {row["local"] for row in j.unmapped_cloud_sessions()}
     started: set[int] = set()
     active: int | None = None
     for row in j.db.execute(

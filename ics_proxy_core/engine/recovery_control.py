@@ -334,10 +334,7 @@ class RecoveryControl:
             or local_start.get("local") is None
             and local_start.get("stage") in ("prepared", "issued", "accepted")
             or j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-            or j.db.execute(
-                "SELECT 1 FROM transactions WHERE vendor IS NULL OR (stop IS NULL AND local IS NOT ?) LIMIT 1",
-                (local,),
-            ).fetchone()
+            or j.has_unsettled_sessions(continuing_local=local)
         ):
             return Pending(
                 Prerequisite.SOURCE, "ordinary continuation awaits fresh source and reconciled owner authority"

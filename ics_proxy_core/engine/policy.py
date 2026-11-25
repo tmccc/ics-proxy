@@ -60,6 +60,7 @@ class Policy:
     extensions: dict[tuple[str, str], str] = field(default_factory=dict)
     configuration_keys: frozenset[str] = frozenset()
     extra_vendor_actions: frozenset[str] = frozenset()
+    owner_start_tag: str | None = field(default=None, repr=False)
 
     # Reject a malformed policy at construction rather than weakening validation later.
     def __post_init__(self) -> None:
@@ -74,6 +75,22 @@ class Policy:
             raise DeniedError("vendor tag trust must be explicit")
         if any(mode not in ("read", "write") for mode in self.extensions.values()):
             raise DeniedError("extensions must be explicitly classified as read or write")
+        if self.owner_start_tag is not None and (
+            self.allow_local_start
+            or not self.strict_cloud_authorization
+            or not isinstance(self.owner_start_tag, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,20}", self.owner_start_tag) is None
+            or any(self.is_owner_start_tag(tag) for tag in self.allowed_tags)
+        ):
+            raise DeniedError("owner Start requires a dedicated tag in managed mode")
+
+    # The owner tag belongs only to authenticated managed Start, never to general tag permissions.
+    def is_owner_start_tag(self, tag: Any) -> bool:
+        return (
+            self.owner_start_tag is not None
+            and isinstance(tag, str)
+            and tag.casefold() == self.owner_start_tag.casefold()
+        )
 
     # Classify known requests; opaque vendor bodies require an explicit message-specific rule.
     def kind(self, action: str, payload: dict[str, Any]) -> str:
@@ -121,6 +138,8 @@ class Policy:
                 raise DeniedError("configuration key is not explicitly allowed")
         elif action == "RemoteStartTransaction":
             tag = payload.get("idTag")
+            if self.is_owner_start_tag(tag):
+                raise DeniedError("the dedicated owner tag cannot be used by a vendor Start")
             dynamic = (
                 self.trust_vendor_start_tags and isinstance(tag, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,20}", tag)
             )
