@@ -144,17 +144,13 @@ class Journal:
         self.db.execute("PRAGMA foreign_keys=ON")
         if self.db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise RecoveryRequiredError("journal integrity check failed")
+        self._owner_schema = self._read_owner_schema()
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS transactions(
                 local INTEGER PRIMARY KEY, connector INTEGER NOT NULL, start TEXT UNIQUE NOT NULL,
                 stop TEXT, vendor INTEGER, live INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS one_open_connector ON transactions(connector) WHERE stop IS NULL;
-            CREATE TABLE IF NOT EXISTS owner_sessions(
-                local INTEGER PRIMARY KEY REFERENCES transactions(local));
-            CREATE TABLE IF NOT EXISTS owner_meter_values(
-                local INTEGER NOT NULL REFERENCES owner_sessions(local), sequence INTEGER NOT NULL,
-                token TEXT UNIQUE NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(local,sequence));
             CREATE TABLE IF NOT EXISTS receipts(
                 token TEXT PRIMARY KEY, action TEXT NOT NULL, digest TEXT NOT NULL, response TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox(
@@ -214,6 +210,36 @@ class Journal:
                 "UPDATE mutations SET state='uncertain' WHERE state='pending' AND token IN "
                 "(SELECT mutation FROM vendor_command_scope WHERE wire_result='dispatched')"
             )
+
+    # A journal either has both owner tables with valid references, or keeps its original schema.
+    def _read_owner_schema(self) -> bool:
+        tables = dict(
+            self.db.execute("SELECT name,type FROM sqlite_schema WHERE name IN ('owner_sessions','owner_meter_values')")
+        )
+        if not tables:
+            return False
+        if (
+            tables != {"owner_sessions": "table", "owner_meter_values": "table"}
+            or self.db.execute("PRAGMA foreign_key_check(owner_sessions)").fetchone() is not None
+            or self.db.execute("PRAGMA foreign_key_check(owner_meter_values)").fetchone() is not None
+        ):
+            raise RecoveryRequiredError("journal owner session schema is incomplete or inconsistent")
+        return True
+
+    # Use individual statements so creation, the Start and its receipt share the same commit.
+    def _create_owner_schema(self) -> None:
+        self.db.execute("CREATE TABLE owner_sessions(local INTEGER PRIMARY KEY REFERENCES transactions(local))")
+        self.db.execute(
+            "CREATE TABLE owner_meter_values(local INTEGER NOT NULL REFERENCES owner_sessions(local), "
+            "sequence INTEGER NOT NULL, token TEXT UNIQUE NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(local,sequence))"
+        )
+
+    # Callbacks in the first Start can see its uncommitted schema without caching it across rollback.
+    def _has_owner_schema(self) -> bool:
+        return self._owner_schema or (
+            self.db.in_transaction
+            and self.db.execute("SELECT 1 FROM sqlite_schema WHERE name='owner_sessions'").fetchone() is not None
+        )
 
     # Recover independent delivery faults after an exact forwarded reply can retire its own timeout.
     def _recover_deliveries(self) -> None:
@@ -567,6 +593,7 @@ class Journal:
         *,
         owner_authorized: bool = False,
     ) -> dict[str, Any]:
+        created_owner_schema = False
         with self.atomic():
             cached = self.receipt(token, "StartTransaction", payload)
             if cached is not None:
@@ -593,6 +620,9 @@ class Journal:
                     (local, payload["connectorId"], encoded(payload), encoded(info or {"status": "Accepted"})),
                 )
                 if owner_authorized:
+                    if not self._owner_schema:
+                        self._create_owner_schema()
+                        created_owner_schema = True
                     self.db.execute("INSERT INTO owner_sessions(local) VALUES(?)", (local,))
                 else:
                     self.enqueue("StartTransaction", payload, local)
@@ -600,7 +630,9 @@ class Journal:
                     accepted(local)
             answer = {"transactionId": local, "idTagInfo": info or {"status": "Accepted"}}
             self.remember(token, "StartTransaction", payload, answer)
-            return answer
+        if created_owner_schema:
+            self._owner_schema = True
+        return answer
 
     # Accept a stop once without ever clearing some other session on the connector.
     def stop(
@@ -662,14 +694,21 @@ class Journal:
     def is_owner_session(self, local: int | None) -> bool:
         return (
             type(local) is int
+            and self._has_owner_schema()
             and self.db.execute("SELECT 1 FROM owner_sessions WHERE local=?", (local,)).fetchone() is not None
         )
+
+    # The optional schema never enters SQL compiled for a journal without owner sessions.
+    def _unmapped_cloud_predicate(self) -> str:
+        if self._has_owner_schema():
+            return "vendor IS NULL AND local NOT IN (SELECT local FROM owner_sessions)"
+        return "vendor IS NULL"
 
     # Reconciliation tools inspect only transactions that can have a vendor mapping.
     def unmapped_cloud_sessions(self, *, after_local: int | None = None) -> sqlite3.Cursor:
         return self.db.execute(
-            "SELECT local,start,stop FROM transactions WHERE vendor IS NULL "
-            "AND local NOT IN (SELECT local FROM owner_sessions) AND (? IS NULL OR local>?)",
+            "SELECT local,start,stop FROM transactions WHERE "
+            f"{self._unmapped_cloud_predicate()} AND (? IS NULL OR local>?)",
             (after_local, after_local),
         )
 
@@ -677,7 +716,7 @@ class Journal:
     def has_unsettled_sessions(self, *, continuing_local: int | None = None) -> bool:
         row = self.db.execute(
             "SELECT 1 FROM transactions WHERE (stop IS NULL AND local IS NOT ?) "
-            "OR (vendor IS NULL AND local NOT IN (SELECT local FROM owner_sessions)) LIMIT 1",
+            f"OR ({self._unmapped_cloud_predicate()}) LIMIT 1",
             (continuing_local,),
         ).fetchone()
         return row is not None
