@@ -244,6 +244,7 @@ class TrialSession:
                 trust_vendor_start_tags=True,
                 strict_cloud_authorization=True,
                 allow_local_start=allow_local_start,
+                owner_start_tag=config.owner_start_tag if not allow_local_start else None,
                 local_stack_level=config.station_stack_level,
                 extensions={
                     ("IoCharger", name): mode

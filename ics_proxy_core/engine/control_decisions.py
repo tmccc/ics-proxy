@@ -75,7 +75,7 @@ from .rpc import UnavailableError
 from .schedule_control import ScheduleControl
 from .security import SecurityError, StaleEvidenceError
 from .start_handoff import NativeStartReport, OwnedStartResult, StartHandoff, StartHandoffContext, StartPublication
-from .start_policy import ACTIVE, start_refusal
+from .start_policy import ACTIVE, owner_tag_separate, start_refusal
 from .start_settlement import RetirementCandidate, StartFailureAction, StartFailureFacts, settle_start
 from .stop_settlement import StopAcceptance
 from .store import RecoveryRequiredError, StationZeroStorageError, encoded, fingerprint
@@ -1238,6 +1238,13 @@ class ControlDecisions:
             raise DeniedError("trial vendor controls are frozen")
         control = self.journal.get("control", {})
         if write and action != "RemoteStopTransaction":
+            lease, active = self.journal.starts.lease, self.journal.active()
+            if (
+                (lease is not None and lease.owner_start_tag is not None)
+                or (active is not None and self.journal.is_owner_session(active))
+                or (control.get("start_pending") and self.journal.starts.receipt().get("owner_authorized") is True)
+            ):
+                raise DeniedError("vendor writes await closure of the locally authorized Start or session")
             if self.journal.current_change.read().recovering:
                 raise DeniedError("cloud writes await settlement of the current selection")
             if own_mutation is None:
@@ -1646,6 +1653,20 @@ class ControlDecisions:
         check()
         if gateway.journal.known_start(payload):
             return await gateway.decide_report(lambda: commit(None, None))
+        tag = payload.get("idTag")
+        if isinstance(tag, str) and (
+            gateway.policy.is_owner_start_tag(tag) or self.journal.starts.pending_owner_tag(tag)
+        ):
+            reports = gateway.start_reports
+            if reports is None:
+                raise DeniedError("owner Start reports require managed operation")
+            if gateway.owner_start_seconds(tag, issued=True) is None and self.journal.starts.pending_owner_tag(tag):
+                await reports.prepare_hold(payload)
+                check()
+            if self._owner_report_seconds(gateway, tag) is None:
+                raise DeniedError("the owner tag requires an exact issued Start")
+            ticket = gateway.journal.get("control", {}).get("ticket")
+            return await reports.commit_at_verified_ceiling(lambda: commit(None, ticket))
         if gateway.start_reports is not None and not gateway.journal.known_start(payload):
             await gateway.start_reports.prepare_hold(payload)
             check()
@@ -1690,6 +1711,16 @@ class ControlDecisions:
                 raise DeniedError("a newer owner operation superseded the reported start")
         return await gateway.decide_report(lambda: commit(native_report, ticket))
 
+    # Retain a previously issued report under verified zero without reviving its positive authorization.
+    def _owner_report_seconds(self, gateway: Gateway, tag: str) -> int | None:
+        seconds = gateway.owner_start_seconds(tag, issued=True)
+        if seconds is not None:
+            return seconds
+        reports = gateway.start_reports
+        if reports is not None and self.journal.starts.pending_owner_tag(tag) and reports.permits_held(tag):
+            return 1
+        return None
+
     # Validate the report and commit its command/native binding with the new transaction.
     def record_start_report(
         self,
@@ -1705,6 +1736,11 @@ class ControlDecisions:
         if not isinstance(tag, str):
             raise DeniedError("a reported start requires a tag")
         known = gateway.journal.known_start(payload)
+        owner_seconds = None
+        if not known and (gateway.policy.is_owner_start_tag(tag) or self.journal.starts.pending_owner_tag(tag)):
+            owner_seconds = self._owner_report_seconds(gateway, tag)
+            if owner_seconds is None:
+                raise DeniedError("owner Start authority changed before its session was recorded")
         historical = None
         if (
             not known
@@ -1716,14 +1752,20 @@ class ControlDecisions:
             )
         ):
             historical = gateway.auth_info.accepted_for_delayed_report(tag, occurred.timestamp(), payload["timestamp"])
-        if not known and not gateway._tag_allowed(
-            tag, lifecycle=True, historical=historical is not None, native_report=native_report is not None
+        if (
+            not known
+            and owner_seconds is None
+            and not gateway._tag_allowed(
+                tag, lifecycle=True, historical=historical is not None, native_report=native_report is not None
+            )
         ):
             raise DeniedError("tag is not approved for local authorization")
 
         # Permission binding and the pending flag belong to the very same commit as the new Start fact.
         def accepted(local: int) -> None:
-            if native_report is not None:
+            if owner_seconds is not None:
+                gateway.controls.bind_start(tag, local)
+            elif native_report is not None:
                 native_report.record(local)
             elif gateway.start_reports is None or not gateway.start_reports.defer_binding(local, payload["idTag"]):
                 gateway.authorisation.consume(payload["idTag"], local)
@@ -1731,15 +1773,19 @@ class ControlDecisions:
             if gateway.start_reports is not None:
                 gateway.start_reports.recorded(local, payload)
 
-        info = historical or (
-            gateway._tag_info(tag) if gateway.policy.strict_cloud_authorization and not known else None
-        )
+        info: dict[str, Any] | None
+        if owner_seconds is not None:
+            info = gateway.auth_info.local(owner_seconds)
+        else:
+            info = historical or (
+                gateway._tag_info(tag) if gateway.policy.strict_cloud_authorization and not known else None
+            )
         if info is not None:
             if info["status"] != "Accepted":
                 raise DeniedError("authorization changed before accepting the new session")
-            if historical is None and not gateway._local_tag(tag):
+            if owner_seconds is None and historical is None and not gateway._local_tag(tag):
                 gateway.auth_info.require_dynamic(info)
-        answer = gateway.journal.start(token, payload, accepted, info)
+        answer = gateway.journal.start(token, payload, accepted, info, owner_authorized=owner_seconds is not None)
         gateway.journal.outcomes.retain_bound_owner_start()
         return answer
 
@@ -1764,7 +1810,7 @@ class ControlDecisions:
         # Revocation or a newer Pause can invalidate authorization while native evidence is awaited.
         def check() -> None:
             guard()
-            if not gateway._local_start_allowed(tag):
+            if not gateway.policy.is_owner_start_tag(tag) and not gateway._local_start_allowed(tag):
                 raise DeniedError("managed test tag authorization is no longer current")
 
         check()
@@ -1798,25 +1844,34 @@ class ControlDecisions:
         previous = self.journal.get("control", {})
         if previous.get("uncertain") or previous.get("start_pending"):
             raise RecoveryRequiredError("previous local outcome requires reconciliation")
-        if (
-            not any(tag.casefold() == approved.casefold() for approved in self.control.policy.allowed_tags)
-            or self.journal.active() is not None
-        ):
+        owner_authorized = self.control.policy.is_owner_start_tag(tag)
+        if owner_authorized:
+            permitted = guard is not None and self.control.owner_start_seconds(tag, request_id) is not None
+        else:
+            permitted = any(tag.casefold() == approved.casefold() for approved in self.control.policy.allowed_tags)
+        if not permitted or self.journal.active() is not None:
             raise DeniedError("tag is not allowed or a transaction is unresolved")
         with self.journal.atomic():
             epoch, ticket = self.control._claim(previous.get("inhibit", False))
-            self.journal.starts.prepare(ticket, fingerprint(tag.casefold()), request_id)
+            self.journal.starts.prepare(
+                ticket, fingerprint(tag.casefold()), request_id, owner_authorized=owner_authorized
+            )
             if on_prepared is not None:
                 on_prepared()
         return epoch, ticket, previous
 
     # Check the original Boot, active lease and the latest tag approval before positive work.
-    def require_local_start(self, tag: str, boot: str | None, guard: Callable[[], None] | None) -> None:
+    def require_local_start(
+        self, tag: str, boot: str | None, guard: Callable[[], None] | None, request_id: str | None
+    ) -> None:
         if self.control.boot() != boot:
             raise UnavailableError("Start lost its original charger Boot")
         if guard is not None:
             guard()
-        if self.control.authorize is not None and not self.control.authorize(tag):
+        if self.control.policy.is_owner_start_tag(tag):
+            if self.control.owner_start_seconds(tag, request_id) is None:
+                raise DeniedError("the exact owner Start approval is no longer current")
+        elif self.control.authorize is not None and not self.control.authorize(tag):
             raise DeniedError("authorization changed before forwarding a local start")
 
     # Arm only the current ticket after its ceiling and current authorization agree.
@@ -2024,6 +2079,8 @@ class ControlDecisions:
         c.native.require(initial, closed=True)
         if initial.physical.connection != "Plug":
             raise DeniedError("test requires a freshly connected idle vehicle")
+        if lease.owner_start_tag is not None and not owner_tag_separate(initial, lease.owner_start_tag):
+            raise DeniedError("the dedicated owner tag overlaps the charger's schedule")
         charging.guard(lease)
         if j.active() is not None:
             raise DeniedError("another session began before the Start's idle hold")

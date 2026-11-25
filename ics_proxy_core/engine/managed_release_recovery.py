@@ -210,7 +210,7 @@ async def reconcile_owner_release(c: ManagedController) -> bool:
             and terminal_test is None
             or j.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
             or j.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-            or j.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1").fetchone()
+            or j.has_unsettled_sessions()
             or any(
                 row["id"] != ((denied_start_evidence(c, fault) or {}).get("normal") or {}).get("id")
                 and row["id"] != (terminal_test.identifier if terminal_test is not None else None)

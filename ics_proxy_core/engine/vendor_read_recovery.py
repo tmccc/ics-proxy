@@ -57,7 +57,7 @@ def recover_legacy_vendor_read(journal: Journal) -> bool:
             or charge.get("state") in ("armed", "starting", "awaiting_power", "charging", "running", "stopping")
             or current.get("state") not in (None, "completed", "cancelled")
             or journal.db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone()
-            or journal.db.execute("SELECT 1 FROM transactions WHERE stop IS NULL OR vendor IS NULL LIMIT 1").fetchone()
+            or journal.has_unsettled_sessions()
             or journal.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
         ):
             return False
