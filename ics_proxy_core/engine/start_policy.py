@@ -18,11 +18,13 @@ if TYPE_CHECKING:
 ACTIVE = frozenset({"armed", "starting", "awaiting_power", "charging", "running", "stopping"})
 
 
+# Select the local identity at admission when the vendor registration is unavailable.
 def offline_owner_tag(charging: ManagedCharging) -> str | None:
     session = charging.controller.session
     return None if session.runtime.vendor_registered else session.gateway.policy.owner_start_tag
 
 
+# A dedicated owner identity must stay separate from every saved native plan.
 def owner_tag_separate(native: HandoverEvidence, tag: str) -> bool:
     plans = None if native.saved_schedule is None else native.saved_schedule.get("planList")
     return isinstance(plans, list) and all(

@@ -809,6 +809,7 @@ class Gateway:
             return None
         return self.start_reports.owner_start_seconds(tag, request_id, issued=issued)
 
+    # Answer only for the exact live Boot and issued owner Start window.
     def _owner_tag_info(self, tag: str, epoch: int, boot: str | None) -> dict[str, Any]:
         self._require_epoch("charger", epoch)
         remaining = self.owner_start_seconds(tag, issued=True) if self.boot_observation == boot else None

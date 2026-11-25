@@ -21,6 +21,7 @@ from tests.tls_support import tls as tls
 OWNER_TAG = "HOUSEHOLD_LOCAL"
 
 
+# Use a separate configured owner identity and age the fixture's existing vendor approval.
 def provision_local_start(child):
     path = child.directory / "trial.json"
     config = json.loads(path.read_text())
@@ -36,10 +37,12 @@ def provision_local_start(child):
             )
 
 
+# Require that the public Start state is available while cloud registration is absent.
 def local_start_ready(status):
     return status.get("cloud_connected") is False and status.get("can_start") is True
 
 
+# Read the exact stored local meter payloads without taking journal ownership.
 def retained_meters(child, local):
     path = child.rig.prepared.config.journal.as_uri()
     with closing(sqlite3.connect(path + "?mode=ro", uri=True)) as db:
@@ -49,6 +52,7 @@ def retained_meters(child, local):
         ]
 
 
+# Test a real cloud write over the independently reconnected vendor socket.
 async def check_vendor_profile_blocked(bench):
     before = len(bench.device_calls)
     profile = commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 16, 1001, stack_level=0)
@@ -57,6 +61,7 @@ async def check_vendor_profile_blocked(bench):
     assert not any(wire[2] == "SetChargingProfile" for wire in bench.device_calls[before:])
 
 
+# Exercise management Start and Stop with independently driven charger reports and power evidence.
 async def charge_locally(child, minute, start_count, *, reconnect_before_report=False):
     bench, peer = child.rig.bench, child.rig.peer
     ready = await child.status(local_start_ready)
@@ -112,6 +117,8 @@ async def charge_locally(child, minute, start_count, *, reconnect_before_report=
     return local_id, start_message, meter, stop_message
 
 
+# Intent: run two local charges and restart the service during a real simulated vendor outage.
+# Why: the second Start and cold recovery must work without vendor approval or fabricated history sync.
 async def test_two_local_sessions_and_process_replacement_with_expired_vendor_approval(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch
 ):
@@ -167,6 +174,8 @@ async def test_two_local_sessions_and_process_replacement_with_expired_vendor_ap
         ]
 
 
+# Intent: reconnect the vendor after the owner Start issues and before the lifecycle report arrives.
+# Why: the initial local approval and resulting session must retain the same command owner.
 async def test_vendor_reconnect_before_owner_report_cannot_change_the_local_attempt(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch
 ):
@@ -195,6 +204,8 @@ async def test_vendor_reconnect_before_owner_report_cannot_change_the_local_atte
         ]
 
 
+# Intent: deliver an exact charger rejection of an issued owner Start.
+# Why: the local identity must lose eligibility for both Authorize and a new lifecycle report.
 async def test_rejected_owner_start_cannot_authorize_or_open_a_session(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch
 ):
@@ -217,6 +228,7 @@ async def test_rejected_owner_start_cannot_authorize_or_open_a_session(
         ready = await child.status(local_start_ready)
         original = bench.firmware.answer
 
+        # Make the independent peer reject the actual Start while retaining every other normal reply.
         def reject_start(action, payload):
             return {"status": "Rejected"} if action == "RemoteStartTransaction" else original(action, payload)
 
@@ -231,6 +243,8 @@ async def test_rejected_owner_start_cannot_authorize_or_open_a_session(
         assert reported[0] == 4 and child.durable()["transactions"] == transactions
 
 
+# Intent: accept an already issued Start report only under verified zero after Pause revokes approval.
+# Why: the proxy needs the exact session identity to Stop without allowing more positive current.
 async def test_pause_revokes_owner_authorize_but_retains_the_issued_report_at_zero(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch
 ):

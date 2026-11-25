@@ -7,14 +7,16 @@ import json
 import sqlite3
 import ssl
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_view import charger_history, session_history, summarize_charger_history
-from ics_proxy_core.engine.store import Journal
+from ics_proxy_core.engine.store import Journal, RecoveryRequiredError
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session
+from tests.prototype_rig import START
 from tests.tls_support import tls as tls
 
 
@@ -37,6 +39,42 @@ def test_completed_history_requires_stop_delivery_not_just_start_mapping(tmp_pat
         assert session_history(journal)[0]["energy_kwh"] == 1
     finally:
         journal.close()
+
+
+# Intent: the journal adds owner tables only with the first successful owner-authorized Start.
+# Why: a failed commit must leave the legacy schema and transaction allocation intact for recovery.
+def test_owner_session_schema_follows_committed_start(tmp_path: Path) -> None:
+    path = tmp_path / "state.db"
+    with closing(Journal(path, "SYNTHETIC")) as journal:
+        original_tables = {row[0] for row in journal.db.execute("SELECT name FROM sqlite_schema WHERE type='table'")}
+        assert "owner_sessions" not in original_tables and "owner_meter_values" not in original_tables
+        journal.db.execute("CREATE TEMP TABLE parent(id INTEGER PRIMARY KEY)")
+        journal.db.execute("CREATE TEMP TABLE child(id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
+
+        # The deferred reference fails COMMIT after the optional schema and session can be read in the transaction.
+        def fail_commit(local: int) -> None:
+            assert journal.is_owner_session(local)
+            journal.db.execute("INSERT INTO child VALUES(1)")
+
+        with pytest.raises(sqlite3.IntegrityError):
+            journal.start("owner-failed", START, fail_commit, owner_authorized=True)
+        assert journal.active() is None and not journal.has_unsettled_sessions()
+        assert not journal.is_owner_session(1001) and journal.unmapped_cloud_sessions().fetchone() is None
+        assert {
+            row[0] for row in journal.db.execute("SELECT name FROM sqlite_schema WHERE type='table'")
+        } == original_tables
+        assert journal.receipt("owner-failed", "StartTransaction", START) is None
+
+        reply = journal.start("owner-completed", START, owner_authorized=True)
+        local = reply["transactionId"]
+        journal.stop("owner-stop", {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 2000})
+        assert journal.next_delivery() is None and not journal.has_unsettled_sessions()
+
+    with closing(Journal(path, "SYNTHETIC")) as journal:
+        assert journal.is_owner_session(local) and journal.vendor_id(local) is None
+        journal.db.execute("DROP TABLE owner_meter_values")
+    with pytest.raises(RecoveryRequiredError, match="owner session schema"):
+        Journal(path, "SYNTHETIC")
 
 
 # Intent: the native history view preserves measured values, strips private fields and rejects invalid rows.
