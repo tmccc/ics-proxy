@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Let the proxy run the commissioned midnight–06:00 schedule during an iCS outage when configured for local
+  schedule control. The proxy records one Start attempt per window and applies zero and an exact-session Stop at cutoff.
 - Support opt-in owner Start while iCS is disconnected. Retain the locally authorized session and its charger
   reports in the proxy journal, including across a service restart.
 - Let a Home Assistant session Stop join an unanswered Pause Stop for the same session when the charger is

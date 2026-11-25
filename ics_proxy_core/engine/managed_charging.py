@@ -30,6 +30,7 @@ from .store import Journal, RecoveryRequiredError, StationZeroStorageError, fing
 from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
+    from .local_schedule_window import ScheduleWindow
     from .managed import ManagedController
 
 DURATION = 120
@@ -69,6 +70,7 @@ class ChargeLease:
     first_flow: TestFlow | None = None
     accepted_boot: str | None = None
     owner_start_tag: str | None = field(default=None, repr=False)
+    schedule: ScheduleWindow | None = None
 
 
 class ManagedCharging:
@@ -177,13 +179,23 @@ class ManagedCharging:
         )
 
     # The decision owner accepts the request and launches work only after its journal commit.
-    def accept(self, identifier: str, action: str, revision: int) -> dict[str, Any]:
+    def accept(
+        self, identifier: str, action: str, revision: int, *, schedule: ScheduleWindow | None = None
+    ) -> dict[str, Any]:
         return self.controller.session.gateway.controls.decisions.accept_start(
-            self, identifier, action, revision, STARTUP_BUDGET, DURATION
+            self, identifier, action, revision, STARTUP_BUDGET, DURATION, schedule=schedule
         )
 
     # Capture the existing data and time budget for the accepted Start.
-    def _start_lease(self, identifier: str, action: str, revision: int) -> ChargeLease:
+    def _start_lease(
+        self,
+        identifier: str,
+        action: str,
+        revision: int,
+        *,
+        schedule: ScheduleWindow | None = None,
+        startup: float = STARTUP_BUDGET,
+    ) -> ChargeLease:
         c, j = self.controller, self.journal
         g = c.session.gateway
         source = "local" if action in ("start", "start_test") else "cloud"
@@ -196,14 +208,15 @@ class ManagedCharging:
             fingerprint(j.identity),
             c.native.spec.digest,
             j.get("control", {}).get("stop_epoch", 0),
-            time.monotonic() + STARTUP_BUDGET,
-            time.monotonic() + STARTUP_BUDGET + (0 if action == "start" else DURATION),
+            time.monotonic() + startup,
+            time.monotonic() + startup + (0 if action == "start" else DURATION),
             j.db.execute("SELECT COALESCE(MAX(rowid),0) FROM mutations").fetchone()[0],
             mode=c.requests.intent().mode,
             normal=action == "start",
             current_a=c.current.selected(),
             accepted_boot=g.boot_observation,
             owner_start_tag=offline_owner_tag(self) if action == "start" else None,
+            schedule=schedule,
         )
 
     # The worker and deadline keep their existing lifetimes after the request is recorded.

@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 OWNER_PAUSE = "managed_owner_pause"
 OWNER_STOP = "managed_owner_stop"
 OFFLINE_PAUSE = "managed_offline_pause"
+LOCAL_SCHEDULE_OCCURRENCE = "managed_owner_schedule_occurrence"
 RELEASE_PAUSE_ACK = "managed_release_pause_acknowledgement"
 PAUSE_RELEASE_PROOF = "_release_ack"
 RETURN_OUTCOME = (

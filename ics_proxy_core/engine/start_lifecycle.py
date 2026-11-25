@@ -7,10 +7,10 @@ import sqlite3
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
-from .managed_intent import ControlIntent, insert_request
+from .managed_intent import LOCAL_SCHEDULE_OCCURRENCE, ControlIntent, insert_request
 from .policy import DeniedError
 from .security import SecurityError
 from .start_handoff import StartHandoffContext, StartPublication
@@ -320,6 +320,11 @@ class StartLifecycle:
         state = "accepted" if local else "completed"
         result = {"accepted_at": accepted_at} if local else {"armed": True, "charging_started": False}
         with j.atomic():
+            if lease.schedule is not None:
+                j.put(
+                    LOCAL_SCHEDULE_OCCURRENCE,
+                    {"request": lease.identifier, "window": asdict(lease.schedule), "local": None},
+                )
             j.put(
                 "managed_test_charge",
                 {
@@ -782,6 +787,15 @@ class StartLifecycle:
                 },
             )
             j.control.project(control, start_pending=False)
+
+            if receipt.get("owner_authorized") is True:
+                occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE, {})
+                if (
+                    occurrence
+                    and occurrence.get("request") == receipt.get("request_id")
+                    and occurrence.get("local") is None
+                ):
+                    j.put(LOCAL_SCHEDULE_OCCURRENCE, {**occurrence, "local": local})
 
     # A current physical Pause proof may annotate the exact existing wire evidence without rewriting its outcome.
     def pause_verified(self, receipt: dict[str, Any], revision: int) -> None:

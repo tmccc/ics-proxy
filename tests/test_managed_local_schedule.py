@@ -1,0 +1,186 @@
+"""Drive the proxy's opted-in overnight fallback over real loopback charger and native connections."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+import pytest
+
+from ics_proxy_core.engine import local_schedule
+from ics_proxy_core.engine.auth_info import tag_key
+from ics_proxy_core.engine.managed import ManagedController
+from ics_proxy_core.engine.managed_intent import LOCAL_SCHEDULE_OCCURRENCE
+from ics_proxy_core.engine.managed_view import refresh_for_read
+from tests.current_rig import ChargeRig
+from tests.handover_helpers import crash
+from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
+from tests.native_schedule_support import ORIGINAL_PLAN, ZONE, SchedulePeer, SchedulerClock
+from tests.prototype_rig import BOOT, START
+from tests.runtime_rig import until
+from tests.test_managed_offline_owner import OWNER_TAG
+from tests.test_managed_vendor_catchup import CatchupBench
+from tests.tls_support import tls as tls
+
+NATIVE_TAG = ORIGINAL_PLAN["idTag"]
+MIDNIGHT = datetime(2026, 11, 25, tzinfo=ZONE).timestamp()
+
+
+# Replace the real proxy owner without changing either physical peer or the durable journal.
+@asynccontextmanager
+async def connection(rig, token, *, online=False):
+    session = managed_session(rig)
+    await session.start()
+    if online:
+        rig.route_to_trial()
+    async with rig.charger(session) as charger:
+        if online:
+            await introduced(rig, session, charger, token)
+        else:
+            assert (await rig.bench.call(charger, token, "BootNotification", BOOT))[0] == 3
+            await until(lambda: session.runtime.status.vendor_failed_charger_epoch == session.gateway._charger_epoch)
+        controller = ManagedController(session)
+        try:
+            yield ChargeRig(rig, session, controller, charger)
+        finally:
+            await controller.current.close()
+            await controller.charging.close()
+            if controller.pause_task is not None:
+                await asyncio.gather(controller.pause_task, return_exceptions=True)
+            await crash(session)
+
+
+# Poll the real controller while only its schedule's civil clock is simulated.
+async def status(test, predicate):
+    async with asyncio.timeout(6):
+        while True:
+            current = refresh_for_read(test.controller, await test.controller.tick())
+            if predicate(current):
+                return current
+            assert current["state"] not in ("attention", "stopping"), current
+            await asyncio.sleep(0.02)
+
+
+# Exercise a cold outage with an actual cached decision for the native timer identity.
+@asynccontextmanager
+async def overnight(tmp_path, tls, unused_tcp_port, monkeypatch, *, manual_pause=False, expired=True):
+    clock = SchedulerClock(MIDNIGHT - 60)
+    monkeypatch.setattr(local_schedule, "time", SimpleNamespace(time=lambda: clock.now, monotonic=time.monotonic))
+    async with managed_bench(
+        tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
+    ) as rig:
+        rig.prepared.config = replace(rig.prepared.config, owner_start_tag=OWNER_TAG, owner_schedule_timezone=ZONE.key)
+        async with connection(rig, "online-introduction", online=True) as initial:
+            c, j = initial.controller, initial.session.journal
+            await healthy(c)
+            expiry = (datetime.now(UTC) + timedelta(hours=-1 if expired else 1)).isoformat()
+            j.db.execute(
+                "INSERT OR REPLACE INTO auth_info(digest,info,observed) VALUES (?,?,?)",
+                (tag_key(NATIVE_TAG), json.dumps({"status": "Accepted", "expiryDate": expiry}), time.time()),
+            )
+            assert initial.session.gateway.auth_info.get(NATIVE_TAG)["status"] == ("Expired" if expired else "Accepted")
+            if manual_pause:
+                c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+                await status(initial, lambda value: value.get("local_hold_verified") is True)
+            await rig.bench.vendor_outage()
+        yield rig, clock
+
+
+# Intent: a clean automatic outage Pause allows exactly one local session for the saved recurring plan.
+# Why: neither stale approval nor a native retry with current approval can reopen the scheduled owner occurrence.
+@pytest.mark.parametrize("expired", [True, False], ids=["expired-vendor-approval", "native-retry-with-cached-approval"])
+async def test_offline_schedule_uses_exact_owner_session_once(tmp_path, tls, unused_tcp_port, monkeypatch, expired):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch, expired=expired) as (rig, clock):
+        bench, peer = rig.bench, rig.peer
+        async with connection(rig, "first-offline-boot") as test:
+            c, j = test.controller, test.session.journal
+            paused = await status(test, lambda value: value.get("local_hold_verified") is True)
+            assert c.requests.offline_pause_current(c.requests.intent())
+            assert paused["cloud_connected"] is False
+            assert paused["station_ceiling_a"] == paused["power_w"] == 0
+            assert not starts(rig) and j.get(LOCAL_SCHEDULE_OCCURRENCE) is None
+
+            # Cross midnight and let the independent device answer the proxy's actual exact owner Start.
+            clock.now = MIDNIGHT
+            await status(test, lambda value: bool(starts(rig)))
+            await c.charging.settle()
+            assert [frame[3] for frame in starts(rig)] == [{"connectorId": 1, "idTag": OWNER_TAG}]
+            assert test.session.gateway.auth_info.get(NATIVE_TAG)["status"] == ("Expired" if expired else "Accepted")
+            invalid = await bench.call(test.charger, uuid.uuid4().hex, "Authorize", {"idTag": NATIVE_TAG})
+            assert invalid[2]["idTagInfo"]["status"] == "Invalid"
+            authorized = await bench.call(test.charger, uuid.uuid4().hex, "Authorize", {"idTag": OWNER_TAG})
+            assert authorized[2]["idTagInfo"]["status"] == "Accepted"
+            requested = START | {"idTag": OWNER_TAG, "timestamp": datetime.fromtimestamp(clock.now, UTC).isoformat()}
+            started = await bench.call(test.charger, uuid.uuid4().hex, "StartTransaction", requested)
+            assert started[0] == 3 and started[2]["idTagInfo"]["status"] == "Accepted", started
+            local = started[2]["transactionId"]
+            peer.plan_session = (local, 987654)
+            peer.paused, peer.permission_enabled = False, True
+            bench.cp, bench.connection = "C", "Charging"
+            bench.firmware.requested_current = 32
+            active = await status(test, lambda value: value.get("power_w") == 1440 and value.get("stop_target"))
+            occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
+            assert occurrence["local"] == local and j.is_owner_session(local)
+            assert c.requests.receipt(occurrence["request"])["result"]["local_session_verified"] is True
+            assert j.vendor_id(local) is None
+            assert not j.db.execute("SELECT 1 FROM outbox WHERE local=?", (local,)).fetchone()
+
+            # Stop the exact session early and wait for the separate real lifecycle and native closure.
+            stop = uuid.uuid4().hex
+            c.command(stop, "stop_session", active["control_revision"], target=active["stop_target"])
+            await asyncio.wait_for(bench.remote_stop.wait(), 5)
+            assert c.requests.receipt(stop)["state"] != "completed" and j.active() == local
+            peer.permission_enabled = False
+            clock.now = MIDNIGHT + 300
+            stopped = {
+                "transactionId": local,
+                "timestamp": datetime.fromtimestamp(clock.now, UTC).isoformat(),
+                "meterStop": requested["meterStart"] + 120,
+            }
+            assert (await bench.call(test.charger, uuid.uuid4().hex, "StopTransaction", stopped))[0] == 3
+            await status(test, lambda value: c.requests.receipt(stop)["state"] == "completed")
+            assert j.active() is None and len(starts(rig)) == 1
+            if not expired:
+                # A retry from the real plan cannot reopen this already used window, even with usable cache.
+                invalid = await bench.call(test.charger, uuid.uuid4().hex, "Authorize", {"idTag": NATIVE_TAG})
+                retry = await bench.call(
+                    test.charger,
+                    uuid.uuid4().hex,
+                    "StartTransaction",
+                    requested | {"idTag": NATIVE_TAG, "meterStart": stopped["meterStop"]},
+                )
+                assert invalid[2]["idTagInfo"]["status"] == "Invalid" and retry[0] == 4
+                assert j.active() is None
+
+        async with connection(rig, "second-offline-boot") as replacement:
+            recovered = await status(replacement, lambda value: value.get("local_hold_verified") is True)
+            assert recovered["cloud_connected"] is False and recovered["station_ceiling_a"] == 0
+            assert replacement.controller.requests.offline_pause_current(replacement.controller.requests.intent())
+            assert replacement.session.journal.get(LOCAL_SCHEDULE_OCCURRENCE)["local"] == local
+            for _ in range(3):
+                await replacement.controller.tick()
+            assert len(starts(rig)) == 1 and replacement.session.journal.active() is None
+
+
+# Intent: pass through an eligible civil boundary without local authorization if the owner paused or it is too late.
+# Why: schedule configuration cannot override the current manual hold or begin a session at the tariff cutoff.
+@pytest.mark.parametrize(("manual_pause", "offset"), [(True, 0), (False, 6 * 3600)], ids=["manual-pause", "cutoff"])
+async def test_offline_schedule_requires_current_permission_and_window(
+    tmp_path, tls, unused_tcp_port, monkeypatch, manual_pause, offset
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch, manual_pause=manual_pause) as (rig, clock):
+        async with connection(rig, "offline-hold") as test:
+            c, j = test.controller, test.session.journal
+            await status(test, lambda value: value.get("local_hold_verified") is True)
+            assert c.requests.offline_pause_current(c.requests.intent()) is not manual_pause
+            clock.now = MIDNIGHT + offset
+            for _ in range(3):
+                current = await c.tick()
+                assert current["local_hold_verified"] and current["station_ceiling_a"] == current["power_w"] == 0
+            assert not starts(rig) and j.get(LOCAL_SCHEDULE_OCCURRENCE) is None

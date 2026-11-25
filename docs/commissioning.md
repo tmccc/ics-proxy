@@ -96,12 +96,26 @@ identities used by the commissioned schedule. Keep this setting private with the
 When iCS is disconnected, a normal Start through authenticated management can use that identity for one request.
 The proxy verifies the current charger connection, idle state, selected ceiling, and existing command outcomes
 before issuing the Start. Use **Stop** to close that exact session, or **Pause charger** to keep a zero hold after
-closure. Cloud availability and charging readiness are reported separately. The saved timer, timed tests, and
-Return to app control follow their existing authorization and recovery rules.
+closure. Cloud availability and charging readiness are reported separately. Timed tests and Return to app
+control follow their existing authorization and recovery rules. The saved timer can opt in to local schedule
+control below.
 
 Sessions started under this local authorization stay in the proxy journal with their charger reports and are
 available through the proxy's history. Keep the journal when updating the service. A downgrade involving locally
 authorized sessions needs a rehearsed build and journal pair that supports those records.
+
+### The midnight schedule during a vendor outage
+
+With `owner_start_tag` set, configure `owner_schedule_timezone` with the installation's IANA time zone, such as
+`Europe/London`, to let the proxy run the commissioned daily midnight–06:00 plan when iCS is disconnected.
+The proxy requires fresh evidence of the exact saved single-connector Fast plan. It uses the selected current
+within the plan and commissioned ceiling. The endpoints are local civil time, including on clock-change days.
+
+The proxy can start from app and schedule mode or from a clean automatic outage hold. A Pause requested by
+the owner stays in effect. The journal permits one scheduled Start attempt per window, including across
+replacement and after a manual Stop. On the first control pass at or after 06:00 the proxy requests a zero
+hold and Stop for the exact session it started. It verifies closure separately from the charger’s reply.
+Normal iCS app and native schedule authorization apply when iCS is connected.
 
 ## Run the service
 

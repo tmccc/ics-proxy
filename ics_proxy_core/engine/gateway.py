@@ -137,6 +137,9 @@ class StartReports(Protocol):
 
     def owner_start_seconds(self, tag: str, request_id: str | None, *, issued: bool) -> int | None: ...
 
+    # A simultaneous native wakeup cannot spend this same locally owned occurrence.
+    def local_schedule_blocks(self, tag: str, occurred: float | None) -> bool: ...
+
     # Establish any required owner hold before the gateway pins its ticket.
     async def prepare_hold(self, payload: dict[str, Any]) -> None: ...
 
@@ -619,7 +622,11 @@ class Gateway:
                             latest = self._tag_info(payload["idTag"])
                             info = (
                                 latest
-                                if self._tag_allowed(payload["idTag"]) or latest["status"] != "Accepted"
+                                if (
+                                    self._tag_allowed(payload["idTag"])
+                                    and not self.local_schedule_blocks(payload["idTag"])
+                                )
+                                or latest["status"] != "Accepted"
                                 else {"status": "Invalid"}
                             )
                         return info
@@ -803,6 +810,14 @@ class Gateway:
     def _local_tag(self, tag: str) -> bool:
         return any(tag.casefold() == approved.casefold() for approved in self.policy.allowed_tags)
 
+    # A real vendor Start grant remains exact; a saved-plan tag on its own cannot race the owner's occurrence.
+    def local_schedule_blocks(self, tag: str, occurred: float | None = None) -> bool:
+        return (
+            self.start_reports is not None
+            and not self.authorisation.allows(tag)
+            and self.start_reports.local_schedule_blocks(tag, occurred)
+        )
+
     # The local executor and charger reports consult the same managed Start lease.
     def owner_start_seconds(self, tag: str, request_id: str | None = None, *, issued: bool = False) -> int | None:
         if self.start_reports is None or not self.policy.is_owner_start_tag(tag):
@@ -933,6 +948,7 @@ class Gateway:
         if (
             not isinstance(tag, str)
             or self.retiring()
+            or self.local_schedule_blocks(tag)
             or self.journal.get("control", {}).get("inhibit")
             or not self.journal.phase.read().legacy_active
         ):

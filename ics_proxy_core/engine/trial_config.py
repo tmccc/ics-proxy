@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..frames import basic_auth_header
 from .ics import unique_object
@@ -142,6 +143,7 @@ class TrialConfig:
     max_current_a: float = 6
     local_tags: frozenset[str] = field(default_factory=frozenset)
     owner_start_tag: str | None = None
+    owner_schedule_timezone: str | None = None
 
     # Name the optional incident file alongside the private journal.
     @property
@@ -251,6 +253,15 @@ class TrialConfig:
             or any(self.owner_start_tag.casefold() == tag.casefold() for tag in self.local_tags)
         ):
             raise SecurityError("the owner Start tag must be separate from the app and schedule tags")
+        if self.owner_schedule_timezone is not None:
+            if self.owner_start_tag is None:
+                raise SecurityError("the local schedule requires the configured owner Start tag")
+            if not isinstance(self.owner_schedule_timezone, str) or not 1 <= len(self.owner_schedule_timezone) <= 128:
+                raise SecurityError("the local schedule requires a named time zone")
+            try:
+                ZoneInfo(self.owner_schedule_timezone)
+            except ValueError, ZoneInfoNotFoundError:
+                raise SecurityError("the local schedule requires a named time zone") from None
         self.check_paths()
 
     # Load only an explicit private configuration; do not discover household files or infer credentials.
@@ -258,7 +269,7 @@ class TrialConfig:
     def load(cls, path: Path) -> TrialConfig:
         value = private_json(path)
         keys = set(cls.__dataclass_fields__)
-        if not (keys - {"owner_start_tag"} <= value.keys() <= keys):
+        if not (keys - {"owner_start_tag", "owner_schedule_timezone"} <= value.keys() <= keys):
             raise SecurityError("trial configuration fields are incomplete or unknown")
         paths = {
             "native_secret",

@@ -27,6 +27,7 @@ from .current_policy import (
     current_source_decision,
     original_current_plan,
 )
+from .local_schedule_cutoff import scheduled_cutoff_target
 from .managed_facts import ManagedFacts
 from .managed_intent import (
     OFFLINE_PAUSE,
@@ -85,6 +86,7 @@ if TYPE_CHECKING:
     from .command_outcomes import OwnerWire, TransactionReplyStatus
     from .gateway import Gateway
     from .local_control import LocalControl
+    from .local_schedule_window import ScheduleWindow
     from .managed import ManagedController
     from .managed_charging import ChargeLease, ManagedCharging
     from .managed_current import ManagedCurrentLimits
@@ -1291,7 +1293,15 @@ class ControlDecisions:
 
     # Acceptance and its one-shot deadline commit before any positive effect; duplicate identifiers return receipts.
     def accept_start(
-        self, charging: ManagedCharging, identifier: str, action: str, revision: int, startup: float, duration: float
+        self,
+        charging: ManagedCharging,
+        identifier: str,
+        action: str,
+        revision: int,
+        startup: float,
+        duration: float,
+        *,
+        schedule: ScheduleWindow | None = None,
     ) -> dict[str, Any]:
         c, j = charging.controller, self.journal
         previous = c.requests.existing(identifier, action, revision)
@@ -1308,7 +1318,13 @@ class ControlDecisions:
                 if action == "start"
                 else "test requires current shared six-ampere authority and no pending work"
             )
-        lease = charging._start_lease(identifier, action, revision)
+        if schedule is not None:
+            startup = min(startup, c.local_schedule.remaining(schedule))
+            if startup <= 0:
+                raise DeniedError("the scheduled Start window closed before admission")
+        lease = charging._start_lease(identifier, action, revision, schedule=schedule, startup=startup)
+        if schedule is not None and (not lease.normal or lease.owner_start_tag is None):
+            raise DeniedError("a local schedule requires its bounded owner Start authorization")
         j.starts.admit(lease, action, startup, duration)
         charging._launch_start(lease)
         return c.requests.receipt(identifier)
@@ -1361,6 +1377,7 @@ class ControlDecisions:
             )
         ):
             raise DeniedError("managed test Start permission expired or was superseded")
+        c.local_schedule.require_lease(lease)
 
     # Bind only the exact initial hold for the admitted lease on the current Boot.
     def bind_initial_start_zero(self, lease: ChargeLease) -> None:
@@ -1636,6 +1653,13 @@ class ControlDecisions:
         # A replay can return its stored result, while a new Start must retain its original introduction.
         def check() -> None:
             gateway._require_epoch("charger", epoch)
+            tag = payload.get("idTag")
+            if (
+                isinstance(tag, str)
+                and gateway.local_schedule_blocks(tag, occurred.timestamp())
+                and not gateway.journal.known_start(payload)
+            ):
+                raise DeniedError("the owner already reserved this native schedule occurrence")
             if (
                 gateway.journal.phase.read().supervised
                 and (boot is None or gateway.boot_observation != boot)
@@ -2082,6 +2106,7 @@ class ControlDecisions:
         if lease.owner_start_tag is not None and not owner_tag_separate(initial, lease.owner_start_tag):
             raise DeniedError("the dedicated owner tag overlaps the charger's schedule")
         charging.guard(lease)
+        require_allowed(c.local_schedule.positive_decision(initial))
         if j.active() is not None:
             raise DeniedError("another session began before the Start's idle hold")
 
@@ -2551,6 +2576,9 @@ class ControlDecisions:
         requests: ManagedRequests | None,
     ) -> Frame:
         connection, local = current_control_scope(gateway), self.journal.active()
+        scheduled = scheduled_cutoff_target(self.journal)
+        if scheduled is not None and local not in (None, scheduled):
+            raise RecoveryRequiredError("the scheduled cutoff cannot Stop a replacement session")
         intent, request = None, None
         if requests is not None:
             try:
@@ -2573,6 +2601,8 @@ class ControlDecisions:
                 gateway.retiring()
                 or not control_scope_matches(gateway, connection)
                 or self.journal.active() not in (None, local)
+                or (current_target := scheduled_cutoff_target(self.journal)) is not None
+                and local not in (None, current_target)
                 or intent is not None
                 and requests is not None
                 and requests.intent() != intent

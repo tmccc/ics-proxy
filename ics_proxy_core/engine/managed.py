@@ -14,6 +14,8 @@ from .command_processor import CommandPriority
 from .composite import STATION_COMPOSITE_FAULT, ExcessiveCompositeError
 from .connection_scope import ControlScope, control_scope_matches, current_control_scope, current_scope
 from .local_control import ControlSupersededError
+from .local_schedule import LocalSchedule
+from .local_schedule_cutoff import scheduled_cutoff_target
 from .managed_charging import ManagedCharging
 from .managed_current import ManagedCurrentLimits
 from .managed_current_recovery import capture_interrupted_collision
@@ -100,6 +102,7 @@ class ManagedController:
 
         self.current = ManagedCurrentLimits(self)
         self.charging = ManagedCharging(self)
+        self.local_schedule = LocalSchedule(self, session.prepared.config.owner_schedule_timezone)
         self.session_stop = ManagedSessionStop(self)
         session.managed_session_stop = self.session_stop
         self.ordinary = OrdinaryRecovery(self)
@@ -248,11 +251,15 @@ class ManagedController:
     # Keep the physical Stop independent from the requesting websocket's lifetime and retain uncertainty honestly.
     async def _stop_requested(self) -> None:
         try:
+            if scheduled_cutoff_target(self.session.journal) is not None:
+                return  # The scheduled cutoff owns only its exact session.
             if self.charging.scoped_normal_stop():
                 await self.charging.reconcile_expired()
                 return
             await self.ensure_pause_zero()
             g, j = self.session.gateway, self.session.journal
+            if scheduled_cutoff_target(j) is not None:
+                return
             controls = g.controls
             scope = controls.decisions.prepare_pause_stop(g, self.requests)
             local = scope.local
@@ -397,6 +404,9 @@ class ManagedController:
 
     # Let the shared owner recheck outage and Start debt at the native send gate.
     def positive_decision(self, native: HandoverEvidence) -> GateDecision:
+        decision = self.local_schedule.positive_decision(native)
+        if isinstance(decision, Pending):
+            return decision
         return self.session.gateway.controls.decisions.recovery.positive_decision(self, native)
 
     # Verified zero and cloud/lifecycle prerequisites are independent from source and physical release effects.
@@ -514,6 +524,7 @@ class ManagedController:
         self.commands.decide(self.session.gateway.retry_reply_writes)
         self.commands.decide(self.session.runtime.settle_saved_delivery)
         self.commands.decide(self.session_stop.expire)
+        await self.local_schedule.stop_if_due()
         pending = await self._pending_work()
         if pending is not None:
             self.latest_native = None
@@ -539,6 +550,8 @@ class ManagedController:
             return PollStatus("degraded", "native_observation_unavailable")
         if verdict.healthy and self.requests.intent().mode == "app":
             self.requests.complete_legacy_return()
+        if verdict.local_healthy:
+            self.local_schedule.consider(observed.native)
         return observed.native, verdict
 
     # Pending owned completions retain their existing settlement priority before any new native audit.
