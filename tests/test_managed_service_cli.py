@@ -597,6 +597,7 @@ async def test_automatic_release_waits_at_zero_after_cloud_loss(
         (True, "writer", False, False),
         (True, None, True, False),
         pytest.param(False, "cloud_worker", False, False, id="unexpected-cloud-worker-exit"),
+        pytest.param(False, "cancel_shutdown", False, False, id="cancelled-shutdown"),
         pytest.param(True, None, False, True, id="occupied-management-port"),
     ],
 )
@@ -671,7 +672,7 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
                 raise RuntimeError("synthetic output-worker creation refusal")
 
             monkeypatch.setattr(managed_proxy, "ReportWriter", refuse_writer)
-        elif failed_output is not None:
+        elif failed_output is not None and failed_output != "cancel_shutdown":
             blocked = rig.prepared.config.journal.with_suffix(
                 ".status.json" if failed_output == "status" else ".events.jsonl"
             )
@@ -758,6 +759,29 @@ async def test_managed_runner_signal_shutdown_retains_zero_and_records_stop(
                     session.runtime._runner.cancel()
                     with pytest.raises(RuntimeError, match="cloud worker stopped unexpectedly"):
                         await asyncio.wait_for(running, 8)
+                elif failed_output == "cancel_shutdown":
+                    controller = controllers[0]
+                    entered, release = asyncio.Event(), asyncio.Event()
+                    close_current = controller.current.close
+
+                    # Interrupt the service wait while the first real controller still owns retirement.
+                    async def gated_close() -> None:
+                        entered.set()
+                        await release.wait()
+                        await close_current()
+
+                    monkeypatch.setattr(controller.current, "close", gated_close)
+                    callbacks[signal.SIGTERM]()
+                    try:
+                        await asyncio.wait_for(entered.wait(), 5)
+                        for _ in range(2):
+                            running.cancel()
+                            await asyncio.sleep(0)
+                    finally:
+                        release.set()
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(running, 8)
+                    assert controller.current._closing and controller.charging._closing
                 else:
                     callbacks[signal.SIGTERM]()
                     assert await asyncio.wait_for(running, 8) == 0

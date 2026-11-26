@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 import uuid
 from contextlib import AsyncExitStack, closing
@@ -1549,6 +1550,50 @@ def test_exact_stop_rejection_fences_receipt_after_replacement(tmp_path, source)
         assert receipt["state"] == "failed"
         assert receipt["result"]["classification"] == "stop_rejected"
         assert journal.outcomes.session(local).closed
+
+
+# Intent: SQLite writer contention cannot let replacement skip its Stop receipt retirement.
+# Why: the previous process's monotonic deadline cannot govern a replacement's receipt lifetime.
+def test_replacement_requires_stop_retirement_when_writer_is_busy(tmp_path):
+    path = tmp_path / "busy-stop-journal.sqlite"
+    with closing(Journal(path, "synthetic-charger")) as journal:
+        requests = ManagedRequests(journal)
+        controller = SimpleNamespace(session=SimpleNamespace(journal=journal))
+        live = ManagedSessionStop(controller)
+        local = journal.start("start-report", START)["transactionId"]
+        future = time.monotonic() + 600
+        bindings = {
+            "unsent": {"dispatched": False, "confirmation_deadline": time.monotonic() - 1},
+            "dispatched": {"dispatched": 1, "confirmation_deadline": future},
+            "joined": {
+                "dispatched": False,
+                "joined": 1,
+                "local_attempts": ["dispatched"],
+                "confirmation_deadline": future,
+            },
+        }
+        for request, binding in bindings.items():
+            binding["local"] = local
+            state = "accepted" if request == "unsent" else "running"
+            insert_request(journal, request, "stop_session", 0, {"_session_stop": binding}, state=state)
+
+        with closing(sqlite3.connect(path, isolation_level=None, timeout=0)) as competing:
+            journal.db.execute("PRAGMA busy_timeout=0")
+            competing.execute("BEGIN IMMEDIATE")
+            live.expire()
+            with pytest.raises(sqlite3.OperationalError) as error:
+                ManagedSessionStop(controller)
+            assert error.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
+            assert competing.in_transaction and not journal.db.in_transaction
+            assert [requests.receipt(request)["state"] for request in bindings] == ["accepted", "running", "running"]
+
+        ManagedSessionStop(controller)
+        for request, binding in bindings.items():
+            state, result = journal.db.execute(
+                "SELECT state,result FROM managed_requests WHERE id=?", (request,)
+            ).fetchone()
+            assert state == ("failed" if request == "unsent" else "uncertain")
+            assert json.loads(result) == {"classification": "process_replaced", "_session_stop": binding}
 
 
 # Intent: a replacement can finish a previously verified closure without reopening its retired wire window.

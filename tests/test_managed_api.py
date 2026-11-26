@@ -24,7 +24,8 @@ from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
 from ics_proxy_core.engine.managed_diagnostics import snapshot
 from ics_proxy_core.engine.store import RecoveryRequiredError
-from tests.charge_rig import positive_flow, ready
+from ics_proxy_core.engine.trial_session import ManagedRefusal
+from tests.charge_rig import actual_stop, positive_flow, ready
 from tests.current_rig import adjustable
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
 from tests.management_peer import TOKEN, call
@@ -245,6 +246,64 @@ async def test_real_management_socket_reads_and_idempotent_pause(
                     assert controller.requests.intent().mode == "paused"
             finally:
                 await api.close()
+
+
+# Intent: saved Current and Stop receipts remain replayable while a strict introduction refusal awaits storage.
+# Why: an exact retry reads the original result and can never authorize a new charger write.
+async def test_management_replays_bound_receipts_during_introduction_refusal(
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch
+):
+    async with adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+        c, bench = b.controller, b.rig.bench
+        published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
+        port = unused_tcp_port_factory()
+        api = ManagementServer(ManagementSettings(port, tmp_path / "unused-token", TOKEN), c, lambda: published)
+        await api.start()
+        try:
+            async with connect(
+                f"ws://127.0.0.1:{port}/management",
+                additional_headers={"Authorization": "Bearer " + TOKEN},
+                subprotocols=["ics-proxy.v1"],
+            ) as socket:
+                current = {"id": uuid.uuid4().hex, "revision": c.requests.intent().revision, "current_a": 16}
+                assert (await call(socket, "set_current", **current))["ok"]
+                await c.current.settle()
+                assert (await call(socket, "receipt", request_id=current["id"]))["result"]["state"] == "completed"
+
+                local = await positive_flow(b, "daily")
+                await healthy(c)
+                target = c.session_stop.target()
+                assert target is not None
+                stop = {"id": uuid.uuid4().hex, "revision": c.requests.intent().revision, "target": target}
+                assert (await call(socket, "stop_session", **stop))["ok"]
+                await actual_stop(b, local)
+                assert (await call(socket, "receipt", request_id=stop["id"]))["result"]["state"] == "completed"
+
+                before = list(bench.device_calls)
+                other_target = ("a" if target[0] != "a" else "b") + target[1:]
+                pending = ManagedRefusal("native_authority_or_preservation_failed", {})
+                with monkeypatch.context() as refusal:
+                    refusal.setattr(b.session, "_introduction_refusal", pending)
+                    for command, request, conflict in (
+                        ("set_current", current, {"current_a": 20}),
+                        ("stop_session", stop, {"target": other_target}),
+                    ):
+                        saved = (await call(socket, "receipt", request_id=request["id"]))["result"]
+                        expected = {"id": request["id"], "ok": True, "result": saved}
+                        assert await call(socket, command, **request) == expected
+                        assert await call(socket, command, **(request | conflict)) == {
+                            "ok": False,
+                            "error": "invalid_request",
+                        }
+                    fresh = uuid.uuid4().hex
+                    assert await call(socket, "set_current", id=fresh, revision=stop["revision"], current_a=20) == {
+                        "ok": False,
+                        "error": "not_ready",
+                    }
+                    assert (await call(socket, "receipt", request_id=fresh))["result"]["state"] == "not_found"
+                assert bench.device_calls == before
+        finally:
+            await api.close()
 
 
 # Intent: a status read cannot restore control hints when it cannot read the outcome of a forwarded command.

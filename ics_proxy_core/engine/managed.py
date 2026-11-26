@@ -152,7 +152,12 @@ class ManagedController:
     ) -> dict[str, Any]:
         if self.stopping:
             raise UnavailableError("managed service is stopping")
-        if action != "pause" and self.session._introduction_refusal is not None:
+        # Allow saved requests to reach their original argument checks while fresh work awaits the diagnostic.
+        if (
+            action != "pause"
+            and self.session._introduction_refusal is not None
+            and self.requests.existing(identifier, action, revision) is None
+        ):
             raise RecoveryRequiredError("strict introduction refusal awaits durable diagnostic")
         if action == "set_current":
             if current_a is None:

@@ -299,6 +299,7 @@ class ManagedSessionStop:
         verified, proofs = self._closure_proof()
         native_first, native_proofs = self._native_first_proof()
         # The same rejection evidence also excludes a receipt from closure while its failure write awaits retry.
+        # A replacement cannot defer retirement to a poll that uses the previous process's deadline.
         self._update_receipts(
             "state=CASE WHEN json_extract(result,'$._session_stop.dispatched') "
             "OR json_extract(result,'$._session_stop.joined') "
@@ -310,6 +311,7 @@ class ManagedSessionStop:
             "json_extract(result,'$.accepted_at')<=?))",
             (STOP_SESSION, replaced, time.monotonic(), time.time() - CONFIRMATION_SECONDS),
             rejections=rejections,
+            retry_busy=not replaced,
             retry_after_rollback=not replaced,
         )
 
@@ -329,6 +331,7 @@ class ManagedSessionStop:
         binding: tuple[Any, ...],
         *,
         rejections: StopRejections = SAVED_STOP_REJECTIONS,
+        retry_busy: bool = True,
         retry_after_rollback: bool = False,
     ) -> bool:
         j = self.controller.session.journal
@@ -336,7 +339,7 @@ class ManagedSessionStop:
             return True
         transaction_started = False
         try:
-            with j.atomic(retry_busy=True):
+            with j.atomic(retry_busy=retry_busy):
                 transaction_started = True
                 j.db.execute(
                     f"{rejections.prefix}UPDATE managed_requests SET {assignments} WHERE {where}",
