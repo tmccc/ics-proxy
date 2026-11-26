@@ -119,6 +119,55 @@ def test_unreadable_stop_checkpoint_preserves_incident_journal(tmp_path, vendor,
         assert db.execute("SELECT CAST(value AS BLOB) FROM meta WHERE key=?", (key,)).fetchone() == (damaged,)
 
 
+# Intent: keep the exact Stop request and lifecycle when a historical wire projection is incomplete.
+# Why: a missing reply column leaves the command outcome unknown even if closure is still verifiable.
+@pytest.mark.parametrize("vendor", [False, True], ids=["owner", "vendor"])
+def test_missing_wire_reply_column_preserves_stop_lifecycle(tmp_path, vendor):
+    path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"
+    with closing(Journal(path, "test-charger")) as journal:
+        ManagedRequests(journal)
+        local = journal.start("original-start", START)["transactionId"]
+        wire = uuid.uuid4().hex
+        if vendor:
+            token = vendor_attempt(journal, local, wire, result="Accepted")
+            journal.db.execute("ALTER TABLE vendor_command_scope RENAME COLUMN wire_result TO old_reply")
+        else:
+            token = write_request(journal, local, dispatched=True)
+            journal.outcomes.record_owner_wire(
+                OwnerWire(wire, token, token, BOOT, STOP_ACTION, local, None, "Accepted")
+            )
+            journal.db.execute("ALTER TABLE owner_command_wires RENAME COLUMN reply TO old_reply")
+        journal.stop("original-stop", {"transactionId": local, "meterStop": 102, "timestamp": START["timestamp"]})
+
+    report = stop_incident_report(path, events, vendor=vendor)
+    assert report["journal"]["available"]
+    assert report["journal"]["request"]["request"] == reference(token)
+    assert report["journal"]["lifecycle"] == "closed"
+    assert report["journal"]["charger_reported_stop_at"] == "2026-11-23T17:30:00+00:00"
+    assert report["wire"]["dispatch"] == ("unknown" if vendor else "possible_dispatch")
+    assert report["wire"]["reply"] == "unknown"
+
+
+# Intent: keep a known Stop request when an optional result is unreadable or absent from an older schema.
+# Why: its request state does not depend on decoding the optional result fields.
+@pytest.mark.parametrize("missing_result", [False, True], ids=["unreadable", "absent"])
+def test_stop_incident_keeps_request_without_optional_result(tmp_path, missing_result):
+    path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"
+    with closing(Journal(path, "test-charger")) as journal:
+        ManagedRequests(journal)
+        token = write_request(journal, 42, dispatched=True)
+        if missing_result:
+            journal.db.execute("ALTER TABLE managed_requests RENAME COLUMN result TO old_result")
+        else:
+            journal.db.execute("UPDATE managed_requests SET result=CAST(? AS TEXT) WHERE id=?", (b"\xff", token))
+
+    report = stop_incident_report(path, events, request_reference=reference(token))
+    assert report["journal"]["available"]
+    assert report["journal"]["request"]["request"] == reference(token)
+    assert report["journal"]["request"]["state"] == "running"
+    assert report["wire"]["reply"] == "unknown"
+
+
 # Intent: follow only the original predecessor set even if another session has a definite reply.
 # Why: a closed follower needs an exact acceptance, or a refusal from every represented predecessor.
 @pytest.mark.parametrize(
@@ -480,7 +529,8 @@ def test_stop_report_keeps_joined_replies_with_their_original_attempt(tmp_path):
 # Intent: validate a joined Pause reply against the same original claim in the engine and the report.
 # Why: after both primary writes fail, only the original Pause ticket can recover the reply.
 @pytest.mark.parametrize(
-    "checkpoint", ["exact", "wrong-boot", "wrong-ticket", "unknown-request", "no-request", "wrong-key"]
+    "checkpoint",
+    ["exact", "wrong-boot", "wrong-ticket", "unknown-request", "no-request", "wrong-key", "no-pause-result"],
 )
 def test_joined_owner_checkpoint_must_match_pause_claim(tmp_path, checkpoint):
     path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"
@@ -513,7 +563,14 @@ def test_joined_owner_checkpoint_must_match_pause_claim(tmp_path, checkpoint):
             journal.db.execute("DELETE FROM meta WHERE key=?", (key,))
             journal.put(f"retained_transaction_reply_owner:{wire}", asdict(reply))
         joined = write_request(journal, local, dispatched=False, joined=1, owner_wire_attempts=[wire])
+        if checkpoint == "no-pause-result":
+            journal.db.executescript(
+                "CREATE TABLE old_requests AS SELECT * FROM managed_requests;"
+                "DROP TABLE managed_requests; ALTER TABLE old_requests RENAME TO managed_requests;"
+            )
+            journal.db.execute("UPDATE managed_requests SET result=NULL WHERE id=?", (pause,))
         report = stop_incident_report(path, events, request_reference=reference(joined))
+        assert report["journal"]["available"] and report["journal"]["request"]["request"] == reference(joined)
     exact = checkpoint == "exact"
     with closing(Journal(path, "test-charger")) as journal:
         assert journal.outcomes.owner_wires("wire", wire) == ((reply,) if exact else ())

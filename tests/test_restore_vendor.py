@@ -20,7 +20,8 @@ from ics_proxy_core.engine import trial_handover_evidence
 from ics_proxy_core.engine.native_bounded_handover import NativeBoundedHandover
 from ics_proxy_core.engine.native_http import NativeTransportUnavailableError, read_native
 from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
-from ics_proxy_core.engine.store import RecoveryRequiredError
+from ics_proxy_core.engine.store import JournalOwnerBusyError, RecoveryRequiredError
+from ics_proxy_core.engine.trial_evidence import UnpluggedEvidenceRequiredError
 from ics_proxy_core.engine.trial_session import save_private
 from ics_proxy_core.frames import basic_auth_header
 from tests.charge_rig import actual_stop, positive_flow, ready
@@ -31,7 +32,7 @@ from tests.prototype_rig import BOOT
 from tests.tls_support import tls as tls
 from tools import restore_vendor
 from tools.managed_proxy import serve
-from tools.restore_vendor import run
+from tools.restore_vendor import RestoreFailure, RestoreReason, RestoreRefusalError, RestoreStage, run
 
 
 class RestorePeer(NativeVehiclePeer):
@@ -179,50 +180,83 @@ async def failed_restore_cli(action, config, spec, native_port=80):
 # Intent: give useful restore guidance for known refusals while keeping unclassified error details private.
 # Why: journal or native failures can embed private data, including during an interrupted restoration.
 @pytest.mark.parametrize(
-    ("stage", "error", "reason", "hint"),
+    ("stage", "error", "reason", "error_name", "hint"),
     [
         (
-            "verify_unplugged_managed_pause",
-            RecoveryRequiredError("restoration needs a settled managed Pause at a selected 6 A"),
+            RestoreStage.VERIFY_UNPLUGGED_MANAGED_PAUSE,
+            RestoreRefusalError(RestoreReason.SETTLED_PAUSE_REQUIRED, "private fixture detail"),
             "settled_pause_required",
+            "RecoveryRequiredError",
             "settled Pause with 6 A selected",
         ),
         (
-            "verify_unplugged_managed_pause",
-            RecoveryRequiredError("cleanup does not belong to this managed restoration"),
+            RestoreStage.VERIFY_UNPLUGGED_MANAGED_PAUSE,
+            RestoreRefusalError(RestoreReason.RESTORE_RECORD_MISMATCH, "private fixture detail"),
             "restore_record_mismatch",
+            "RecoveryRequiredError",
             "matching set for this installation",
         ),
         (
-            "verify_vendor_connection",
-            TimeoutError("private fixture detail"),
-            "vendor_connection_unverified",
-            "Check that the charger can reach iCS",
+            RestoreStage.OPEN_JOURNAL,
+            JournalOwnerBusyError("private fixture detail"),
+            "journal_in_use",
+            "RecoveryRequiredError",
+            "Stop the proxy service",
         ),
         (
-            "restore_original_route",
-            TimeoutError("private fixture detail"),
+            RestoreStage.VERIFY_UNPLUGGED_MANAGED_PAUSE,
+            UnpluggedEvidenceRequiredError("private fixture detail"),
+            "unplugged_idle_required",
+            "SecurityError",
+            "unplug the car",
+        ),
+        (
+            RestoreStage.VERIFY_UNPLUGGED_MANAGED_PAUSE,
+            RecoveryRequiredError("cleanup does not belong to this managed restoration"),
             "restore_stage_failed",
+            "RecoveryRequiredError",
             "Review the restore instructions for this stage",
         ),
         (
-            "verify_unplugged_managed_pause",
+            RestoreStage.VERIFY_VENDOR_CONNECTION,
+            TimeoutError("private fixture detail"),
+            "vendor_connection_unverified",
+            "TimeoutError",
+            "Check that the charger can reach iCS",
+        ),
+        (
+            RestoreStage.RESTORE_ORIGINAL_ROUTE,
+            TimeoutError("private fixture detail"),
+            "restore_stage_failed",
+            "TimeoutError",
+            "Review the restore instructions for this stage",
+        ),
+        (
+            RestoreStage.VERIFY_UNPLUGGED_MANAGED_PAUSE,
             StaleEvidenceError("private fixture detail"),
             "native_evidence_unavailable",
+            "StaleEvidenceError",
             "reachable locally",
         ),
         (
-            "restore_original_current",
+            RestoreStage.RESTORE_ORIGINAL_CURRENT,
             NativeTransportUnavailableError("private fixture detail"),
             "native_evidence_unavailable",
+            "NativeTransportUnavailableError",
             "reachable locally",
         ),
     ],
 )
-def test_restore_guidance_matches_observed_stage_without_private_details(stage, error, reason, hint):
-    actual_reason, next_step = restore_vendor.restore_guidance(stage, error)
-    assert actual_reason == reason and hint in next_step
-    assert "private fixture detail" not in next_step
+def test_restore_guidance_matches_observed_stage_without_private_details(stage, error, reason, error_name, hint):
+    report = RestoreFailure.capture(stage, error).value()
+    assert report == {
+        "restore_failed": error_name,
+        "complete": False,
+        "restore_stage": stage.value,
+        "restore_reason": reason,
+        "next_step": report["next_step"],
+    }
+    assert hint in report["next_step"] and "private fixture detail" not in json.dumps(report)
 
 
 # Intent: report invalid restore inputs with the stage and a corrective action.
@@ -239,7 +273,7 @@ async def test_maintenance_close_preserves_restore_stage(tmp_path, tls, unused_t
             pass
 
         async def finish_restore(handover, patch, close_listener, *, report_stage):
-            report_stage("restore_original_route")
+            report_stage(RestoreStage.RESTORE_ORIGINAL_ROUTE)
             if transfer_failed:
                 raise NativeTransportUnavailableError("test route observation interrupted")
             return {"complete": True}
@@ -277,7 +311,7 @@ async def test_restore_check_is_offline(tmp_path, tls, unused_tcp_port, monkeypa
         config, spec = tmp_path / "trial.json", spec_file(tmp_path, test.rig)
         port = test.rig.prepared.observer.port
         assert await run("check", config, spec, port) == 0
-        with pytest.raises(RecoveryRequiredError, match="journal already has an active owner"):
+        with pytest.raises(JournalOwnerBusyError, match="journal already has an active owner"):
             await run("restore", config, spec, port)
         report = await failed_restore_cli("restore", config, spec, port)
         assert report["restore_failed"] == "RecoveryRequiredError"
@@ -373,7 +407,7 @@ async def test_restore_refuses_plugged_vehicle_before_any_write(tmp_path, tls, u
         peers_before = list(test.rig.bench.device_calls)
         config, spec = tmp_path / "trial.json", spec_file(tmp_path, test.rig)
         port = test.rig.prepared.observer.port
-        with pytest.raises((SecurityError, RecoveryRequiredError)):
+        with pytest.raises(UnpluggedEvidenceRequiredError, match="fresh matching unplugged zero-power evidence"):
             await run("restore", config, spec, port)
         report = await failed_restore_cli("restore", config, spec, port)
         assert report["restore_failed"] == "SecurityError"

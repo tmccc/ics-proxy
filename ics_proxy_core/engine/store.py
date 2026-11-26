@@ -23,6 +23,10 @@ class RecoveryRequiredError(RuntimeError):
     """An uncertain remote outcome needs reconciliation instead of automatic replay."""
 
 
+class JournalOwnerBusyError(RecoveryRequiredError):
+    """Another process still holds the journal's exclusive owner lock."""
+
+
 class ReleaseDeferredError(RecoveryRequiredError):
     """An owner release was withheld before the positive profile reached the transport."""
 
@@ -96,7 +100,7 @@ class Journal:
             try:
                 fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                raise RecoveryRequiredError("journal already has an active owner") from None
+                raise JournalOwnerBusyError("journal already has an active owner") from None
             for state in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm"), Path(str(path) + "-journal")):
                 try:
                     info = state.lstat()

@@ -22,6 +22,10 @@ if TYPE_CHECKING:
     from .trial_handover_evidence import HandoverEvidence
 
 
+class UnpluggedEvidenceRequiredError(SecurityError):
+    """Fresh evidence did not show an unplugged vehicle at zero current and power."""
+
+
 @dataclass(frozen=True, repr=False)
 class Resource:
     """Complete physical bytes establish equality; a semantic projection checks a newly written constant profile."""
@@ -186,7 +190,9 @@ class Evidence:
     def require_disconnected(self, identity: str, max_age: float = 30) -> None:
         self.require_fresh(identity, max_age)
         if self.cp != "A" or self.connection != "Unplug" or self.current_a != 0 or self.power_w != 0:
-            raise SecurityError("trial requires fresh matching unplugged zero-power evidence and a closed session")
+            raise UnpluggedEvidenceRequiredError(
+                "trial requires fresh matching unplugged zero-power evidence and a closed session"
+            )
 
 
 class NativeObserver:

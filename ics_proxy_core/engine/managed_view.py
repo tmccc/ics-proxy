@@ -16,7 +16,13 @@ from .managed_facts import ManagedFacts
 from .managed_intent import OFFLINE_PAUSE, automatic_pause_cause
 from .managed_release_wait import awaiting_known_stops, awaiting_observations
 from .native_faults import STATION_CEILING_LOST
-from .native_history import latest_completion_available
+from .native_history import (
+    CompletionOrder,
+    NativeHistoryReading,
+    completion_agrees,
+    completion_order,
+    latest_completion_available,
+)
 from .store import Journal
 from .supervision import ControlProof, HealthVerdict, PollStatus
 
@@ -184,77 +190,51 @@ class ChargerHistorySummary:
     latest_completion_known: bool
 
 
-# Use the known transaction order for managed charges, even when the charger clock moves backwards.
 def summarize_charger_history(
-    records: tuple[dict[str, Any], ...], latest_closed: int | None = None
+    records: tuple[dict[str, Any], ...], latest_closed: int | None = None, *, as_of: float | None = None
 ) -> ChargerHistorySummary:
     summaries: list[dict[str, Any]] = []
     completed: dict[int, tuple[int, int]] = {}
-    energy: dict[int, float] = {}
-    latest_times = (0, 0)
+    latest_order: CompletionOrder = (0, 0)
     latest_energy: float | None = None
-    newest_unreadable = (0.0, 0.0)
-    unreadable_recent = False
-    latest_time = time.time() + 30
+    complete = True
+    checked_at = time.time() if as_of is None else as_of
     for record in records:
-        identifier = record.get("transactionId")
-        if identifier == -1:
+        # Failed unassigned attempts are retained separately and never constitute a session.
+        raw_identifier = record.get("transactionId")
+        if type(raw_identifier) is int and raw_identifier == -1:
             continue
-        raw_start, stop = record.get("startTime"), record.get("stopTime", 0)
-        start = raw_start if type(raw_start) is int else 0
-        first, last = record.get("meterStart"), record.get("meterStop", 0)
-        start_valid = 0 < start <= latest_time
-        stop_valid = type(stop) is int and 0 <= stop <= latest_time
-        if (
-            not start_valid
-            or not stop_valid
-            or type(identifier) is not int
-            or type(first) is not int
-            or type(last) is not int
-            or not 0 <= first <= 10**12
-            or not 0 <= last <= 10**12
-            or stop != 0
-            and (stop < start or last < first)
-        ):
-            # Known completion times still order a row whose energy is unreadable.
-            # Use an upper bound when the chronology itself is uncertain.
-            unreadable_times = (
-                (stop, start)
-                if start_valid and stop_valid and stop >= start
-                else (max(start if start_valid else math.inf, stop if stop_valid else math.inf), math.inf)
-            )
-            newest_unreadable = max(newest_unreadable, unreadable_times)
-            if latest_closed is not None and (type(identifier) is not int or identifier >= latest_closed):
-                unreadable_recent = True
-            continue
-        if stop:
-            times = stop, start
-            completed[identifier] = times
-            energy[identifier] = (last - first) / 1000
-            if times > latest_times:
-                latest_times, latest_energy = times, energy[identifier]
-            elif times == latest_times and latest_energy != energy[identifier]:
+        reading = NativeHistoryReading.read(record, checked_at)
+        identifier, start, stop = reading.identifier, reading.start, reading.stop
+        energy = reading.energy
+        if stop != 0:
+            order = completion_order(identifier, start, stop, latest_closed)
+            if order > latest_order:
+                latest_order, latest_energy = order, energy
+            elif not completion_agrees(latest_order, latest_energy, order, energy):
                 latest_energy = None
+        if not reading.valid:
+            complete = False
+            continue
+        assert identifier is not None and start is not None and stop is not None
+        if stop:
+            completed[identifier] = stop, start
         summaries.append(
             {
                 "started_at": datetime.fromtimestamp(start, UTC).isoformat(),
                 "stopped_at": datetime.fromtimestamp(stop, UTC).isoformat() if stop else None,
-                "energy_kwh": energy[identifier] if stop else None,
+                "energy_kwh": energy,
             }
         )
-    complete = newest_unreadable == (0.0, 0.0)
-    if latest_closed is None:
-        # Coincident timestamps can establish energy only when the matching records agree.
-        latest_known = complete if not completed else latest_energy is not None and latest_times > newest_unreadable
-    else:
-        # The journal can receive the Stop before native history includes that same assigned ID.
-        latest_energy = energy.get(latest_closed)
-        latest_known = not unreadable_recent and max(completed, default=None) == latest_closed
+    latest_known = latest_energy is not None or (latest_closed is None and latest_order == (0, 0))
+    # The journal can receive the Stop before native history includes that same assigned ID.
+    if latest_closed is not None and latest_order[0] != latest_closed:
+        latest_known = False
     return ChargerHistorySummary(
         sorted(summaries, key=lambda r: r["started_at"], reverse=True)[:20],
         complete,
         completed,
-        latest_energy,
+        latest_energy if latest_known else None,
         latest_known,
     )
 
@@ -354,7 +334,8 @@ def observed_status(
             history_read = True
     except sqlite3.Error:
         closed, archive, history_read = None, None, False
-    history = summarize_charger_history(native.history, closed)
+    history_checked_at = time.time()
+    history = summarize_charger_history(native.history, closed, as_of=history_checked_at)
     records_missing = bool(archive and (archive.get("missing_records") or archive.get("missing_attempts")))
     # A previously completed charge can come back damaged or open under the same transaction ID.
     check_archive = archive and (
@@ -365,7 +346,12 @@ def observed_status(
     latest_known = (
         history_read
         and history.latest_completion_known
-        and (not check_archive or latest_completion_available(j, history.completed, closed))
+        and (
+            not check_archive
+            or latest_completion_available(
+                j, history.completed, closed, latest_energy=history.last_energy, as_of=history_checked_at
+            )
+        )
     )
     try:
         can_set_current = c.current.available(native)

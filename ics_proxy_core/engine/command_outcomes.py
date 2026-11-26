@@ -285,6 +285,8 @@ def _owner_stop_claim_matches(db: sqlite3.Connection, reply: OwnerWire) -> bool:
             (reply.request, reply.ticket, STOP_SESSION),
         ).fetchall()
         for request, action, raw in claims:
+            if raw is None:
+                return False
             try:
                 result = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
             except ValueError, RecursionError:

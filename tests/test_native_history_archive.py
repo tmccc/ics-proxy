@@ -86,7 +86,9 @@ def test_latest_native_completion_uses_stop_time_without_a_managed_close(history
     [(1100, 7000, 2.0), (1000, 7000, None), (1000, 12000, 7.0)],
     ids=["later-start", "ambiguous-energy", "same-energy"],
 )
-def test_native_completion_resolves_timestamp_ties(start: int, meter_stop: int, expected_energy: float | None) -> None:
+def test_native_completion_resolves_timestamp_ties(
+    history_journal: Journal, start: int, meter_stop: int, expected_energy: float | None
+) -> None:
     rows = (
         row(1002) | {"startTime": 1000, "stopTime": 1250, "meterStop": 12000},
         row(1001) | {"startTime": start, "stopTime": 1250, "meterStop": meter_stop},
@@ -97,6 +99,16 @@ def test_native_completion_resolves_timestamp_ties(start: int, meter_stop: int, 
         assert history.last_energy == expected_energy
         managed = summarize_charger_history(records, latest_closed=1002)
         assert managed.latest_completion_known and managed.last_energy == 7.0
+
+    archive = NativeHistoryArchive(history_journal)
+    archive.observe([], list(rows), allow_missing=True)
+    for visible in rows:
+        assert archive.observe([], [visible], allow_missing=True)["missing_records"] == 1
+        history = summarize_charger_history((visible,))
+        assert history.latest_completion_known
+        assert latest_completion_available(history_journal, history.completed, latest_energy=history.last_energy) == (
+            history.last_energy == expected_energy
+        )
 
 
 # Intent: order an absent archive row sharing the visible latest Stop time by its recorded Start.
@@ -142,6 +154,28 @@ def test_unreadable_energy_uses_the_same_completion_order_as_the_archive(
     assert known is available
     if known:
         assert summary.last_energy == 7.0
+
+
+# Intent: an explicitly open row with unreadable energy never competes as a completion.
+# Why: the same row can be visible or retained as an original open record.
+def test_damaged_open_row_does_not_obscure_a_completion(history_journal: Journal) -> None:
+    visible = row(1001)
+    opened = row(1002, closed=False) | {"meterStop": None}
+    archive = NativeHistoryArchive(history_journal)
+    original = [opened]
+    archive.observe(original, [visible, opened], allow_missing=True)
+
+    only_open = summarize_charger_history((opened,))
+    assert not only_open.complete and only_open.latest_completion_known
+    assert only_open.last_energy is None
+    history = summarize_charger_history((visible, opened))
+    assert not history.complete
+    assert history.latest_completion_known and history.last_energy == 0.5
+
+    assert archive.observe(original, [visible], allow_missing=True)["missing_records"] == 1
+    history = summarize_charger_history((visible,))
+    assert history.complete and history.latest_completion_known and history.last_energy == 0.5
+    assert latest_completion_available(history_journal, history.completed, latest_energy=history.last_energy)
 
 
 # Intent: any number of absent original records is archived and reported without rewriting original admission data.

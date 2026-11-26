@@ -23,6 +23,7 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
+from ics_proxy_core.engine.ics import unique_object
 from ics_proxy_core.engine.incident_observation import IncidentObservation
 from ics_proxy_core.engine.managed_intent import OWNER_PAUSE, decode_intent, decode_pause_claim
 from ics_proxy_core.engine.security import SecurityError
@@ -32,6 +33,7 @@ MAX_EVENT_BYTES = 64 * 1024
 MAX_REPORT_EVENTS = 24
 UNKNOWN = "unknown"
 STAGES = ("prepared", "issued", "accepted", "rejected", "unsent", "reconciled")
+DELIVERY_STATES = {state.encode(): state for state in ("queued", "inflight", "ambiguous", "rejected")}
 
 
 # Accept only the engine's exact random UUID/ticket shape.
@@ -167,70 +169,92 @@ def observations(path: Path) -> list[dict[str, Any]]:
     return list(events)
 
 
+# Decode each optional object independently. Keep SQLite out of UTF-8 decoding of JSON payloads.
+def object_fields(value: object) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value, object_pairs_hook=unique_object) if isinstance(value, (str, bytes)) else None
+    except ValueError, RecursionError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+# An unavailable projection is distinct from a successful read with no matching rows.
+def evidence_rows(db: sqlite3.Connection, sql: str, parameters: tuple[Any, ...] = ()) -> list[tuple[Any, ...]] | None:
+    try:
+        return db.execute(sql, parameters).fetchall()
+    except sqlite3.Error, UnicodeError:
+        return None
+
+
+def journal_tables(db: sqlite3.Connection) -> set[str]:
+    return {name for (name,) in db.execute("SELECT name FROM sqlite_schema WHERE type='table'")}
+
+
 # Read small named metadata values without returning opaque payloads or entire journal rows.
 def metadata(db: sqlite3.Connection, key: str) -> dict[str, Any]:
-    row = db.execute("SELECT CASE WHEN length(value)<=8192 THEN value END FROM meta WHERE key=?", (key,)).fetchone()
-    try:
-        value = json.loads(row[0]) if row is not None and row[0] is not None else None
-    except ValueError, UnicodeError, RecursionError:
-        return {}
-    return value if isinstance(value, dict) else {}
+    rows = evidence_rows(db, "SELECT CAST(value AS BLOB) FROM meta WHERE key=? AND length(value)<=8192", (key,))
+    return object_fields(rows[0][0]) if rows else {}
 
 
 # Select a retained local Start by its exact management UUID, preserving unrelated historical receipts.
-def retained_start(db: sqlite3.Connection) -> tuple[str | None, dict[str, Any] | None]:
-    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='managed_requests'").fetchone() is None:
+def retained_start(db: sqlite3.Connection, tables: set[str]) -> tuple[str | None, dict[str, Any] | None]:
+    if "managed_requests" not in tables:
         return None, None
-    row = db.execute(
+    rows = evidence_rows(
+        db,
         "SELECT id,action,revision,state FROM managed_requests "
-        "WHERE action IN ('start','start_test') ORDER BY rowid DESC LIMIT 1"
-    ).fetchone()
-    if row is None or (raw := identifier(row[0])) is None or type(row[2]) is not int or not 0 <= row[2] < 2**53:
+        "WHERE action IN ('start','start_test') ORDER BY rowid DESC LIMIT 1",
+    )
+    if not rows:
+        return None, None
+    row = rows[0]
+    if (raw := identifier(row[0])) is None or type(row[2]) is not int or not 0 <= row[2] < 2**53:
         return None, None
     state = row[3] if row[3] in ("accepted", "running", "uncertain", "completed", "failed") else UNKNOWN
     return raw, {"request": reference(raw), "action": row[1], "revision": row[2], "state": state}
 
 
-# Only the transaction named by this receipt can establish lifecycle or cloud delivery evidence.
-def lifecycle_fields(db: sqlite3.Connection, local: object) -> tuple[str, str, list[dict[str, Any]]]:
+# Receipt-bound lifecycle and delivery remain readable independently of either source's schema.
+def lifecycle_fields(db: sqlite3.Connection, tables: set[str], local: object) -> tuple[str, str, list[dict[str, Any]]]:
     if local is None:
         return "unbound", UNKNOWN, []
     if type(local) is not int or not 0 < local < 2**63:
         return UNKNOWN, UNKNOWN, []
-    row = db.execute("SELECT stop IS NOT NULL,vendor IS NOT NULL FROM transactions WHERE local=?", (local,)).fetchone()
-    if row is None:
-        return UNKNOWN, UNKNOWN, []
-    return "closed" if row[0] else "open", "recorded" if row[1] else "unmapped", pending_delivery_fields(db, local)
+    delivery = pending_delivery_fields(db, tables, local)
+    if "transactions" not in tables:
+        return UNKNOWN, UNKNOWN, delivery
+    closure = evidence_rows(db, "SELECT stop IS NOT NULL FROM transactions WHERE local=?", (local,))
+    cloud = evidence_rows(db, "SELECT vendor IS NOT NULL FROM transactions WHERE local=?", (local,))
+    lifecycle = ("closed" if closure[0][0] else "open") if closure else UNKNOWN
+    mapping = ("recorded" if cloud[0][0] else "unmapped") if cloud else UNKNOWN
+    return lifecycle, mapping, delivery
 
 
-# Preserve queued delivery evidence when a historical journal lacks the optional reply table.
-def pending_delivery_fields(db: sqlite3.Connection, local: int) -> list[dict[str, Any]]:
-    tables = {
-        name
-        for (name,) in db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('outbox','delivery_replies')"
-        )
-    }
+# Preserve queued delivery when the optional reply table is missing or unreadable.
+def pending_delivery_fields(db: sqlite3.Connection, tables: set[str], local: int) -> list[dict[str, Any]]:
     if "outbox" not in tables:
         return []
-    reply_projection = (
-        "EXISTS(SELECT 1 FROM delivery_replies r WHERE r.token=o.token "
-        "AND r.action=o.action AND r.payload=o.payload AND r.local=o.local)"
-        if "delivery_replies" in tables
-        else "0"
+    fields = "SELECT o.action,CAST(o.state AS BLOB)"
+    queued = (
+        "FROM outbox o WHERE o.local=? AND o.action IN ('StartTransaction','StopTransaction') ORDER BY o.seq LIMIT 4"
     )
+    rows = None
+    if "delivery_replies" in tables:
+        rows = evidence_rows(
+            db,
+            f"{fields},EXISTS(SELECT 1 FROM delivery_replies r WHERE r.token=o.token "
+            f"AND r.action=o.action AND r.payload=o.payload AND r.local=o.local) {queued}",
+            (local,),
+        )
+    if rows is None:
+        rows = evidence_rows(db, f"{fields},0 {queued}", (local,))
     return [
         {
             "event": action,
-            "state": state if state in ("queued", "inflight", "ambiguous", "rejected") else UNKNOWN,
+            "state": DELIVERY_STATES.get(state, UNKNOWN),
             "reply_saved": bool(reply_saved),
         }
-        for action, state, reply_saved in db.execute(
-            f"SELECT o.action,o.state,{reply_projection} "
-            "FROM outbox o WHERE o.local=? AND o.action IN ('StartTransaction','StopTransaction') "
-            "ORDER BY o.seq LIMIT 4",
-            (local,),
-        )
+        for action, state, reply_saved in rows or ()
     ]
 
 
@@ -242,10 +266,12 @@ def retained_start_reply(
     keys = (
         ((prefix + pending_wire[0],),)
         if pending_wire is not None
-        else db.execute("SELECT key FROM meta WHERE key GLOB ? AND length(key)=?", (prefix + "*", len(prefix) + 34))
+        else evidence_rows(
+            db, "SELECT key FROM meta WHERE key GLOB ? AND length(key)=?", (prefix + "*", len(prefix) + 34)
+        )
     )
     result = UNKNOWN
-    for (key,) in keys:
+    for (key,) in keys or ():
         wire = key[len(prefix) :]
         if not re.fullmatch(r"l-[a-f0-9]{32}", wire):
             continue
@@ -264,8 +290,8 @@ def retained_start_reply(
         if pending_wire is not None:
             if boot != pending_wire[1]:
                 continue
-        elif db.execute("SELECT 1 FROM owner_command_wires WHERE wire=?", (wire,)).fetchone() is not None:
-            # This ID already belongs to a different durable call.
+        elif evidence_rows(db, "SELECT 1 FROM owner_command_wires WHERE wire=?", (wire,)) != []:
+            # A checkpoint alone cannot displace a different or unreadable durable call.
             continue
         if result != UNKNOWN:
             return UNKNOWN
@@ -274,17 +300,18 @@ def retained_start_reply(
 
 
 # Read the exact saved wire receipt, with the completed Start stage available on older journals.
-def saved_start_reply(db: sqlite3.Connection, request: str, ticket: str, stage: str) -> str:
+def saved_start_reply(db: sqlite3.Connection, tables: set[str], request: str, ticket: str, stage: str) -> str:
     if stage in ("accepted", "rejected"):
         return stage
-    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_command_wires'").fetchone():
+    if "owner_command_wires" not in tables:
         return UNKNOWN
-    rows = db.execute(
+    rows = evidence_rows(
+        db,
         "SELECT wire,boot,local,limit_a,reply FROM owner_command_wires "
         "WHERE request=? AND ticket=? AND action='RemoteStartTransaction' LIMIT 2",
         (request, ticket),
-    ).fetchall()
-    if len(rows) > 1:
+    )
+    if rows is None or len(rows) > 1:
         return UNKNOWN
     pending_wire = None
     if rows:
@@ -445,6 +472,7 @@ def journal_facts(path: Path) -> dict[str, Any]:
     result: dict[str, Any] = {"available": False, "intent": None, "request": None, "start": None}
     try:
         with read_journal(path) as db:
+            tables = journal_tables(db)
             intent = intent_fields(metadata(db, "managed_control_intent"))
             claim = decode_pause_claim(metadata(db, OWNER_PAUSE))
             if intent is not None:
@@ -455,7 +483,7 @@ def journal_facts(path: Path) -> dict[str, Any]:
                 )
             wire = metadata(db, "local_start_receipt")
             owner = metadata(db, "managed_test_charge")
-            original, request = retained_start(db)
+            original, request = retained_start(db, tables)
             if request is not None and original == owner.get("id"):
                 current = owner.get("current_a")
                 if type(current) in (int, float) and 6 <= current <= 32:
@@ -465,13 +493,13 @@ def journal_facts(path: Path) -> dict[str, Any]:
             stage = wire.get("stage")
             if original is not None and wire.get("request_id") == original and ticket and stage in STAGES:
                 lifecycle, cloud_mapping, delivery = (
-                    lifecycle_fields(db, wire["local"]) if "local" in wire else (UNKNOWN, UNKNOWN, [])
+                    lifecycle_fields(db, tables, wire["local"]) if "local" in wire else (UNKNOWN, UNKNOWN, [])
                 )
                 published = owner.get("start_rpc_accepted") if owner.get("id") == original else None
                 start = {
                     "ticket": ticket,
                     "stage": stage,
-                    "saved_reply": saved_start_reply(db, original, wire["ticket"], stage),
+                    "saved_reply": saved_start_reply(db, tables, original, wire["ticket"], stage),
                     "authority_published": published if type(published) is bool else None,
                     "lifecycle": lifecycle,
                     "cloud_mapping": cloud_mapping,
@@ -584,7 +612,7 @@ def incident_report(journal: Path, event_path: Path) -> dict[str, Any]:
         "schema_version": 1,
         "journal": saved,
         "wire": {"request": request, "ticket": ticket, "send": transport, "observed_reply": reply},
-        "waiting_for_evidence": waiting if start.get("lifecycle", UNKNOWN) != UNKNOWN else None,
+        "waiting_for_evidence": waiting if start.get("lifecycle", UNKNOWN) != UNKNOWN or pending else None,
         "observations": timeline[-MAX_REPORT_EVENTS:],
         "sampled_status": sampled_status(journal.with_suffix(".status.json")),
     }

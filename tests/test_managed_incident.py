@@ -687,10 +687,32 @@ def test_incident_preserves_historical_start_receipt(tmp_path, stage):
         journal.close()
 
 
-# Intent: keep the bound ledger and any queued delivery rows readable without a reply table.
-# Why: the Start and Stop reports remain useful when historical snapshots lack optional delivery records.
-@pytest.mark.parametrize("outbox", [False, True], ids=["no-outbox", "outbox-without-replies"])
-def test_incident_keeps_bound_lifecycle_without_delivery_tables(tmp_path, outbox):
+# Intent: keep the exact Start and its charge evidence when optional metadata cannot be decoded.
+# Why: a saved intent or owner state can be damaged independently of the receipt and transaction.
+@pytest.mark.parametrize("key", ["managed_control_intent", "managed_test_charge"])
+def test_incident_keeps_bound_start_with_unreadable_metadata(tmp_path, key):
+    path, events = tmp_path / "journal.db", tmp_path / "missing-events.jsonl"
+    request, ticket = uuid.uuid4().hex, uuid.uuid4().hex
+    with closing(Journal(path, "OFFLINE001")) as journal:
+        ManagedRequests(journal).accept(request, "start", 0)
+        journal.put(
+            "local_start_receipt", {"request_id": request, "ticket": ticket, "stage": "accepted", "local": None}
+        )
+        journal.db.execute("INSERT OR REPLACE INTO meta VALUES(?,CAST(? AS TEXT))", (key, b'{"bad":"\xff"}'))
+
+    report = incident_report(path, events)
+    assert report["journal"]["available"]
+    assert report["journal"]["request"]["request"] == reference(request)
+    assert report["journal"]["start"]["ticket"] == reference(ticket)
+    assert report["journal"]["start"]["saved_reply"] == "accepted"
+
+
+# Intent: keep readable lifecycle and queued evidence when an optional journal table is absent or has an old schema.
+# Why: the Start and Stop reports gather independent facts from the same private snapshot.
+@pytest.mark.parametrize(
+    "missing", ["outbox", "replies", "reply_fields", "delivery_state", "transactions", "mapping", "closure"]
+)
+def test_incident_keeps_independent_lifecycle_and_delivery(tmp_path, missing):
     path, events = tmp_path / "journal.db", tmp_path / "missing-events.jsonl"
     start, ticket, stop = (uuid.uuid4().hex for _ in range(3))
     with closing(Journal(path, "OFFLINE001")) as journal:
@@ -704,18 +726,36 @@ def test_incident_keeps_bound_lifecycle_without_delivery_tables(tmp_path, outbox
             "INSERT INTO transactions(local,connector,start,stop,vendor) VALUES(42,1,'{}',?,99)",
             (json.dumps({"transactionId": 42, "timestamp": "2026-11-01T01:00:00Z"}),),
         )
-        if outbox:
+        if missing == "outbox":
+            journal.db.execute("DROP TABLE outbox")
+        else:
             journal.db.execute(
                 "INSERT INTO outbox(token,action,payload,local,state) "
                 "VALUES('delivery','StopTransaction','{}',42,'queued')"
             )
-        else:
-            journal.db.execute("DROP TABLE outbox")
-        journal.db.execute("DROP TABLE delivery_replies")
+        if missing in ("outbox", "replies", "reply_fields"):
+            journal.db.execute("DROP TABLE delivery_replies")
+        if missing == "reply_fields":
+            journal.db.execute("CREATE TABLE delivery_replies(token TEXT PRIMARY KEY)")
+            journal.db.execute("INSERT INTO delivery_replies VALUES('delivery')")
+        if missing == "delivery_state":
+            journal.db.execute(
+                "INSERT INTO outbox(token,action,payload,local,state) "
+                "VALUES('other','StartTransaction','{}',42,CAST(? AS TEXT))",
+                (b"\xff",),
+            )
+        if missing == "transactions":
+            journal.db.execute("DROP TABLE transactions")
+        if missing == "mapping":
+            journal.db.execute("ALTER TABLE transactions RENAME COLUMN vendor TO old_vendor")
+        if missing == "closure":
+            journal.db.execute("ALTER TABLE transactions RENAME COLUMN stop TO old_stop")
 
     start_report = incident_report(path, events)
     stop_report = stop_incident_report(path, events)
-    delivery = [{"event": "StopTransaction", "state": "queued", "reply_saved": False}] if outbox else []
+    delivery = [] if missing == "outbox" else [{"event": "StopTransaction", "state": "queued", "reply_saved": False}]
+    if missing == "delivery_state":
+        delivery.append({"event": "StartTransaction", "state": "unknown", "reply_saved": False})
     for report, request in ((start_report, start), (stop_report, stop)):
         assert report["journal"]["available"]
         assert report["journal"]["request"]["request"] == reference(request)
@@ -723,9 +763,12 @@ def test_incident_keeps_bound_lifecycle_without_delivery_tables(tmp_path, outbox
     lifecycle = start_report["journal"]["start"]
     assert lifecycle["saved_reply"] == "accepted"
     for facts in (lifecycle, stop_report["journal"]):
-        assert facts["lifecycle"] == "closed" and facts["cloud_mapping"] == "recorded"
+        assert facts["lifecycle"] == ("unknown" if missing in ("transactions", "closure") else "closed")
+        assert facts["cloud_mapping"] == ("unknown" if missing in ("transactions", "mapping") else "recorded")
         assert facts["pending_delivery"] == delivery
-    assert start_report["waiting_for_evidence"] == (["cloud_delivery"] if outbox else [])
+    expected_timestamp = None if missing in ("transactions", "closure") else "2026-11-01T01:00:00+00:00"
+    assert stop_report["journal"]["charger_reported_stop_at"] == expected_timestamp
+    assert start_report["waiting_for_evidence"] == (["cloud_delivery"] if delivery else [])
 
 
 # Intent: project only exact retained reply and lifecycle records, with a bounded and redacted event excerpt.
