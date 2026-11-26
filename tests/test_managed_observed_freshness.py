@@ -481,7 +481,8 @@ async def test_expired_session_stop_sample_stays_expired_after_wall_rebase(
 
         with monkeypatch.context() as reader:
             reader.setattr(c.native, "observe", slow_observation)
-            await c.native.read()
+            with pytest.raises(StaleEvidenceError):
+                await c.native.read()
             assert not c.native.session_stop_verified(local)
         await c.native.read()
         assert c.native.session_stop_verified(local)
