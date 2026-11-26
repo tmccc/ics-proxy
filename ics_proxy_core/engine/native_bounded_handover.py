@@ -1235,7 +1235,7 @@ class NativeBoundedHandover:
         # The fresh original-route read started after this exact journal state was loaded.
         # Wall-clock corrections between the two observations cannot reverse that order.
         outage_at = state.get("backend_outage_at")
-        if type(outage_at) not in (int, float) or not 0 < outage_at < float("inf"):
+        if isinstance(outage_at, bool) or not isinstance(outage_at, (int, float)) or not 0 < outage_at < float("inf"):
             raise UnavailableError("original backend needs a fresh observed offline-to-online transition")
         self.save("backend_verified", backend_verified_at=native.physical.observed_at)
         return {"original_backend_connected": True, "native_limit_a": 6, "complete": False}

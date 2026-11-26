@@ -181,6 +181,7 @@ async def test_held_status_crosses_entry_replacement(
             assert entry.state is ConfigEntryState.NOT_LOADED
             assert not old.notice.active and old.cancel_timer is None
             before_notice = dict(_async_get_or_create_notifications(hass))
+            assert old.notification_id not in before_notice
             saved(None)
             old.update_notification(True)
             assert dict(_async_get_or_create_notifications(hass)) == before_notice
@@ -197,19 +198,24 @@ async def test_held_status_crosses_entry_replacement(
         if release_order == "old-first":
             gate.release[0].set()
             await finished(old_read)
-            # The current owner has not supplied a result yet: an old healthy snapshot cannot dismiss its fault.
-            assert old.notification_id in _async_get_or_create_notifications(hass)
+            # The late result cannot change the notice state left by reload or explicit disable.
+            visible = old.notification_id in _async_get_or_create_notifications(hass)
+            assert visible == (transition == "reload")
             assert old.cancel_timer is None
-            gate.release[1].set()
-            await finished(replacing)
-        else:
-            gate.release[1].set()
-            await finished(replacing)
-            assert_current(hass, entry, healthy=new_healthy, revision=1)
+        gate.release[1].set()
+        await finished(replacing)
+        if transition == "disable-enable" and not new_healthy:
+            notice = entry.runtime_data.notice
+            assert notice.problem_since == clock.value and not notice.notified and notice.cancel_timer is not None
+            assert notice.notification_id not in _async_get_or_create_notifications(hass)
+            clock.value += 61
+            callbacks[-1](None)
+        current = assert_current(hass, entry, healthy=new_healthy, revision=1)
+        if release_order == "new-first":
             gate.release[0].set()
             await finished(old_read)
             assert old.cancel_timer is None
-        current = assert_current(hass, entry, healthy=new_healthy, revision=1)
+            assert_current(hass, entry, healthy=new_healthy, revision=1)
         assert current is not old and entry.disabled_by is None
         assert len(gate.request_ids) == len(set(gate.request_ids))
         # Old callbacks remain inert after both success and ongoing fault of the replacement owner.
