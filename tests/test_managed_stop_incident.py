@@ -10,7 +10,13 @@ import pytest
 
 from ics_proxy_core.engine.command_outcomes import ForwardedReply, OwnerWire
 from ics_proxy_core.engine.managed_intent import ManagedRequests, insert_request
-from ics_proxy_core.engine.stop_settlement import STOP_COMPLETION_FIELDS, STOP_SESSION, settle_saved_stop_rejections
+from ics_proxy_core.engine.stop_settlement import (
+    STOP_COMPLETION_FIELDS,
+    STOP_SESSION,
+    StopPredecessors,
+    predecessor_stop_reply,
+    settle_saved_stop_rejections,
+)
 from ics_proxy_core.engine.store import Journal
 from ics_proxy_core.engine.trial_session import save_private
 from tools.managed_incident import reference
@@ -52,6 +58,70 @@ def vendor_attempt(journal, local, wire, *, result="dispatched"):
     if result in ("Accepted", "Rejected"):
         journal.mutation_finished(token, True)
     return token
+
+
+# Intent: follow only the original predecessor set even if another session has a definite reply.
+# Why: a closed follower needs an exact acceptance, or a refusal from every represented predecessor.
+@pytest.mark.parametrize(
+    ("managed_reply", "vendor_reply", "exact", "unidentified", "expected"),
+    [
+        ("Rejected", "Accepted", True, False, "Accepted"),
+        ("Accepted", "Rejected", True, False, "Accepted"),
+        ("Rejected", "Rejected", True, False, "Rejected"),
+        ("Rejected", None, True, False, None),
+        ("Rejected", "Rejected", True, True, None),
+        ("Rejected", "Accepted", False, False, None),
+        (None, "Rejected", True, False, None),
+    ],
+)
+def test_bound_stop_predecessor_reply(tmp_path, managed_reply, vendor_reply, exact, unidentified, expected):
+    with closing(Journal(tmp_path / "journal.db", "test-charger")) as journal:
+        ManagedRequests(journal)
+        original = journal.start("original-start", START)["transactionId"]
+        journal.stop("original-stop", {"transactionId": original, "meterStop": 102, "timestamp": START["timestamp"]})
+        successor = journal.start("new-start", START | {"meterStart": 103})["transactionId"]
+        request = write_request(journal, original, dispatched=True)
+        journal.outcomes.record_owner_wire(
+            OwnerWire(uuid.uuid4().hex, request, request, BOOT, STOP_ACTION, original, None, managed_reply)
+        )
+        wire = uuid.uuid4().hex
+        mutation = vendor_attempt(journal, original if exact else successor, wire)
+        if vendor_reply is not None:
+            prefix = "retained_stop" if vendor_reply == "Accepted" else "retained_transaction_reply"
+            journal.put(f"{prefix}_vendor:{wire}", asdict(ForwardedReply(mutation, STOP_ACTION, wire, vendor_reply)))
+        predecessors = StopPredecessors(
+            local=original,
+            local_requests=(request,),
+            vendor_mutations=(mutation,),
+            unidentified_shutdown_stop=unidentified,
+        )
+        assert predecessor_stop_reply(journal.outcomes, original, predecessors) == expected
+        if not exact:
+            assert predecessor_stop_reply(journal.outcomes, successor, predecessors) is None
+
+
+# Intent: read the legacy scalar accepted predecessor after its original journal row rotates out.
+# Why: an older receipt can have an exact retained reply without the newer arrays of bound attempts.
+def test_legacy_joined_stop_report_retains_its_primary_reply(tmp_path):
+    path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"
+    with closing(Journal(path, "test-charger")) as journal:
+        ManagedRequests(journal)
+        local = journal.start("start-token", START)["transactionId"]
+        wire = uuid.uuid4().hex
+        vendor = vendor_attempt(journal, local, wire, result="Accepted")
+        request = write_request(
+            journal, local, joined=1, accepted_attempt={"origin": "vendor", "identifier": vendor, "wire": wire}
+        )
+        journal.stop("stop-token", {"transactionId": local, "meterStop": 102, "timestamp": START["timestamp"]})
+        journal.db.execute(f"UPDATE managed_requests SET {STOP_COMPLETION_FIELDS} WHERE id=?", (request,))
+        journal.capacity = 1
+        journal.mutation_intent("vendor", "SetChargingProfile", {"profile": "next"})
+        assert journal.outcomes.vendor(vendor) is None
+
+    report = stop_incident_report(path, events, request_reference=reference(request))
+    assert report["wire"]["joined_attempts"] == [
+        {"origin": "vendor", "request": reference(vendor), "reply": "accepted", "reply_source": "joined_receipt"}
+    ]
 
 
 # Intent: keep a rejection recovered from its checkpoint after the original vendor row is rotated.

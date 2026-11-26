@@ -156,7 +156,21 @@ class ObservedConnection(sqlite3.Connection):
     # Post-COMMIT means execute actually returned; SQLite's pre-statement trace alone cannot establish durability.
     def execute(self, sql, parameters=(), /):
         self.checkpoint(sql, parameters, True)
-        result = super().execute(sql, parameters)
+        native_first = (
+            Gate.phase == "after-native-first-stop-checkpoint"
+            and not Gate.fired
+            and sql.startswith("INSERT OR REPLACE INTO meta")
+            and parameters[:1] == ("retained_session_stop_native_first_closures",)
+            and Gate.identifier in json.loads(parameters[1])
+        )
+        try:
+            result = super().execute(sql, parameters)
+        except sqlite3.Error:
+            if native_first:
+                Gate.freeze(self, "after-native-first-stop-checkpoint")
+            raise
+        if native_first:
+            Gate.freeze(self, "after-native-first-stop-checkpoint")
         self.checkpoint(sql, parameters, False)
         return result
 

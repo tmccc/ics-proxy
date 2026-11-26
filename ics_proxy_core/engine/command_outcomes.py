@@ -579,6 +579,14 @@ class CommandOutcomes:
     def _retained_vendor_replies(self) -> tuple[ForwardedReply, ...]:
         return self._retained_replies("vendor", self._decode_vendor_reply)
 
+    # Inspect the affirmed checkpoint using the same original mutation and wire binding as recovery.
+    def retained_vendor_stop_replies(self) -> dict[tuple[str, str], TransactionReplyStatus]:
+        return {
+            (reply.mutation, reply.wire): reply.status
+            for reply in self._retained_vendor_replies()
+            if reply.action == "RemoteStopTransaction"
+        }
+
     # Accept a definite retained vendor reply only for its original forwarded attempt.
     def _decode_vendor_reply(self, saved: dict[str, Any]) -> ForwardedReply | None:
         if (

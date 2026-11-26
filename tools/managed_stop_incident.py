@@ -15,8 +15,9 @@ from ics_proxy_core.engine.policy import DeniedError
 from ics_proxy_core.engine.stop_settlement import (
     STOP_NONTERMINAL_CLASSIFICATIONS,
     STOP_SESSION,
+    bound_stop_ids,
     joined_stop_acceptance,
-    saved_stop_attempt,
+    saved_stop_replies,
 )
 from tools.managed_incident import (
     MAX_REPORT_EVENTS,
@@ -239,15 +240,11 @@ def saved_joined_replies(
 ) -> tuple[dict[tuple[str, str], str], dict[str, tuple[str, str]]]:
     requests: dict[tuple[str, str], str] = {}
     wires: dict[str, tuple[str, str]] = {}
-    for field, status in (("additional_accepted_attempts", "accepted"), ("rejected_attempts", "rejected")):
-        items = binding.get(field)
-        if not isinstance(items, list):
-            continue
-        for item in items[:MAX_REPORT_EVENTS]:
-            if (attempt := saved_stop_attempt(item, request)) is not None:
-                requests.setdefault((attempt.origin, attempt.identifier), status)
-                if attempt.origin == "local" and attempt.wire is not None:
-                    wires.setdefault(attempt.wire, (attempt.identifier, status))
+    for attempt, reply in saved_stop_replies(binding, request, limit=MAX_REPORT_EVENTS):
+        status = DEFINITE_REPLIES[reply]
+        requests.setdefault((attempt.origin, attempt.identifier), status)
+        if attempt.origin == "local" and attempt.wire is not None:
+            wires.setdefault(attempt.wire, (attempt.identifier, status))
     return requests, wires
 
 
@@ -261,11 +258,8 @@ def joined_attempts(
         saved = {"request": reference(accepted.identifier), "reply": "accepted", "reply_source": "joined_receipt"}
     saved_requests, saved_wires = saved_joined_replies(binding, request)
     for origin, key in (("local", "local_attempts"), ("vendor", "vendor_attempts")):
-        tokens = binding.get(key)
-        if not isinstance(tokens, list):
-            continue
-        unique = dict.fromkeys(token for item in tokens if (token := identifier(item)) is not None and token != request)
-        for token in tuple(unique)[:MAX_REPORT_EVENTS]:
+        tokens = tuple(item for item in bound_stop_ids(binding, key, request) if identifier(item) is not None)
+        for token in tokens[:MAX_REPORT_EVENTS]:
             reply = wire_fields()
             if origin == "local":
                 reply = owner_reply(db, tables, token, local)
@@ -294,23 +288,21 @@ def joined_attempts(
                     "reply_source": reply["reply_source"],
                 }
             )
-    wires = binding.get("owner_wire_attempts")
-    if isinstance(wires, list):
-        unique_wires = dict.fromkeys(wire for item in wires if (wire := wire_id(item)) is not None)
-        for wire in tuple(unique_wires)[:MAX_REPORT_EVENTS]:
-            evidence = joined_owner_wire(db, tables, wire, local)
-            if accepted is not None and accepted.origin == "local" and accepted.wire == wire:
-                if saved is None:
-                    continue
-                if evidence is None or evidence["reply"] != "accepted":
-                    evidence = saved
-                saved = None
-            elif (checkpoint := saved_wires.get(wire)) is not None:
-                predecessor, status = checkpoint
-                if evidence is None or evidence["reply"] != status:
-                    evidence = {"request": reference(predecessor), "reply": status, "reply_source": "joined_receipt"}
-            if evidence is not None:
-                attempts.append({"origin": "local", **evidence})
+    wires = tuple(item for item in bound_stop_ids(binding, "owner_wire_attempts", request) if wire_id(item) is not None)
+    for wire in wires[:MAX_REPORT_EVENTS]:
+        evidence = joined_owner_wire(db, tables, wire, local)
+        if accepted is not None and accepted.origin == "local" and accepted.wire == wire:
+            if saved is None:
+                continue
+            if evidence is None or evidence["reply"] != "accepted":
+                evidence = saved
+            saved = None
+        elif (checkpoint := saved_wires.get(wire)) is not None:
+            predecessor, status = checkpoint
+            if evidence is None or evidence["reply"] != status:
+                evidence = {"request": reference(predecessor), "reply": status, "reply_source": "joined_receipt"}
+        if evidence is not None:
+            attempts.append({"origin": "local", **evidence})
     if accepted is not None and saved is not None:
         attempts.insert(0, {"origin": accepted.origin, **saved})
     return attempts

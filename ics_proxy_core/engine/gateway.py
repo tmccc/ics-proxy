@@ -30,7 +30,7 @@ from .command_outcomes import (
 )
 from .command_processor import CommandPriority, CommandProcessor
 from .connection_scope import ControlScope, control_scope_matches, current_control_scope
-from .control_decisions import StopPredecessors, StopZeroEvidence, VendorStopAlreadyAnsweredError
+from .control_decisions import StopZeroEvidence, VendorStopAlreadyAnsweredError
 from .delivery_reply import DeliveryReply, stop_result_shape_supported
 from .events import OBSERVATION_ACTIONS, validate_observation
 from .ics import TransactionQuery, is_transaction_query, unique_object
@@ -53,6 +53,7 @@ from .rpc import InboundCache, Peer, RegistrationDeferredError, Sender, Unavaila
 from .security import SecurityError
 from .start_handoff import NativeStartReport as NativeStartReport
 from .start_handoff import OwnedStartResult, StartHandoff
+from .stop_settlement import StopPredecessors
 from .store import ConflictError, Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
 from .vendor_read_recovery import recover_legacy_vendor_read
 

@@ -80,12 +80,12 @@ from .security import SecurityError, StaleEvidenceError
 from .start_handoff import NativeStartReport, OwnedStartResult, StartHandoff, StartHandoffContext, StartPublication
 from .start_policy import ACTIVE, owner_tag_separate, start_refusal
 from .start_settlement import RetirementCandidate, StartFailureAction, StartFailureFacts, settle_start
-from .stop_settlement import StopAttempt
+from .stop_settlement import StopPredecessors, predecessor_stop_reply
 from .store import RecoveryRequiredError, StationZeroStorageError, encoded, fingerprint
 from .trial_evidence import Resource, profile_projection
 
 if TYPE_CHECKING:
-    from .command_outcomes import OwnerWire, TransactionReplyStatus
+    from .command_outcomes import TransactionReplyStatus
     from .gateway import Gateway
     from .local_control import LocalControl
     from .local_schedule_window import ScheduleWindow
@@ -144,17 +144,6 @@ class StopZeroEvidence(Protocol):
 
     # Report whether the latest evidence still covers the exact open session at zero.
     def stop_zero_verified(self, local: int) -> bool: ...
-
-
-@dataclass(frozen=True)
-class StopPredecessors:
-    """The earlier Stop attempts that could cover this request at admission."""
-
-    accepted: StopAttempt | None = None
-    local_requests: tuple[str, ...] = ()
-    owner_wires: tuple[str, ...] = ()
-    vendor_mutations: tuple[str, ...] = ()
-    unidentified_shutdown_stop: bool = False
 
 
 class StopDecision(Enum):
@@ -2412,7 +2401,7 @@ class ControlDecisions:
             local, boot, reuse=_StopReuse.INCLUDE_CURRENT_BOOT_UNANSWERED, session_only=True
         )
         if decision is StopDecision.ACCEPTED:
-            return StopPredecessors(accepted=outcomes.accepted_stop_attempt(local))
+            return StopPredecessors(local, accepted=outcomes.accepted_stop_attempt(local))
         if decision is StopDecision.WAIT_FOR_REPORT:
             return self._waiting_stop_predecessors(local, boot)
         return None
@@ -2445,6 +2434,7 @@ class ControlDecisions:
                     unidentified_shutdown_stop = True
         owner_wires = outcomes.unanswered_owner_stop_wires(local, boot, represented_requests=local_requests)
         return StopPredecessors(
+            local=local,
             local_requests=local_requests,
             owner_wires=tuple(dict.fromkeys((*owner_wires, *shutdown_wires))),
             vendor_mutations=vendor_mutations,
@@ -2457,25 +2447,8 @@ class ControlDecisions:
         session = outcomes.session(local)
         if session is None or not session.closed:
             raise DeniedError("cloud Stop lost its original open session")
-        if earlier.accepted is not None:
-            raise VendorStopAlreadyAnsweredError("Accepted")
-
-        # One acceptance settles this attempt. A refusal needs a reply from every represented wire.
-        def owner_status(wires: tuple[OwnerWire, ...]) -> TransactionReplyStatus | None:
-            replies = {wire.reply for wire in wires if wire.action == "RemoteStopTransaction" and wire.local == local}
-            if "Accepted" in replies:
-                return "Accepted"
-            return "Rejected" if replies == {"Rejected"} else None
-
-        replies = [
-            *(owner_status(outcomes.owner_wires("request", request)) for request in earlier.local_requests),
-            *(owner_status(outcomes.owner_wires("wire", wire)) for wire in earlier.owner_wires),
-            *(outcomes.status(mutation) for mutation in earlier.vendor_mutations),
-        ]
-        if "Accepted" in replies:
-            raise VendorStopAlreadyAnsweredError("Accepted")
-        if replies and not earlier.unidentified_shutdown_stop and all(status == "Rejected" for status in replies):
-            raise VendorStopAlreadyAnsweredError("Rejected")
+        if (reply := predecessor_stop_reply(outcomes, local, earlier)) is not None:
+            raise VendorStopAlreadyAnsweredError(reply)
         raise RecoveryRequiredError("cloud Stop awaits the charger's original reply")
 
     # Additional reuse requires verified zero for this session.

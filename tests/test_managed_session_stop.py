@@ -25,7 +25,7 @@ from ics_proxy_core.engine.managed_intent import ManagedRequests, insert_request
 from ics_proxy_core.engine.managed_session_stop import ManagedSessionStop
 from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.security import SecurityError
-from ics_proxy_core.engine.store import Journal, RecoveryRequiredError
+from ics_proxy_core.engine.store import Journal, RecoveryRequiredError, encoded, fingerprint
 from ics_proxy_core.frames import build_call_error, build_call_result
 from tests.charge_rig import ChargeRig, owner_rig, positive_flow, ready, report_actual_stop
 from tests.current_rig import adjustable, locally_ready, select
@@ -1137,6 +1137,11 @@ async def test_accepted_stop_closure_survives_publication_refusal(
             assert receipt.result["_session_stop"].get("closure_verified") is (
                 None if recovery == "marker-refused" else True
             )
+            if recovery == "marker-refused":
+                report = j.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()["stop"]
+                assert j.get(managed_session_stop._RETAINED_STOP_CLOSURES) == {
+                    request: [receipt.revision, receipt.result["target"], local, fingerprint(report)]
+                }
         finally:
             j.db.execute("DROP TRIGGER refuse_stop_publication")
 
@@ -1367,6 +1372,46 @@ def test_replacement_settles_only_saved_verified_stop_closure(tmp_path, verified
         receipt = requests.receipt("stop-request")
         assert receipt["state"] == ("completed" if verified else "uncertain")
         assert receipt["result"].get("session_stopped") is (True if verified else None)
+
+
+# Intent: reopen a journal with each legacy, exact or mismatched retained closure binding.
+# Why: a retained closure can settle only the original admission and exact committed report on restart.
+@pytest.mark.parametrize("binding", ["legacy", "exact", "revision", "target", "session", "report"])
+def test_replacement_validates_retained_stop_closure_binding(tmp_path, binding):
+    path = tmp_path / "retained-closure.sqlite"
+    with closing(Journal(path, "synthetic-charger")) as journal:
+        ManagedRequests(journal)
+        local = journal.start("start-report", START)["transactionId"]
+        stop = {"transactionId": local, "meterStop": 1200, "timestamp": "2026-01-01T00:01:00Z"}
+        journal.stop("stop-report", stop)
+        target = "a" * 64
+        insert_request(
+            journal,
+            "stop-request",
+            "stop_session",
+            3,
+            {"target": target, "_session_stop": {"local": local, "dispatched": True}},
+            state="running",
+        )
+        proof = [3, target, local, fingerprint(encoded(stop))]
+        changes = {"revision": (0, 2), "target": (1, "b" * 64), "session": (2, local + 1), "report": (3, "c" * 64)}
+        if binding in changes:
+            index, value = changes[binding]
+            proof[index] = value
+        journal.put(
+            managed_session_stop._RETAINED_STOP_CLOSURES, {"stop-request": local if binding == "legacy" else proof}
+        )
+
+    with closing(Journal(path, "synthetic-charger")) as journal:
+        gateway = Gateway(journal)
+        requests = ManagedRequests(journal)
+        ManagedSessionStop(SimpleNamespace(session=SimpleNamespace(journal=journal, gateway=gateway)))
+        receipt = requests.receipt("stop-request", include_binding=True)
+        assert receipt["revision"] == 3 and receipt["target"] == target
+        if binding in ("legacy", "exact"):
+            assert receipt["state"] == "completed" and receipt["result"]["session_stopped"] is True
+        else:
+            assert receipt["state"] == "uncertain" and receipt["result"] == {"classification": "process_replaced"}
 
 
 # Intent: existing successful Stop receipts may still carry an earlier progress classification on disk.

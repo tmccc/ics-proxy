@@ -50,6 +50,8 @@ _BUFFERED_NATIVE_FIRST = (
     "AND json_extract(proof.value,'$[2]')=json_extract(managed_requests.result,'$._session_stop.local'))"
 )
 
+type VerifiedStopClosure = tuple[int, str | None, int, str]
+
 
 @dataclass(frozen=True)
 class SessionStop:
@@ -70,19 +72,37 @@ class ManagedSessionStop:
     def __init__(self, controller: ManagedController) -> None:
         self.controller = controller
         self.worker: asyncio.Task[None] | None = None
-        try:
-            saved = controller.session.journal.get(_RETAINED_STOP_CLOSURES, {})
-        except ValueError, RecursionError:
-            saved = {}
-        self._retained_closures = (
-            {request: local for request, local in saved.items() if type(local) is int and 0 < local < 2**63}
-            if isinstance(saved, dict)
-            else {}
-        )
+        self._retained_closures = self._saved_closures()
         self._verified_closures = self._retained_closures.copy()
         self._retained_native_first = self._saved_native_first()
         self._native_first = self._retained_native_first.copy()
         self.expire(replaced=True)
+
+    # Legacy checkpoints bind the allocated local ID. New checkpoints also bind the admission and closing report.
+    def _saved_closures(self) -> dict[str, int | VerifiedStopClosure]:
+        try:
+            saved = self.controller.session.journal.get(_RETAINED_STOP_CLOSURES, {})
+        except ValueError, RecursionError:
+            return {}
+        if not isinstance(saved, dict):
+            return {}
+        closures: dict[str, int | VerifiedStopClosure] = {}
+        for request, proof in saved.items():
+            if type(proof) is int and 0 < proof < 2**63:
+                closures[request] = proof
+            elif isinstance(proof, list) and len(proof) == 4:
+                revision, target, local, digest = proof
+                if (
+                    type(revision) is int
+                    and 0 <= revision < 2**63
+                    and (target is None or isinstance(target, str) and len(target) == 64)
+                    and type(local) is int
+                    and 0 < local < 2**63
+                    and isinstance(digest, str)
+                    and len(digest) == 64
+                ):
+                    closures[request] = revision, target, local, digest
+        return closures
 
     # An independent checkpoint can outlive a refused write to the receipt itself.
     def _saved_native_first(self) -> dict[str, tuple[int, str, int]]:
@@ -348,8 +368,17 @@ class ManagedSessionStop:
     # A refused receipt write can leave the same exact closure in memory or in the separate checkpoint.
     def _closure_proof(self) -> tuple[str, tuple[str, ...]]:
         if self._verified_closures:
-            return f"({STOP_CLOSURE_VERIFIED} OR {STOP_BUFFERED_CLOSURE})", (encoded(self._verified_closures),)
+            return f"({STOP_CLOSURE_VERIFIED} OR {STOP_BUFFERED_CLOSURE})", (self._buffered_closure_locals(),)
         return STOP_CLOSURE_VERIFIED, ()
+
+    # Keep the SQL settlement selector bound to each exact request and its validated local transaction.
+    def _buffered_closure_locals(self) -> str:
+        return encoded(
+            {
+                request: proof if isinstance(proof, int) else proof[2]
+                for request, proof in self._verified_closures.items()
+            }
+        )
 
     # Only unfinished receipt writes need a separate proof across process replacement.
     def _retain_closures(self) -> None:
@@ -381,22 +410,30 @@ class ManagedSessionStop:
         bindings: tuple[str, ...] = (STOP_SESSION,)
         if not observed:
             where += f" AND {STOP_BUFFERED_CLOSURE}"
-            bindings += (encoded(self._verified_closures),)
+            bindings += (self._buffered_closure_locals(),)
         j = self.controller.session.journal
-        # A previously buffered receipt may already have completed or been rejected.
-        self._verified_closures = {
-            row[0]: row[1]
-            for row in j.db.execute(
-                f"{rejections.prefix}SELECT id,json_extract(result,'$._session_stop.local') "
-                f"FROM managed_requests WHERE {where}",
-                (*rejections.bindings, *bindings),
-            )
-        }
+        # The current observation can prove closure. A resumed checkpoint must match the original receipt and report.
+        closures: dict[str, int | VerifiedStopClosure] = {}
+        for request, revision, target, local, stop in j.db.execute(
+            f"{rejections.prefix}SELECT id,revision,json_extract(result,'$.target'),transactions.local,stop "
+            "FROM managed_requests JOIN transactions "
+            f"ON transactions.local=json_extract(result,'$._session_stop.local') WHERE {where}",
+            (*rejections.bindings, *bindings),
+        ):
+            if not isinstance(stop, str) or (target is not None and (not isinstance(target, str) or len(target) != 64)):
+                continue
+            proof: VerifiedStopClosure = revision, target, local, fingerprint(stop)
+            saved = self._verified_closures.get(request)
+            if observed:
+                closures[request] = proof
+            elif saved is not None and saved in (local, proof):
+                closures[request] = saved
+        self._verified_closures = closures
         if self._verified_closures and self._update_receipts(
             STOP_CLOSURE_FIELDS,
             (),
             f"{rejections.closed_receipts} AND {STOP_BUFFERED_CLOSURE} AND NOT {STOP_CLOSURE_VERIFIED}",
-            (STOP_SESSION, encoded(self._verified_closures)),
+            (STOP_SESSION, self._buffered_closure_locals()),
             rejections=rejections,
             retry_after_rollback=True,
         ):
