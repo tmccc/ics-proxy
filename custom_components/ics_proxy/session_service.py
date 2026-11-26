@@ -72,7 +72,17 @@ def register_session_service(hass: HomeAssistant) -> None:
         action = call.data["action"]
         target = call.data.get("target")
         requested_revision = call.data.get("revision")
-        revision = (coordinator.data or {}).get("control_revision")
+        generation = call.data.get("canvas_generation")
+        claim = None
+        if generation is not None:
+            if frame_epoch is None or target is not None or requested_revision is not None:
+                return response
+            claim = coordinator.canvas_commands.claim("start" if action == "start" else "stop", generation)
+            if claim is None:
+                return response
+            target, revision = claim.binding.target, claim.binding.revision
+        else:
+            revision = (coordinator.data or {}).get("control_revision")
         if type(revision) is not int:
             return response
 
@@ -99,7 +109,7 @@ def register_session_service(hass: HomeAssistant) -> None:
                 and (frame_epoch is None or (data.get("charging_session_open") is True and coordinator.fresh_native))
             )
 
-        if not request_is_current():
+        if claim is None and not request_is_current():
             return response
 
         # Retain the attempted request reference even if the receipt is lost or refused.
@@ -111,7 +121,7 @@ def register_session_service(hass: HomeAssistant) -> None:
             if (
                 not frame_is_current(frame_epoch, coordinator, owner)
                 or active_coordinator() is not coordinator
-                or not request_is_current()
+                or not (coordinator.canvas_commands.owns(claim) if claim is not None else request_is_current())
             ):
                 raise ProxyError("The display request is no longer current")
 
@@ -128,7 +138,12 @@ def register_session_service(hass: HomeAssistant) -> None:
         except ProxyError:
             pass  # An unknown or rejected outcome must never appear confirmed to the caller.
         finally:
-            await coordinator.async_refresh()
+            before_refresh = coordinator.data
+            try:
+                await coordinator.async_refresh()
+            finally:
+                if claim is not None:
+                    coordinator.canvas_commands.finish(claim, response["confirmed"] is True, before_refresh)
         return response
 
     hass.services.async_register(
@@ -141,6 +156,7 @@ def register_session_service(hass: HomeAssistant) -> None:
                 vol.Optional("target"): vol.Match(r"[a-f0-9]{64}\Z"),
                 vol.Optional("revision"): vol.All(int, vol.Range(min=0, max=2**53 - 1)),
                 vol.Optional("canvas_rendered_at_epoch"): vol.All(int, vol.Range(min=1, max=FRAME_MAX_EPOCH)),
+                vol.Optional("canvas_generation"): vol.Match(r"[a-f0-9]{32}\Z"),
                 vol.Optional("include_request_reference"): bool,
             }
         ),

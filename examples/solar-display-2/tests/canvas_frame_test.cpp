@@ -4,7 +4,11 @@
 #include "canvas_frame.h"
 
 using solar_display::CanvasFreshness;
-using solar_display::CanvasRequestFeedback;
+using solar_display::CanvasControlState;
+using solar_display::CanvasControlView;
+using solar_display::ChargerButton;
+using solar_display::ChargerFeedback;
+using solar_display::parse_canvas_marker;
 
 void publish(CanvasFreshness &frame, uint32_t rendered, uint32_t received_ms, int64_t wall) {
   assert(frame.accepts(rendered, received_ms, wall));
@@ -44,44 +48,61 @@ int main() {
   assert(pressed_before_wrap.rendered_at() == 2000);
   assert(pressed_before_wrap.render_age_ms(500, 2001) == 2000);
 
-  constexpr auto start = "start:00000000000001";
-  constexpr auto stop = "stop:current-session";
-  constexpr auto new_stop = "stop:next-session";
-  CanvasRequestFeedback feedback;
-  feedback.submitted(start);
-  feedback.observe("idle", 3000, start, 1000, 3000);
-  assert(!feedback.retired(3000, start, 1000, 3000));
-  feedback.observe("starting", 3000, start, 1500, 3000);
-  assert(!feedback.retired(3000, start, 1500, 3000));
-  // A refresh of the same control can arrive during the wait for confirmation.
-  feedback.observe("idle", 3001, start, 4000, 3003);
-  assert(feedback.retired(3001, start, 4000, 3003));
-  // Frames rendered before confirmation can arrive later than the frame already displayed.
-  assert(feedback.retired(3002, start, 5000, 3004));
-  assert(!feedback.retired(3004, start, 5000, 3004));
-  assert(!feedback.retired(3001, stop, 4000, 3003));
-  feedback.reset_pending();
-  feedback.observe("idle", 3001, start, 5000, 3004);
-  assert(feedback.retired(3001, start, 5000, 3004));
+  const std::string first(32, 'a'), next(32, 'b');
+  const std::string start = "v2:start:" + first;
+  const std::string stop = "v2:stop:" + next;
+  const auto older = parse_canvas_marker("d51a1000003e8" + std::string(14, '0'));
+  const auto start_image = parse_canvas_marker("d51a0000003e8d52a1" + first);
+  const auto stop_image = parse_canvas_marker("d51a0000003e9d52a2" + next);
+  assert(older.rendered_at == 1000 && older.control == "legacy");
+  assert(start_image.rendered_at == 1000 && start_image.control == start);
+  assert(stop_image.rendered_at == 1001 && stop_image.control == stop);
+  assert(parse_canvas_marker("d51a0000003e8").control.empty());
+  assert(parse_canvas_marker("d51a0000003e8d52a1").control == "invalid");
+  assert(parse_canvas_marker("d51a0000003ezd52a1" + first).rendered_at == 0);
+  assert(parse_canvas_marker("d51a0000003e8d52a1" + std::string(32, 'A')).control == "invalid");
+  assert(CanvasControlState::parse("v2:idle:none:-").button == ChargerButton::NONE);
+  assert(CanvasControlState::parse("v2:idle:none:" + first).feedback == ChargerFeedback::UNKNOWN);
+  assert(CanvasControlState::parse("v2:idle:start:-").feedback == ChargerFeedback::UNKNOWN);
 
-  feedback.submitted(stop);
-  feedback.observe("stopping", 3004, stop, 5000, 3004);
-  feedback.observe("stopping_timeout", 3004, stop, 6000, 3005);
-  feedback.observe("idle", 3004, stop, 7000, 3006);
-  assert(!feedback.retired(3004, stop, 7000, 3006));
+  CanvasControlView view;
+  view.observe("v2:idle:start:" + first);
+  assert(view.allows(ChargerButton::START, start_image.control));
+  assert(!view.allows(ChargerButton::STOP, start_image.control));
+  assert(!view.allows(ChargerButton::START, older.control));
+  view.submitted(start, last_ms - 499);
+  view.observe("v2:idle:start:" + first);
+  assert(!view.allows(ChargerButton::START, start));
+  assert(!view.needs_recheck(2499) && view.needs_recheck(2500));
+  view.recheck_sent(2500);
+  assert(!view.needs_recheck(2501));
+  view.observe("v2:idle:start:" + first);
+  assert(view.allows(ChargerButton::START, start));
 
-  feedback.submitted(stop);
-  feedback.observe("stopping", 3004, stop, 7000, 3006);
-  feedback.observe("idle", 3007, new_stop, 9000, 3008);
-  assert(!feedback.retired(3007, new_stop, 9000, 3008));
-  assert(feedback.retired(3007, stop, 9000, 3008));
+  // Pending feedback wins even if a same-generation admission read was already requested.
+  view.submitted(start, 3000);
+  view.recheck_sent(6000);
+  view.observe("v2:starting:none:-");
+  view.observe("v2:idle:start:" + first);
+  assert(!view.needs_recheck(12000) && !view.allows(ChargerButton::START, start));
+  view.observe("v2:starting_timeout:stop:" + next);
+  assert(!view.allows(ChargerButton::START, start));
+  assert(view.allows(ChargerButton::STOP, stop_image.control));
+  view.observe("v2:idle:start:" + first);
+  assert(!view.allows(ChargerButton::START, start));
+  view.observe("v2:idle:stop:" + next);
 
-  feedback.submitted(stop);
-  feedback.observe("stopping", 5000, stop, last_ms - 999, 5010);
-  feedback.observe("idle", 5000, stop, last_ms - 499, 5010);
-  assert(feedback.retired(5004, stop, 500, 5011));
-  // A backward clock change discards the time bound, preserving the known exact frame.
-  assert(!feedback.retired(5004, stop, 1500, 5005));
-  assert(feedback.retired(5000, stop, 1500, 5005));
-  assert(!feedback.retired(5004, stop, 2000, 5012));
+  // Reconnect keeps an already submitted generation blocked, including any in-flight read of it.
+  view.submitted(stop, 13000);
+  view.recheck_sent(16000);
+  view.invalidate();
+  assert(!view.allows(ChargerButton::STOP, stop));
+  view.observe("v2:idle:stop:" + next);
+  assert(!view.needs_recheck(19000) && !view.allows(ChargerButton::STOP, stop));
+  view.observe("v2:unavailable:none:-");
+  assert(!view.allows(ChargerButton::STOP, stop));
+  const std::string after_reconnect(32, 'c');
+  view.observe("v2:idle:stop:" + after_reconnect);
+  assert(!view.allows(ChargerButton::STOP, stop_image.control));
+  assert(view.allows(ChargerButton::STOP, "v2:stop:" + after_reconnect));
 }

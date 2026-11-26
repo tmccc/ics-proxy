@@ -8,6 +8,7 @@ from typing import Any
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from . import ProxyEntry
 from .coordinator import ProxyCoordinator
@@ -56,7 +57,33 @@ NATIVE_CONTROL_MODES = frozenset(
 
 # Add the same stable set after every reload, independent of whether a vehicle or active session is present.
 async def async_setup_entry(hass: HomeAssistant, entry: ProxyEntry, add_entities: AddEntitiesCallback) -> None:
-    add_entities([ProxySensor(entry.runtime_data, *description) for description in VALUES])
+    add_entities(
+        [
+            *(ProxySensor(entry.runtime_data, *description) for description in VALUES),
+            DisplayCommandSensor(entry.runtime_data),
+        ]
+    )
+
+
+class DisplayCommandSensor(ProxyEntity, SensorEntity, RestoreEntity):
+    """Expose one versioned view for rendering and the live display controls."""
+
+    def __init__(self, coordinator: ProxyCoordinator) -> None:
+        super().__init__(coordinator, "sensor", "display_command", "Display command")
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def native_value(self) -> str:
+        return self.coordinator.canvas_commands.state
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is not None:
+            self.coordinator.canvas_commands.restore_interrupted(last.state)
 
 
 class ProxySensor(ProxyEntity, SensorEntity):

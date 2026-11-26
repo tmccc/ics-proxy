@@ -17,6 +17,7 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import ProxyClient, ProxyError
+from .canvas_command import CanvasCommands
 from .diagnostic_view import explanation
 from .notification import notice_for
 
@@ -51,12 +52,30 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.received_at = time.monotonic()
         self.canvas_owner: str | None = None
         self.canvas_activation: tuple[float, float] | None = None
+        self.canvas_commands = CanvasCommands(self)
         self.cancel_timer = None
         entry.async_on_unload(self.cancel_expiry)
+        entry.async_on_unload(self.canvas_commands.retire)
 
     # Require a new frame after entry activation or the first observation of a different owner.
     def mark_canvas_activation(self) -> None:
         self.canvas_activation = frame_clock() if self.canvas_owner is not None else None
+
+    # Availability and actual writes use the same entry and notification generation.
+    def entry_is_current(self) -> bool:
+        entry = self.config_entry
+        return (
+            entry is not None
+            and entry.disabled_by is None
+            and self.hass.config_entries.async_get_entry(entry.entry_id) is entry
+            and self.notice.active
+            and self.notice.generation == self.notice_generation
+        )
+
+    @callback
+    def async_update_listeners(self) -> None:
+        self.canvas_commands.observe()
+        super().async_update_listeners()
 
     # Keep a write bound to its original status and integration generation across the WebSocket handshake.
     async def async_command(
@@ -71,14 +90,7 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # HA records a disable before queued unload work can invalidate the coordinator generation.
         def require_current_entry() -> None:
-            entry = self.config_entry
-            if (
-                entry is None
-                or entry.disabled_by is not None
-                or self.hass.config_entries.async_get_entry(entry.entry_id) is not entry
-                or not self.notice.active
-                or self.notice.generation != self.notice_generation
-            ):
+            if not self.entry_is_current():
                 raise ProxyError("The charger control entry is no longer active")
             if before_write is not None:
                 before_write()

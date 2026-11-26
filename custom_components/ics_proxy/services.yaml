@@ -17,7 +17,7 @@ session_command:
         text:
     revision:
       name: Start control revision
-      description: The control_revision from the Session open sensor when Start was shown. Required with a canvas render epoch.
+      description: The control_revision from the Session open sensor when Start was shown. Required for an older canvas Start that supplies an epoch without a generation.
       selector:
         number:
           min: 0
@@ -25,12 +25,17 @@ session_command:
           mode: box
     canvas_rendered_at_epoch:
       name: Canvas render epoch
-      description: Optional whole-second Unix timestamp encoded in the image displayed when the button was pressed.
+      description: The whole-second Unix timestamp encoded in the image displayed when the button was pressed. Required with a canvas generation.
       selector:
         number:
           min: 1
           max: 4294967295
           mode: box
+    canvas_generation:
+      name: Canvas command generation
+      description: The generation encoded for this action in the displayed image. Supply the render epoch and leave the target and revision empty.
+      selector:
+        text:
     include_request_reference:
       name: Include request reference
       description: Return a redacted reference for the attempted request. Use it to look up a local Stop incident.

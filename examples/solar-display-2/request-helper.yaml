@@ -1,19 +1,9 @@
-input_select:
-  general_display_2_ics_request:
-    name: General Display 2 ICS Request
-    options:
-      - idle
-      - starting
-      - stopping
-      - starting_timeout
-      - stopping_timeout
-script:
-  general_display_2_ics_feedback_expiry:
-    alias: General Display 2 ICS Feedback Expiry
-    mode: restart
-    sequence:
-      - delay:
-          seconds: 20
-      - event: general_display_2_ics_feedback_expired
-        event_data:
-          feedback_context: "{{ feedback_context }}"
+template:
+  - sensor:
+      - name: General Display 2 ICS Control
+        unique_id: general_display_2_ics_control
+        default_entity_id: sensor.general_display_2_ics_control
+        state: >-
+          {% set command = states('sensor.ics_proxy_display_command') -%}
+          {{ command if is_state('automation.general_display_2_ics_charger_buttons', 'on')
+             and command.startswith('v2:') else 'v2:unavailable:none:-' }}
