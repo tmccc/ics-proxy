@@ -49,32 +49,39 @@ int main() {
   constexpr auto new_stop = "stop:next-session";
   CanvasRequestFeedback feedback;
   feedback.submitted(start);
-  feedback.observe("idle", 3000, start);
-  assert(!feedback.retired(3000, start));
-  feedback.observe("starting", 3000, start);
-  assert(!feedback.retired(3000, start));
+  feedback.observe("idle", 3000, start, 1000, 3000);
+  assert(!feedback.retired(3000, start, 1000, 3000));
+  feedback.observe("starting", 3000, start, 1500, 3000);
+  assert(!feedback.retired(3000, start, 1500, 3000));
   // A refresh of the same control can arrive during the wait for confirmation.
-  feedback.observe("idle", 3001, start);
-  assert(feedback.retired(3001, start));
-  assert(!feedback.retired(3002, start));
-  assert(!feedback.retired(3001, stop));
+  feedback.observe("idle", 3001, start, 4000, 3003);
+  assert(feedback.retired(3001, start, 4000, 3003));
+  // Frames rendered before confirmation can arrive later than the frame already displayed.
+  assert(feedback.retired(3002, start, 5000, 3004));
+  assert(!feedback.retired(3004, start, 5000, 3004));
+  assert(!feedback.retired(3001, stop, 4000, 3003));
   feedback.reset_pending();
-  feedback.observe("idle", 3001, start);
-  assert(feedback.retired(3001, start));
+  feedback.observe("idle", 3001, start, 5000, 3004);
+  assert(feedback.retired(3001, start, 5000, 3004));
 
   feedback.submitted(stop);
-  feedback.observe("stopping", 3002, stop);
-  feedback.observe("stopping_timeout", 3002, stop);
-  feedback.observe("idle", 3002, stop);
-  assert(!feedback.retired(3002, stop));
+  feedback.observe("stopping", 3004, stop, 5000, 3004);
+  feedback.observe("stopping_timeout", 3004, stop, 6000, 3005);
+  feedback.observe("idle", 3004, stop, 7000, 3006);
+  assert(!feedback.retired(3004, stop, 7000, 3006));
 
   feedback.submitted(stop);
-  feedback.observe("stopping", 3002, stop);
-  feedback.observe("idle", 3003, new_stop);
-  assert(!feedback.retired(3003, new_stop));
+  feedback.observe("stopping", 3004, stop, 7000, 3006);
+  feedback.observe("idle", 3007, new_stop, 9000, 3008);
+  assert(!feedback.retired(3007, new_stop, 9000, 3008));
+  assert(feedback.retired(3007, stop, 9000, 3008));
 
   feedback.submitted(stop);
-  feedback.observe("stopping", 3004, stop);
-  feedback.observe("idle", 3004, stop);
-  assert(feedback.retired(3004, stop));
+  feedback.observe("stopping", 5000, stop, last_ms - 999, 5010);
+  feedback.observe("idle", 5000, stop, last_ms - 499, 5010);
+  assert(feedback.retired(5004, stop, 500, 5011));
+  // A backward clock change discards the time bound, preserving the known exact frame.
+  assert(!feedback.retired(5004, stop, 1500, 5005));
+  assert(feedback.retired(5000, stop, 1500, 5005));
+  assert(!feedback.retired(5004, stop, 2000, 5012));
 }

@@ -67,27 +67,38 @@ class CanvasRequestFeedback {
     this->pending_ = false;
   }
 
-  void observe(std::string_view request, uint32_t rendered_at, std::string_view control) {
+  void observe(std::string_view request, uint32_t rendered_at, std::string_view control, uint32_t now, int64_t epoch) {
     if (request == "starting" || request == "stopping") {
       this->pending_ = this->submitted_.starts_with(request == "starting" ? "start:" : "stop:");
       return;
     }
     // Idle without a pending transition can also be the initial or a repeated subscription value.
     if (request == "idle" && !this->pending_) return;
-    if (request == "idle" && rendered_at != 0 && control == this->submitted_) {
-      this->retired_ = {rendered_at, this->submitted_};
+    if (request == "idle") {
+      this->retired_ = {control == this->submitted_ ? rendered_at : 0, this->submitted_};
+      this->confirmed_ms_ = now;
+      this->confirmed_epoch_ = epoch;
     }
     this->reset_pending();
   }
 
-  bool retired(uint32_t rendered_at, std::string_view control) const {
-    return rendered_at != 0 && rendered_at == this->retired_.rendered_at && control == this->retired_.control;
+  bool retired(uint32_t rendered_at, std::string_view control, uint32_t now, int64_t epoch) {
+    // Keep the exact consumed frame across a rewind, but allow new frames on the new clock sequence.
+    // Allow for separate rounding of elapsed seconds and the synchronized wall clock.
+    if (this->confirmed_epoch_ > 0 && epoch > 0 &&
+        epoch + 1 < this->confirmed_epoch_ + (now - this->confirmed_ms_) / 1000) {
+      this->confirmed_epoch_ = 0;
+    }
+    return rendered_at != 0 && control == this->retired_.control &&
+           (rendered_at == this->retired_.rendered_at || rendered_at <= this->confirmed_epoch_);
   }
 
  private:
   std::string submitted_;
   bool pending_{false};
   CanvasMarker retired_;
+  uint32_t confirmed_ms_{0};
+  int64_t confirmed_epoch_{0};
 };
 
 // The server's clock supplies the age at download. Elapsed time keeps that
@@ -269,8 +280,8 @@ class StableCanvasFrame : public esphome::image::Image {
   CanvasFreshness &pressed_freshness() { return this->pressed_freshness_; }
   CanvasRequestFeedback &request_feedback() { return this->request_feedback_; }
 
-  bool control_retired(std::string_view control) const {
-    return this->request_feedback_.retired(this->freshness_.rendered_at(), control);
+  bool control_retired(std::string_view control, uint32_t now, int64_t epoch) {
+    return this->request_feedback_.retired(this->freshness_.rendered_at(), control, now, epoch);
   }
 
  protected:
