@@ -410,6 +410,25 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         await hass.async_stop(force=True)
 
 
+@asynccontextmanager
+async def run_display_core(config_dir, request):
+    hass = HomeAssistant(str(config_dir))
+    loader.async_setup(hass)
+    hass.config_entries = ConfigEntries(hass, {})
+    assert await bootstrap.async_load_base_functionality(hass)
+    config = yaml.safe_load((PROJECT / "controls.yaml").read_text())
+    helper = yaml.safe_load((PROJECT / "request-helper.yaml").read_text())
+    hass.services.async_register("ics_proxy", "session_command", request, supports_response=SupportsResponse.ONLY)
+    assert await async_setup_component(hass, "input_select", helper)
+    assert await async_setup_component(hass, "automation", {"automation": [config]})
+    await hass.async_start()
+    await hass.async_block_till_done()
+    try:
+        yield hass
+    finally:
+        await hass.async_stop(force=True)
+
+
 # Intent: a Home Assistant restart carries an interrupted request into the existing unconfirmed feedback.
 # Why: the independent proxy can still settle that request after the original Home Assistant run ends.
 @pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
@@ -427,25 +446,7 @@ async def test_display_restores_interrupted_feedback_after_ha_restart(tmp_path, 
         request_started.set()
         return await asyncio.Future()
 
-    @asynccontextmanager
-    async def run_core():
-        hass = HomeAssistant(str(tmp_path))
-        loader.async_setup(hass)
-        hass.config_entries = ConfigEntries(hass, {})
-        assert await bootstrap.async_load_base_functionality(hass)
-        config = yaml.safe_load((PROJECT / "controls.yaml").read_text())
-        helper = yaml.safe_load((PROJECT / "request-helper.yaml").read_text())
-        hass.services.async_register("ics_proxy", "session_command", request, supports_response=SupportsResponse.ONLY)
-        assert await async_setup_component(hass, "input_select", helper)
-        assert await async_setup_component(hass, "automation", {"automation": [config]})
-        await hass.async_start()
-        await hass.async_block_till_done()
-        try:
-            yield hass
-        finally:
-            await hass.async_stop(force=True)
-
-    async with run_core() as hass:
+    async with run_display_core(tmp_path, request) as hass:
         assert hass.states.get(PENDING).state == "idle"
         hass.states.async_set("sensor.ics_display_screen_source", "Home Assistant")
         hass.states.async_set(
@@ -474,9 +475,51 @@ async def test_display_restores_interrupted_feedback_after_ha_restart(tmp_path, 
         assert hass.states.get(AUTOMATION).attributes["current"] == 1
 
     unconfirmed = pending + "_timeout"
-    async with run_core() as hass:
+    async with run_display_core(tmp_path, request) as hass:
         assert hass.states.get(PENDING).state in (pending, unconfirmed)
         async with asyncio.timeout(6):
             while hass.states.get(PENDING).state != unconfirmed or hass.states.get(AUTOMATION).attributes["current"]:
                 await asyncio.sleep(0.02)
+        assert hass.states.get(PENDING).context.id == hass.states.get(AUTOMATION).context.id
+        await asyncio.sleep(5.1)
+        assert hass.states.get(PENDING).state == unconfirmed
         assert calls == [original_request]
+
+
+# Intent: startup discards messages left by a previous HA process while preserving pending requests.
+# Why: an abrupt exit can leave an old saved timeout for a different request.
+@pytest.mark.parametrize("feedback", ["starting_timeout", "stopping_timeout"])
+async def test_display_discards_restored_unconfirmed_message(tmp_path, feedback):
+    async def request(call):
+        pytest.fail("Cleanup submitted a charger request")
+
+    async with run_display_core(tmp_path, request) as hass:
+        await hass.services.async_call(
+            "input_select",
+            "select_option",
+            {"entity_id": PENDING, "option": feedback},
+            blocking=True,
+        )
+        assert hass.states.get(PENDING).state == feedback
+
+    async with run_display_core(tmp_path, request) as hass:
+        assert hass.states.get(PENDING).state == "idle"
+
+
+# Intent: a future-dated live message retires on the next cleanup tick.
+# Why: otherwise a backward wall-clock step extends the time taken to clear feedback by the size of the step.
+async def test_display_discards_unconfirmed_message_after_backward_clock_step(tmp_path):
+    async def request(call):
+        pytest.fail("Cleanup submitted a charger request")
+
+    async with run_display_core(tmp_path, request) as hass:
+        # Model an automation result written with the old, faster wall clock.
+        hass.states.async_set(
+            PENDING,
+            "starting_timeout",
+            hass.states.get(PENDING).attributes,
+            timestamp=(datetime.now(UTC) + timedelta(minutes=2)).timestamp(),
+        )
+        async with asyncio.timeout(6):
+            while hass.states.get(PENDING).state != "idle":
+                await asyncio.sleep(0.02)

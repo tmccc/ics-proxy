@@ -12,7 +12,8 @@ a request. Start also requires the current control revision and permission to st
 match the current open session. The touchscreen shows pending and unconfirmed feedback for the exact request from
 the live Home Assistant helper, including between image downloads. While the automation is enabled, an
 unconfirmed message clears on the first five-second cleanup tick after 20 seconds, or when a new request
-replaces it. A charger tap must begin and end while the button is available and no request is pending.
+replaces it. If a clock correction makes the message timestamp later than the current time, the next cleanup tick
+clears it. A charger tap must begin and end while the button is available and no request is pending.
 When Home Assistant reports the automation as off or unavailable, the touchscreen immediately greys out both
 charger buttons and ignores taps on them. If Home Assistant removes the automation without sending a state
 update, the previous button image can remain until the next render or the offline timeout. Home Assistant
@@ -23,8 +24,9 @@ buttons wait for the request helper, automation state and active-run count from 
 The offline dashboard hides request feedback.
 
 If disabling the automation or restarting Home Assistant interrupts a Start or Stop wait, the first cleanup tick
-after the automation resumes marks the saved request unconfirmed. The charger buttons wait for that feedback to
-update before accepting another tap. The proxy can still settle the original request.
+after the automation resumes marks a saved pending request unconfirmed. The charger buttons wait for that feedback
+to update before accepting another tap. Home Assistant startup clears restored unconfirmed messages. An abrupt exit
+can lose display feedback that Home Assistant has yet to save. The proxy can still settle the original request.
 
 Use this with a compatible 480 × 480 ESPHome/LVGL touchscreen whose Home Assistant renderer provides the assigned
 view and display image. The canvas example is a package for an existing board configuration. The board supplies its

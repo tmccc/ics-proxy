@@ -17,6 +17,9 @@ triggers:
   - trigger: time_pattern
     id: clear_feedback
     seconds: "/5"
+  - trigger: homeassistant
+    id: discard_restored_feedback
+    event: start
 variables:
   touch_data: "{{ trigger.event.data if trigger.id == 'touch' else {} }}"
   touch_x: "{{ touch_data.get('x', '') | int(-1) }}"
@@ -33,14 +36,20 @@ conditions:
       - condition: and
         conditions:
           - condition: trigger
-            id: clear_feedback
+            id: [clear_feedback, discard_restored_feedback]
           - condition: template
             value_template: >-
               {% set feedback = states.input_select.general_display_2_ics_request %}
-              {{ (request_feedback in ['starting', 'stopping']
-                  and this is mapping and this.attributes.current | int(-1) == 0)
-                 or (request_feedback in ['starting_timeout', 'stopping_timeout']
-                     and as_timestamp(now()) - as_timestamp(feedback.last_changed) >= 20) }}
+              {% if request_feedback in ['starting_timeout', 'stopping_timeout'] %}
+                {# A cleanup tick during startup may already have published fresh feedback with this automation's context. #}
+                {% set age = as_timestamp(now()) - as_timestamp(feedback.last_changed) %}
+                {{ (trigger.id == 'discard_restored_feedback'
+                    and (this is not mapping or feedback.context.id != this.context.id))
+                   or (trigger.id == 'clear_feedback' and (age < 0 or age >= 20)) }}
+              {% else %}
+                {{ trigger.id == 'clear_feedback' and request_feedback in ['starting', 'stopping']
+                   and this is mapping and this.attributes.current | int(-1) == 0 }}
+              {% endif %}
       - condition: and
         conditions:
           - condition: trigger
@@ -91,7 +100,7 @@ conditions:
 actions:
   - if:
       - condition: trigger
-        id: clear_feedback
+        id: [clear_feedback, discard_restored_feedback]
     then:
       - action: input_select.select_option
         target:
