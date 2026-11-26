@@ -316,7 +316,13 @@ class NativeBoundedHandover:
                         self.ordinary_source_observer(native)
                 if measured.exceeded:
                     raise _NativeMeasurementError(native, measured, self.authority(), sequence)
-                _require_ready(native, False, self.allow_unplugged, closing_local)
+                recovery = gateway.controls.decisions.recovery
+                if (
+                    closing_local is None
+                    or closing_local != native.physical.native_transaction_id
+                    or not recovery.owner_closure_gap(self, native)
+                ):
+                    _require_ready(native, False, self.allow_unplugged, closing_local)
             except NativeContentError as error:
                 invalidate()
                 # An adapter refusal may arrive after a newer Boot; validate its authority before freezing it as strict.
@@ -366,14 +372,14 @@ class NativeBoundedHandover:
                 applicable = current()
                 if repair is not None:
                     repair.finish(attempt, "readiness" if applicable else "superseded")
-                if applicable and as_result and isinstance(error, NativeReadinessError) and error.unplugged_at_zero:
+                if applicable and as_result and isinstance(error, NativeReadinessError):
                     recovery, journal = gateway.controls.decisions.recovery, gateway.journal
                     local, active = error.native.physical.native_transaction_id, journal.active()
                     known = local == active or active is None and journal.latest_mapped_stop(local)
                     if (
-                        known
-                        or recovery.closed_session_stop_wait(error.native)
-                        or recovery.closed_owner_session_wait(error.native)
+                        recovery.owner_closure_gap(self, error.native)
+                        or error.unplugged_at_zero
+                        and (known or recovery.closed_session_stop_wait(error.native))
                     ):
                         return Pending(Prerequisite.LIFECYCLE, str(error), error)
                 raise
@@ -399,7 +405,7 @@ class NativeBoundedHandover:
                 self._remember_stop_sample(native, sequence)
             if not stop_only and self.observation_listener is not None:
                 self.observation_listener(native)
-            if as_result and gateway.controls.decisions.recovery.closed_owner_session_wait(native):
+            if as_result and gateway.controls.decisions.recovery.owner_closure_gap(self, native):
                 return Pending(Prerequisite.LIFECYCLE, "owner session Stop awaits independent native closure")
             # A valid open source remains fresh while this particular operation awaits a closed station.
             if closed:
@@ -489,11 +495,16 @@ class NativeBoundedHandover:
 
     # Renew a retained ceiling after Boot without rewriting it or creating a missing station profile.
     async def require_retained_station(self, limit: float) -> None:
+        closing_local = self.gateway.journal.latest_owner_stop_id() if limit == 0 else None
         try:
-            native = await self.read(owned=True)
+            native = await self.read(owned=True, closing_local=closing_local)
         except _NativeMeasurementError as error:
             raise UnavailableError("retained station awaits a settled measurement") from error
-        self.require_known_session(native)
+        owner_closure = closing_local is not None and self.gateway.controls.decisions.recovery.owner_closure_gap(
+            self, native
+        )
+        if not owner_closure:
+            self.require_known_session(native)
         if self._selected_measurements(native, self._inspect(native)).exceeded:
             raise UnavailableError("retained station awaits a settled measurement")
         if not any(
@@ -501,7 +512,8 @@ class NativeBoundedHandover:
             for resource in native.physical.resources
         ):
             raise SecurityError("charger did not retain the commissioned station ceiling across Boot")
-        self.require_selected_output(native)
+        if not owner_closure:
+            self.require_selected_output(native)
 
     # Only a copy of the already validated USER scalar is normalized; original admission bytes are never rewritten.
     def binding_digest(self, native: HandoverEvidence) -> str:

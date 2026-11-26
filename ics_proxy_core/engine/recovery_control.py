@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 from ..constants import HUB_PROFILE_ID
-from .connection_scope import CloudAttemptScope, control_scope_matches, current_scope
+from .connection_scope import CloudAttemptScope, control_scope_matches, current_control_scope, current_scope
 from .control_state import ControlState
 from .managed_intent import OFFLINE_PAUSE, ControlIntent, write_intent
 from .managed_recovery import local_recovery_binding
@@ -31,9 +31,11 @@ if TYPE_CHECKING:
     from .control_decisions import ControlDecisions
     from .gateway import Gateway
     from .managed import ManagedController
+    from .managed_charging import ManagedCharging
     from .native_bounded import NativeReadinessError
     from .native_bounded_handover import NativeBoundedHandover
     from .ordinary_recovery import OrdinaryRecovery
+    from .recovery_contracts import AuthorityStamp
     from .runtime import ConnectionRuntime
     from .trial_handover_evidence import HandoverEvidence
     from .trial_session import TrialSession
@@ -105,6 +107,7 @@ class RecoveryControl:
             and c.native.introduction_lineage == scope.lineage
             and c.native.acknowledged_lineage != scope.lineage
             and intent.mode == "app"
+            and self.held_owner_closure(c) is None
         ):
             with j.atomic(retry_busy=True):
                 can_restore = not isinstance(self.offline_return_decision(c), Pending)
@@ -178,12 +181,12 @@ class RecoveryControl:
         return RecoveryFacts(tuple(obligations), intent.mode == "paused")
 
     # A verified normal local Start may join ordinary supervision only after its exact request really completed.
-    def verified_normal(self, ordinary: OrdinaryRecovery) -> bool:
-        c, j = ordinary.c, self.journal
-        state, receipt = c.charging.state(), j.starts.receipt()
+    def verified_normal(self, charging: ManagedCharging) -> bool:
+        j = self.journal
+        state, receipt = charging.state(), j.starts.receipt()
         local = state.get("local_transaction")
         if (
-            c.charging.lease is not None
+            charging.lease is not None
             or state.get("kind") != "normal"
             or state.get("source") != "local"
             or state.get("state") != "running"
@@ -273,19 +276,22 @@ class RecoveryControl:
             and j.vendor_id(local) is None
         )
 
-    # A genuine owner-session Stop allows only a wait for the matching independent zero reading to catch up.
-    def closed_owner_session_wait(self, native: HandoverEvidence) -> bool:
+    # A genuine owner-session Stop can explain a lagging ID at zero draw, even before its offer reaches zero.
+    def owner_closure_gap(self, handover: NativeBoundedHandover, native: HandoverEvidence) -> bool:
         j, physical = self.journal, native.physical
         local = physical.native_transaction_id
+        selected = j.get("control", {}).get("resume_limit", handover.gateway.policy.max_current_a)
         return (
             physical.transaction_open
             and type(local) is int
             and native.is_fresh(5)
-            and native.output_limit_a == 0
+            and type(selected) in (int, float)
+            and 0 <= native.output_limit_a <= selected
             and physical.power_w == 0
             and all(value == 0 for value in native.currents_a + native.powers_w)
             and j.active() is None
             and j.latest_owner_stop_id() == local
+            and handover.commissioned_binding_matches(native)
         )
 
     # Either channel can close a proven session first; disagreement grants only a restrictive wait.
@@ -311,7 +317,7 @@ class RecoveryControl:
         return (
             j.latest_mapped_stop(local)
             or self.closed_session_stop_wait(native)
-            or self.closed_owner_session_wait(native)
+            or self.owner_closure_gap(ordinary.c.native, native)
         )
 
     # The same exact ordinary source and owner prerequisites apply before and inside the outgoing gate.
@@ -375,15 +381,19 @@ class RecoveryControl:
         return ALLOW
 
     # Claim the exact zero before its independent charger write.
-    def claim_ordinary_hold(self, ordinary: OrdinaryRecovery, reason: str) -> Callable[[], None]:
+    def claim_ordinary_hold(
+        self, ordinary: OrdinaryRecovery, reason: str, *, owner_closure: int | None = None
+    ) -> Callable[[], None]:
         c, j, g = ordinary.c, self.journal, ordinary.c.session.gateway
         if not ordinary.ordinary() or not g.current_boot_seen(g._charger_epoch):
             raise RecoveryRequiredError("ordinary recovery awaits admitted current owner authority")
         c.native.spec.require_boot(j.get("boot"))
         if not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest):
             raise RecoveryRequiredError("ordinary zero hold requires the existing admitted station receipt")
-        current = j.get(KEY, {})
+        previous = current = j.get(KEY, {})
         local = j.active()
+        if owner_closure is not None and (local is not None or j.latest_owner_stop_id() != owner_closure):
+            raise RecoveryRequiredError("owner closure hold lost its latest closed session")
         if not ordinary.active():
             current = {
                 "state": "holding",
@@ -394,16 +404,20 @@ class RecoveryControl:
                 "reason": reason,
                 "at_epoch": time.time(),
             }
-            j.put(KEY, current)
         elif current.get("local") is not None and local is None:
             old = j.db.execute("SELECT stop FROM transactions WHERE local=?", (current["local"],)).fetchone()
             if old is not None and old["stop"] is not None:
                 current = {**current, "local": None, "start": None}
-                j.put(KEY, current)
+        if owner_closure is not None and current.get("owner_closure") != owner_closure:
+            current = {**current, "owner_closure": owner_closure}
         epoch, boot = g._charger_epoch, g.boot_observation
-        if not j.get("control", {}).get("inhibit") or j.get("control", {}).get("owner") != "local":
-            g.controls._claim(True, stopping=True)
-        j.phase.recover()
+        connection = current_control_scope(g)
+        with j.atomic(retry_busy=True):
+            if current != previous:
+                j.put(KEY, current)
+            if not ControlState(j.get("control", {})).local_hold:
+                g.controls._claim(True, stopping=True)
+            j.phase.recover()
         c.released_epoch = None
 
         # A new owner intent, source epoch or overlapping state machine cannot inherit this station write.
@@ -418,10 +432,69 @@ class RecoveryControl:
                 or not g.current_boot_seen(epoch)
                 or not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest)
                 or g.controls.desired() != 0
+                or owner_closure is not None
+                and (
+                    not control_scope_matches(g, connection)
+                    or j.active() is not None
+                    or j.latest_owner_stop_id() != owner_closure
+                )
             ):
                 raise RecoveryRequiredError("ordinary zero hold was superseded")
 
         return guard
+
+    # Only the saved closure of the latest owner session can use this zero hold without cloud registration.
+    def held_owner_closure(self, c: ManagedController) -> int | None:
+        j = self.journal
+        hold, intent = j.get(KEY, {}), c.requests.intent()
+        local = hold.get("owner_closure")
+        if (
+            type(local) is int
+            and hold.get("state") == "holding"
+            and intent == ControlIntent("app", hold.get("revision"))
+            and j.active() is None
+            and j.latest_owner_stop_id() == local
+        ):
+            return local
+        return None
+
+    # Independent closed zero and settled reports can hand the exact hold over to the usual automatic Pause.
+    def complete_owner_closure(
+        self,
+        ordinary: OrdinaryRecovery,
+        local: int,
+        native: HandoverEvidence,
+        authority: AuthorityStamp | None,
+        sequence: int,
+    ) -> Pending | None:
+        c, j = ordinary.c, self.journal
+        if (
+            authority is None
+            or authority.ticket is None
+            or c.authority() != authority
+            or c.native.last_resolved_read != sequence
+            or not ordinary.ordinary()
+            or self.held_owner_closure(c) != local
+        ):
+            return Pending(Prerequisite.SUPERSEDED, "owner closure hold was superseded")
+        if native.physical.transaction_open:
+            if self.owner_closure_gap(c.native, native):
+                return Pending(Prerequisite.LIFECYCLE, "owner session Stop awaits independent native closure")
+            raise SecurityError("managed native transaction has no exact accepted local counterpart")
+        if not native.is_fresh(5) or not c.native.commissioned_binding_matches(native):
+            return Pending(Prerequisite.NATIVE, "owner closure awaits fresh commissioned native evidence")
+        if native.output_limit_a > c.current.selected():
+            raise SecurityError("actual native output limit exceeds the selected current")
+        if native.output_limit_a != 0 or c.native.stop_zero_refusal(native, local=local):
+            return Pending(Prerequisite.ZERO_PROOF, "owner closure awaits the current station zero")
+        decision = self.offline_return_decision(c)
+        if isinstance(decision, Pending):
+            return decision
+        with j.atomic(retry_busy=True):
+            paused = write_intent(j, authority.intent, "paused")
+            j.put(OFFLINE_PAUSE, paused.revision)
+            j.control.complete(authority.ticket, uncertain=False)
+        return None
 
     # Record the zero proof and publish its exact Boot revision together.
     def confirm_ordinary_zero(
@@ -755,7 +828,7 @@ class RecoveryControl:
             return None
         if (
             self.closed_session_stop_wait(native)
-            or self.closed_owner_session_wait(native)
+            or self.owner_closure_gap(handover, native)
             or j.get("managed_mode")
             and j.get("managed_control_intent", {}).get("mode") == "app"
             or handover.recovery_zero_only is not None
@@ -893,8 +966,10 @@ class RecoveryControl:
                 and all(value == 0 for value in native.currents_a + native.powers_w)
             ):
                 return  # Keep reception and restrictive recovery available while native closure catches up.
-            if handover.commissioned_binding_matches(native) and (
-                self.closed_session_stop_wait(native) or self.closed_owner_session_wait(native)
+            if (
+                handover.commissioned_binding_matches(native)
+                and self.closed_session_stop_wait(native)
+                or self.owner_closure_gap(handover, native)
             ):
                 return
             if (
@@ -938,6 +1013,6 @@ class RecoveryControl:
     def unplugged_closure(self, c: ManagedController, error: NativeReadinessError) -> bool:
         return error.unplugged_at_zero and (
             error.native.physical.native_transaction_id == self.journal.active()
-            or self.closed_owner_session_wait(error.native)
+            or self.owner_closure_gap(c.native, error.native)
             or c.ordinary.closure_gap(error.native)
         )

@@ -430,8 +430,10 @@ class ManagedController:
                 await asyncio.sleep(0.02)
         if self.current.applying():
             raise RecoveryRequiredError("current application owns the pending native verification")
+        j = self.session.journal
+        recovery = self.session.gateway.controls.decisions.recovery
         try:
-            native = await self.native.read()
+            native = await self.native.read(closing_local=j.latest_owner_stop_id())
             measured = self.native._selected_measurements(native, self.native._inspect(native))
             authority, sequence = self.native.authority(), self.native.last_resolved_read
         except _NativeMeasurementError as candidate:
@@ -442,7 +444,7 @@ class ManagedController:
             if error.unplugged_at_zero and self.session_stop.closure_pending(error.native):
                 self.latest_native = None
                 raise RecoveryRequiredError("session Stop awaits both local closure observations") from error
-            if not self.session.gateway.controls.decisions.recovery.unplugged_closure(self, error):
+            if not recovery.unplugged_closure(self, error):
                 raise
             self.latest_native = None
             self.failures = 0
@@ -491,7 +493,10 @@ class ManagedController:
                 return True
 
             if not self.commands.decide(accept):
-                await self.ordinary.hold("native_closure_pending")
+                owner_closure = (
+                    native.physical.native_transaction_id if recovery.owner_closure_gap(self.native, native) else None
+                )
+                await self.ordinary.hold("native_closure_pending", owner_closure=owner_closure)
                 raise RecoveryRequiredError("ordinary zero hold awaits exact lifecycle closure")
             return native
 

@@ -41,7 +41,7 @@ class OrdinaryRecovery:
 
     # Use the shared owner's exact normal-Start provenance.
     def verified_normal(self) -> bool:
-        return self.control.verified_normal(self)
+        return self.control.verified_normal(self.c.charging)
 
     # Check that ordinary recovery owns the current app intent.
     def ordinary(self) -> bool:
@@ -77,9 +77,10 @@ class OrdinaryRecovery:
         return self.control.ordinary_closure_gap(self, native)
 
     # Execute the zero proof under the shared owner's exact restrictive claim.
-    async def hold(self, reason: str) -> None:
+    async def hold(self, reason: str, *, owner_closure: int | None = None) -> None:
         guard = self.c.commands.decide(
-            lambda: self.control.claim_ordinary_hold(self, reason), priority=CommandPriority.RESTRICT
+            lambda: self.control.claim_ordinary_hold(self, reason, owner_closure=owner_closure),
+            priority=CommandPriority.RESTRICT,
         )
         await self.c.session.gateway.controls.ensure_ceiling(guard=guard)
 
@@ -106,6 +107,23 @@ class OrdinaryRecovery:
     # Retry the journal note under the exact release that already completed, without touching the charger.
     def finish_recovery(self) -> bool:
         return self.c.commands.decide(lambda: self.control.settle_ordinary(self))
+
+    # Observe the exact owner hold even without iCS. Only the station ceiling may be reasserted here.
+    async def recover_owner_closure(self, local: int) -> Pending | None:
+        c = self.c
+        await self.hold("native_closure_pending", owner_closure=local)
+        authority = c.authority()
+        try:
+            native = await c.native.read(closing_local=local)
+        except NativeReadinessError as error:
+            if error.native.physical.transaction_open or error.native.output_limit_a == 0:
+                raise
+            native = error.native  # A closed unplugged sample may still carry the previous offer.
+        sequence = c.native.last_resolved_read
+        return c.commands.decide(
+            lambda: self.control.complete_owner_closure(self, local, native, authority, sequence),
+            priority=CommandPriority.RESTRICT,
+        )
 
     # Fresh zero/source proof restores only the original intent and never emits a Start or Stop.
     async def recover(self) -> Pending | None:

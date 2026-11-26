@@ -84,10 +84,14 @@ class RecoveryCoordinator:
                 if intent is not None:
                     await self.restore(intent, offline_pause=True)
             elif work is RecoveryWork.ORDINARY:
-                if not decisions.cloud_ready(c):
+                owner_closure = decisions.held_owner_closure(c)
+                if owner_closure is not None:
+                    pending = await c.ordinary.recover_owner_closure(owner_closure)
+                elif not decisions.cloud_ready(c):
                     await c.ordinary.hold("restricted_introduction")
                     return Pending(Prerequisite.CLOUD, "ordinary recovery awaits the current cloud connection")
-                pending = await c.ordinary.recover()
+                else:
+                    pending = await c.ordinary.recover()
                 if pending is not None:
                     return pending
             elif work is RecoveryWork.CONNECTION:
