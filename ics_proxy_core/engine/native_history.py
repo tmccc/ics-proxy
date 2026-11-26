@@ -221,7 +221,8 @@ class NativeHistoryReading:
     @classmethod
     def read(cls, record: dict[str, Any], as_of: float) -> NativeHistoryReading:
         identifier, start, stop = record.get("transactionId"), record.get("startTime"), record.get("stopTime")
-        first, last = record.get("meterStart"), record.get("meterStop", 0)
+        first = record.get("meterStart")
+        last = record.get("meterStop", 0 if type(stop) is int and stop == 0 else None)
         latest_time = as_of + 30
         return cls(
             identifier if type(identifier) is int and 0 < identifier <= 2**31 - 1 else None,

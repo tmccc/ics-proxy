@@ -34,6 +34,8 @@ MAX_REPORT_EVENTS = 24
 UNKNOWN = "unknown"
 STAGES = ("prepared", "issued", "accepted", "rejected", "unsent", "reconciled")
 DELIVERY_STATES = {state.encode(): state for state in ("queued", "inflight", "ambiguous", "rejected")}
+# Project only known states so an unreadable value cannot mask the request's identity.
+MANAGED_REQUEST_STATE = "CASE WHEN state IN ('accepted','running','uncertain','completed','failed') THEN state END"
 
 
 # Accept only the engine's exact random UUID/ticket shape.
@@ -202,7 +204,7 @@ def retained_start(db: sqlite3.Connection, tables: set[str]) -> tuple[str | None
         return None, None
     rows = evidence_rows(
         db,
-        "SELECT id,action,revision,state FROM managed_requests "
+        f"SELECT id,action,revision,{MANAGED_REQUEST_STATE} FROM managed_requests "
         "WHERE action IN ('start','start_test') ORDER BY rowid DESC LIMIT 1",
     )
     if not rows:
@@ -210,7 +212,7 @@ def retained_start(db: sqlite3.Connection, tables: set[str]) -> tuple[str | None
     row = rows[0]
     if (raw := identifier(row[0])) is None or type(row[2]) is not int or not 0 <= row[2] < 2**53:
         return None, None
-    state = row[3] if row[3] in ("accepted", "running", "uncertain", "completed", "failed") else UNKNOWN
+    state = row[3] or UNKNOWN
     return raw, {"request": reference(raw), "action": row[1], "revision": row[2], "state": state}
 
 
@@ -316,6 +318,14 @@ def saved_start_reply(db: sqlite3.Connection, tables: set[str], request: str, ti
     pending_wire = None
     if rows:
         wire, boot, local, limit, reply = rows[0]
+        if (
+            not isinstance(wire, str)
+            or not re.fullmatch(r"(?:l-)?[a-f0-9]{32}", wire)
+            or (boot is not None and identifier(boot) is None)
+            or local is not None
+            or limit is not None
+        ):
+            return UNKNOWN
         if reply is not None:
             return {
                 "Accepted": "accepted",
@@ -325,8 +335,6 @@ def saved_start_reply(db: sqlite3.Connection, tables: set[str], request: str, ti
                 "NotSupported": "other",
                 "Unknown": "other",
             }.get(reply, UNKNOWN)
-        if not isinstance(wire, str) or local is not None or limit is not None:
-            return UNKNOWN
         pending_wire = wire, boot
     return retained_start_reply(db, request, ticket, pending_wire) if stage in ("issued", "reconciled") else UNKNOWN
 

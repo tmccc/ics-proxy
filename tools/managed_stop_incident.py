@@ -18,6 +18,7 @@ from ics_proxy_core.engine.stop_settlement import (
     saved_stop_replies,
 )
 from tools.managed_incident import (
+    MANAGED_REQUEST_STATE,
     MAX_REPORT_EVENTS,
     UNKNOWN,
     evidence_rows,
@@ -328,11 +329,12 @@ def local_stop(
     parameters = (STOP_SESSION, request_reference, request_reference, 1 if request_reference is None else 2)
     rows = evidence_rows(
         db,
-        f"SELECT id,revision,state,CASE WHEN length(result)<=65536 THEN CAST(result AS BLOB) END {selection}",
+        f"SELECT id,revision,{MANAGED_REQUEST_STATE},"
+        f"CASE WHEN length(result)<=65536 THEN CAST(result AS BLOB) END {selection}",
         parameters,
     )
     if rows is None:
-        rows = evidence_rows(db, f"SELECT id,revision,state,NULL {selection}", parameters)
+        rows = evidence_rows(db, f"SELECT id,revision,{MANAGED_REQUEST_STATE},NULL {selection}", parameters)
     if not rows or len(rows) != 1 or (token := identifier(rows[0][0])) is None:
         return None, None, wire_fields()
     row = rows[0]
@@ -346,7 +348,7 @@ def local_stop(
         "request": reference(token),
         "action": STOP_SESSION,
         "revision": revision if type(revision) is int and 0 <= revision < 2**53 else None,
-        "state": state if state in ("accepted", "running", "uncertain", "completed", "failed") else UNKNOWN,
+        "state": state or UNKNOWN,
         "accepted_at": receipt_timestamp(result.get("accepted_at")),
         "classification": classification
         if classification in ("stop_not_sent", "stop_rejected", *STOP_NONTERMINAL_CLASSIFICATIONS)
@@ -372,7 +374,8 @@ def vendor_stop(db: sqlite3.Connection, tables: set[str]) -> tuple[dict[str, Any
     if "mutations" in tables:
         rows = evidence_rows(
             db,
-            "SELECT token,state FROM mutations WHERE origin='vendor' AND action=? ORDER BY rowid DESC LIMIT 1",
+            "SELECT token,CASE WHEN state IN ('pending','uncertain','confirmed') THEN state END "
+            "FROM mutations WHERE origin='vendor' AND action=? ORDER BY rowid DESC LIMIT 1",
             (STOP_ACTION,),
         )
     if not rows or (token := identifier(rows[0][0])) is None:
@@ -380,7 +383,7 @@ def vendor_stop(db: sqlite3.Connection, tables: set[str]) -> tuple[dict[str, Any
     request = {
         "request": reference(token),
         "action": STOP_ACTION,
-        "state": rows[0][1] if rows[0][1] in ("pending", "uncertain", "confirmed") else UNKNOWN,
+        "state": rows[0][1] or UNKNOWN,
     }
     local, wire, result = vendor_scope(db, tables, token)
     return request, local_id(local), vendor_reply(db, tables, token, wire, result)

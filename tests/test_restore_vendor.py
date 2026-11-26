@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ics_proxy_core.engine import trial_handover_evidence
+from ics_proxy_core.engine import trial_evidence, trial_handover_evidence
 from ics_proxy_core.engine.native_bounded_handover import NativeBoundedHandover
 from ics_proxy_core.engine.native_http import NativeTransportUnavailableError, read_native
 from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
@@ -321,17 +321,25 @@ async def test_restore_check_is_offline(tmp_path, tls, unused_tcp_port, monkeypa
         assert peer.requests == reads and not peer.writes
 
 
-# Intent: identify missing maintenance credentials in the restore CLI before it contacts the charger.
+# Intent: identify missing or malformed maintenance credentials before contacting the charger.
 # Why: the offline native check succeeds independently and later restore stages can resume without TLS files.
-async def test_restore_reports_missing_maintenance_credentials(tmp_path, tls, unused_tcp_port, monkeypatch):
+@pytest.mark.parametrize("malformed_basic", [False, True], ids=["missing-key", "invalid-utf8"])
+async def test_restore_reports_invalid_maintenance_credentials(
+    tmp_path, tls, unused_tcp_port, monkeypatch, malformed_basic
+):
     async with commissioned(
         tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
     ) as test:
         await stop_paused(test)
         rig = test.rig
         config, spec = tmp_path / "trial.json", spec_file(tmp_path, rig)
-        private_key = rig.prepared.config.private_key
-        private_key.unlink()
+        if malformed_basic:
+            credential = rig.prepared.config.incoming_secret
+            assert credential is not None
+            save_private(credential, {"username": rig.prepared.config.identity, "password": "\ud800"})
+        else:
+            credential = rig.prepared.config.private_key
+            credential.unlink()
         port = rig.prepared.observer.port
         reads = list(rig.peer.requests)
 
@@ -339,9 +347,63 @@ async def test_restore_reports_missing_maintenance_credentials(tmp_path, tls, un
         report = await failed_restore_cli("restore", config, spec, port)
         assert report["restore_stage"] == "validate_maintenance_credentials"
         assert report["restore_reason"] == "maintenance_credentials_unverified"
+        assert report["restore_failed"] == "SecurityError"
         assert "private key" in report["next_step"]
-        assert str(private_key) not in json.dumps(report)
+        assert str(credential) not in json.dumps(report)
         assert rig.peer.requests == reads and not rig.peer.writes
+
+
+# Intent: report a timed-out LAN snapshot before touching charger settings.
+# Why: the overall snapshot can reach its deadline even when an individual native request has succeeded.
+async def test_restore_reports_native_snapshot_deadline(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
+    ) as test:
+        await stop_paused(test)
+        rig = test.rig
+        config, spec = tmp_path / "trial.json", spec_file(tmp_path, rig)
+        stages = []
+
+        async def read(observer, action, data=None):
+            if action == "getConfig":
+                return {"Id": observer.config.identity, "bPSN": observer.config.hardware_identity}
+            await asyncio.sleep(0)
+            pytest.fail("the aggregate native deadline did not interrupt the snapshot")
+
+        with monkeypatch.context() as snapshot:
+            snapshot.setattr(trial_evidence, "asyncio", SimpleNamespace(timeout=lambda _: asyncio.timeout(0)))
+            snapshot.setattr(trial_evidence.NativeObserver, "_read", read)
+            with pytest.raises(NativeTransportUnavailableError) as error:
+                await run("restore", config, spec, rig.prepared.observer.port, report_stage=stages.append)
+        report = RestoreFailure.capture(stages[-1], error.value).value()
+        assert report["restore_stage"] == "verify_unplugged_managed_pause"
+        assert report["restore_reason"] == "native_evidence_unavailable"
+        assert not rig.peer.writes
+
+
+# Intent: preserve the distinct vendor failure when completed native reads show that the backend stays offline.
+async def test_restore_reports_vendor_wait_deadline(monkeypatch):
+    journal = SimpleNamespace(
+        phase=SimpleNamespace(read=lambda: SimpleNamespace(value="backend_restore_pending")),
+        get=lambda *args: {"route_restored": True},
+    )
+
+    async def observe_backend():
+        return {"original_backend_connected": False}
+
+    async def patch(*args):
+        pytest.fail("restore attempted to change settings while the vendor link was offline")
+
+    handover = SimpleNamespace(gateway=SimpleNamespace(journal=journal), observe_backend=observe_backend)
+    monkeypatch.setattr(
+        restore_vendor, "asyncio", SimpleNamespace(timeout=lambda _: asyncio.timeout(0), sleep=asyncio.sleep)
+    )
+    stages = []
+    with pytest.raises(TimeoutError) as error:
+        await restore_vendor.finish_restore(handover, patch, report_stage=stages.append)
+    report = RestoreFailure.capture(stages[-1], error.value).value()
+    assert report["restore_stage"] == "verify_vendor_connection"
+    assert report["restore_reason"] == "vendor_connection_unverified"
 
 
 # Intent: tell the operator how to establish Pause before any restore change has been made.

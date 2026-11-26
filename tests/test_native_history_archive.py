@@ -156,6 +156,25 @@ def test_unreadable_energy_uses_the_same_completion_order_as_the_archive(
         assert summary.last_energy == 7.0
 
 
+# Intent: a completed row needs an actual Stop meter reading even when it started at zero.
+# Why: an unreadable live or archived completion cannot confirm the energy of a timestamp tie.
+def test_missing_stop_meter_cannot_establish_zero_energy(history_journal: Journal) -> None:
+    visible = row(1001) | {"startTime": 1100, "stopTime": 1250, "meterStart": 0, "meterStop": 0}
+    unreadable = visible | {"transactionId": 1002, "filename": "synthetic-history-1002.json"}
+    del unreadable["meterStop"]
+
+    history = summarize_charger_history((visible, unreadable))
+    assert not history.complete and not history.latest_completion_known
+    assert history.last_energy is None
+
+    archive = NativeHistoryArchive(history_journal)
+    archive.observe([], [visible, unreadable], allow_missing=True)
+    assert archive.observe([], [visible], allow_missing=True)["missing_records"] == 1
+    history = summarize_charger_history((visible,))
+    assert history.latest_completion_known and history.last_energy == 0.0
+    assert not latest_completion_available(history_journal, history.completed, latest_energy=history.last_energy)
+
+
 # Intent: an explicitly open row with unreadable energy never competes as a completion.
 # Why: the same row can be visible or retained as an original open record.
 def test_damaged_open_row_does_not_obscure_a_completion(history_journal: Journal) -> None:

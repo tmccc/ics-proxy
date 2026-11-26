@@ -148,6 +148,32 @@ def test_missing_wire_reply_column_preserves_stop_lifecycle(tmp_path, vendor):
     assert report["wire"]["reply"] == "unknown"
 
 
+# The identity, binding and actual reply survive a damaged request state.
+@pytest.mark.parametrize("vendor", [False, True], ids=["owner", "vendor"])
+def test_unreadable_stop_request_state_preserves_other_evidence(tmp_path, vendor):
+    path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"
+    with closing(Journal(path, "test-charger")) as journal:
+        ManagedRequests(journal)
+        local = journal.start("original-start", START)["transactionId"]
+        wire = uuid.uuid4().hex
+        if vendor:
+            token = vendor_attempt(journal, local, wire, result="Accepted")
+            journal.db.execute("UPDATE mutations SET state=CAST(? AS TEXT) WHERE token=?", (b"\xff", token))
+        else:
+            token = write_request(journal, local, dispatched=True)
+            journal.outcomes.record_owner_wire(
+                OwnerWire(wire, token, token, BOOT, STOP_ACTION, local, None, "Accepted")
+            )
+            journal.db.execute("UPDATE managed_requests SET state=CAST(? AS TEXT) WHERE id=?", (b"\xff", token))
+        journal.stop("original-stop", {"transactionId": local, "meterStop": 102, "timestamp": START["timestamp"]})
+
+    report = stop_incident_report(path, events, vendor=vendor, request_reference=None if vendor else reference(token))
+    assert report["journal"]["request"]["request"] == reference(token)
+    assert report["journal"]["request"]["state"] == "unknown"
+    assert report["journal"]["lifecycle"] == "closed"
+    assert report["wire"]["reply"] == "accepted"
+
+
 # Intent: keep a known Stop request when an optional result is unreadable or absent from an older schema.
 # Why: its request state does not depend on decoding the optional result fields.
 @pytest.mark.parametrize("missing_result", [False, True], ids=["unreadable", "absent"])

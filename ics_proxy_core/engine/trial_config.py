@@ -71,8 +71,11 @@ def basic_secret(path: Path, identity: str | None) -> str:
     ):
         raise SecurityError("trial Basic credential must match its configured identity")
     password = value.get("password")
-    if not isinstance(password, str) or not 1 <= len(password.encode()) <= 512:
-        raise SecurityError("trial password is missing or unbounded")
+    try:
+        if not isinstance(password, str) or not 1 <= len(password.encode()) <= 512:
+            raise SecurityError("trial password is missing or unbounded")
+    except UnicodeEncodeError:
+        raise SecurityError("trial password is not valid UTF-8") from None
     if any(ord(c) < 32 or ord(c) == 127 for c in password) or password.lower().startswith("bearer "):
         raise SecurityError("trial requires a charger Basic secret, not an app token")
     return basic_auth_header(username, password)[1]

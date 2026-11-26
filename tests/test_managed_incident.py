@@ -469,7 +469,8 @@ def test_incident_cli_selects_the_exact_stop_reference(tmp_path, tls, capsys):
 
 # Intent: a newer unsent local Start remains the incident selected after cloud test metadata replaces it.
 # Why: the report must never attach an older command's physical reply to the latest owner request.
-def test_incident_uses_latest_local_request_even_without_wire_receipt(tmp_path):
+@pytest.mark.parametrize("damaged_state", [False, True])
+def test_incident_uses_latest_local_request_even_without_wire_receipt(tmp_path, damaged_state):
     path = tmp_path / "journal.db"
     event_path = tmp_path / "journal.start-events.jsonl"
     old, new, cloud, ticket = (uuid.uuid4().hex for _ in range(4))
@@ -481,18 +482,37 @@ def test_incident_uses_latest_local_request_even_without_wire_receipt(tmp_path):
         journal.put("local_start_receipt", {"request_id": old, "ticket": ticket, "stage": "accepted"})
         requests.accept(new, "start", 1)
         requests.finish(new, "failed", {"classification": "preflight_refused_unsent"})
+        if damaged_state:
+            journal.db.execute("UPDATE managed_requests SET state=CAST(? AS TEXT) WHERE id=?", (b"\xff", new))
         requests.accept(cloud, "arm_cloud_test", 1)
         journal.put("managed_test_charge", {"id": cloud, "source": "cloud", "state": "armed"})
+        managed_proxy.event(
+            event_path,
+            {
+                "run": uuid.uuid4().hex,
+                "sequence": 1,
+                "at": 1,
+                "event": "start_reply",
+                "request": reference(old),
+                "ticket": reference(ticket),
+                "reply": "accepted",
+            },
+        )
         learned = incident_report(path, event_path)
         saved = learned["journal"]
         assert saved["request"] == {
             "request": hashlib.sha256(new.encode()).hexdigest()[:32],
             "action": "start",
             "revision": 1,
-            "state": "failed",
+            "state": "unknown" if damaged_state else "failed",
         }
         assert saved["start"] is None
-        assert learned["wire"]["ticket"] is None and learned["wire"]["observed_reply"] == "unknown"
+        assert learned["wire"] == {
+            "request": reference(new),
+            "ticket": None,
+            "send": "unknown",
+            "observed_reply": "unknown",
+        }
     finally:
         journal.close()
 
@@ -532,6 +552,31 @@ def test_incident_reads_the_exact_saved_start_reply(tmp_path, wire_reply, shown,
     assert result["journal"]["start"]["lifecycle"] == "unbound"
     assert result["wire"]["send"] == "matching_reply" and result["wire"]["observed_reply"] == "unknown"
     assert result["waiting_for_evidence"] == [waiting]
+
+
+# A matching request and ticket do not make a malformed row a valid transaction Start.
+@pytest.mark.parametrize(
+    "override",
+    [{"wire": "bad-wire"}, {"boot": "bad-boot"}, {"local": 42}, {"limit": 6}],
+    ids=["wire", "boot", "local", "limit"],
+)
+def test_incident_rejects_a_misbound_primary_start_reply(tmp_path, override):
+    path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"
+    request, ticket = uuid.uuid4().hex, uuid.uuid4().hex
+    with closing(Journal(path, "OFFLINE001")) as journal:
+        ManagedRequests(journal).accept(request, "start", 0)
+        journal.put("local_start_receipt", {"request_id": request, "ticket": ticket, "stage": "issued", "local": None})
+        fields = {"wire": "l-" + uuid.uuid4().hex, "boot": uuid.uuid4().hex, "local": None, "limit": None}
+        journal.db.execute(
+            "INSERT INTO owner_command_wires VALUES(:wire,:request,:ticket,:boot,"
+            "'RemoteStartTransaction',:local,:limit,'Accepted')",
+            {**fields, **override, "request": request, "ticket": ticket},
+        )
+
+    report = incident_report(path, events)
+    assert report["journal"]["start"]["saved_reply"] == "unknown"
+    assert report["wire"]["send"] == "unknown"
+    assert report["waiting_for_evidence"] == ["start_outcome_or_lifecycle"]
 
 
 # Intent: show a real reply checkpoint before the normal wire receipt or Start result is published.
