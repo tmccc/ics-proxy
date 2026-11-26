@@ -584,6 +584,32 @@ async def test_temporary_pause_receipt_failure_retries_only_the_read(actual_hass
     assert first["request_id"] == final["request_id"] == pause["id"]
 
 
+# Intent: an HTTP 503 during receipt upgrade can recover after either first-reply outcome.
+# Why: a draining management listener can temporarily refuse the upgrade while the saved Pause survives.
+@pytest.mark.parametrize("drop_reply", [False, True], ids=["accepted-reply", "lost-reply"])
+async def test_receipt_upgrade_during_shutdown_retries_only_the_read(actual_hass, peer, drop_reply):
+    await setup(actual_hass, peer)
+    peer["lose_reply"] = drop_reply
+    peer["pending_receipt"] = True
+
+    # Refuse the first receipt upgrade after the original Pause has reached the peer.
+    async def refuse_receipt_upgrade():
+        assert [command for command in peer["commands"] if command != "status"] == ["pause"]
+        raise web.HTTPServiceUnavailable()
+
+    # Arrange the refusal after the Pause's own successful upgrade, including when its reply is lost.
+    async def prepare_pause_upgrade():
+        peer["before_handshake"] = refuse_receipt_upgrade
+
+    peer["before_handshake"] = prepare_pause_upgrade
+    await actual_hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
+    assert "before_handshake" not in peer
+    pause, receipt = (request for request in peer["requests"] if request["command"] != "status")
+    assert pause["command"] == "pause" and receipt["command"] == "receipt"
+    assert receipt["request_id"] == pause["id"] and receipt["id"] != pause["id"]
+    assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "Paused locally"
+
+
 # Intent: a possibly sent command needs an exact, readable receipt to confirm success.
 # Why: even a freshly paused charger does not identify which request caused the hold.
 @pytest.mark.parametrize(

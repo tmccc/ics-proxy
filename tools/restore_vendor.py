@@ -171,11 +171,8 @@ async def finish_restore(
     journal = handover.gateway.journal
     phase = journal.phase.read().value
     if phase == "complete":
-        try:
-            handover.require_normal_restoration(await handover.observe())
-        except Exception:
-            report_stage("verify_restored_configuration")
-            raise
+        report_stage("verify_restored_configuration")
+        handover.require_normal_restoration(await handover.observe())
         return {"original_configuration_restored": True, "native_backend_connected": True, "complete": True}
     if phase != "backend_restore_pending":
         raise RecoveryRequiredError("restoration requires verified profile cleanup")
@@ -263,10 +260,11 @@ async def run(
             before_send=lambda: require_unplugged(native),
         )
 
-    report_stage("verify_unplugged_managed_pause")
+    report_stage("open_restore_journal")
     with closing(open_native_journal(config.journal, config.identity, spec, require_existing=True)) as journal:
         book = ResourceBook(journal, prepared.baseline)
-        if journal.phase.read().value in ("backend_restore_pending", "complete"):
+        phase = journal.phase.read()
+        if phase.value in ("backend_restore_pending", "complete"):
             if journal.get(MANAGED_RESTORE_INTENT) != spec.digest:
                 raise RecoveryRequiredError("cleanup does not belong to this managed restoration")
             gateway = Gateway(journal, Policy(allow_local_start=False))
@@ -286,6 +284,8 @@ async def run(
         except SecurityError:
             report_stage("validate_maintenance_credentials")
             raise
+        if not phase.cleanup:
+            report_stage("verify_unplugged_managed_pause")
         await prepare_cleanup(book, spec, observe, patch, report_stage=report_stage)
     # The durable cleanup phase also fences a service restart between the two exclusive journal opens.
     session = TrialSession(

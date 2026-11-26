@@ -805,6 +805,46 @@ async def test_ordinary_start_cannot_write_after_entry_retirement(
     assert "start" not in replacement_peer["commands"]
 
 
+# Intent: a recorded disable revokes a pending ordinary Start even while the entry is still loaded.
+# Why: Home Assistant can be waiting for the entry lock before the coordinator learns it is being unloaded.
+@pytest.mark.parametrize("surface", ["session_action", "start_button"])
+async def test_ordinary_start_cannot_write_while_disable_waits_for_unload(actual_hass, canvas_peer, surface):
+    hass, peer = actual_hass, canvas_peer
+    entry = await setup_proxy(hass, peer["port"])
+    original = entry.runtime_data
+    disable_task = None
+
+    # Hold the management handshake until HA records the disable and waits to unload.
+    async def disable_entry():
+        nonlocal disable_task
+        disable_task = asyncio.create_task(
+            hass.config_entries.async_set_disabled_by(entry.entry_id, ConfigEntryDisabler.USER)
+        )
+        await asyncio.sleep(0)
+        assert entry.disabled_by is ConfigEntryDisabler.USER
+        assert entry.state is ConfigEntryState.LOADED and entry.runtime_data is original
+        assert original.notice.active and not disable_task.done()
+
+    try:
+        async with entry.setup_lock:
+            peer["before_handshake"] = disable_entry
+            if surface == "session_action":
+                result = await call_session_command(hass, "start", revision=0)
+                assert result == {"confirmed": False, "request_reference": None}
+            else:
+                with pytest.raises(HomeAssistantError, match="charger control entry is no longer active"):
+                    await hass.services.async_call(
+                        "button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True
+                    )
+            assert disable_task is not None
+            assert set(peer["commands"]) == {"status"}
+            assert peer["state"]["charging_session_open"] is False
+    finally:
+        if disable_task is not None:
+            assert await disable_task
+    assert entry.state is ConfigEntryState.NOT_LOADED
+
+
 # Intent: an already-issued command keeps its original receipt lookup across entry retirement.
 # Why: a change of integration endpoint cannot undo a proxy write or transfer its receipt to another endpoint.
 async def test_ordinary_start_reads_its_receipt_after_entry_retirement(actual_hass, canvas_peer, replacement_peer):

@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from hashlib import sha256
+from http import HTTPStatus
 from typing import Any
 
 import aiohttp
@@ -157,7 +158,12 @@ class ProxyClient:
                         raise TypeError("The local charger proxy returned a non-text response")
                     response = message.json()
         except (aiohttp.ClientError, TimeoutError, ValueError, TypeError, RecursionError) as error:
-            if command == "receipt" and isinstance(error, (aiohttp.ClientConnectionError, TimeoutError)):
+            # The management listener can refuse a WebSocket upgrade with HTTP 503 during shutdown.
+            if command == "receipt" and (
+                isinstance(error, (aiohttp.ClientConnectionError, TimeoutError))
+                or isinstance(error, aiohttp.WSServerHandshakeError)
+                and error.status == HTTPStatus.SERVICE_UNAVAILABLE
+            ):
                 raise ReceiptUnavailableError("The saved command result is temporarily unavailable") from None
             if sending and command not in ("status", "history", "receipt"):
                 raise UnknownCommandOutcomeError(_UNKNOWN_OUTCOME) from None

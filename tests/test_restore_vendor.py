@@ -249,7 +249,7 @@ async def test_restore_check_is_offline(tmp_path, tls, unused_tcp_port, monkeypa
             await run("restore", config, spec, port)
         report = await failed_restore_cli("restore", config, spec, port)
         assert report["restore_failed"] == "RecoveryRequiredError"
-        assert report["restore_stage"] == "verify_unplugged_managed_pause"
+        assert report["restore_stage"] == "open_restore_journal"
         assert report["restore_reason"] == "journal_in_use"
         assert "Stop the proxy service" in report["next_step"]
         assert peer.requests == reads and not peer.writes
@@ -665,6 +665,7 @@ async def test_restore_keeps_history_for_each_managed_bound(
             "complete": True,
         }
         stages = {
+            "open_restore_journal",
             "verify_unplugged_managed_pause",
             "verify_6_a_and_remove_proxy_profiles",
             "restore_original_route",
@@ -673,6 +674,12 @@ async def test_restore_keeps_history_for_each_managed_bound(
         }
         assert all(report == {"restore_stage": report.get("restore_stage")} for report in output[:-1])
         assert {report["restore_stage"] for report in output[:-1]} == stages
+
+        recheck_stages = []
+        writes = list(peer.writes)
+        assert await run(*args, report_stage=recheck_stages.append) == 0
+        assert recheck_stages == ["open_restore_journal", "verify_restored_configuration"]
+        assert peer.writes == writes and journal_facts(db_path) == (records, "complete")
 
 
 # Intent: resume a route write that succeeded before a lost reply and a backward host clock correction.
@@ -699,6 +706,13 @@ async def test_restore_reconnect_after_backward_host_clock_correction(tmp_path, 
 
         bench.online = True
         clock_offset = 0
-        assert await asyncio.wait_for(run(*args), 5) == 0
+        resume_stages = []
+        assert await asyncio.wait_for(run(*args, report_stage=resume_stages.append), 5) == 0
+        assert resume_stages == [
+            "open_restore_journal",
+            "restore_original_route",
+            "verify_vendor_connection",
+            "restore_original_current",
+        ]
         assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}, route, {"AmpLmt": "32"}]
         assert peer.runtime_user == 320 and journal_facts(rig.prepared.config.journal) == (records, "complete")

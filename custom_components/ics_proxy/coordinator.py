@@ -69,9 +69,16 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ):
             fields["canvas_owner"] = owner
 
-        # A retired coordinator can read an issued receipt but must never send a new command.
+        # HA records a disable before queued unload work can invalidate the coordinator generation.
         def require_current_entry() -> None:
-            if not self.notice.active or self.notice.generation != self.notice_generation:
+            entry = self.config_entry
+            if (
+                entry is None
+                or entry.disabled_by is not None
+                or self.hass.config_entries.async_get_entry(entry.entry_id) is not entry
+                or not self.notice.active
+                or self.notice.generation != self.notice_generation
+            ):
                 raise ProxyError("The charger control entry is no longer active")
             if before_write is not None:
                 before_write()
