@@ -359,9 +359,18 @@ class ControlDecisions:
 
         return guard
 
-    # A heartbeat or report can start waiting after native preflight and before the positive profile send.
-    def release_send_decision(self, controller: ManagedController, attempt: ReleaseAttempt) -> GateDecision:
+    # A close and reopen can change the journal even if the active ID is empty again.
+    def release_ownership_decision(self, attempt: ReleaseAttempt) -> GateDecision:
         decision = attempt.positive_guard()
+        if isinstance(decision, Pending):
+            return decision
+        if attempt.lifecycle is not None and self.journal.lifecycle_position() != attempt.lifecycle:
+            return Pending(Prerequisite.LIFECYCLE, "charging records changed during release verification")
+        return ALLOW
+
+    # Delivery work can arrive after preflight, while the positive write is still unsent.
+    def release_positive_decision(self, controller: ManagedController, attempt: ReleaseAttempt) -> GateDecision:
+        decision = self.release_ownership_decision(attempt)
         if isinstance(decision, Pending):
             return decision
         if controller.session.gateway.vendor._pending or not ManagedFacts(controller).cloud_queue_empty():
@@ -459,10 +468,10 @@ class ControlDecisions:
         self, c: ManagedController, attempt: ReleaseAttempt, native: HandoverEvidence | Pending
     ) -> RestoreProgress | ReleaseAttempt:
         g, j = c.session.gateway, self.journal
-        guard, expected_intent = attempt.positive_guard, attempt.intent
+        expected_intent = attempt.intent
         connection = (attempt.scope, attempt.control_revision)
         ticket, return_request, continuing_local = attempt.before_ticket, attempt.request_id, attempt.continuing_local
-        decision = guard()
+        decision = self.release_ownership_decision(attempt)
         if isinstance(decision, Pending):
             return RestoreProgress(RestoreState.WAITING, decision)
         if isinstance(native, Pending):
@@ -480,7 +489,7 @@ class ControlDecisions:
             or j.get("control", {}).get("uncertain")
         ):
             raise UnavailableError("managed release authority changed during its native check")
-        decision = guard()
+        decision = self.release_ownership_decision(attempt)
         if isinstance(decision, Pending):
             return RestoreProgress(RestoreState.WAITING, decision)
         if expected_intent.mode == "paused":
@@ -582,7 +591,7 @@ class ControlDecisions:
         return_request, expected_intent = attempt.request_id, attempt.intent
         if not c.publication_is_current(authority):
             return Pending(Prerequisite.SUPERSEDED, "release publication was superseded")
-        decision = attempt.positive_guard()
+        decision = self.release_ownership_decision(attempt)
         if isinstance(decision, Pending):
             return decision
         j.put("managed_owner_epoch", attempt.scope.epoch)
@@ -608,7 +617,7 @@ class ControlDecisions:
     ) -> RestoreProgress:
         g, j = c.session.gateway, self.journal
         expected_intent, return_request = attempt.intent, attempt.request_id
-        decision = ALLOW if result.published else attempt.positive_guard()
+        decision = ALLOW if result.published else self.release_ownership_decision(attempt)
         disposition = release_disposition(
             attempt.purpose,
             result,
@@ -999,19 +1008,26 @@ class ControlDecisions:
         worker._settling_overlap = None
         return None
 
+    # Every recovery step keeps the exact selection and intent that requested the rollback.
+    def _owns_current_recovery(
+        self, worker: ManagedCurrentLimits, change: dict[str, Any], expected: ControlIntent
+    ) -> bool:
+        c = worker.controller
+        current = self.journal.current_change.read()
+        return (
+            not c.stopping
+            and c.requests.intent() == expected
+            and current.recovering
+            and current.identifier == change["id"]
+        )
+
     # Reclaim only the current operation's own zero if earlier restoration failed to settle.
     def reclaim_current_recovery(
         self, worker: ManagedCurrentLimits, change: dict[str, Any], expected: ControlIntent
     ) -> bool:
         c, j = worker.controller, self.journal
         g = c.session.gateway
-        current = j.current_change.read()
-        if (
-            c.stopping
-            or c.requests.intent() != expected
-            or not current.recovering
-            or current.identifier != change["id"]
-        ):
+        if not self._owns_current_recovery(worker, change, expected):
             return False
         if g.controls.desired() != 0:
             with j.atomic():
@@ -1033,12 +1049,7 @@ class ControlDecisions:
         if c.native.authority() != native_authority or c.native.last_resolved_read != sequence:
             return False, Pending(Prerequisite.SUPERSEDED, "current recovery observation was superseded")
         current = j.current_change.read()
-        if (
-            c.stopping
-            or c.requests.intent() != expected
-            or not current.recovering
-            or current.identifier != change["id"]
-        ):
+        if not self._owns_current_recovery(worker, change, expected):
             return False, None
         decision = c.native.session_decision(native)
         if isinstance(decision, Pending):
@@ -1067,66 +1078,68 @@ class ControlDecisions:
                 return False, decision
         return True, local
 
-    # Retry a failed receipt write only after the restored limit and exact session are still verified.
+    # Bind native verification and receipt publication to the same decision turn.
     async def retry_current_recovery(
         self, worker: ManagedCurrentLimits, change: dict[str, Any], expected: ControlIntent
     ) -> tuple[bool, Pending | None]:
         c, j = worker.controller, self.journal
         g = c.session.gateway
-        if worker._settling_overlap is not None and not c.stopping:
-            identifier, authority, local = worker._settling_overlap
-            lifecycle = j.lifecycle_position()
-            if identifier == change["id"] and c.authority() == authority and lifecycle[1] == local and g.controls.ready:
-                native = await c.native.read_result(owned=True)
-                if c.stopping or c.requests.intent() != expected:
-                    return True, Pending(Prerequisite.SUPERSEDED, "current recovery yielded to newer control")
-                same_authority = c.authority() == authority
-                if same_authority and j.lifecycle_position() != lifecycle:
-                    worker._settling_overlap = None
-                    return False, Pending(Prerequisite.LIFECYCLE, "charger lifecycle changed during current recovery")
-                if (
-                    not isinstance(native, Pending)
-                    and same_authority
-                    and g.controls.ready
-                    and g.controls.desired() == change["previous_a"]
-                ):
-                    decision = c.native.session_decision(native)
-                    if decision is ALLOW:
-                        decision = (
-                            current_source_decision(g, None)
-                            if local is None
-                            else current_session_decision(g, native, local)
-                        )
-                    if isinstance(decision, Pending):
-                        worker._settling_overlap = None
-                        return False, decision
-                    try:
-                        c.session.book.require_confirmed_station(native.physical.resources, change["previous_a"])
-                    except DeniedError:
-                        pass  # A later attempt can reclaim the exact restrictive hold and restore the profile.
-                    else:
-                        return True, self.complete_current_recovery(worker, change, authority, local)
+        proof = worker._settling_overlap
+        if proof is None:
+            return False, None
+        if (
+            proof.identifier != change["id"]
+            or not self._owns_current_recovery(worker, change, expected)
+            or c.authority() != proof.authority
+            or not g.controls.ready
+        ):
             worker._settling_overlap = None
-        return False, None
+            return False, None
+        if j.lifecycle_position() != proof.lifecycle:
+            worker._settling_overlap = None
+            return False, Pending(Prerequisite.LIFECYCLE, "charger lifecycle changed during current recovery")
 
-    # Settle only the previous current and authority this recovery verified.
-    def complete_current_recovery(
-        self, worker: ManagedCurrentLimits, change: dict[str, Any], authority: AuthorityStamp, local: int | None
-    ) -> Pending | None:
-        # The restored receipt may be retried only under the authority and session it verified.
-        def settle() -> Pending | None:
-            if worker.controller.authority() != authority or self.journal.active() != local:
-                return Pending(Prerequisite.SUPERSEDED, "current recovery lost its confirmed authority")
+        native = await c.native.read_result(owned=True)
+        native_authority, sequence = c.native.authority(), c.native.last_resolved_read
+
+        def settle() -> tuple[bool, Pending | None]:
+            if worker._settling_overlap != proof:
+                return True, Pending(Prerequisite.SUPERSEDED, "current recovery verification was superseded")
+            worker._settling_overlap = None
+            if not self._owns_current_recovery(worker, change, expected) or c.authority() != proof.authority:
+                return True, Pending(Prerequisite.SUPERSEDED, "current recovery yielded to newer control")
+            if j.lifecycle_position() != proof.lifecycle:
+                return False, Pending(Prerequisite.LIFECYCLE, "charger lifecycle changed during current recovery")
+            if (
+                isinstance(native, Pending)
+                or c.native.authority() != native_authority
+                or c.native.last_resolved_read != sequence
+                or not native.is_fresh(5)
+                or not g.controls.ready
+                or g.controls.desired() != change["previous_a"]
+            ):
+                return False, None
+            local = proof.lifecycle[1]
+            decision = c.native.session_decision(native)
+            if decision is ALLOW:
+                decision = (
+                    current_source_decision(g, None) if local is None else current_session_decision(g, native, local)
+                )
+            if isinstance(decision, Pending):
+                return False, decision
             try:
-                with self.journal.atomic():
+                c.session.book.require_confirmed_station(native.physical.resources, change["previous_a"])
+            except DeniedError:
+                return False, None  # A later attempt can restore the missing proof under zero.
+            try:
+                with j.atomic():
                     self.restore_previous_current(worker, recovery=change)
             except sqlite3.Error as error:
-                worker._settling_overlap = (change["id"], authority, local)
-                return Pending(Prerequisite.RECONCILIATION, "current recovery awaits its receipt write", error)
-            worker._settling_overlap = None
-            return None
+                worker._settling_overlap = proof
+                return True, Pending(Prerequisite.RECONCILIATION, "current recovery awaits its receipt write", error)
+            return True, None
 
-        return worker.controller.commands.decide(settle)
+        return c.commands.decide(settle)
 
     # Accept a delayed genuine original-plan report under this operation's zero, without inventing its lifecycle.
     async def prepare_current_report(

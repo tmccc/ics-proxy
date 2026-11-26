@@ -80,14 +80,17 @@ lost replies and overlapping Pause.
    before charger checks begin. The physical ticket is claimed later.
    [Request and preflight](../ics_proxy_core/engine/control_decisions.py)
 2. The recovery coordinator reads the charger. `prepare_release_attempt()` checks the fresh zero evidence and
-   rechecks the original intent, connection, and ticket. It binds an explicit Return to that zero-hold ticket
-   and Boot. The vendor registration must belong to the current charger connection and commissioned Boot details.
+   rechecks the original intent, connection, ticket, and journal lifecycle. It binds an explicit Return to that
+   zero-hold ticket and Boot. The vendor registration must belong to the current charger connection and Boot.
    [Recovery coordinator](../ics_proxy_core/engine/recovery_coordinator.py)
 3. `claim_release()` takes the physical ticket. The local executor rechecks the guard at the wire boundary.
-   A verified ceiling can publish shared control in `complete_release()`. Restoring zero uses the same release
-   ticket and still checks the original Boot. [Local executor](../ics_proxy_core/engine/local_control.py)
+   `complete_release()` rechecks the same ownership and lifecycle before publishing a verified ceiling. Restoring
+   zero uses the same release ticket and original Boot. [Local executor](../ics_proxy_core/engine/local_control.py)
 4. `settle_release()` uses the attempt's actual send, reply, verification, and rollback evidence to decide
    whether to finish, wait, or record a fault. [Release policy](../ics_proxy_core/engine/recovery_policy.py)
+
+Overlapping current recovery uses this release path to restore the previous ceiling. It saves the original
+receipt in the same decision turn that verifies the latest native observation, station ceiling, and lifecycle.
 
 The [developer guide](developer.md) describes the engine, model, Home Assistant, recovery discovery and installation
 rehearsal test suites.

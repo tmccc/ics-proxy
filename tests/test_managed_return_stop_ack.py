@@ -9,9 +9,10 @@ from datetime import UTC, datetime
 
 import pytest
 
+from ics_proxy_core.engine.recovery_contracts import Reply
 from ics_proxy_core.frames import build_call_error
 from tests.charge_rig import ChargeRig
-from tests.current_rig import release_bench
+from tests.current_rig import adjustable, release_bench
 from tests.managed_rig import healthy, starts
 from tests.native_schedule_support import timer_bench
 from tests.prototype_rig import START
@@ -63,6 +64,57 @@ async def test_return_waits_for_replaced_cloud_before_positive_send(
         test = ChargeRig(b.rig, b.session, c, b.charger)
         await completed_control(test, identifier, mode="app", revision=revision + 1, ceiling=6)
         assert c.requests.receipt(identifier)["state"] == "completed"
+
+
+# Intent: a complete lifecycle can obsolete a Return's physical proof before publication.
+# Why: the active transaction can remain empty on both sides of the intervening Start and Stop.
+async def test_return_rolls_back_after_lifecycle_advances_before_publication(
+    tmp_path, tls, unused_tcp_port, monkeypatch
+):
+    async with adjustable(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, gateway, bench, journal = b.controller, b.session.gateway, b.rig.bench, b.session.journal
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        assert (await healthy(c))["local_hold_verified"]
+        await until(lambda: not gateway.vendor._pending and journal.next_delivery() is None)
+        intent, request = c.requests.intent(), uuid.uuid4().hex
+        initial_position = journal.lifecycle_position()
+        assert initial_position[1] is None
+        before = len(bench.received_limits)
+        verify = gateway.controls._cap_result
+        verified = []
+
+        # Advance the journal after the actual profile and composite replies, before ownership is published.
+        async def verify_with_late_lifecycle(call, limit, epoch, *, guard=None):
+            reply = await verify(call, limit, epoch, guard=guard)
+            assert isinstance(reply, Reply) and reply.frame[2] == {"status": "Accepted"}
+            verified.append(limit)
+            if limit > 0 and len(verified) == 1:
+                assert journal.lifecycle_position() == initial_position and bench.firmware.effective_limit() == 6
+                start = START | {"idTag": "APP_OWNER"}
+                local = journal.start("intervening-start", start, owner_authorized=True)["transactionId"]
+                stop = {"transactionId": local, "meterStop": start["meterStart"], "timestamp": start["timestamp"]}
+                journal.stop("intervening-stop", stop)
+                bench.history.append({"transactionId": local, "start": start, "stop": stop})
+                assert journal.lifecycle_position() == (local, None)
+                assert journal.next_delivery() is None
+            return reply
+
+        monkeypatch.setattr(gateway.controls, "_cap_result", verify_with_late_lifecycle)
+        assert c.command(request, "app_control", intent.revision)["state"] == "accepted"
+        await c.return_requested(request, intent.revision)
+
+        receipt = c.requests.receipt(request, include_binding=True)
+        assert journal.lifecycle_position() != initial_position and journal.active() is None, receipt
+        assert (receipt["id"], receipt["action"], receipt["revision"]) == (request, "app_control", intent.revision)
+        assert receipt["state"] == "accepted" and c.requests.intent() == intent
+        assert verified == [6, 0] and bench.received_limits[before:] == [6, 0]
+        assert bench.firmware.effective_limit() == 0 and gateway.controls.desired() == 0
+
+        await c.return_requested(request, intent.revision)
+        assert c.requests.receipt(request)["state"] == "completed" and c.requests.intent().mode == "app"
+        assert verified == [6, 0, 6] and bench.firmware.effective_limit() == 6
+        assert not journal.fault.latched()
+        assert not any(frame[2] in ("RemoteStartTransaction", "RemoteStopTransaction") for frame in bench.device_calls)
 
 
 # Intent: one accepted Return waits at zero for a known Stop ACK and completes without a new UUID.

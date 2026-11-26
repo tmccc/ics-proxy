@@ -49,6 +49,7 @@ class ReleaseAttempt:
     request_id: str | None = None
     continuing_local: int | None = None
     wires: OwnerWireScope | None = None
+    lifecycle: tuple[int, int | None] | None = None
 
     # The positive reply belongs to the exact issued Set, even if rollback later sends a different Set to zero.
     @property

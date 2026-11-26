@@ -107,26 +107,36 @@ def release_disposition(
             if current == result.published_authority and not faulted and publication_allowed
             else ReleaseDisposition.STALE
         )
+    lifecycle_changed_after_reply = (
+        result.pending is not None
+        and result.pending.reason is Prerequisite.LIFECYCLE
+        and effects.positive_dispatched
+        and effects.positive_reply is WireReply.ACCEPTED
+    )
     if (
         result.claimed
         and result.pending is not None
         and (
             purpose == "automatic"
             or result.pending.reason in (Prerequisite.CLOUD_ACK, Prerequisite.CLOUD_DELIVERY, Prerequisite.SUPERSEDED)
+            or lifecycle_changed_after_reply
         )
         and result.failure is None
         and not result.cancelled
         and not result.cleanup_failed
-        and not effects.positive_dispatched
-        and not effects.positive_verified
+        and (not effects.positive_dispatched and not effects.positive_verified or lifecycle_changed_after_reply)
         and effects.zero_verified
         and current == result.authority
         and result.authority.ticket is not None
         and zero_ready
         and not faulted
     ):
-        # Cloud delivery can defer the same Return after its unsent attempt has verified zero.
-        if purpose == "automatic" or result.pending.reason is Prerequisite.CLOUD_DELIVERY:
+        # A new lifecycle invalidates the release proof. Verified rollback gives the owner a fresh starting point.
+        if (
+            purpose == "automatic"
+            or result.pending.reason is Prerequisite.CLOUD_DELIVERY
+            or lifecycle_changed_after_reply
+        ):
             return ReleaseDisposition.WAIT
         return ReleaseDisposition.NOT_SENT
     return ReleaseDisposition.FAULT

@@ -98,6 +98,15 @@ class AuthorityStamp:
     ticket: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class CurrentRecoverySettlement:
+    """The exact released selection and lifecycle still awaiting receipt publication."""
+
+    identifier: str
+    authority: AuthorityStamp
+    lifecycle: tuple[int, int | None]
+
+
 @dataclass(frozen=True)
 class ReleaseHandoff:
     """The wire child owns final SQL and invokes the memory notification only after successful COMMIT."""

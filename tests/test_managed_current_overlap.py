@@ -446,7 +446,15 @@ async def test_overlap_recovery_requires_live_station_before_settlement(
 # Intent: revoke a restored positive offer in the same turn when fresh native evidence disagrees.
 # Why: a changed source or pending lifecycle reconciliation invalidates the release for the original session.
 @pytest.mark.parametrize(
-    "after_composite", ("original", "source_changed", "native_closed", "ledger_closed", "transport_unavailable")
+    "after_composite",
+    (
+        "original",
+        "source_changed",
+        "native_closed",
+        "ledger_closed",
+        "ledger_closed_before_commit",
+        "transport_unavailable",
+    ),
 )
 async def test_first_overlap_settlement_distinguishes_conflict_from_unavailable(
     tmp_path, tls, unused_tcp_port, monkeypatch, after_composite
@@ -473,6 +481,8 @@ async def test_first_overlap_settlement_distinguishes_conflict_from_unavailable(
             assert before["state"] == "uncertain"
             result = b.device.answer
             positive_composites = []
+            ledger_closes = after_composite in ("ledger_closed", "ledger_closed_before_commit")
+            queued_report = None
 
             # Arrange the independent native change after the simulated charger confirms the previous limit.
             def observe_after_positive_composite(action, payload):
@@ -503,12 +513,41 @@ async def test_first_overlap_settlement_distinguishes_conflict_from_unavailable(
                     return await read_result(**kwargs)
 
                 monkeypatch.setattr(b.c.native, "read_result", read_after_closing_report)
+            elif after_composite == "ledger_closed_before_commit":
+                read_result = b.c.native.read_result
+
+                # Give the already observed Stop the earlier turn while the current receipt still awaits publication.
+                def record_closing_report():
+                    assert positive_composites and b.device.effective_limit() == 6
+                    assert b.c.requests.receipt(identifier) == before and j.active() == local
+                    j.stop(
+                        uuid.uuid4().hex,
+                        {
+                            "transactionId": local,
+                            "meterStop": START["meterStart"],
+                            "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
+                        },
+                    )
+
+                # Submit the journal update in the normal decision queue after the actual native read completes.
+                async def queue_closure_after_read(**kwargs):
+                    nonlocal queued_report
+                    native = await read_result(**kwargs)
+                    if b.c.current._settling_overlap is not None and queued_report is None:
+                        assert native.physical.transaction_open and native.physical.native_transaction_id == local
+                        queued_report = asyncio.create_task(b.c.commands.run(record_closing_report), eager_start=True)
+                    return native
+
+                monkeypatch.setattr(b.c.native, "read_result", queue_closure_after_read)
             try:
                 status = await b.c.tick()
+                if after_composite == "ledger_closed_before_commit":
+                    assert queued_report is not None and j.outcomes.stop_report_closed(local)
+                    await queued_report
                 receipt = b.c.requests.receipt(identifier)
                 change = j.current_change.read().value
                 assert positive_composites and not b.stops() and not starts(b.rig)
-                assert j.active() == (None if after_composite == "ledger_closed" else local)
+                assert j.active() == (None if ledger_closes else local)
                 if after_composite == "original":
                     assert receipt["state"] == "failed" and b.device.effective_limit() == 6
                 else:
@@ -517,7 +556,7 @@ async def test_first_overlap_settlement_distinguishes_conflict_from_unavailable(
                         assert status["state"] == "reconciling"
                         assert b.device.effective_limit() == 0 and b.device.current == 0
                         assert b.session.gateway.controls.desired() == 0
-                        if after_composite != "ledger_closed":
+                        if not ledger_closes:
                             assert change["continuing_local"] is None
                     else:
                         assert b.rig.peer.unavailable_requests and b.c.native.last_verified_at == 0
@@ -525,9 +564,12 @@ async def test_first_overlap_settlement_distinguishes_conflict_from_unavailable(
                 if after_composite == "native_closed":
                     assert change["native_open"] is False
                     await b.close_transaction(local)
-                elif after_composite == "ledger_closed":
+                elif ledger_closes:
                     b.device.active = None
-                if after_composite in ("native_closed", "ledger_closed"):
+                    b.device.requested_current = 0
+                    b.rig.peer.permission_enabled = False
+                    b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+                if after_composite == "native_closed" or ledger_closes:
                     assert (await healthy(b.c))["station_ceiling_a"] == 6
                     assert b.c.requests.receipt(identifier)["state"] == "failed" and not b.stops() and not starts(b.rig)
             finally:
