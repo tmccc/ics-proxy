@@ -17,7 +17,7 @@ session_command:
         text:
     revision:
       name: Start control revision
-      description: Optional control_revision from the Session open sensor when the Start button was shown.
+      description: The control_revision from the Session open sensor when Start was shown. Required with a canvas render epoch.
       selector:
         number:
           min: 0

@@ -17,6 +17,16 @@ STOP_TEST = "tests/test_managed_session_stop.py"
 STOP_JOIN = f"{STOP_TEST}::test_joined_session_stop_settles_from_late_rejection"
 STOP_PUBLICATION = f"{STOP_TEST}::test_accepted_stop_closure_survives_publication_refusal"
 STOP_RESTART = "tests/test_managed_stop_replacement.py::test_unmapped_stop_replacement_waits_for_native_closure"
+STOP_NATIVE_FIRST_PROCESS = (
+    "tests/test_real_process_death.py::test_process_cut_after_queued_stop_observes_native_closure"
+)
+SCHEDULE = "tests/test_managed_local_schedule.py"
+SCHEDULE_CUTOFF = "tests/test_managed_local_schedule_cutoff.py"
+CUTOFF_REPLACEMENT = f"{SCHEDULE_CUTOFF}::test_cutoff_retains_elapsed_deadline_across_replacement"
+CUTOFF_REWIND = f"{SCHEDULE_CUTOFF}::test_observed_cutoff_survives_refused_claim_and_wall_rewind"
+SCHEDULE_VENDOR_RETURN = f"{SCHEDULE}::test_cloud_returns_before_local_schedule_sends_start"
+STOP_INCIDENT = "tests/test_managed_stop_incident.py"
+INCIDENT_WAL = "tests/test_managed_incident.py::test_incident_respects_the_published_live_wal_boundary"
 PAUSE_OVERLAP = (
     "tests/test_managed_cloud_zero_controls.py::test_local_pause_and_cloud_stop_share_unanswered_stop_at_zero"
 )
@@ -32,6 +42,9 @@ SHUTDOWN_JOIN = (
     "tests/test_journal_fault_recovery.py::test_shutdown_waits_for_exact_prior_stops_or_an_independent_attempt"
 )
 HA_TEST = "tests_ha_proxy/test_client.py::test_session_stop_shares_the_vendor_wire_in_either_order"
+HA_DISPLAY = "tests_ha_proxy/test_display_example.py"
+HA_DISPLAY_STOP = f"{HA_DISPLAY}::test_canvas_stop_rechecks_the_local_session"
+HA_DISPLAY_HANDSHAKE = f"{HA_DISPLAY}::test_canvas_frame_can_expire_during_the_management_handshake"
 
 SUITES = {
     "engine": (
@@ -71,6 +84,10 @@ SUITES = {
             f"{STOP_RESTART}[exact-stop-proof-unplugged]",
             f"{STOP_RESTART}[report-only-plugged]",
             f"{STOP_RESTART}[report-only-unplugged]",
+            f"{STOP_NATIVE_FIRST_PROCESS}[checkpoint-saved]",
+            f"{STOP_NATIVE_FIRST_PROCESS}[both-writes-refused]",
+            f"{STOP_TEST}::test_replacement_validates_retained_stop_closure_binding[legacy]",
+            f"{STOP_TEST}::test_replacement_validates_retained_stop_closure_binding[report]",
             f"{STOP_TEST}::test_live_stop_confirmation_uses_elapsed_time[-30]",
             f"{STOP_TEST}::test_live_stop_confirmation_uses_elapsed_time[30]",
             f"{STOP_TEST}::test_queued_stop_cannot_dispatch_after_expiry_write_rolls_back",
@@ -87,9 +104,32 @@ SUITES = {
             f"{SHUTDOWN_JOIN}[legacy]",
             f"{JOURNAL_TEST}[startup]",
             f"{JOURNAL_TEST}[live-retry]",
+            f"{CUTOFF_REPLACEMENT}[same]",
+            f"{CUTOFF_REPLACEMENT}[changed]",
+            f"{CUTOFF_REPLACEMENT}[unknown]",
+            f"{CUTOFF_REPLACEMENT}[legacy]",
+            f"{CUTOFF_REWIND}[cutoff-saved]",
+            f"{CUTOFF_REWIND}[cutoff-retained-in-memory]",
+            f"{SCHEDULE_VENDOR_RETURN}[vendor-lost-during-rollback-automatic-return]",
+            f"{SCHEDULE}::test_overlapping_timezone_change_does_not_repeat_local_occurrence",
+            "tests/test_vendor_stop_rotation.py::test_queued_vendor_stop_keeps_reply_through_rotation[Accepted]",
+            f"{STOP_INCIDENT}::test_legacy_joined_stop_report_retains_its_primary_reply",
+            f"{STOP_INCIDENT}::test_saved_vendor_rejection_survives_joined_receipt_settlement",
+            f"{INCIDENT_WAL}[published]",
         ),
     ),
-    "ha": ("offline_ha_validate.py", (f"{HA_TEST}[local]", f"{HA_TEST}[vendor]")),
+    "ha": (
+        "offline_ha_validate.py",
+        (
+            f"{HA_TEST}[local]",
+            f"{HA_TEST}[vendor]",
+            f"{HA_DISPLAY}::test_canvas_start_requires_the_displayed_revision",
+            f"{HA_DISPLAY_STOP}[old_native]",
+            f"{HA_DISPLAY_STOP}[closed]",
+            f"{HA_DISPLAY_HANDSHAKE}[start]",
+            f"{HA_DISPLAY_HANDSHAKE}[stop]",
+        ),
+    ),
 }
 
 

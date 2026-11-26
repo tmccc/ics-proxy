@@ -53,10 +53,10 @@ python -B tools/check_control_settlement.py ha
 ```
 
 The hosted checks run this selection before the routine engine checks and full Home Assistant suites. It covers
-both local and vendor-app Stop orders, including Pause overlap when a reply is lost. It also covers expired requests whose
-receipt write failed, exact shutdown dependencies, closure reports, process replacement, clock adjustments, and
-a new charger Boot. The Home Assistant cases check what the session control shows while the result is pending
-and after the exact session closes.
+local and vendor-app Stop order, Pause overlap, closure across a refused receipt write and process replacement,
+and exact Stop evidence across journal rotation. Scheduled cases exercise a clock rewind at cutoff, an
+unavailable cutoff claim, and vendor registration changing during Start rollback. The Home Assistant cases
+check the Stop receipt and reject stale canvas requests at the action and management write boundaries.
 
 ## Public replay files
 

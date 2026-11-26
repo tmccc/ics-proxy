@@ -618,6 +618,107 @@ async def test_display_service_rejects_pre_rewind_frames(actual_hass, peer, monk
     await hass.services.async_call("script", "turn_off", {"entity_id": EXPIRY}, blocking=True)
 
 
+# Submit a real integration action and ask for its exact attempted request reference.
+async def call_session_command(hass, action, **fields):
+    return await hass.services.async_call(
+        "ics_proxy",
+        "session_command",
+        {"action": action, "include_request_reference": True, **fields},
+        blocking=True,
+        return_response=True,
+    )
+
+
+# Intent: only an ordinary Start may use the coordinator's current revision when no revision is supplied.
+# Why: a canvas Start must use the control the user actually saw.
+async def test_canvas_start_requires_the_displayed_revision(actual_hass, peer, monkeypatch):
+    from custom_components.ics_proxy import session_service
+
+    wall = 1000
+    monkeypatch.setattr(session_service, "_frame_clock", lambda: (wall, wall))
+    await setup_proxy(actual_hass, peer["port"])
+    wall += 2
+    result = await call_session_command(actual_hass, "start", canvas_rendered_at_epoch=wall - 1)
+    assert result == {"confirmed": False, "request_reference": None}
+    assert set(peer["commands"]) == {"status"}
+
+    # An ordinary HA call may still use the current revision.
+    result = await call_session_command(actual_hass, "start")
+    assert result["confirmed"] is True
+    assert result["request_reference"] is not None
+    (command,) = [request for request in peer["requests"] if request["command"] == "start"]
+    assert command["revision"] == 0
+
+
+# Intent: require fresh native session evidence for the displayed Stop target, even with the vendor offline.
+# Why: target equality alone does not show that the original session is still open.
+@pytest.mark.parametrize("invalid", ["closed", "unknown", "old_native", "old_status"])
+async def test_canvas_stop_rechecks_the_local_session(actual_hass, peer, monkeypatch, invalid):
+    from custom_components.ics_proxy import session_service
+
+    wall = 1000
+    monkeypatch.setattr(session_service, "_frame_clock", lambda: (wall, wall))
+    peer["state"].update(charging_session_open=True, can_start=False, stop_target=TARGET)
+    entry = await setup_proxy(actual_hass, peer["port"])
+    wall += 2
+    # Leave the old target in the coordinator, as it can remain between timer and poll updates.
+    coordinator = entry.runtime_data
+    if invalid in ("old_native", "old_status"):
+        key = "native_age_seconds" if invalid == "old_native" else "status_age_seconds"
+        coordinator.data[key] = 15
+        coordinator.received_at -= 0.1
+    else:
+        coordinator.data["charging_session_open"] = False if invalid == "closed" else None
+    result = await call_session_command(actual_hass, "stop_session", target=TARGET, canvas_rendered_at_epoch=wall - 1)
+    assert result == {"confirmed": False, "request_reference": None}
+    assert set(peer["commands"]) == {"status"}
+
+    peer["state"].update(healthy=False, local_healthy=True, cloud_connected=False)
+    await coordinator.async_refresh()
+    result = await call_session_command(actual_hass, "stop_session", target=TARGET, canvas_rendered_at_epoch=wall - 1)
+    assert result["confirmed"] is True
+    assert result["request_reference"] is not None
+    (command,) = [request for request in peer["requests"] if request["command"] == "stop_session"]
+    assert command["target"] == TARGET
+
+
+# Intent: stop an expired display action before its first management write and omit the attempt reference.
+# Why: a slow handshake can outlive a frame that was fresh when the action began.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+async def test_canvas_frame_can_expire_during_the_management_handshake(actual_hass, peer, monkeypatch, starting):
+    from custom_components.ics_proxy import session_service
+
+    wall = 1000
+    monkeypatch.setattr(session_service, "_frame_clock", lambda: (wall, wall))
+    if not starting:
+        peer["state"].update(charging_session_open=True, can_start=False, stop_target=TARGET)
+    await setup_proxy(actual_hass, peer["port"])
+    frame = wall + 1
+    wall = frame + 44
+    entered_handshake = False
+
+    # Advance the simulated frame clock just before the real protocol upgrade.
+    async def expire_frame():
+        nonlocal wall, entered_handshake
+        entered_handshake = True
+        wall += 1
+
+    # The real management socket upgrades only after the original frame has expired.
+    peer["before_handshake"] = expire_frame
+    action = "start" if starting else "stop_session"
+    fields = {"revision": 0} if starting else {"target": TARGET}
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=frame, **fields)
+    assert entered_handshake
+    assert result == {"confirmed": False, "request_reference": None}
+    assert set(peer["commands"]) == {"status"}
+
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=wall, **fields)
+    assert result["confirmed"] is True
+    assert result["request_reference"] is not None
+    assert peer["commands"].count(action) == 1
+    assert "receipt" not in peer["commands"]
+
+
 # Intent: a Home Assistant restart carries an interrupted request into the existing unconfirmed feedback.
 # Why: the independent proxy can still settle that request after the original Home Assistant run ends.
 @pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])

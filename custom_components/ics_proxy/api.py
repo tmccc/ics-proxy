@@ -113,7 +113,9 @@ class ProxyClient:
         self.session, self.port, self.token = session, port, token
 
     # One bounded websocket exchange has no reconnect or retry path and authenticates outside the message body.
-    async def request(self, command: str, **fields: Any) -> dict[str, Any]:
+    async def request(
+        self, command: str, *, before_write: Callable[[], None] | None = None, **fields: Any
+    ) -> dict[str, Any]:
         identifier = fields.pop("id", uuid.uuid4().hex)
         sending = False
         try:
@@ -133,6 +135,8 @@ class ProxyClient:
                     protocols=["ics-proxy.v1"],
                     max_msg_size=65536,
                 ) as connection:
+                    if before_write is not None:
+                        before_write()
                     sending = True
                     await connection.send_json({"id": identifier, "command": command, **fields})
                     message = await connection.receive()
@@ -206,7 +210,13 @@ class ProxyClient:
 
     # Send the control once and recover a lost first reply by reading the original request's receipt.
     async def command(
-        self, action: str, revision: int, *, report_reference: Callable[[str], None] | None = None, **fields: Any
+        self,
+        action: str,
+        revision: int,
+        *,
+        report_reference: Callable[[str], None] | None = None,
+        before_write: Callable[[], None] | None = None,
+        **fields: Any,
     ) -> None:
         supplied_id = "id" in fields
         identifier = fields.pop("id", uuid.uuid4().hex)
@@ -234,11 +244,24 @@ class ProxyClient:
                 return isinstance(receipt.get("target"), str) and receipt["target"] == fields.get("target")
             return True
 
-        if report_reference is not None:
-            # Match the operator report's redaction without exposing a usable receipt ID.
-            report_reference(sha256(identifier.encode("ascii")).hexdigest()[:32])
+        # A guarded request gets a reference only after it passes its last local check.
+        def prepare_write() -> None:
+            if before_write is not None:
+                before_write()
+            if report_reference is not None:
+                # Match the operator report's redaction without exposing a usable receipt ID.
+                report_reference(sha256(identifier.encode("ascii")).hexdigest()[:32])
+
+        if before_write is None:
+            prepare_write()
         try:
-            receipt: dict[str, Any] | None = await self.request(action, id=identifier, revision=revision, **fields)
+            receipt: dict[str, Any] | None = await self.request(
+                action,
+                id=identifier,
+                revision=revision,
+                before_write=prepare_write if before_write is not None else None,
+                **fields,
+            )
         except UnknownCommandOutcomeError:
             receipt = None
         if receipt is not None and not matches(receipt):

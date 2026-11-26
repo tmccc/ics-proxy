@@ -81,6 +81,8 @@ async def peer():
         if request.headers.get("Authorization") != "Bearer " + TOKEN:
             raise web.HTTPUnauthorized()
         socket = web.WebSocketResponse(protocols=["ics-proxy.v1"])
+        if (before_handshake := control.pop("before_handshake", None)) is not None:
+            await before_handshake()
         await socket.prepare(request)
         message = await socket.receive()
         if message.type != WSMsgType.TEXT:

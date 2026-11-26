@@ -9,7 +9,7 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 
 from .api import ProxyError
-from .coordinator import DOMAIN
+from .coordinator import DOMAIN, ProxyCoordinator
 
 FRAME_MAX_AGE = 45
 FRAME_MAX_EPOCH = 2**32 - 1
@@ -47,20 +47,8 @@ def register_session_service(hass: HomeAssistant) -> None:
         )
 
     # A failed unload can leave the current coordinator available to handle an exact session request.
-    async def handle(call: ServiceCall) -> dict[str, bool | str | None]:
-        response: dict[str, bool | str | None] = {"confirmed": False}
-        include_reference = call.data.get("include_request_reference", False)
-        if include_reference:
-            response["request_reference"] = None
-        frame_epoch = call.data.get("canvas_rendered_at_epoch")
-        if frame_epoch is not None and not frame_is_current(frame_epoch):
-            return response
-
-        # Record the attempted request even if its receipt is lost or the proxy refuses it.
-        def record_reference(reference: str) -> None:
-            response["request_reference"] = reference
-
-        coordinator = next(
+    def active_coordinator() -> ProxyCoordinator | None:
+        return next(
             (
                 runtime
                 for entry in hass.config_entries.async_entries(DOMAIN)
@@ -70,32 +58,69 @@ def register_session_service(hass: HomeAssistant) -> None:
             ),
             None,
         )
+
+    # A display request carries evidence from the frame where the user pressed the button.
+    async def handle(call: ServiceCall) -> dict[str, bool | str | None]:
+        response: dict[str, bool | str | None] = {"confirmed": False}
+        include_reference = call.data.get("include_request_reference", False)
+        if include_reference:
+            response["request_reference"] = None
+        frame_epoch = call.data.get("canvas_rendered_at_epoch")
+        if frame_epoch is not None and not frame_is_current(frame_epoch):
+            return response
+        coordinator = active_coordinator()
         if coordinator is None:
             return response
-        data = coordinator.data or {}
         action = call.data["action"]
         target = call.data.get("target")
         requested_revision = call.data.get("revision")
-        revision = data.get("control_revision")
-        if not coordinator.last_update_success or type(revision) is not int:
+        revision = (coordinator.data or {}).get("control_revision")
+        if type(revision) is not int:
             return response
-        if action == "start":
-            if (
-                target is not None
-                or requested_revision is not None
-                and (type(requested_revision) is not int or requested_revision != revision)
-                or data.get("can_start") is not True
-                or not coordinator.fresh_local_healthy
-            ):
-                return response
-            fields: dict[str, str] = {}
-        else:
-            if requested_revision is not None or not isinstance(target, str) or target != data.get("stop_target"):
-                return response
-            fields = {"target": target}
+
+        # Reuse the same current control checks before connecting and after a canvas connection opens.
+        def request_is_current() -> bool:
+            data = coordinator.data or {}
+            current_revision = data.get("control_revision")
+            if not coordinator.last_update_success or type(current_revision) is not int or current_revision != revision:
+                return False
+            if action == "start":
+                return (
+                    target is None
+                    and (
+                        (requested_revision is None and frame_epoch is None)
+                        or (type(requested_revision) is int and requested_revision == revision)
+                    )
+                    and data.get("can_start") is True
+                    and coordinator.fresh_local_healthy
+                )
+            return (
+                requested_revision is None
+                and isinstance(target, str)
+                and target == data.get("stop_target")
+                and (frame_epoch is None or (data.get("charging_session_open") is True and coordinator.fresh_native))
+            )
+
+        if not request_is_current():
+            return response
+
+        # Retain the attempted request reference even if the receipt is lost or refused.
+        def record_reference(reference: str) -> None:
+            response["request_reference"] = reference
+
+        # The frame or its current control can expire while Home Assistant opens the management connection.
+        def require_current_canvas() -> None:
+            if not frame_is_current(frame_epoch) or active_coordinator() is not coordinator or not request_is_current():
+                raise ProxyError("The display request is no longer current")
+
+        fields = {"target": target} if action == "stop_session" else {}
         try:
             await coordinator.client.command(
-                action, revision, report_reference=record_reference if include_reference else None, **fields
+                action,
+                revision,
+                report_reference=record_reference if include_reference else None,
+                before_write=require_current_canvas if frame_epoch is not None else None,
+                **fields,
             )
             response["confirmed"] = True
         except ProxyError:

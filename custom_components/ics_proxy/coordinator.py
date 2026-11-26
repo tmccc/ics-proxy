@@ -65,27 +65,22 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         return value + max(0, time.monotonic() - self.received_at)
 
+    # Physical session evidence can stay current when the vendor connection is unavailable.
+    @property
+    def fresh_native(self) -> bool:
+        ages = [self.age(key) for key in AGE_FIELDS]
+        return (self.data or {}).get("running") is True and all(a is not None and 0 <= a <= 15 for a in ages)
+
     # Health cannot outlive either the independent native reading or the service report which verified it.
     @property
     def fresh_healthy(self) -> bool:
-        data = self.data or {}
-        ages = [self.age(key) for key in AGE_FIELDS]
-        return (
-            data.get("running") is True
-            and data.get("healthy") is True
-            and all(a is not None and 0 <= a <= 15 for a in ages)
-        )
+        return self.fresh_native and (self.data or {}).get("healthy") is True
 
     # Explicit local health can retain safe native control during a manufacturer-cloud outage.
     @property
     def fresh_local_healthy(self) -> bool:
         data = self.data or {}
-        ages = [self.age(key) for key in AGE_FIELDS]
-        return (
-            data.get("running") is True
-            and data.get("local_healthy", data.get("healthy")) is True
-            and all(a is not None and 0 <= a <= 15 for a in ages)
-        )
+        return self.fresh_native and data.get("local_healthy", data.get("healthy")) is True
 
     # Retire a previous snapshot expiry when new data arrives or HA unloads the entry.
     @callback

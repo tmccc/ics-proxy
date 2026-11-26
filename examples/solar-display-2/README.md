@@ -13,12 +13,13 @@ age against elapsed time. A refresh with the same control leaves that press boun
 The action requires a new frame after iCS integration setup. After it detects a backward clock adjustment, it
 requires a frame timestamp beyond the preceding clock range. The charger buttons may appear available while
 the Home Assistant clock catches up and the display receives a new frame.
-Start also requires the current control revision and permission to start. Stop requires the target to
-match the current open session. The touchscreen shows pending and unconfirmed feedback for the exact request from
-the live Home Assistant helper, including between image downloads. While the automation is enabled, an
-unconfirmed message clears after 20 elapsed seconds or when a new request replaces it. Home Assistant clock
-corrections do not extend the delay. A charger tap must begin and end while the button is available and no request
-is pending.
+Start also requires the displayed control revision to match the current revision and permission to start.
+Stop requires the displayed target to match a fresh, verified open session. The action checks the pressed frame
+and current control again before sending the management request. The touchscreen shows pending and unconfirmed
+feedback for the exact request from the live Home Assistant helper, including between image downloads. While the
+automation is enabled, an unconfirmed message clears after 20 elapsed seconds or when a new request replaces it.
+Home Assistant clock corrections do not extend the delay. A charger tap must begin and end while the button is
+available and no request is pending.
 When Home Assistant reports the automation as off or unavailable, the touchscreen immediately greys out both
 charger buttons and ignores taps on them. If Home Assistant removes the automation without sending a state
 update, the previous button image can remain until the next render or the offline timeout. Home Assistant
@@ -64,3 +65,6 @@ The example leaves charging decisions, retries, and recovery with the proxy.
 If Home Assistant offers Start but the display says **Charger buttons unavailable**, check that the touch
 automation is enabled, its entity ID matches both calls in the template, and the request helper is available.
 Once the frame refreshes, the display should say **Ready to start** when the proxy allows Start and no request is pending.
+
+Run the offline C++ freshness regression with `python -B examples/solar-display-2/tests/test_canvas_frame.py`.
+It uses `g++` with C++20 and exercises the actual firmware header with a simulated clock.
