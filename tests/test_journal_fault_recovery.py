@@ -6,6 +6,7 @@ from contextlib import closing
 
 import pytest
 
+from ics_proxy_core.engine.command_outcomes import OwnerWire
 from ics_proxy_core.engine.managed_intent import ManagedRequests, insert_request
 from ics_proxy_core.engine.store import Journal, fingerprint
 from tests.prototype_rig import START
@@ -80,6 +81,37 @@ def test_actual_writer_busy_does_not_change_journal(tmp_path):
     finally:
         other.close()
         j.close()
+
+
+# Intent: report a real reply independently of the order SQLite could save the associated attempts.
+# Why: a delayed insert for an earlier unanswered wire does not erase a reply for the same logical Pause.
+def test_owner_reply_diagnostics_survive_out_of_order_wire_storage(tmp_path):
+    path = tmp_path / "journal.db"
+    request, first, second = "a" * 32, "l-" + "b" * 32, "l-" + "c" * 32
+    with closing(Journal(path, "synthetic")) as j:
+        ManagedRequests(j)
+        insert_request(j, request, "pause", 0, {}, state="running")
+        local = j.start("fixture-start", START)["transactionId"]
+        j.db.executescript(f"""
+            CREATE TEMP TRIGGER refuse_first_wire BEFORE INSERT ON owner_command_wires
+            WHEN NEW.wire = '{first}' BEGIN SELECT RAISE(ABORT, 'fixture refusal'); END;
+        """)
+        older = OwnerWire(first, request, "d" * 32, "e" * 32, "RemoteStopTransaction", local, None)
+        newer = OwnerWire(second, request, "f" * 32, "1" * 32, "RemoteStopTransaction", local, None)
+        j.outcomes.record_owner_wire(older)
+        j.outcomes.record_owner_wire(newer)
+        j.outcomes.record_owner_reply(newer, [3, second, {"status": "Accepted"}])
+
+        observed = j.outcomes.owner(request, include_wires=True)
+        assert observed is not None and [wire.wire for wire in observed.wires] == [second, first]
+        assert observed.reply_known and observed.state == "running"
+        j.db.execute("DROP TRIGGER refuse_first_wire")
+        j.outcomes.retry_owner_writes()
+
+    with closing(Journal(path, "synthetic")) as j:
+        observed = j.outcomes.owner(request, include_wires=True)
+        assert observed is not None and [wire.wire for wire in observed.wires] == [second, first]
+        assert observed.reply_known and observed.state == "running"
 
 
 # Intent: settle a definite owner Start rejection from exact evidence after both normal writes fail.

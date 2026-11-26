@@ -137,13 +137,18 @@ class CanvasCommands:
             self._show_timeout(claim.binding.pending_feedback)
         self.coordinator.async_update_listeners()
 
-    def restore_interrupted(self, state: str, owner: object) -> None:
+    def restore_interrupted(self, state: str, owner: object, pending_feedback: object) -> None:
+        # Older saved state carries the pending phase only in the entity state.
+        if pending_feedback is None and state in ("v2:starting:none:-", "v2:stopping:none:-"):
+            pending_feedback = state.split(":")[1]
         if (
             isinstance(owner, str)
             and owner == self.coordinator.canvas_owner
-            and state in ("v2:starting:none:-", "v2:stopping:none:-")
+            and isinstance(pending_feedback, str)
+            and pending_feedback in ("starting", "stopping")
+            and state in (f"v2:{pending_feedback}:none:-", "v2:unavailable:none:-")
         ):
-            self._show_timeout(state.split(":")[1])
+            self._show_timeout(pending_feedback)
 
     def _show_timeout(self, pending_feedback: str) -> None:
         self._clear_timeout()

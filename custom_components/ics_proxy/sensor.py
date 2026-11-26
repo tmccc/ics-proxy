@@ -84,14 +84,19 @@ class DisplayCommandSensor(ProxyEntity, SensorEntity, RestoreEntity):
         pending = self.coordinator.canvas_commands.pending
         if pending is None:
             return None
-        return RestoredExtraData({"pending_owner": pending.binding.owner})
+        return RestoredExtraData(
+            {"pending_owner": pending.binding.owner, "pending_feedback": pending.binding.pending_feedback}
+        )
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         last = await self.async_get_last_state()
         stored = await self.async_get_last_extra_data()
         if last is not None and stored is not None:
-            self.coordinator.canvas_commands.restore_interrupted(last.state, stored.as_dict().get("pending_owner"))
+            data = stored.as_dict()
+            self.coordinator.canvas_commands.restore_interrupted(
+                last.state, data.get("pending_owner"), data.get("pending_feedback")
+            )
 
 
 class ProxySensor(ProxyEntity, SensorEntity):

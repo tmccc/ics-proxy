@@ -1127,10 +1127,15 @@ class ControlDecisions:
                 )
             if isinstance(decision, Pending):
                 return False, decision
+            previous = change["previous_a"]
             try:
-                c.session.book.require_confirmed_station(native.physical.resources, change["previous_a"])
-            except DeniedError:
+                c.session.book.require_confirmed_station(native.physical.resources, previous)
+                measured = c.native._inspect(native).selected(previous)
+            except DeniedError, StaleEvidenceError:
                 return False, None  # A later attempt can restore the missing proof under zero.
+            if native.output_limit_a > previous or measured.exceeded:
+                self.reclaim_current_recovery(worker, change, expected)
+                return True, Pending(Prerequisite.ZERO_PROOF, "native output exceeds the restored current ceiling")
             try:
                 with j.atomic():
                     self.restore_previous_current(worker, recovery=change)
@@ -1139,7 +1144,11 @@ class ControlDecisions:
                 return True, Pending(Prerequisite.RECONCILIATION, "current recovery awaits its receipt write", error)
             return True, None
 
-        return c.commands.decide(settle)
+        settled, pending = c.commands.decide(settle)
+        # A contradictory reading already claimed the exact hold and still needs its wire proof.
+        if settled and pending is not None and pending.reason is Prerequisite.ZERO_PROOF:
+            await self.protect_current_overlap(worker)
+        return settled, pending
 
     # Accept a delayed genuine original-plan report under this operation's zero, without inventing its lifecycle.
     async def prepare_current_report(

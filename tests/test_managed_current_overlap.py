@@ -444,7 +444,7 @@ async def test_overlap_recovery_requires_live_station_before_settlement(
 
 
 # Intent: revoke a restored positive offer in the same turn when fresh native evidence disagrees.
-# Why: a changed source or pending lifecycle reconciliation invalidates the release for the original session.
+# Why: the original session, lifecycle and independently observed current must still support the restored ceiling.
 @pytest.mark.parametrize(
     "after_composite",
     (
@@ -453,6 +453,8 @@ async def test_overlap_recovery_requires_live_station_before_settlement(
         "native_closed",
         "ledger_closed",
         "ledger_closed_before_commit",
+        "output_over_previous",
+        "draw_over_previous",
         "transport_unavailable",
     ),
 )
@@ -483,6 +485,17 @@ async def test_first_overlap_settlement_distinguishes_conflict_from_unavailable(
             positive_composites = []
             ledger_closes = after_composite in ("ledger_closed", "ledger_closed_before_commit")
             queued_report = None
+            native_value = b.rig.peer.native
+
+            # Leave the charger profile and composite intact while its independent connector or meter disagrees.
+            def native_after_positive_composite(key):
+                value = native_value(key)
+                if positive_composites and b.device.effective_limit() == 6:
+                    if after_composite == "output_over_previous" and key == "CONNECTOR":
+                        value[0]["outLimit"] = 160
+                    elif after_composite == "draw_over_previous" and key == "METER":
+                        value[0]["meterData"].update(cur=[160, 0, 0], power=[3840, 0, 0, 3840])
+                return value
 
             # Arrange the independent native change after the simulated charger confirms the previous limit.
             def observe_after_positive_composite(action, payload):
@@ -501,6 +514,7 @@ async def test_first_overlap_settlement_distinguishes_conflict_from_unavailable(
                 return answer
 
             monkeypatch.setattr(b.device, "answer", observe_after_positive_composite)
+            monkeypatch.setattr(b.rig.peer, "native", native_after_positive_composite)
             if after_composite == "ledger_closed":
                 read_result = b.c.native.read_result
 
@@ -556,7 +570,7 @@ async def test_first_overlap_settlement_distinguishes_conflict_from_unavailable(
                         assert status["state"] == "reconciling"
                         assert b.device.effective_limit() == 0 and b.device.current == 0
                         assert b.session.gateway.controls.desired() == 0
-                        if not ledger_closes:
+                        if after_composite in ("source_changed", "native_closed"):
                             assert change["continuing_local"] is None
                     else:
                         assert b.rig.peer.unavailable_requests and b.c.native.last_verified_at == 0

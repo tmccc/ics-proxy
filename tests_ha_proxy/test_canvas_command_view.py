@@ -165,14 +165,15 @@ async def test_canvas_feedback_expires_after_an_unconfirmed_same_revision(actual
 
 
 # Intent: restore interrupted feedback only for its original commissioned charger.
-# Why: a replacement entry may only publish offers backed by its own fresh status.
+# Why: a telemetry gap disables offers but the interrupted request still needs feedback after reload.
+@pytest.mark.parametrize("native_gap", [False, True], ids=["fresh_native", "native_gap"])
 @pytest.mark.parametrize(
     "reloaded_owner, feedback",
     [(OWNER, "starting_timeout"), (NEW_OWNER, "idle")],
     ids=["same_charger", "replacement_charger"],
 )
 async def test_canvas_reload_restores_only_interrupted_feedback(
-    actual_hass, peer, frame_clock, reloaded_owner, feedback
+    actual_hass, peer, frame_clock, reloaded_owner, feedback, native_gap
 ):
     peer["state"]["canvas_owner"] = OWNER
     entry = await setup_proxy(actual_hass, peer["port"])
@@ -190,6 +191,11 @@ async def test_canvas_reload_restores_only_interrupted_feedback(
     try:
         await asyncio.wait_for(entered.wait(), 3)
         assert actual_hass.states.get(ENTITY).state == "v2:starting:none:-"
+        if native_gap:
+            peer["state"]["native_age_seconds"] = None
+            await old_coordinator.async_refresh()
+            assert actual_hass.states.get(ENTITY).state == "v2:unavailable:none:-"
+            peer["state"]["native_age_seconds"] = 0
         peer["state"]["canvas_owner"] = reloaded_owner
         await actual_hass.config_entries.async_reload(entry.entry_id)
         assert entry.runtime_data is not old_coordinator
@@ -198,3 +204,25 @@ async def test_canvas_reload_restores_only_interrupted_feedback(
         release.set()
     assert await command == {"confirmed": False}
     assert "start" not in peer["commands"]
+
+
+@pytest.mark.parametrize(
+    "state, pending_feedback, restored_feedback",
+    [
+        ("v2:stopping:none:-", None, ["stopping"]),
+        ("v2:stopping_timeout:none:-", "stopping", []),
+        ("v2:idle:start:" + "f" * 32, "starting", []),
+        ("v2:unavailable:none:-", "idle", []),
+    ],
+    ids=["legacy_pending", "already_timed_out", "offer", "invalid_feedback"],
+)
+def test_canvas_restore_accepts_only_saved_pending_feedback(monkeypatch, state, pending_feedback, restored_feedback):
+    from custom_components.ics_proxy.canvas_command import CanvasCommands
+
+    commands = CanvasCommands(SimpleNamespace(canvas_owner=OWNER))
+    restored = []
+    monkeypatch.setattr(commands, "_show_timeout", restored.append)
+
+    commands.restore_interrupted(state, OWNER, pending_feedback)
+
+    assert restored == restored_feedback

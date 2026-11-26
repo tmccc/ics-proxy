@@ -180,7 +180,7 @@ class OwnerCommand:
     wires: tuple[OwnerWire, ...]
     sessions: tuple[SessionEffect, ...]
 
-    # A real reply is reporting evidence even when local completion or physical closure still awaits proof.
+    # A real reply is reporting evidence. Storage order is independent of dispatch and receipt order.
     @property
     def reply_known(self) -> bool:
         if self.action in ("start", "start_test"):
@@ -192,7 +192,7 @@ class OwnerCommand:
             relevant = [wire for wire in self.wires if wire.action == "RemoteStopTransaction"]
         else:
             relevant = [wire for wire in self.wires if wire.action == "SetChargingProfile" and wire.limit_a]
-        return bool(relevant) and relevant[-1].reply in ("Accepted", "Rejected", "NotSupported", "Unknown")
+        return any(wire.reply in ("Accepted", "Rejected", "NotSupported", "Unknown") for wire in relevant)
 
 
 @dataclass(frozen=True)
