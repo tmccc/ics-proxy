@@ -36,6 +36,7 @@ from ics_proxy_core.engine.station import StationChoice  # noqa: E402
 from ics_proxy_core.engine.store import RecoveryRequiredError, fingerprint  # noqa: E402
 from ics_proxy_core.engine.trial_config import TrialConfig  # noqa: E402
 from ics_proxy_core.engine.trial_evidence import profile_projection  # noqa: E402
+from ics_proxy_core.engine.trial_session import validate_state_path  # noqa: E402
 from tools.rollback_recovery_state import RECOVERY_METADATA, recovery_history_settled  # noqa: E402
 
 
@@ -179,7 +180,8 @@ def stopped_journal(path: Path):
     require(
         stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077, "journal_unavailable"
     )
-    descriptor = os.open(str(path) + ".lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    lock_path = Path(str(path) + ".lock")
+    descriptor = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, "rb") as lock:
         held = os.fstat(lock.fileno())
         require(
@@ -190,6 +192,14 @@ def stopped_journal(path: Path):
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RollbackRefusedError("journal_owner_running") from None
+        try:
+            validate_state_path(path)
+        except SecurityError:
+            raise RollbackRefusedError("journal_unavailable") from None
+        require(
+            os.path.samestat(info, path.lstat()) and os.path.samestat(held, lock_path.lstat()),
+            "journal_unavailable",
+        )
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as db:
             db.execute("PRAGMA query_only=ON")
             db.execute("BEGIN")

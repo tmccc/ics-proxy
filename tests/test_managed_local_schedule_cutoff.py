@@ -9,11 +9,13 @@ from datetime import UTC, datetime
 
 import pytest
 
+from ics_proxy_core.constants import HUB_PROFILE_ID
 from ics_proxy_core.engine.local_schedule_cutoff import scheduled_cutoff_target
 from ics_proxy_core.engine.managed_current import capability_value
 from ics_proxy_core.engine.managed_intent import LOCAL_SCHEDULE_OCCURRENCE
 from ics_proxy_core.engine.managed_sources import ORDINARY_HOLD
 from ics_proxy_core.engine.managed_view import refresh_for_read
+from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
 from tests.managed_rig import starts
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
@@ -300,6 +302,13 @@ async def test_natural_owner_stop_with_unplugged_connector(
                 if report_order != "ocpp-first":
                     assert j.active() == hold["local"] == local and hold["start"]
                     assert not j.outcomes.stop_report_closed(local)
+                    if report_order == "unplug-first" and offered:
+                        bench.cp, bench.connection = "B", "Plug"
+                        waiting = await c.tick()
+                        assert waiting["state"] == "reconciling" and not waiting["local_hold_verified"]
+                        assert j.active() == local and j.get(ORDINARY_HOLD) == hold
+                        assert bench.firmware.effective_limit() == 0 and not stops(bench)
+                        bench.cp, bench.connection = "A", "Unplug"
                     if operator_pause and report_order == "native-first":
                         pause = uuid.uuid4().hex
                         c.command(pause, "pause", first_intent.revision)
@@ -347,8 +356,9 @@ async def test_natural_owner_stop_with_unplugged_connector(
 # Audits must still reject a different native ID or real draw while awaiting the genuine Stop.
 @pytest.mark.parametrize("activity", ["drawing", "foreign-id"])
 @pytest.mark.parametrize("cloud_returned", [False, True], ids=["offline", "cloud-returned"])
+@pytest.mark.parametrize("replugged", [False, True], ids=["unplugged", "replugged"])
 async def test_unplugged_owner_wait_rejects_other_native_activity(
-    tmp_path, tls, unused_tcp_port, monkeypatch, activity, cloud_returned
+    tmp_path, tls, unused_tcp_port, monkeypatch, activity, cloud_returned, replugged
 ):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
         async with connection(rig, "contradictory-active-owner") as test:
@@ -365,6 +375,8 @@ async def test_unplugged_owner_wait_rejects_other_native_activity(
             assert (await c.tick())["state"] == "reconciling"
             assert bench.firmware.effective_limit() == 0
 
+            if replugged:
+                bench.cp, bench.connection = ("C", "Charging") if activity == "drawing" else ("B", "Plug")
             if activity == "foreign-id":
                 bench.firmware.active = local + 1
             else:
@@ -382,6 +394,102 @@ async def test_unplugged_owner_wait_rejects_other_native_activity(
             assert view["state"] == "attention" and view["fault"] == "native_authority_or_preservation_failed"
             assert j.active() == local and not j.outcomes.stop_report_closed(local)
             assert not stops(bench) and len(starts(rig)) == 1 and bench.firmware.effective_limit() == 0
+
+
+# Losing the installed zero is a fault on either side of the genuine Stop report.
+@pytest.mark.parametrize("station", ["missing", "changed"])
+@pytest.mark.parametrize("closure", ["native-open", "native-closed", "ocpp-closed"])
+async def test_unplugged_owner_wait_reports_station_fault(
+    tmp_path, tls, unused_tcp_port, monkeypatch, station, closure
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "unplugged-owner-station-fault") as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            local, meter_start = await begin(test, clock)
+            clock.now = MIDNIGHT + 30
+            bench.cp, bench.connection = "A", "Unplug"
+            bench.firmware.requested_current = 0
+            rig.peer.permission_enabled = False
+            monkeypatch.setattr(rig.peer, "native", report_offer(rig.peer, lambda: 6))
+            assert (await c.tick())["state"] == "reconciling"
+            assert j.get(ORDINARY_HOLD)["local"] == local and bench.firmware.effective_limit() == 0
+
+            if closure == "native-closed":
+                bench.firmware.active = None
+            elif closure == "ocpp-closed":
+                await close(test, clock, local, meter_start)
+                bench.firmware.active = local
+                assert (await c.tick())["state"] == "reconciling"
+                assert j.get(ORDINARY_HOLD)["owner_closure"] == local
+
+            mark = len(bench.device_calls)
+            if station == "missing":
+                bench.firmware.profiles.pop(HUB_PROFILE_ID)
+            else:
+                profile = bench.firmware.profiles[HUB_PROFILE_ID]
+                profile["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] = 6
+
+            for _ in range(4):
+                view = await c.tick()
+            expected = "station_ceiling_lost" if station == "missing" else "native_authority_or_preservation_failed"
+            assert view["state"] == "attention" and view["fault"] == j.fault.classification() == expected
+            assert not view["local_hold_verified"] and len(starts(rig)) == 1
+            assert j.outcomes.stop_report_closed(local) is (closure == "ocpp-closed")
+            protective_stop = station == "missing" and closure == "native-open"
+            assert stops(bench) == ([{"transactionId": local}] if protective_stop else [])
+            fresh = bench.device_calls[mark:]
+            assert not any(frame[2] == "ClearChargingProfile" for frame in fresh)
+            writes = [frame[3]["csChargingProfiles"] for frame in fresh if frame[2] == "SetChargingProfile"]
+            if station == "missing":
+                assert not writes
+            assert all(
+                profile["chargingProfileId"] == HUB_PROFILE_ID
+                and profile["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0
+                for profile in writes
+            )
+
+
+# Startup can observe a proved station loss before the saved owner closure is restored.
+@pytest.mark.parametrize("ocpp_closed", [False, True], ids=["native-closed", "ocpp-closed"])
+async def test_replacement_reports_missing_station_during_owner_wait(
+    tmp_path, tls, unused_tcp_port, monkeypatch, ocpp_closed
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        bench = rig.bench
+        async with connection(rig, "before-station-loss") as test:
+            c, j = test.controller, test.session.journal
+            local, meter_start = await begin(test, clock)
+            intent = c.requests.intent()
+            clock.now = MIDNIGHT + 30
+            bench.cp, bench.connection = "A", "Unplug"
+            bench.firmware.requested_current = 0
+            rig.peer.permission_enabled = False
+            monkeypatch.setattr(rig.peer, "native", report_offer(rig.peer, lambda: 6))
+            assert (await c.tick())["state"] == "reconciling"
+            assert j.get(ORDINARY_HOLD)["local"] == local and bench.firmware.effective_limit() == 0
+            if ocpp_closed:
+                await close(test, clock, local, meter_start)
+                bench.firmware.active = local
+                assert (await c.tick())["state"] == "reconciling"
+                assert j.get(ORDINARY_HOLD)["owner_closure"] == local
+            else:
+                bench.firmware.active = None
+
+        mark = len(bench.device_calls)
+        bench.firmware.profiles.pop(HUB_PROFILE_ID)
+        async with connection(rig, "after-station-loss") as test:
+            c, j = test.controller, test.session.journal
+            view = await c.tick()
+            assert view["state"] == "attention" and view["fault"] == "station_ceiling_lost"
+            assert not view["local_hold_verified"] and c.requests.intent() == intent
+            assert j.outcomes.stop_report_closed(local) is ocpp_closed
+            if not ocpp_closed:
+                await close(test, clock, local, meter_start)
+            bench.firmware.active = None
+            assert j.outcomes.stop_report_closed(local) and j.active() is None
+            assert (await c.tick())["fault"] == "station_ceiling_lost"
+            assert HUB_PROFILE_ID not in bench.firmware.profiles and not stops(bench) and len(starts(rig)) == 1
+            assert not any(frame[2] == "SetChargingProfile" for frame in bench.device_calls[mark:])
 
 
 # A real Stop can supersede the native read before the earlier closure evidence resolves.
@@ -522,6 +630,70 @@ async def test_replacement_after_unplug_before_owner_stop(
                 assert c.requests.offline_pause_current(c.requests.intent())
                 await status(test, lambda view: len(starts(rig)) == 2)
                 await c.charging.settle()
+            assert not stops(bench)
+
+
+# Startup can first see an unplugged owner session after an earlier native outage claimed its exact zero.
+@pytest.mark.parametrize("connector", ["plugged", "unplugged-native-closed", "unplugged-id-retained"])
+async def test_replacement_after_owner_unplugs_during_native_outage(
+    tmp_path, tls, unused_tcp_port, monkeypatch, connector
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        bench = rig.bench
+        async with connection(rig, "owner-unplug-outage-original") as test:
+            c, j = test.controller, test.session.journal
+            local, meter_start = await begin(test, clock)
+            intent = c.requests.intent()
+            occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
+            receipt = c.requests.receipt(occurrence["request"])
+            clock.now = MIDNIGHT + 30
+
+            async def unavailable():
+                raise NativeTransportUnavailableError("brief loss of native telemetry")
+
+            with monkeypatch.context() as outage:
+                outage.setattr(c.native, "observe", unavailable)
+                for _ in range(3):
+                    await c.tick()
+            saved = j.get(ORDINARY_HOLD)
+            assert saved["reason"] == "native_observation_unavailable"
+            assert saved["local"] == local and saved["start"]
+            assert bench.firmware.effective_limit() == 0
+            assert j.active() == local and not stops(bench)
+
+            bench.firmware.requested_current = 0
+            rig.peer.permission_enabled = False
+            if connector == "plugged":
+                bench.cp, bench.connection = "B", "Plug"
+            else:
+                bench.cp, bench.connection = "A", "Unplug"
+                if connector == "unplugged-native-closed":
+                    bench.firmware.active = None
+
+        async with connection(rig, "owner-unplug-outage-replacement") as test:
+            c, j = test.controller, test.session.journal
+            assert j.active() == local and not j.outcomes.stop_report_closed(local)
+            if connector == "plugged":
+                assert c.requests.intent().mode == "paused"
+                assert c.charging.state()["state"] == "interrupted"
+                assert j.get(ORDINARY_HOLD) == saved
+                return
+
+            assert c.requests.intent() == intent
+            assert j.get(ORDINARY_HOLD) == {**saved, "reason": "unplugged_session_pending"}
+            assert (await c.tick())["state"] == "reconciling"
+            assert bench.firmware.effective_limit() == 0 and not stops(bench)
+            await close(test, clock, local, meter_start)
+            bench.firmware.active = None
+            await status(test, lambda view: view["local_hold_verified"])
+            assert j.outcomes.stop_report_closed(local) and not j.fault.latched()
+            assert c.requests.receipt(occurrence["request"]) == receipt
+            assert c.requests.offline_pause_current(c.requests.intent())
+
+            bench.cp, bench.connection = "B", "Plug"
+            clock.now = MIDNIGHT + 24 * 3600
+            await status(test, lambda view: len(starts(rig)) == 2)
+            await c.charging.settle()
             assert not stops(bench)
 
 

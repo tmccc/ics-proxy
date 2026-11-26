@@ -5,15 +5,41 @@ import json
 import sqlite3
 import time
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 
-from ics_proxy_core.engine.store import fingerprint
+from ics_proxy_core.engine.store import Journal, fingerprint
 from tests.process_helpers import process_rig
 from tests.tls_support import tls as tls
 from tests_installation.migrated_layout import seed_old_layout
 from tools import check_proxy_rollback as rollback
 from tools.check_proxy_rollback import RollbackRefusedError, check_snapshot, stopped_journal
+
+
+# Every SQLite state file must belong exclusively to the same stopped journal path and lock.
+@pytest.mark.parametrize(
+    "suffix", ["", ".lock", "-wal", "-shm", "-journal"], ids=["journal", "lock", "wal", "shm", "rollback"]
+)
+def test_stopped_journal_refuses_hardlinked_state(tmp_path, suffix):
+    live = tmp_path / "live.sqlite"
+    with closing(Journal(live, "SYNTHETIC")):
+        pass
+    shared = Path(str(live) + suffix)
+    shared.touch(mode=0o600, exist_ok=True)
+    alias = tmp_path / "backup.sqlite"
+    if not suffix:
+        alias.hardlink_to(live)
+        Path(str(alias) + ".lock").touch(mode=0o600)
+        check = alias
+    else:
+        alias.hardlink_to(shared)
+        check = live
+
+    before = set(tmp_path.iterdir())
+    with pytest.raises(RollbackRefusedError, match="^journal_unavailable$"), stopped_journal(check):
+        pytest.fail("rollback inspected a hard-linked journal")
+    assert set(tmp_path.iterdir()) == before
 
 
 # Save the same immutable timed-Start outcome and later verified Pause found in the installed journal.

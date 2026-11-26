@@ -206,9 +206,9 @@ class NativeBoundedHandover:
 
     # Managed recovery receives native availability directly after the same full audit and durable publication.
     async def read_result(
-        self, *, closed: bool = False, closing_local: int | None = None
+        self, *, closed: bool = False, owned: bool = False, closing_local: int | None = None
     ) -> HandoverEvidence | Pending:
-        return await self._read(closed=closed, as_result=True, closing_local=closing_local)
+        return await self._read(closed=closed, as_result=True, owned=owned, closing_local=closing_local)
 
     # One audit implementation owns strict verdicts, supersession, resource reconciliation and optional availability.
     async def _read(

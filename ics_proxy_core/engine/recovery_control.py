@@ -12,12 +12,13 @@ from typing import TYPE_CHECKING, Any, Literal
 from ..constants import HUB_PROFILE_ID
 from .connection_scope import CloudAttemptScope, control_scope_matches, current_control_scope, current_scope
 from .control_state import ControlState
-from .managed_intent import OFFLINE_PAUSE, ControlIntent, write_intent
+from .managed_intent import OFFLINE_PAUSE, ControlIntent, decode_intent, write_intent
 from .managed_recovery import local_recovery_binding
 from .managed_settlement import require_settled_debt
 from .managed_sources import ORDINARY_HOLD as KEY
 from .managed_sources import ORDINARY_SOURCE as SOURCE
 from .managed_sources import recorded_station_profile
+from .native_faults import STATION_CEILING_LOST
 from .recovery_contracts import ALLOW, GateDecision, Guard, Pending, Prerequisite
 from .recovery_policy import RecoveryFacts, RecoveryObligation, RecoveryWork
 from .rpc import IntroductionDeferredError, UnavailableError
@@ -477,16 +478,20 @@ class RecoveryControl:
             or not self.verified_normal(charging)
         ):
             return False
-        if not self.ordinary(charging) or not recorded_station_profile(
-            j, c.native.spec.digest, c.native.spec.boot_digest
-        ):
+        if not self.ordinary(charging):
             return False
         active = j.active()
         if active is not None:
-            return active == local and self.held_owner_stop_pending(c)
-        if j.latest_owner_stop_id() != local:
+            if active != local or not self.held_owner_stop_pending(c):
+                return False
+        elif j.latest_owner_stop_id() != local:
             return False
-        if not self.ordinary_active(c) or j.get(KEY, {}).get("owner_closure") != local:
+        if (active is not None or self.held_owner_closure(c) == local) and c.session.book.station_ceiling_lost():
+            c.fault(STATION_CEILING_LOST)
+            return True
+        if not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest):
+            return False
+        if active is None and (not self.ordinary_active(c) or j.get(KEY, {}).get("owner_closure") != local):
             self._save_ordinary_hold(c, "native_closure_pending", None, None, local)
         return True
 
@@ -522,6 +527,16 @@ class RecoveryControl:
             and j.is_owner_session(local)
             and self._owner_hold_matches(hold, local)
         )
+
+    # A known profile failure remains visible while the exact owner waits for closure on either channel.
+    def record_owner_closure_station_fault(self, c: ManagedController) -> None:
+        j = self.journal
+        if j.fault.latched() or not (self.held_owner_stop_pending(c) or self.held_owner_closure(c) is not None):
+            return
+        if c.session.book.station_ceiling_lost():
+            c.fault(STATION_CEILING_LOST)
+        elif j.get("trial_inventory_fault", {}).get("resource") == f"profile:{HUB_PROFILE_ID}":
+            c.fault("native_authority_or_preservation_failed")
 
     # Independent closed zero and settled reports can hand the exact hold over to the usual automatic Pause.
     def complete_owner_closure(
@@ -640,8 +655,18 @@ class RecoveryControl:
     def ordinary_preflight(
         self, ordinary: OrdinaryRecovery, native: HandoverEvidence
     ) -> tuple[dict[str, Any], int | None] | Pending:
-        j = self.journal
+        c, j = ordinary.c, self.journal
         local = j.active()
+        if self.held_owner_stop_pending(c):
+            physical = native.physical
+            if (
+                physical.native_transaction_id not in (None, local)
+                or physical.power_w != 0
+                or any(native.currents_a + native.powers_w)
+                or native.output_limit_a > c.current.selected()
+            ):
+                raise SecurityError("native evidence contradicts the held owner session at zero")
+            return Pending(Prerequisite.LIFECYCLE, "ordinary zero hold awaits exact native closure")
         unplugged_hold = j.get(KEY, {}).get("reason") == "unplugged_session_pending"
         if ordinary.closure_gap(native) or (unplugged_hold and native.physical.transaction_open):
             return Pending(Prerequisite.LIFECYCLE, "ordinary zero hold awaits exact native closure")
@@ -802,7 +827,25 @@ class RecoveryControl:
             self.journal.phase.activate()
             self.journal.phase.begin_introduction()
         else:
+            self._recognize_startup_owner_closure(session.native_bounded, native)
             self.journal.phase.recover()
+
+    # A native outage may own the exact active session before startup can observe that it unplugged.
+    def _recognize_startup_owner_closure(self, handover: NativeBoundedHandover, native: HandoverEvidence) -> None:
+        j = self.journal
+        hold, local = j.get(KEY, {}), j.active()
+        intent, revision = j.get("managed_control_intent"), hold.get("revision")
+        if (
+            hold.get("state") == "holding"
+            and hold.get("reason") == "native_observation_unavailable"
+            and type(revision) is int
+            and intent is not None
+            and decode_intent(intent) == ControlIntent("app", revision)
+            and self._owner_hold_matches(hold, local)
+            and self.owner_closure_gap(handover, native, local)
+            and recorded_station_profile(j, handover.spec.digest, handover.spec.boot_digest)
+        ):
+            j.put(KEY, {**hold, "reason": "unplugged_session_pending"})
 
     # Bind the new observation to the admitted installation before any native wait.
     def begin_introduction(self, handover: NativeBoundedHandover) -> IntroductionClaim:

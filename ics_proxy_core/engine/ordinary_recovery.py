@@ -113,7 +113,7 @@ class OrdinaryRecovery:
         c = self.c
         await self.hold("native_closure_pending", owner_closure=local)
         authority = c.authority()
-        native = await c.native.read(closing_local=local)
+        native = await c.native.read(owned=True, closing_local=local)
         sequence = c.native.last_resolved_read
         return c.commands.decide(
             lambda: self.control.complete_owner_closure(self, local, native, authority, sequence),
@@ -128,7 +128,9 @@ class OrdinaryRecovery:
         active = journal.active()
         closing_local = active if journal.is_owner_session(active) else None
         try:
-            native = await c.native.read_result(closing_local=closing_local)
+            native = await c.native.read_result(
+                owned=self.control.held_owner_stop_pending(c), closing_local=closing_local
+            )
         except NativeReadinessError as error:
             if not error.unplugged_at_zero or not self.closure_gap(error.native):
                 raise

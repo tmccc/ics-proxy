@@ -583,6 +583,10 @@ class ManagedController:
         if j.fault.latched():
             await self.hold_fault()
         await self._stop_for_missing_station()
+        self.commands.decide(
+            lambda: g.controls.decisions.recovery.record_owner_closure_station_fault(self),
+            priority=CommandPriority.RESTRICT,
+        )
         if j.fault.latched():
             if (
                 self.requests.pending_pause()
