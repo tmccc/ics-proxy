@@ -28,7 +28,7 @@ from .current_policy import (
     original_current_plan,
 )
 from .local_schedule import SCHEDULE_CUTOFF, ScheduleCloudReturnedError, ScheduleCutoffError
-from .local_schedule_cutoff import scheduled_cutoff_target
+from .local_schedule_cutoff import record_cutoff_pause, scheduled_cutoff_target
 from .managed_facts import ManagedFacts
 from .managed_intent import (
     ControlIntent,
@@ -1329,9 +1329,9 @@ class ControlDecisions:
         lease = charging._start_lease(identifier, action, revision, schedule=schedule, startup=startup)
         if schedule is not None and (not lease.normal or lease.owner_start_tag is None):
             raise DeniedError("a local schedule requires its bounded owner Start authorization")
-        j.starts.admit(lease, action, startup, duration)
-        if schedule_cutoff is not None:
-            c.local_schedule.deadline = identifier, schedule_cutoff
+        j.starts.admit(lease, action, startup, duration, schedule_cutoff=schedule_cutoff)
+        if schedule_cutoff is not None and schedule_cutoff.epoch is None:
+            c.local_schedule.process_deadline = identifier, schedule_cutoff.deadline
         charging._launch_start(lease)
         return c.requests.receipt(identifier)
 
@@ -1477,7 +1477,7 @@ class ControlDecisions:
         else:
             c = charging.controller
             cutoff = isinstance(error, ScheduleCutoffError) and (result is None or not result.remote_start_dispatched)
-            cloud_returned = isinstance(error, ScheduleCloudReturnedError) and c.session.runtime.vendor_registered
+            cloud_returned = isinstance(error, ScheduleCloudReturnedError)
             charging.stop(
                 lease,
                 SCHEDULE_CUTOFF if cutoff else "start_not_confirmed",
@@ -1565,9 +1565,15 @@ class ControlDecisions:
                     and receipt.get("stage") in ("issued", "accepted")
                 )
                 if not ownership.supersedes(saved.get("revision")):
-                    if not preserve:
-                        write_intent(self.journal, intent, "paused", coalesce=refused)
-                    self._claim_internal_pause(controller, "test", saved["id"])
+                    occurrence = (
+                        controller.local_schedule.due_owner_occurrence(saved["id"]) if intent.mode == "app" else None
+                    )
+                    if occurrence is not None:
+                        record_cutoff_pause(controller, occurrence, intent)
+                    else:
+                        if not preserve:
+                            write_intent(self.journal, intent, "paused", coalesce=refused)
+                        self._claim_internal_pause(controller, "test", saved["id"])
                 self.journal.starts.interrupted(saved, preserve)
         self.journal.starts.retire_refused()
 

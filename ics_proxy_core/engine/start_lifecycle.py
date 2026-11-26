@@ -28,6 +28,7 @@ from .start_settlement import (
 from .store import RecoveryRequiredError, encoded, fingerprint
 
 if TYPE_CHECKING:
+    from .local_schedule_window import ScheduleCutoff
     from .managed_charging import ChargeLease
     from .store import Journal
     from .trial_handover_evidence import HandoverEvidence
@@ -313,7 +314,15 @@ class StartLifecycle:
         self.journal.control.hold(control, start_pending=False)
 
     # Admission owns the new metadata and receipt row, while retaining an older wire receipt until preparation.
-    def admit(self, lease: ChargeLease, action: str, startup: float, duration: float) -> None:
+    def admit(
+        self,
+        lease: ChargeLease,
+        action: str,
+        startup: float,
+        duration: float,
+        *,
+        schedule_cutoff: ScheduleCutoff | None = None,
+    ) -> None:
         j = self.journal
         accepted_at = time.time()
         local = lease.source == "local"
@@ -321,9 +330,15 @@ class StartLifecycle:
         result = {"accepted_at": accepted_at} if local else {"armed": True, "charging_started": False}
         with j.atomic():
             if lease.schedule is not None:
+                assert schedule_cutoff is not None
                 j.put(
                     LOCAL_SCHEDULE_OCCURRENCE,
-                    {"request": lease.identifier, "window": asdict(lease.schedule), "local": None},
+                    {
+                        "request": lease.identifier,
+                        "window": asdict(lease.schedule),
+                        "local": None,
+                        "cutoff_clock": asdict(schedule_cutoff),
+                    },
                 )
             j.put(
                 "managed_test_charge",

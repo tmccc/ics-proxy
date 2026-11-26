@@ -101,8 +101,8 @@ class ManagedController:
         self.status_vendor_epoch: int | None = None
 
         self.current = ManagedCurrentLimits(self)
-        self.charging = ManagedCharging(self)
         self.local_schedule = LocalSchedule(self, session.prepared.config.owner_schedule_timezone)
+        self.charging = ManagedCharging(self)
         self.session_stop = ManagedSessionStop(self)
         session.managed_session_stop = self.session_stop
         self.ordinary = OrdinaryRecovery(self)

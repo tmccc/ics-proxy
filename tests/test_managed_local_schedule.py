@@ -287,7 +287,7 @@ async def test_offline_schedule_retries_an_unsent_native_preflight(tmp_path, tls
                 require_idle(charging, lease, native)
 
             monkeypatch.setattr(decisions, "require_idle_start", refuse_first_preflight)
-            clock.now = MIDNIGHT
+            clock.now = MIDNIGHT + 3600
             refused = await status(
                 test,
                 lambda value: (
@@ -308,11 +308,12 @@ async def test_offline_schedule_retries_an_unsent_native_preflight(tmp_path, tls
             ).fetchone()
 
             rig.bench.cp, rig.bench.connection = "B", "Plug"
-            clock.now = MIDNIGHT + 20
+            clock.step_wall(MIDNIGHT + 20)
             await status(test, lambda value: bool(starts(rig)))
             await c.charging.settle()
             retry = j.get(LOCAL_SCHEDULE_OCCURRENCE)
             assert retry["request"] != refused_request and retry["window"] == original["window"]
+            assert retry["cutoff_clock"] == original["cutoff_clock"]
             assert [frame[3] for frame in starts(rig)] == [{"connectorId": 1, "idTag": OWNER_TAG}]
             assert (
                 j.db.execute(
@@ -323,12 +324,58 @@ async def test_offline_schedule_retries_an_unsent_native_preflight(tmp_path, tls
             )
 
 
+# Intent: a time zone adjustment cannot spend overlapping bounds of the same plan a second time.
+# Why: the earlier exact local Start remains authoritative after Stop and process replacement.
+async def test_overlapping_timezone_change_does_not_repeat_local_occurrence(
+    tmp_path, tls, unused_tcp_port, monkeypatch
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        bench = rig.bench
+        async with connection(rig, "original-timezone") as test:
+            c, j = test.controller, test.session.journal
+            await status(test, lambda value: value.get("local_hold_verified") is True)
+            clock.now = MIDNIGHT
+            await status(test, lambda _: bool(starts(rig)))
+            await c.charging.settle()
+            requested = START | {"idTag": OWNER_TAG, "timestamp": datetime.fromtimestamp(clock.now, UTC).isoformat()}
+            started = await bench.call(test.charger, uuid.uuid4().hex, "StartTransaction", requested)
+            local = started[2]["transactionId"]
+            clock.now = MIDNIGHT + 120
+            stopped = {
+                "transactionId": local,
+                "meterStop": requested["meterStart"],
+                "timestamp": datetime.fromtimestamp(clock.now, UTC).isoformat(),
+            }
+            assert (await bench.call(test.charger, uuid.uuid4().hex, "StopTransaction", stopped))[0] == 3
+            await status(test, lambda _: j.starts.receipt().get("local") == local and j.active() is None)
+            original = j.get(LOCAL_SCHEDULE_OCCURRENCE)
+            assert original["local"] == local and original["window"]["starts_at"] == MIDNIGHT
+
+        rig.prepared.config = replace(rig.prepared.config, owner_schedule_timezone="Atlantic/Azores")
+        clock.now = MIDNIGHT + 2 * 3600
+        async with connection(rig, "adjusted-timezone") as test:
+            c, j = test.controller, test.session.journal
+            await status(test, lambda value: value.get("normal_start_ready") is True)
+            for _ in range(3):
+                await c.tick()
+            assert j.get(LOCAL_SCHEDULE_OCCURRENCE) == original
+            assert len(starts(rig)) == 1 and j.active() is None
+
+            clock.now += 24 * 3600
+            await status(test, lambda _: len(starts(rig)) == 2)
+            assert j.get(LOCAL_SCHEDULE_OCCURRENCE)["window"]["starts_at"] == MIDNIGHT + 25 * 3600
+
+
 # Intent: return the verified hold to iCS if it reconnects before the scheduled Start is sent.
 # Why: an unsent Start should permit normal app authority unless a newer explicit Pause supersedes it.
 @pytest.mark.parametrize("explicit_pause", [False, True], ids=["automatic-return", "new-explicit-pause"])
-@pytest.mark.parametrize("reply_limit", [None, 0, 6], ids=["initial-zero-confirmed", "zero-reply", "positive-reply"])
+@pytest.mark.parametrize(
+    ("reply_limit", "flap"),
+    [(None, False), (0, False), (6, False), (6, True)],
+    ids=["initial-zero-confirmed", "zero-reply", "positive-reply", "vendor-lost-during-rollback"],
+)
 async def test_cloud_returns_before_local_schedule_sends_start(
-    tmp_path, tls, unused_tcp_port, monkeypatch, explicit_pause, reply_limit
+    tmp_path, tls, unused_tcp_port, monkeypatch, explicit_pause, reply_limit, flap
 ):
     clock = SchedulerClock(MIDNIGHT - 60)
     monotonic = time.monotonic()
@@ -349,6 +396,7 @@ async def test_cloud_returns_before_local_schedule_sends_start(
             controls = test.session.gateway.controls
             stop = controls.stop
             reached_boundary, release = asyncio.Event(), asyncio.Event()
+            rollback_reached, rollback_release = asyncio.Event(), asyncio.Event()
 
             # Pause the scheduled worker after the initial zero is verified and before it can send Start.
             async def wait_after_initial_zero(**kwargs):
@@ -361,12 +409,16 @@ async def test_cloud_returns_before_local_schedule_sends_start(
 
             # The independent charger applies the profile before releasing its actual TLS reply.
             async def wait_for_profile_reply(action, payload):
-                if reached_boundary.is_set() or action != "SetChargingProfile":
+                if action != "SetChargingProfile":
                     return
                 schedule = payload["csChargingProfiles"]["chargingSchedule"]
-                if schedule["chargingSchedulePeriod"][0]["limit"] == reply_limit:
+                limit = schedule["chargingSchedulePeriod"][0]["limit"]
+                if not reached_boundary.is_set() and limit == reply_limit:
                     reached_boundary.set()
                     await release.wait()
+                elif flap and reached_boundary.is_set() and limit == 0 and not rollback_reached.is_set():
+                    rollback_reached.set()
+                    await rollback_release.wait()
 
             if reply_limit is None:
                 monkeypatch.setattr(controls, "stop", wait_after_initial_zero)
@@ -385,14 +437,23 @@ async def test_cloud_returns_before_local_schedule_sends_start(
                     c.command(pause, "pause", c.requests.intent().revision)
                 bench.vendor_available = True
                 await until(lambda: test.session.runtime.vendor_registered, timeout=20)
+                if flap:
+                    release.set()
+                    await asyncio.wait_for(rollback_reached.wait(), 5)
+                    await bench.vendor_outage()
+                    await until(lambda: not test.session.runtime.vendor_registered)
             finally:
                 release.set()
+                rollback_release.set()
 
             await c.charging.settle()
             if reply_limit == 6 and not explicit_pause:
                 pending_intent = c.requests.intent()
                 assert pending_intent.mode == "paused" and c.requests.offline_pause_current(pending_intent)
                 assert j.get(AUTOMATIC_PAUSE_CAUSE) == {"revision": pending_intent.revision, "cause": "local_charge"}
+            if flap:
+                assert not test.session.runtime.vendor_registered
+                bench.vendor_available = True
             expected = "paused" if explicit_pause else "app"
             result = await status(
                 test,

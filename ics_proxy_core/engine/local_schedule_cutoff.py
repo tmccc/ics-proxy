@@ -18,6 +18,7 @@ from .store import RecoveryRequiredError, fingerprint
 if TYPE_CHECKING:
     from .control_decisions import PauseStopClaim
     from .managed import ManagedController
+    from .managed_intent import ControlIntent
     from .store import Journal
 
 
@@ -32,6 +33,17 @@ def scheduled_cutoff_target(journal: Journal) -> int | None:
     intent = decode_intent(journal.get("managed_control_intent"))
     marker = journal.get(OFFLINE_PAUSE)
     return local if intent.mode == "paused" and type(marker) is int and revision == marker == intent.revision else None
+
+
+# The exact cutoff keeps its Pause ownership across both an ordinary cutoff and startup recovery.
+def record_cutoff_pause(c: ManagedController, occurrence: dict[str, Any], intent: ControlIntent) -> dict[str, Any]:
+    j = c.session.journal
+    paused = write_intent(j, intent, "paused")
+    occurrence = {**occurrence, "stop_revision": paused.revision}
+    j.put(OCCURRENCE, occurrence)
+    record_automatic_pause(j, paused, "local_charge")
+    c.session.gateway.controls._claim(True, stopping=True)
+    return occurrence
 
 
 def _claim_cutoff(
@@ -53,11 +65,7 @@ def _claim_cutoff(
             if active != local and (active is not None or not j.outcomes.stop_report_closed(local)):
                 return None
         elif intent.mode == "app" and active == local and "stop_revision" not in occurrence:
-            paused = write_intent(j, intent, "paused")
-            occurrence = {**occurrence, "stop_revision": paused.revision}
-            j.put(OCCURRENCE, occurrence)
-            record_automatic_pause(j, paused, "local_charge")
-            g.controls._claim(True, stopping=True)
+            occurrence = record_cutoff_pause(c, occurrence, intent)
         else:
             return None  # An explicit Pause or newer intent already owns any further effects.
         return occurrence, g.controls.decisions.prepare_pause_stop(g, c.requests)

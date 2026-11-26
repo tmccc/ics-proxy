@@ -6,11 +6,15 @@ import json
 import sqlite3
 import time
 from dataclasses import asdict
+from math import isfinite
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
+from .command_processor import CommandPriority
 from .connection_scope import control_scope_matches
 from .local_schedule_cutoff import cutoff
-from .local_schedule_window import schedule_window
+from .local_schedule_window import ScheduleCutoff, schedule_window
 from .managed_intent import LOCAL_SCHEDULE_OCCURRENCE as OCCURRENCE
 from .policy import DeniedError
 from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
@@ -37,6 +41,16 @@ class ScheduleCutoffError(DeniedError):
     """The exact admitted overnight window reached its cutoff."""
 
 
+# A persisted elapsed deadline can only be compared within the same host boot and time namespace.
+def host_clock_epoch() -> str | None:
+    try:
+        boot = UUID(Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip())
+        namespace = Path("/proc/self/ns/time").stat()
+    except OSError, ValueError:
+        return None
+    return fingerprint([boot.hex, namespace.st_dev, namespace.st_ino])
+
+
 class LocalSchedule:
     """An outage can delegate an unchanged native plan to the normal local owner once per window."""
 
@@ -45,7 +59,9 @@ class LocalSchedule:
         self.controller = controller
         self.timezone = timezone
         self.journal = controller.session.journal
-        self.deadline: tuple[str, float] | None = None
+        self.process_deadline: tuple[str, float] | None = None
+        self.clock_epoch = host_clock_epoch() if timezone is not None else None
+        self.expired_request: str | None = None
 
     # Record the exact source of a same-tag session while its independent plan marker is available.
     def observe_native_occurrence(self, native: HandoverEvidence) -> None:
@@ -60,18 +76,21 @@ class LocalSchedule:
             or j.is_owner_session(local)
         ):
             return
-        window = schedule_window(native, c.native.spec.saved_schedule_digest, self.timezone, time.time())
+        from .gateway import timestamp
+
+        start = json.loads(j.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()[0])
+        occurred = timestamp(start["timestamp"]).timestamp()
+        window = schedule_window(native, c.native.spec.saved_schedule_digest, self.timezone, occurred)
         if window is None:
             return
         saved, bounds = j.get(NATIVE_OCCURRENCE, {}), asdict(window)
-        if saved and saved["window"]["starts_at"] > window.starts_at:
+        if saved and (
+            saved["window"]["starts_at"] > window.starts_at or "local" in saved and window.overlaps(saved["window"])
+        ):
             return
         if saved.get("window") != bounds:
             saved = {"window": bounds}
-        if "local" in saved:
-            return  # A positive native occurrence already consumes this exact window.
-        start = json.loads(j.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()[0])
-        if not self._matches_window(window, start):
+        if fingerprint(start["idTag"].casefold()) != window.tag_digest:
             return
         digest = fingerprint(start)
         if native.session_plan_id == window.plan_id:
@@ -95,10 +114,10 @@ class LocalSchedule:
     def _native_window_used(self, window: ScheduleWindow) -> bool:
         j = self.journal
         saved = j.get(NATIVE_OCCURRENCE, {})
+        if "local" in saved and window.overlaps(saved["window"]):
+            return True
         if saved.get("window") != asdict(window):
             saved = {}
-        if "local" in saved:
-            return True
         unrelated = saved.get("unrelated", {})
         transactions = j.db.execute("SELECT local,start FROM transactions WHERE connector=1 ORDER BY local DESC")
         for local, payload in transactions:
@@ -127,7 +146,7 @@ class LocalSchedule:
             return
         identifier = fingerprint(["local-schedule", c.native.spec.digest, asdict(window)])[:32]
         previous = self.journal.get(OCCURRENCE, {})
-        if previous and previous["window"]["starts_at"] >= window.starts_at:
+        if previous and (previous["window"]["starts_at"] >= window.starts_at or window.overlaps(previous["window"])):
             if (
                 previous["window"] != asdict(window)
                 or previous.get("local") is not None
@@ -172,10 +191,19 @@ class LocalSchedule:
         )
 
     # Sample both clocks before admission so a later wall-clock correction cannot extend this occurrence.
-    def sample_cutoff(self, window: ScheduleWindow) -> tuple[float, float]:
+    def sample_cutoff(self, window: ScheduleWindow) -> tuple[float, ScheduleCutoff]:
         elapsed = time.monotonic()
-        remaining = window.ends_at - time.time()
-        return remaining, elapsed + remaining
+        now = time.time()
+        if not window.starts_at <= now < window.ends_at:
+            raise DeniedError("the scheduled Start window changed before admission")
+        deadline = elapsed + (window.ends_at - now)
+        previous = self.journal.get(OCCURRENCE, {})
+        if previous.get("window") == asdict(window):
+            original = self._elapsed_deadline(previous)
+            if self._elapsed(previous, now) or original is None:
+                raise DeniedError("the original scheduled Start window reached its cutoff")
+            deadline = min(deadline, original)
+        return deadline - elapsed, ScheduleCutoff(self.clock_epoch, deadline)
 
     # The startup watchdog may expire before the overnight cutoff. Only the exact latter owns automatic recovery.
     def cutoff_elapsed(self, lease: ChargeLease) -> bool:
@@ -310,7 +338,7 @@ class LocalSchedule:
     # Fence only the competing native plan tag while the local schedule owns its Start handoff.
     def blocks_tag(self, tag: str, occurred: float | None) -> bool:
         occurrence = self.journal.get(OCCURRENCE, {})
-        if not occurrence or self.timezone is None:
+        if not occurrence:
             return False
         window, lease = occurrence["window"], self.controller.charging.lease
         when = time.time() if occurred is None else occurred
@@ -342,7 +370,7 @@ class LocalSchedule:
             return Pending(Prerequisite.SOURCE, "the local schedule does not permit positive current")
         return ALLOW
 
-    # A backward clock step cannot extend an admitted occurrence while the same process is running.
+    # A backward clock step cannot extend an admitted occurrence.
     def _due(self, occurrence: dict[str, Any]) -> bool:
         now = time.time()
         return (
@@ -352,13 +380,63 @@ class LocalSchedule:
             or self._elapsed(occurrence, now)
         )
 
-    # Either the scheduled wall end or the same occurrence's elapsed deadline ends the window.
+    # Only a known elapsed budget can keep the exact occurrence eligible after replacement.
     def _elapsed(self, occurrence: dict[str, Any], now: float) -> bool:
-        return now >= occurrence["window"]["ends_at"] or (
-            self.deadline is not None
-            and self.deadline[0] == occurrence["request"]
-            and time.monotonic() >= self.deadline[1]
-        )
+        request = occurrence["request"]
+        if occurrence.get("cutoff_reached") is True:
+            return True
+        if self.expired_request != request and now < occurrence["window"]["ends_at"]:
+            deadline = self._elapsed_deadline(occurrence)
+            if deadline is not None and time.monotonic() < deadline:
+                return False
+        self.expired_request = request
+        self._retain_cutoff(occurrence)
+        return True
+
+    # A legacy occurrence or a different host clock epoch has no comparable elapsed deadline.
+    def _elapsed_deadline(self, occurrence: dict[str, Any]) -> float | None:
+        if self.process_deadline is not None and self.process_deadline[0] == occurrence["request"]:
+            return self.process_deadline[1]
+        clock = occurrence.get("cutoff_clock")
+        if isinstance(clock, dict) and self.clock_epoch is not None and clock.get("epoch") == self.clock_epoch:
+            deadline = clock.get("deadline")
+            if type(deadline) is float and isfinite(deadline):
+                return deadline
+        return None
+
+    # Retain an observed cutoff even if its exact Stop claim cannot be written yet.
+    def _retain_cutoff(self, occurrence: dict[str, Any]) -> None:
+        j = self.journal
+        if j.db.in_transaction:
+            return  # The surrounding ownership transaction retains its own cutoff or Start settlement.
+
+        # The current journal row may already contain independent Start or Stop evidence.
+        def retain() -> None:
+            latest = j.get(OCCURRENCE, {})
+            if latest.get("request") == occurrence["request"] and latest.get("cutoff_reached") is not True:
+                j.put(OCCURRENCE, {**latest, "cutoff_reached": True})
+
+        try:
+            self.controller.commands.decide(retain, priority=CommandPriority.RESTRICT)
+        except sqlite3.Error:
+            if j.db.in_transaction:
+                raise
+
+    # Claim only the interrupted Start's exact still-open occurrence when its cutoff already applies.
+    def due_owner_occurrence(self, identifier: str) -> dict[str, Any] | None:
+        j = self.journal
+        occurrence: dict[str, Any] = j.get(OCCURRENCE, {})
+        local = occurrence.get("local")
+        if (
+            occurrence.get("request") == identifier
+            and type(local) is int
+            and local == j.active()
+            and j.is_owner_session(local)
+            and "stop_revision" not in occurrence
+            and self._due(occurrence)
+        ):
+            return occurrence
+        return None
 
     # Periodic restrictive work can stop its own session even when no complete native poll is available.
     async def stop_if_due(self) -> None:

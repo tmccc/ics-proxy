@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .ics_writes import utc_time
@@ -40,6 +40,25 @@ class ScheduleWindow:
     ends_at: float
     limit_a: float
     tag_digest: str
+
+    # Replacing the configured time zone cannot spend an overlapping occurrence of the same plan twice.
+    def overlaps(self, saved: dict[str, Any]) -> bool:
+        starts_at: float = saved["starts_at"]
+        ends_at: float = saved["ends_at"]
+        return (
+            self.schedule_digest == saved["schedule_digest"]
+            and self.plan_id == saved["plan_id"]
+            and self.starts_at < ends_at
+            and starts_at < self.ends_at
+        )
+
+
+@dataclass(frozen=True)
+class ScheduleCutoff:
+    """The original elapsed cutoff and the host clock epoch that can compare it."""
+
+    epoch: str | None
+    deadline: float
 
 
 def schedule_window(native: HandoverEvidence, expected_digest: str, timezone: str, now: float) -> ScheduleWindow | None:

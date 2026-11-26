@@ -20,6 +20,7 @@ from ics_proxy_core.engine.managed_intent import AUTOMATIC_PAUSE_CAUSE, LOCAL_SC
 from ics_proxy_core.engine.managed_sources import ORDINARY_HOLD
 from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
+from ics_proxy_core.engine.recovery_contracts import Pending
 from tests.managed_rig import healthy, introduced, managed_bench, starts
 from tests.native_schedule_support import ZONE, SchedulePeer, SchedulerClock
 from tests.prototype_rig import BOOT, START
@@ -194,6 +195,100 @@ async def test_cutoff_uses_elapsed_time_after_scheduled_receipt_read(
             clock.step_wall(MIDNIGHT + 6 * 3600 - 60)
             await c.tick()
             assert bench.firmware.effective_limit() == 0
+            assert stops(bench) == [{"transactionId": local}]
+
+
+# Intent: replacement keeps elapsed cutoff authority across a wall rewind and handles uncomparable clock records.
+# Why: a positive budget observed under a different or unknown host clock cannot keep the exact session open.
+@pytest.mark.parametrize("clock_epoch", ["same", "observed-wall", "changed", "unknown", "unavailable", "legacy"])
+async def test_cutoff_retains_elapsed_deadline_across_replacement(
+    tmp_path, tls, unused_tcp_port, monkeypatch, clock_epoch
+):
+    first_clock = None if clock_epoch == "unavailable" else "first-clock"
+    monkeypatch.setattr(local_schedule, "host_clock_epoch", lambda: first_clock)
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        bench = rig.bench
+        async with connection(rig, "cutoff-before-replacement") as test:
+            local, meter_start = await begin(test, clock)
+            j = test.session.journal
+            occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
+            assert occurrence["cutoff_clock"]["epoch"] == first_clock
+            assert occurrence.get("stop_revision") is None and not stops(bench)
+            if clock_epoch == "same":
+                clock.now = MIDNIGHT + 6 * 3600
+                clock.step_wall(MIDNIGHT + 6 * 3600 - 60)
+            elif clock_epoch == "observed-wall":
+                c = test.controller
+                sample = c.current_native_sample()
+                assert sample is not None
+                clock.step_wall(MIDNIGHT + 6 * 3600)
+                assert isinstance(c.commands.decide(lambda: c.local_schedule.positive_decision(sample)), Pending)
+                assert j.get(LOCAL_SCHEDULE_OCCURRENCE)["cutoff_reached"] is True and not stops(bench)
+                clock.step_wall(MIDNIGHT + 60)
+            else:
+                clock.now = MIDNIGHT + 60
+                if clock_epoch == "legacy":
+                    del occurrence["cutoff_clock"]
+                    j.put(LOCAL_SCHEDULE_OCCURRENCE, occurrence)
+
+        if clock_epoch in ("changed", "unknown"):
+            monkeypatch.setattr(
+                local_schedule, "host_clock_epoch", lambda: "next-clock" if clock_epoch == "changed" else None
+            )
+        async with connection(rig, "cutoff-after-replacement") as test:
+            j = test.session.journal
+            await status(test, lambda _: bool(stops(bench)))
+            assert j.get(LOCAL_SCHEDULE_OCCURRENCE)["request"] == occurrence["request"]
+            assert scheduled_cutoff_target(j) == local
+            assert stops(bench) == [{"transactionId": local}]
+            assert j.active() == local and bench.firmware.effective_limit() == 0
+            assert len(starts(rig)) == 1
+            await close(test, clock, local, meter_start)
+            await status(test, lambda value: value.get("local_hold_verified") is True)
+            assert stops(bench) == [{"transactionId": local}]
+
+
+# Intent: a refused cutoff claim cannot make an observed wall cutoff eligible after a correction.
+# Why: the next healthy journal turn must still restrict the same open session exactly once.
+@pytest.mark.parametrize("reject_marker", [False, True], ids=["cutoff-saved", "cutoff-retained-in-memory"])
+async def test_observed_cutoff_survives_refused_claim_and_wall_rewind(
+    tmp_path, tls, unused_tcp_port, monkeypatch, reject_marker
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "cutoff-refused-claim") as test:
+            local, meter_start = await begin(test, clock)
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            denied = []
+
+            # Refuse the cutoff claim's BEGIN while optionally refusing the separate expiry observation.
+            def authorize(action, table, column, database, trigger):
+                if action == sqlite3.SQLITE_TRANSACTION and table == "BEGIN":
+                    denied.append(table)
+                    return sqlite3.SQLITE_DENY
+                if reject_marker and action == sqlite3.SQLITE_INSERT and table == "meta":
+                    denied.append(table)
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            clock.step_wall(MIDNIGHT + 6 * 3600)
+            j.db.set_authorizer(authorize)
+            try:
+                await c.local_schedule.stop_if_due()
+            finally:
+                j.db.set_authorizer(None)
+            assert "BEGIN" in denied and ("meta" in denied) is reject_marker
+            occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
+            assert occurrence.get("cutoff_reached", False) is not reject_marker
+            assert scheduled_cutoff_target(j) is None and not stops(bench)
+            assert bench.firmware.effective_limit() == 6
+
+            clock.step_wall(MIDNIGHT + 60)
+            await c.local_schedule.stop_if_due()
+            assert j.get(LOCAL_SCHEDULE_OCCURRENCE)["cutoff_reached"] is True
+            assert scheduled_cutoff_target(j) == local
+            assert stops(bench) == [{"transactionId": local}] and bench.firmware.effective_limit() == 0
+            await close(test, clock, local, meter_start)
+            await status(test, lambda value: value.get("local_hold_verified") is True)
             assert stops(bench) == [{"transactionId": local}]
 
 
