@@ -470,8 +470,15 @@ class ManagedSessionStop:
             return
         try:
             native = await c.native.read(stop_only=True)
-            c.native.require_known_session(native)
-            c.commands.decide(partial(self.observed, native), priority=CommandPriority.RESTRICT)
+
+            # A restricted poll can prove the scheduled session closed before normal supervision resumes.
+            def accept_closure() -> None:
+                c.native.require_known_session(native)
+                if native is c.native._current_stop_sample(None) and native.is_fresh(5):
+                    c.local_schedule.observe_closed(native)
+                self.observed(native)
+
+            c.commands.decide(accept_closure, priority=CommandPriority.RESTRICT)
         except (
             DeniedError,
             NativeTransportUnavailableError,

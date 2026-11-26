@@ -296,7 +296,9 @@ async def test_cutoff_uses_elapsed_time_after_scheduled_receipt_read(
 
 # Intent: replacement keeps elapsed cutoff authority across a wall rewind and handles uncomparable clock records.
 # Why: a positive budget observed under a different or unknown host clock cannot keep the exact session open.
-@pytest.mark.parametrize("clock_epoch", ["same", "observed-wall", "changed", "unknown", "unavailable", "legacy"])
+@pytest.mark.parametrize(
+    "clock_epoch", ["same", "observed-wall", "observed-before-start", "changed", "unknown", "unavailable", "legacy"]
+)
 async def test_cutoff_retains_elapsed_deadline_across_replacement(
     tmp_path, tls, unused_tcp_port, monkeypatch, clock_epoch
 ):
@@ -313,11 +315,11 @@ async def test_cutoff_retains_elapsed_deadline_across_replacement(
             if clock_epoch == "same":
                 clock.now = MIDNIGHT + 6 * 3600
                 clock.step_wall(MIDNIGHT + 6 * 3600 - 60)
-            elif clock_epoch == "observed-wall":
+            elif clock_epoch in ("observed-wall", "observed-before-start"):
                 c = test.controller
                 sample = c.current_native_sample()
                 assert sample is not None
-                clock.step_wall(MIDNIGHT + 6 * 3600)
+                clock.step_wall(MIDNIGHT + (6 * 3600 if clock_epoch == "observed-wall" else -60))
                 assert isinstance(c.commands.decide(lambda: c.local_schedule.positive_decision(sample)), Pending)
                 assert j.get(LOCAL_SCHEDULE_OCCURRENCE)["cutoff_reached"] is True and not stops(bench)
                 clock.step_wall(MIDNIGHT + 60)
@@ -344,11 +346,12 @@ async def test_cutoff_retains_elapsed_deadline_across_replacement(
             assert stops(bench) == [{"transactionId": local}]
 
 
-# Intent: a refused cutoff claim cannot make an observed wall cutoff eligible after a correction.
+# Intent: once the wall clock leaves the admitted window, a refused cutoff claim cannot reopen it.
 # Why: the next healthy journal turn must still restrict the same open session exactly once.
 @pytest.mark.parametrize("reject_marker", [False, True], ids=["cutoff-saved", "cutoff-retained-in-memory"])
+@pytest.mark.parametrize("wall_offset", [-60, 6 * 3600], ids=["before-start", "at-end"])
 async def test_observed_cutoff_survives_refused_claim_and_wall_rewind(
-    tmp_path, tls, unused_tcp_port, monkeypatch, reject_marker
+    tmp_path, tls, unused_tcp_port, monkeypatch, reject_marker, wall_offset
 ):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
         async with connection(rig, "cutoff-refused-claim") as test:
@@ -366,7 +369,7 @@ async def test_observed_cutoff_survives_refused_claim_and_wall_rewind(
                     return sqlite3.SQLITE_DENY
                 return sqlite3.SQLITE_OK
 
-            clock.step_wall(MIDNIGHT + 6 * 3600)
+            clock.step_wall(MIDNIGHT + wall_offset)
             j.db.set_authorizer(authorize)
             try:
                 await c.local_schedule.stop_if_due()
@@ -388,19 +391,19 @@ async def test_observed_cutoff_survives_refused_claim_and_wall_rewind(
             assert stops(bench) == [{"transactionId": local}]
 
 
-# Intent: a scheduled profile reply arrives after 06:00 without a RemoteStart on the charger wire.
+# Intent: a scheduled profile reply arrives outside the admitted window without a RemoteStart on the charger wire.
 # Why: only the same, now verified hold can permit the next day's plan or Return to iCS.
-@pytest.mark.parametrize("timer_first", [False, True], ids=["wire-guard-first", "lease-timer-first"])
+@pytest.mark.parametrize("cutoff_first", ["wire-guard-first", "lease-timer-first", "rewind-before-start"])
 @pytest.mark.parametrize("resume", ["next-window", "cloud-restored", "explicit-pause"])
 async def test_unsent_schedule_cutoff_recovers_app_authority(
-    tmp_path, tls, unused_tcp_port, monkeypatch, timer_first, resume
+    tmp_path, tls, unused_tcp_port, monkeypatch, cutoff_first, resume
 ):
     clock = SchedulerClock(MIDNIGHT - 60)
     base = time.monotonic()
     monkeypatch.setattr(
         local_schedule, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: base + clock.elapsed)
     )
-    if timer_first:
+    if cutoff_first == "lease-timer-first":
         monkeypatch.setattr(
             managed_charging,
             "time",
@@ -432,9 +435,12 @@ async def test_unsent_schedule_cutoff_recovers_app_authority(
             try:
                 await asyncio.wait_for(reached.wait(), 5)
                 assert bench.firmware.effective_limit() == 6 and not starts(rig)
-                clock.now = MIDNIGHT + 6 * 3600
-                clock.step_wall(MIDNIGHT + 6 * 3600 - 60)
-                if timer_first:
+                if cutoff_first == "rewind-before-start":
+                    clock.step_wall(MIDNIGHT - 60)
+                else:
+                    clock.now = MIDNIGHT + 6 * 3600
+                    clock.step_wall(MIDNIGHT + 6 * 3600 - 60)
+                if cutoff_first == "lease-timer-first":
                     c.charging.changed.set()
                     await until(lambda: c.requests.intent().mode == "paused")
                     assert j.get(AUTOMATIC_PAUSE_CAUSE) is None

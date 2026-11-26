@@ -40,6 +40,7 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.notice_generation = self.notice.claim(lambda: time.monotonic())
         self.notification_id = self.notice.notification_id
         self.received_at = time.monotonic()
+        self.canvas_activation: tuple[float, float] | None = None
         self.cancel_timer = None
         entry.async_on_unload(self.cancel_expiry)
 

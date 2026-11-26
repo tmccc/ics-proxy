@@ -23,6 +23,11 @@ def _frame_clock() -> tuple[float, float]:
     return wall, (before + time.monotonic()) / 2
 
 
+# A new coordinator can have the same revision as the previous one. Require its own render sequence.
+def mark_canvas_activation(coordinator: ProxyCoordinator) -> None:
+    coordinator.canvas_activation = _frame_clock()
+
+
 # A response belongs to this exact command. The client reads its receipt and never repeats the write.
 def register_session_service(hass: HomeAssistant) -> None:
     first_wall, first_elapsed = _frame_clock()
@@ -30,7 +35,7 @@ def register_session_service(hass: HomeAssistant) -> None:
     wall_offset = first_wall - first_elapsed
 
     # An observed step makes frame epochs through either wall-clock reading ambiguous.
-    def frame_is_current(epoch: int) -> bool:
+    def frame_is_current(epoch: int, coordinator: ProxyCoordinator | None) -> bool:
         nonlocal reject_through, wall_offset
         wall, elapsed = _frame_clock()
         offset = wall - elapsed
@@ -39,9 +44,14 @@ def register_session_service(hass: HomeAssistant) -> None:
             wall_offset = offset
         else:
             wall_offset = max(wall_offset, offset)
+        if coordinator is None or coordinator.canvas_activation is None:
+            return False
+        activated_wall, activated_elapsed = coordinator.canvas_activation
+        # A clock adjustment can occur while the replacement entry is loading.
+        activated_through = int(max(activated_wall, activated_elapsed + wall_offset))
         return (
             type(epoch) is int
-            and epoch > reject_through
+            and epoch > max(reject_through, activated_through)
             and epoch <= wall
             and elapsed + wall_offset - epoch < FRAME_MAX_AGE
         )
@@ -66,10 +76,8 @@ def register_session_service(hass: HomeAssistant) -> None:
         if include_reference:
             response["request_reference"] = None
         frame_epoch = call.data.get("canvas_rendered_at_epoch")
-        if frame_epoch is not None and not frame_is_current(frame_epoch):
-            return response
         coordinator = active_coordinator()
-        if coordinator is None:
+        if (frame_epoch is not None and not frame_is_current(frame_epoch, coordinator)) or coordinator is None:
             return response
         action = call.data["action"]
         target = call.data.get("target")
@@ -110,7 +118,11 @@ def register_session_service(hass: HomeAssistant) -> None:
 
         # The frame or its current control can expire while Home Assistant opens the management connection.
         def require_current_canvas() -> None:
-            if not frame_is_current(frame_epoch) or active_coordinator() is not coordinator or not request_is_current():
+            if (
+                not frame_is_current(frame_epoch, coordinator)
+                or active_coordinator() is not coordinator
+                or not request_is_current()
+            ):
                 raise ProxyError("The display request is no longer current")
 
         fields = {"target": target} if action == "stop_session" else {}

@@ -18,12 +18,14 @@ from ics_proxy_core import commands
 from ics_proxy_core.engine import managed_session_stop, rpc
 from ics_proxy_core.engine.command_outcomes import ForwardedReply, OwnerWire
 from ics_proxy_core.engine.gateway import Gateway, decode
+from ics_proxy_core.engine.local_schedule_cutoff import scheduled_cutoff_target
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
 from ics_proxy_core.engine.managed_diagnostics import snapshot
 from ics_proxy_core.engine.managed_intent import ManagedRequests, insert_request
 from ics_proxy_core.engine.managed_session_stop import ManagedSessionStop
 from ics_proxy_core.engine.managed_view import refresh_for_read
+from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
 from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError, encoded, fingerprint
 from ics_proxy_core.frames import build_call_error, build_call_result
@@ -37,11 +39,53 @@ from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.service_recovery_helpers import running_service
 from tests.test_managed_boot_supersession import delay_reply
+from tests.test_managed_local_schedule import MIDNIGHT, connection, overnight
+from tests.test_managed_local_schedule_cutoff import begin as begin_scheduled_charge
+from tests.test_managed_local_schedule_cutoff import close as close_scheduled_charge
+from tests.test_managed_local_schedule_cutoff import stops as scheduled_stop_calls
 from tests.test_managed_normal_start import natural_stop, zero_power_session
 from tests.tls_support import tls as tls
 from tools import managed_proxy
 from tools.managed_incident import reference
 from tools.managed_stop_incident import stop_incident_report
+
+
+# Intent: retain a scheduled session's independently verified early closure during an interrupted status poll.
+# Why: the next cutoff must preserve app authority once the exact Stop already achieved physical closure.
+async def test_blocked_poll_records_scheduled_session_stop_closure(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "cutoff-native-outage") as test:
+            local, meter_start = await begin_scheduled_charge(test, clock)
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            request, intent = uuid.uuid4().hex, c.requests.intent()
+            c.command(request, "stop_session", intent.revision, target=c.session_stop.target())
+            await c.session_stop.worker
+            assert scheduled_stop_calls(bench) == [{"transactionId": local}]
+
+            clock.now = MIDNIGHT + 300
+            await close_scheduled_charge(test, clock, local, meter_start)
+            bench.cp, bench.connection = "B", "Plug"
+            observe = c.native.observe
+            attempts = 0
+
+            # Only the full status read fails. The fallback uses a real, independent native observation.
+            async def observe_after_timeout():
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise NativeTransportUnavailableError("the first native audit timed out")
+                return await observe()
+
+            with monkeypatch.context() as outage:
+                outage.setattr(c.native, "observe", observe_after_timeout)
+                await c.tick()
+            assert attempts == 2 and c.requests.receipt(request)["state"] == "completed"
+            assert c.requests.intent() == intent and bench.firmware.effective_limit() == 6
+
+            clock.now = MIDNIGHT + 6 * 3600
+            await c.tick()
+            assert c.requests.intent() == intent and scheduled_cutoff_target(j) is None
+            assert bench.firmware.effective_limit() == 6 and scheduled_stop_calls(bench) == [{"transactionId": local}]
 
 
 # Intent: time an outstanding Stop using actual elapsed time across clock corrections.

@@ -240,8 +240,6 @@ class LocalSchedule:
             raise DeniedError("local schedule occurrence no longer owns Start")
         if self._elapsed(occurrence, now):
             raise ScheduleCutoffError("local schedule window reached its cutoff")
-        if now < window.starts_at:
-            raise DeniedError("local schedule occurrence no longer owns Start")
         if c.session.runtime.vendor_registered and not original_dispatched and not finishing_initial_zero:
             raise ScheduleCloudReturnedError("iCS returned before the local schedule issued Start")
 
@@ -373,20 +371,19 @@ class LocalSchedule:
 
     # A backward clock step cannot extend an admitted occurrence.
     def _due(self, occurrence: dict[str, Any]) -> bool:
-        now = time.time()
         return (
             occurrence.get("stop_revision") is not None
             or self.timezone is None
-            or now < occurrence["window"]["starts_at"]
-            or self._elapsed(occurrence, now)
+            or self._elapsed(occurrence, time.time())
         )
 
-    # Only a known elapsed budget can keep the exact occurrence eligible after replacement.
+    # Keep the exact occurrence eligible only inside its wall window and within its original elapsed budget.
     def _elapsed(self, occurrence: dict[str, Any], now: float) -> bool:
         request = occurrence["request"]
         if occurrence.get("cutoff_reached") is True:
             return True
-        if self.expired_request != request and now < occurrence["window"]["ends_at"]:
+        window = occurrence["window"]
+        if self.expired_request != request and window["starts_at"] <= now < window["ends_at"]:
             deadline = self._elapsed_deadline(occurrence)
             if deadline is not None and time.monotonic() < deadline:
                 return False

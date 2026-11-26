@@ -47,6 +47,7 @@ HA_DISPLAY = "tests_ha_proxy/test_display_example.py"
 HA_DISPLAY_STOP = f"{HA_DISPLAY}::test_canvas_stop_rechecks_the_local_session"
 HA_DISPLAY_HANDSHAKE = f"{HA_DISPLAY}::test_canvas_frame_can_expire_during_the_management_handshake"
 HA_DISPLAY_CLOCK_STEP = f"{HA_DISPLAY}::test_display_service_rejects_pre_adjustment_frames"
+HA_DISPLAY_REPLACEMENT = f"{HA_DISPLAY}::test_display_rejects_start_frame_from_before_entry_replacement"
 
 SUITES = {
     "engine": (
@@ -110,10 +111,13 @@ SUITES = {
             f"{CUTOFF_REPLACEMENT}[changed]",
             f"{CUTOFF_REPLACEMENT}[unknown]",
             f"{CUTOFF_REPLACEMENT}[legacy]",
-            f"{CUTOFF_REWIND}[cutoff-saved]",
-            f"{CUTOFF_REWIND}[cutoff-retained-in-memory]",
+            f"{CUTOFF_REWIND}[at-end-cutoff-saved]",
+            f"{CUTOFF_REWIND}[at-end-cutoff-retained-in-memory]",
+            f"{CUTOFF_REWIND}[before-start-cutoff-saved]",
+            f"{CUTOFF_REWIND}[before-start-cutoff-retained-in-memory]",
             f"{CUTOFF_CLOSED_REPORT}[native-unavailable]",
             f"{SCHEDULE_CUTOFF}::test_cutoff_leaves_settled_early_stop_in_app_mode",
+            f"{STOP_TEST}::test_blocked_poll_records_scheduled_session_stop_closure",
             f"{SCHEDULE_VENDOR_RETURN}[vendor-lost-during-rollback-automatic-return]",
             f"{SCHEDULE}::test_overlapping_timezone_change_does_not_repeat_local_occurrence",
             "tests/test_vendor_stop_rotation.py::test_queued_vendor_stop_keeps_reply_through_rotation[Accepted]",
@@ -134,6 +138,8 @@ SUITES = {
             f"{HA_DISPLAY_HANDSHAKE}[stop]",
             f"{HA_DISPLAY_CLOCK_STEP}[forward_then_rewind-start]",
             f"{HA_DISPLAY_CLOCK_STEP}[forward_then_rewind-stop]",
+            f"{HA_DISPLAY_REPLACEMENT}[reload]",
+            f"{HA_DISPLAY_REPLACEMENT}[remove-add]",
         ),
     ),
 }

@@ -20,6 +20,8 @@ from homeassistant.util import dt as dt_util
 from tests_ha_proxy.conftest import setup_proxy
 from tests_ha_proxy.test_client import peer as peer
 
+replacement_peer = peer
+
 PROJECT = Path(__file__).resolve().parents[1] / "examples" / "solar-display-2"
 SESSION = "binary_sensor.ics_proxy_session_open"
 PENDING = "input_select.general_display_2_ics_request"
@@ -631,6 +633,57 @@ async def test_display_service_rejects_pre_adjustment_frames(actual_hass, peer, 
     assert command["revision"] == REVISION
     assert command.get("target") == (None if starting else TARGET)
     assert "canvas_rendered_at_epoch" not in command
+    await hass.services.async_call("script", "turn_off", {"entity_id": EXPIRY}, blocking=True)
+
+
+# Intent: a fresh frame from another management endpoint cannot start the replacement charger.
+# Why: independent proxies can publish the same numeric control revision.
+@pytest.mark.parametrize("operation", ["reload", "remove-add"])
+async def test_display_rejects_start_frame_from_before_entry_replacement(
+    actual_hass, peer, replacement_peer, monkeypatch, operation
+):
+    from custom_components.ics_proxy import session_service
+
+    hass = actual_hass
+    base = int(datetime.now(UTC).timestamp())
+    wall = base
+    monkeypatch.setattr(session_service, "_frame_clock", lambda: (wall, 100 + wall - base))
+    peer["state"]["control_revision"] = replacement_peer["state"]["control_revision"] = REVISION
+    assert peer["port"] != replacement_peer["port"]
+    await asyncio.gather(condition.async_setup(hass), trigger.async_setup(hass))
+    entry = await setup_proxy(hass, peer["port"])
+    helper = yaml.safe_load((PROJECT / "request-helper.yaml").read_text())
+    config = yaml.safe_load((PROJECT / "controls.yaml").read_text())
+    config["triggers"][1] = {"trigger": "event", "event_type": CLEANUP_TICK, "id": "clear_feedback"}
+    assert await async_setup_component(hass, "input_select", helper)
+    assert await async_setup_component(hass, "script", helper)
+    assert await async_setup_component(hass, "automation", {"automation": [config]})
+    await hass.async_start()
+    await hass.async_block_till_done()
+    monkeypatch.setattr(dt_util, "now", lambda *args: datetime.fromtimestamp(wall, UTC))
+
+    wall += 2
+    old_frame = dt_util.now()
+    publish_display_preview(hass, old_frame)
+    wall += 3
+    if operation == "reload":
+        hass.config_entries.async_update_entry(entry, data={**entry.data, "port": replacement_peer["port"]})
+        assert await hass.config_entries.async_reload(entry.entry_id)
+    else:
+        assert not (await hass.config_entries.async_remove(entry.entry_id))["require_restart"]
+        entry = await setup_proxy(hass, replacement_peer["port"])
+    assert entry.runtime_data.client.port == replacement_peer["port"]
+    assert entry.runtime_data.data["control_revision"] == REVISION
+
+    send_display_tap(hass, True, canvas_age=4, frame_rendered_at=old_frame)
+    await wait_for_feedback(hass, "starting_timeout")
+    assert set(peer["commands"]) == set(replacement_peer["commands"]) == {"status"}
+
+    wall += 2
+    send_display_tap(hass, True)
+    await wait_for_feedback(hass, "idle")
+    (start,) = [request for request in replacement_peer["requests"] if request["command"] == "start"]
+    assert start["revision"] == REVISION
     await hass.services.async_call("script", "turn_off", {"entity_id": EXPIRY}, blocking=True)
 
 
