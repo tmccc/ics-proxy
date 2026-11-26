@@ -155,9 +155,16 @@ async def test_canvas_feedback_expires_after_an_unconfirmed_same_revision(actual
     assert offer(actual_hass, "stop") == replacement
 
 
-# Intent: retain interrupted feedback across reload while retiring the original generation and queued write.
+# Intent: restore interrupted feedback only for its original commissioned charger.
 # Why: a replacement entry may only publish offers backed by its own fresh status.
-async def test_canvas_reload_restores_only_interrupted_feedback(actual_hass, peer, frame_clock):
+@pytest.mark.parametrize(
+    "reloaded_owner, feedback",
+    [(OWNER, "starting_timeout"), (NEW_OWNER, "idle")],
+    ids=["same_charger", "replacement_charger"],
+)
+async def test_canvas_reload_restores_only_interrupted_feedback(
+    actual_hass, peer, frame_clock, reloaded_owner, feedback
+):
     peer["state"]["canvas_owner"] = OWNER
     entry = await setup_proxy(actual_hass, peer["port"])
     old_coordinator = entry.runtime_data
@@ -174,9 +181,10 @@ async def test_canvas_reload_restores_only_interrupted_feedback(actual_hass, pee
     try:
         await asyncio.wait_for(entered.wait(), 3)
         assert actual_hass.states.get(ENTITY).state == "v2:starting:none:-"
+        peer["state"]["canvas_owner"] = reloaded_owner
         await actual_hass.config_entries.async_reload(entry.entry_id)
         assert entry.runtime_data is not old_coordinator
-        assert offer(actual_hass, "start", feedback="starting_timeout") != previous
+        assert offer(actual_hass, "start", feedback=feedback) != previous
     finally:
         release.set()
     assert await command == {"confirmed": False}

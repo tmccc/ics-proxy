@@ -8,8 +8,10 @@ from pathlib import Path
 import pytest
 import yaml
 from homeassistant.config_entries import ConfigEntryDisabler, ConfigEntryState
+from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import condition, trigger
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.template import Template
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
@@ -80,6 +82,7 @@ def test_renderer_and_firmware_use_the_same_command_entity():
     references = re.findall(r"""\b(?:states|state_attr|is_state)\(\s*['"]([^'"]+)['"]""", view)
     assert DISPLAY_VIEW in references
     assert AUTOMATION not in references
+    assert IMAGE not in references
     assert "input_select.general_display_2_ics_request" not in references
     package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
     assert package["substitutions"]["canvas_ics_view_entity"] == DISPLAY_VIEW
@@ -159,20 +162,49 @@ async def test_public_display_example_with_actual_ha(actual_hass, canvas_peer, m
     await install_display(hass)
     monkeypatch.setattr(dt_util, "now", lambda *args: datetime.fromtimestamp(wall, UTC))
     template = Template((PROJECT / "view.html.jinja").read_text(), hass)
-    start = await display_state(hass, "idle", "start")
     wall += 3
     frame = dt_util.now()
+    await display_state(hass, "unavailable", "none")
+    html = template.async_render({"now": frame}, parse_result=False)
+    assert "Charger buttons unavailable" in html and render_marker(html) == f"d51a0{wall:08x}"
+
+    publish_display_preview(hass, frame)
+    start = await display_state(hass, "idle", "start")
     html = template.async_render({"now": frame}, parse_result=False)
     assert "Ready to start" in html
     assert render_marker(html) == f"d51a0{wall:08x}d52a1{start}"
 
+    # New preview timestamps must not change the helper and trigger another render.
+    control_changes = []
+
+    @callback
+    def record_control_change(event):
+        control_changes.append(event)
+
+    unsubscribe = async_track_state_change_event(hass, DISPLAY_VIEW, record_control_change)
     publish_display_preview(hass, frame - timedelta(seconds=46))
     send_display_tap(hass, "start", start)
     await hass.async_block_till_done()
-    publish_display_preview(hass, frame, notification_active=True)
-    send_display_tap(hass, "start", start)
-    await hass.async_block_till_done()
-    publish_display_preview(hass, frame)
+    unsubscribe()
+    assert control_changes == []
+    assert set(peer["commands"]) == {"status"}
+
+    for wrong_route in (
+        {"notification_active": True},
+        {"assigned_views": [VIEW, "other-view"]},
+        {"current_view_id": "other-view"},
+        {"rendered_view_id": "other-view"},
+    ):
+        publish_display_preview(hass, frame, **wrong_route)
+        send_display_tap(hass, "start", start)
+        await display_state(hass, "unavailable", "none")
+        await hass.async_block_till_done()
+        assert set(peer["commands"]) == {"status"}, wrong_route
+        html = template.async_render({"now": frame}, parse_result=False)
+        assert "Charger buttons unavailable" in html and render_marker(html) == f"d51a0{wall:08x}"
+        publish_display_preview(hass, frame)
+        assert await display_state(hass, "idle", "start") == start
+
     for bad in (
         {"device_id": "another-display"},
         {"x": "352"},
@@ -238,6 +270,7 @@ async def test_display_service_rejects_pre_adjustment_frames(
     peer["state"]["control_revision"] = REVISION
     await setup_proxy(hass, peer["port"])
     await install_display(hass)
+    publish_display_preview(hass, datetime.fromtimestamp(wall, UTC))
     action = "start" if starting else "stop_session"
     generation = await display_state(hass, "idle", "start" if starting else "stop")
 
@@ -280,6 +313,7 @@ async def test_display_rejects_start_frame_from_before_entry_replacement(
     replacement_peer["state"]["canvas_owner"] = CANVAS_OWNER
     entry = await setup_proxy(hass, peer["port"])
     await install_display(hass)
+    publish_display_preview(hass, dt_util.now())
     old_generation = await display_state(hass, "idle", "start")
 
     wall += 3

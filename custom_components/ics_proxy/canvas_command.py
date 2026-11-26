@@ -132,8 +132,12 @@ class CanvasCommands:
             self._show_timeout(claim.binding.pending_feedback)
         self.coordinator.async_update_listeners()
 
-    def restore_interrupted(self, state: str) -> None:
-        if state in ("v2:starting:none:-", "v2:stopping:none:-"):
+    def restore_interrupted(self, state: str, owner: object) -> None:
+        if (
+            isinstance(owner, str)
+            and owner == self.coordinator.canvas_owner
+            and state in ("v2:starting:none:-", "v2:stopping:none:-")
+        ):
             self._show_timeout(state.split(":")[1])
 
     def _show_timeout(self, pending_feedback: str) -> None:

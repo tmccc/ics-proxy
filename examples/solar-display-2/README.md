@@ -2,8 +2,10 @@
 
 The Home Assistant integration publishes the eligible charger action, its generation, and request feedback in
 `sensor.ics_proxy_display_command`. The display template sensor exposes that state while the touch automation is
-enabled. A Start offer belongs to the current control revision and commissioned charger. A Stop offer also belongs
-to the verified open session.
+enabled and the preview reports the single assigned Cars & Charger view with no active notification. If the
+preview metadata is still loading, the first image shows disabled buttons. The valid preview then updates the
+template sensor so the renderer can draw the eligible button. A Start offer belongs to the current control revision
+and commissioned charger. A Stop offer also belongs to the verified open session.
 
 When a button is available, the renderer includes the action and generation in the image. The touchscreen enables
 that button only while the image and live state agree. The pressed generation and original render time travel with
@@ -26,8 +28,9 @@ Use a compatible 480 × 480 ESPHome/LVGL touchscreen. The board configuration su
 brightness components, a fallback dashboard, and the Home Assistant renderer integration.
 
 1. Add the `template` configuration from [request-helper.yaml](request-helper.yaml) and install the
-   [touch automation](controls.yaml). Set the actual ESPHome device ID, image entity, screen-source sensor,
-   and view ID in the automation. Point the template sensor at the installed automation and proxy command sensor.
+   [touch automation](controls.yaml). Set the same preview image entity and view ID in both files. Set the actual
+   ESPHome device ID and screen-source sensor in the automation. Point the template sensor at the installed
+   automation and proxy command sensor.
 2. Install [view.html.jinja](view.html.jinja) as the display preview template. The renderer needs the literal
    entity ID in its `states()` call to subscribe to the command view. Its optional vehicle cards can use the
    example entity names or local equivalents.
@@ -45,7 +48,8 @@ brightness components, a fallback dashboard, and the Home Assistant renderer int
 The display calls `ics_proxy.session_command` with `action`, `canvas_generation`, and
 `canvas_rendered_at_epoch`. The integration supplies the original revision and Stop target to the proxy.
 If the display says **Charger buttons unavailable**, check that the automation is enabled, the template sensor
-shows a v2 state, and the latest frame has downloaded.
+shows an eligible action, the preview reports the Cars & Charger view with no active notification, and the latest
+frame has downloaded.
 
 Run the offline firmware regression with `python -B examples/solar-display-2/tests/test_canvas_frame.py`.
 It uses `g++` with C++20 and tests the firmware header with a simulated clock.

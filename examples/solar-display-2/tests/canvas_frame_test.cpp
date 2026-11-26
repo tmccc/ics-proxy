@@ -83,6 +83,7 @@ int main() {
   view.submitted(start, 3000);
   view.recheck_sent(6000);
   view.observe("v2:starting:none:-");
+  view.invalidate();
   view.observe("v2:idle:start:" + first);
   assert(!view.needs_recheck(12000) && !view.allows(ChargerButton::START, start));
   view.observe("v2:starting_timeout:stop:" + next);
@@ -92,13 +93,17 @@ int main() {
   assert(!view.allows(ChargerButton::START, start));
   view.observe("v2:idle:stop:" + next);
 
-  // Reconnect keeps an already submitted generation blocked, including any in-flight read of it.
+  // Reconnect requires a new read before an unacknowledged submission can be retried.
   view.submitted(stop, 13000);
   view.recheck_sent(16000);
   view.invalidate();
+  assert(!view.needs_recheck(19000) && !view.allows(ChargerButton::STOP, stop));
+  view.observe("v2:idle:stop:" + next);
+  assert(view.needs_recheck(19000) && !view.allows(ChargerButton::STOP, stop));
+  view.recheck_sent(19000);
   assert(!view.allows(ChargerButton::STOP, stop));
   view.observe("v2:idle:stop:" + next);
-  assert(!view.needs_recheck(19000) && !view.allows(ChargerButton::STOP, stop));
+  assert(view.allows(ChargerButton::STOP, stop));
   view.observe("v2:unavailable:none:-");
   assert(!view.allows(ChargerButton::STOP, stop));
   const std::string after_reconnect(32, 'c');

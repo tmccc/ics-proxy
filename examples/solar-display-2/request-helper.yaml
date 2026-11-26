@@ -5,5 +5,11 @@ template:
         default_entity_id: sensor.general_display_2_ics_control
         state: >-
           {% set command = states('sensor.ics_proxy_display_command') -%}
+          {% set image = 'image.ics_display_preview' -%}
+          {% set view = 'replace-with-editor-view-id' -%}
           {{ command if is_state('automation.general_display_2_ics_charger_buttons', 'on')
-             and command.startswith('v2:') else 'v2:unavailable:none:-' }}
+             and command.startswith('v2:')
+             and state_attr(image, 'assigned_views') == [view]
+             and state_attr(image, 'current_view_id') == view
+             and state_attr(image, 'rendered_view_id') == view
+             and state_attr(image, 'notification_active') == false else 'v2:unavailable:none:-' }}

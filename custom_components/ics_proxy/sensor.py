@@ -8,7 +8,7 @@ from typing import Any
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers.restore_state import ExtraStoredData, RestoredExtraData, RestoreEntity
 
 from . import ProxyEntry
 from .coordinator import ProxyCoordinator
@@ -79,11 +79,19 @@ class DisplayCommandSensor(ProxyEntity, SensorEntity, RestoreEntity):
     def native_value(self) -> str:
         return self.coordinator.canvas_commands.state
 
+    @property
+    def extra_restore_state_data(self) -> ExtraStoredData | None:
+        pending = self.coordinator.canvas_commands.pending
+        if pending is None:
+            return None
+        return RestoredExtraData({"pending_owner": pending.binding.owner})
+
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         last = await self.async_get_last_state()
-        if last is not None:
-            self.coordinator.canvas_commands.restore_interrupted(last.state)
+        stored = await self.async_get_last_extra_data()
+        if last is not None and stored is not None:
+            self.coordinator.canvas_commands.restore_interrupted(last.state, stored.as_dict().get("pending_owner"))
 
 
 class ProxySensor(ProxyEntity, SensorEntity):

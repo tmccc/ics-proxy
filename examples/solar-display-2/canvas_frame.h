@@ -119,7 +119,7 @@ class CanvasControlView {
 
   void invalidate() {
     this->state_ = {};
-    if (!this->submitted_.empty()) this->acknowledged_ = true;
+    // Discard the old connection's recheck while preserving any acknowledgment already observed.
     this->recheck_sent_ = false;
   }
 
