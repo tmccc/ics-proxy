@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import pytest
 
+from ics_proxy_core.engine.gateway import decode
 from ics_proxy_core.engine.local_schedule_cutoff import scheduled_cutoff_target
 from ics_proxy_core.engine.managed_intent import LOCAL_SCHEDULE_OCCURRENCE
 from ics_proxy_core.engine.managed_session_stop import _RETAINED_STOP_CLOSURES
 from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
+from tests.test_managed_boot_supersession import delay_reply
 from tests.test_managed_local_schedule import MIDNIGHT, connection, overnight
 from tests.test_managed_local_schedule_cutoff import begin, close, stops
 from tests.tls_support import tls as tls
@@ -110,9 +113,23 @@ async def test_scheduled_closure_survives_marker_refusal_and_replacement(tmp_pat
 
 # Intent: honor the exact independent checkpoint when both closure publications are refused.
 # Why: the spent occurrence must remain closed across replacement while the receipt still awaits storage.
-@pytest.mark.parametrize("checkpoint", ["exact", "other-revision", "other-target", "other-report"])
+@pytest.mark.parametrize(
+    ("reply_order", "checkpoint"),
+    [
+        ("accept-before", "exact"),
+        ("accept-before", "other-revision"),
+        ("accept-before", "other-target"),
+        ("accept-before", "other-report"),
+        ("accept-after", "exact"),
+        ("reject-before", "exact"),
+        ("reject-before", "failure-refused"),
+        ("reject-after", "exact"),
+        ("reject-after", "other-report"),
+        ("reject-after", "recovers"),
+    ],
+)
 async def test_cutoff_checks_retained_stop_closure_after_replacement(
-    tmp_path, tls, unused_tcp_port, monkeypatch, checkpoint
+    tmp_path, tls, unused_tcp_port, monkeypatch, reply_order, checkpoint
 ):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
         bench = rig.bench
@@ -121,9 +138,46 @@ async def test_cutoff_checks_retained_stop_closure_after_replacement(
             c, j = test.controller, test.session.journal
             request, intent = uuid.uuid4().hex, c.requests.intent()
             target = c.session_stop.target()
+            reject = reply_order.startswith("reject")
+            answer = bench.firmware.answer
+
+            # Let the charger return the selected outcome on its actual, correlated reply.
+            def stop_answer(action, payload):
+                if reject and action == "RemoteStopTransaction":
+                    return {"status": "Rejected"}
+                return answer(action, payload)
+
+            monkeypatch.setattr(bench.firmware, "answer", stop_answer)
+            send, held, entered = delay_reply(monkeypatch, rig, test.charger, "RemoteStopTransaction")
             c.command(request, "stop_session", intent.revision, target=target)
-            await c.session_stop.worker
-            assert j.outcomes.accepted_stop(local)
+            await asyncio.wait_for(entered.wait(), 2)
+            wire = decode(held[0])[1]
+            peer = test.session.gateway.charger
+            failure_refused = checkpoint == "failure-refused"
+            if failure_refused:
+                j.db.execute(
+                    "CREATE TRIGGER refuse_stop_failure BEFORE UPDATE ON managed_requests "
+                    f"WHEN NEW.id='{request}' AND NEW.state='failed' "
+                    "BEGIN SELECT RAISE(ABORT,'refuse Stop receipt failure'); END"
+                )
+
+            # The receipt should follow the reply regardless of which closure publication was refused.
+            async def deliver_reply():
+                await send(held[0])
+                await c.session_stop.worker
+                c.commands.decide(c.session_stop.expire)
+                assert wire not in peer.reply_windows()
+                assert j.outcomes.owner_wires("wire", wire)[0].reply == ("Rejected" if reject else "Accepted")
+                result = c.requests.receipt(request)
+                if failure_refused:
+                    assert result["state"] == "running"
+                elif reject:
+                    assert result["state"] == "failed" and result["result"]["classification"] == "stop_rejected"
+                return result
+
+            reply_first = reply_order.endswith("before")
+            receipt_after_reply = await deliver_reply() if reply_first else None
+            assert (wire in peer.reply_windows()) is not reply_first
 
             clock.now = MIDNIGHT + 300
             await close(test, clock, local, meter_start)
@@ -139,8 +193,10 @@ async def test_cutoff_checks_retained_stop_closure_after_replacement(
                 "BEGIN SELECT RAISE(ABORT,'refuse Stop receipt closure'); END"
             )
             await poll_through_native_timeout(c, monkeypatch)
+            assert j.active() is None
             receipt = j.outcomes.owner(request)
-            assert receipt is not None and receipt.state == "running"
+            failed = reject and reply_first and not failure_refused
+            assert receipt is not None and receipt.state == ("failed" if failed else "running")
             assert receipt.result["_session_stop"].get("closure_verified") is None
             proof = j.get(_RETAINED_STOP_CLOSURES)[request]
             assert proof[:3] == [intent.revision, target, local]
@@ -149,7 +205,15 @@ async def test_cutoff_checks_retained_stop_closure_after_replacement(
             assert j.get(LOCAL_SCHEDULE_OCCURRENCE).get("native_closed") is None
             assert c.requests.intent() == intent and bench.firmware.effective_limit() == 6
 
-            if checkpoint != "exact":
+            if not reply_first:
+                receipt_after_reply = await deliver_reply()
+                assert c.session_stop.closure_verified(local)
+                assert j.get(_RETAINED_STOP_CLOSURES)[request] == proof
+            if failure_refused:
+                j.db.execute("DROP TRIGGER refuse_stop_failure")
+            elif checkpoint == "recovers":
+                j.db.execute("DROP TRIGGER refuse_stop_closure")
+            elif checkpoint != "exact":
                 fields = {
                     "other-revision": (0, intent.revision + 1),
                     "other-target": (1, "0" * 64),
@@ -164,12 +228,22 @@ async def test_cutoff_checks_retained_stop_closure_after_replacement(
             c, j = test.controller, test.session.journal
             assert c.local_schedule.closed_request is None
             assert c.requests.intent() == intent
-            assert c.session_stop.closure_verified(local) is (checkpoint == "exact")
+            if failure_refused:
+                result = c.requests.receipt(request)
+                assert result["state"] == "failed" and result["result"]["classification"] == "stop_rejected"
+            elif reject:
+                assert c.requests.receipt(request) == receipt_after_reply
+            valid = checkpoint in ("exact", "recovers", "failure-refused")
+            assert c.session_stop.closure_verified(local) is valid
             # Isolate the schedule cutoff from the new connection's independent zero hold.
             await c.local_schedule.stop_if_due()
-            if checkpoint == "exact":
+            if valid:
                 assert c.requests.intent() == intent and scheduled_cutoff_target(j) is None
-                assert j.get(_RETAINED_STOP_CLOSURES)[request] == proof
+                if checkpoint == "recovers":
+                    assert j.get(_RETAINED_STOP_CLOSURES) is None
+                    assert j.outcomes.owner(request).result["_session_stop"]["closure_verified"] is True
+                else:
+                    assert j.get(_RETAINED_STOP_CLOSURES)[request] == proof
             else:
                 assert c.requests.intent().mode == "paused" and scheduled_cutoff_target(j) == local
                 assert j.get(_RETAINED_STOP_CLOSURES) is None

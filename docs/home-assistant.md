@@ -11,6 +11,10 @@ The proxy binds the management WebSocket to loopback. In a container setup, use 
 Home Assistant client can reach that listener, such as the same host network. Keep the token private and
 leave the management listener off public interfaces.
 
+Home Assistant attaches the commissioned proxy marker from the status behind each control when the proxy supports it.
+If another commissioned proxy takes over the same management address before the write arrives, it refuses the request.
+Earlier proxies can still accept ordinary controls using the fields they support.
+
 The entities show current and power, vehicle connection, session state, selected limit, control mode and
 diagnostics. Start and the session-only Stop service use the same proxy as the vendor app. Pause holds at
 zero. A charger can report a session after Pause if an earlier Start was already accepted. The proxy keeps

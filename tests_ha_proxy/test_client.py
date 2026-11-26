@@ -91,7 +91,7 @@ async def peer():
         command = value["command"]
         control["commands"].append(command)
         control["requests"].append(copy.deepcopy(value))
-        if command in ("start", "stop_session") and "canvas_owner" in value:
+        if command not in ("status", "receipt") and "canvas_owner" in value:
             if value["canvas_owner"] != state.get("canvas_owner"):
                 await socket.send_json({"ok": False, "error": "not_ready"})
                 await socket.close()

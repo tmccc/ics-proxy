@@ -66,7 +66,7 @@ class ManagementServer:
         self, settings: ManagementSettings, controller: ManagedController, status: Callable[[], dict[str, Any]]
     ) -> None:
         self.settings, self.controller, self.status = settings, controller, status
-        # Bind canvas writes to the commissioned destination without publishing charger identifiers.
+        # Bind management writes to the commissioned destination without publishing charger identifiers.
         identity = (
             "ics-proxy canvas owner v1",
             controller.session.journal.identity,
@@ -114,9 +114,16 @@ class ManagementServer:
             self.limit_requests(self.recent)
             raise SecurityError("management identifier is invalid")
         command = value.get("command")
+        fields = {"id", "command", "revision"}
+        has_owner = "canvas_owner" in value
+        marker = value.get("canvas_owner")
+        owner = marker if isinstance(marker, str) and re.fullmatch(r"[a-f0-9]{64}", marker) else None
+        if has_owner:
+            fields.add("canvas_owner")
         pause = (
             command == "pause"
-            and set(value) == {"id", "command", "revision"}
+            and set(value) == fields
+            and (not has_owner or owner is not None)
             and type(value["revision"]) is int
             and 0 <= value["revision"] < 2**53
         )
@@ -130,7 +137,6 @@ class ManagementServer:
             if not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):
                 raise SecurityError("management receipt identifier is invalid")
             return self.read_only(value["id"], command, request_id=identifier)
-        fields = {"id", "command", "revision"}
         if command == "set_current":
             fields.add("current_a")
         elif command == "stop_session":
@@ -139,13 +145,11 @@ class ManagementServer:
                 raise SecurityError("management Stop target is invalid")
         elif command not in ("pause", "app_control", "start", "start_test", "arm_cloud_test"):
             raise SecurityError("management command is not supported")
-        if command in ("start", "stop_session") and "canvas_owner" in value:
-            fields.add("canvas_owner")
-            owner = value["canvas_owner"]
-            if not isinstance(owner, str) or not re.fullmatch(r"[a-f0-9]{64}", owner):
-                raise SecurityError("management canvas owner is invalid")
+        if has_owner:
+            if owner is None:
+                raise SecurityError("management owner is invalid")
             if not hmac.compare_digest(owner, self._canvas_owner):
-                raise UnavailableError("management canvas owner has changed")
+                raise UnavailableError("management owner has changed")
         if set(value) != fields:
             raise SecurityError("management command is not supported")
         try:
@@ -198,6 +202,7 @@ class ManagementServer:
             elif command == "status":
                 result = refresh_for_read(self.controller, self.status())
                 result["canvas_owner"] = self._canvas_owner
+                result["management_owner_binding"] = True
             else:
                 raise SecurityError("management read is not supported")
         except sqlite3.Error:

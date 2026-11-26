@@ -57,6 +57,16 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def mark_canvas_activation(self) -> None:
         self.canvas_activation = frame_clock() if self.canvas_owner is not None else None
 
+    # Keep a write bound to the status that supplied its revision, including across the WebSocket handshake.
+    async def async_command(self, action: str, revision: int, **fields: Any) -> None:
+        status = self.data or {}
+        owner = status.get("canvas_owner")
+        if owner is not None and (
+            action in ("start", "stop_session") or status.get("management_owner_binding") is True
+        ):
+            fields["canvas_owner"] = owner
+        await self.client.command(action, revision, **fields)
+
     # Keep the existing coordinator inspection surface while its debounce belongs to the entry.
     @property
     def problem_since(self) -> float | None:
@@ -165,6 +175,7 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         owner = value.get("canvas_owner")
         if not isinstance(owner, str) or not re.fullmatch(r"[a-f0-9]{64}", owner):
             owner = None
+        value["canvas_owner"] = owner
         if owner != self.canvas_owner:
             self.canvas_owner = owner
             self.mark_canvas_activation()

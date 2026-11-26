@@ -89,6 +89,12 @@ def restore_guidance(stage: str, error: Exception) -> tuple[str, str]:
         )
     if stage == "validate_inputs":
         return "inputs_unverified", "Check that the configuration and commissioning files are present and valid."
+    if stage == "validate_maintenance_credentials":
+        return (
+            "maintenance_credentials_unverified",
+            "Check that the proxy service account can read the TLS certificate, private key, and any configured "
+            "CA or OCPP credential files. Verify the certificate is valid for the listener, then retry.",
+        )
     return (
         "restore_stage_failed",
         "Keep the proxy stopped and the car unplugged. Review the restore instructions for this stage before retrying.",
@@ -260,7 +266,11 @@ async def run(
             )
             emit(await finish_restore(handover, patch, report_stage=report_stage))
             return 0
-        tls = prepare_tls(config)
+        try:
+            tls = prepare_tls(config)
+        except SecurityError:
+            report_stage("validate_maintenance_credentials")
+            raise
         await prepare_cleanup(book, spec, observe, patch)
     # The durable cleanup phase also fences a service restart between the two exclusive journal opens.
     session = TrialSession(

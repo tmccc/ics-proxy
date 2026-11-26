@@ -194,6 +194,29 @@ async def test_restore_check_is_offline(tmp_path, tls, unused_tcp_port, monkeypa
         assert peer.requests == reads and not peer.writes
 
 
+# Intent: identify missing maintenance credentials in the restore CLI before it contacts the charger.
+# Why: the offline native check succeeds independently and later restore stages can resume without TLS files.
+async def test_restore_reports_missing_maintenance_credentials(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
+    ) as test:
+        await stop_paused(test)
+        rig = test.rig
+        config, spec = tmp_path / "trial.json", spec_file(tmp_path, rig)
+        private_key = rig.prepared.config.private_key
+        private_key.unlink()
+        port = rig.prepared.observer.port
+        reads = list(rig.peer.requests)
+
+        assert await run("check", config, spec, port) == 0
+        report = await failed_restore_cli("restore", config, spec, port)
+        assert report["restore_stage"] == "validate_maintenance_credentials"
+        assert report["restore_reason"] == "maintenance_credentials_unverified"
+        assert "private key" in report["next_step"]
+        assert str(private_key) not in json.dumps(report)
+        assert rig.peer.requests == reads and not rig.peer.writes
+
+
 # Intent: a plugged vehicle blocks managed restoration before any saved configuration or profile changes.
 # Why: the original backend may independently allow charging as soon as the proxy hands control back.
 async def test_restore_refuses_plugged_vehicle_before_any_write(tmp_path, tls, unused_tcp_port, monkeypatch):

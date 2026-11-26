@@ -116,10 +116,8 @@ def register_session_service(hass: HomeAssistant) -> None:
                 raise ProxyError("The display request is no longer current")
 
         fields = {"target": target} if action == "stop_session" else {}
-        if owner is not None:
-            fields["canvas_owner"] = owner
         try:
-            await coordinator.client.command(
+            await coordinator.async_command(
                 action,
                 revision,
                 report_reference=record_reference if include_reference else None,

@@ -365,6 +365,11 @@ class ManagedSessionStop:
         self._checkpoint_native_first()
         self._settle_closure(stop_rejections(j), observed=True)
 
+    # The schedule independently verified this exact closure, but could not save its occurrence marker.
+    def retain_scheduled_closure(self, local: int) -> None:
+        rejections = stop_rejections(self.controller.session.journal)
+        self._checkpoint_closure(rejections, observed=True, scheduled_local=local)
+
     # The exact closure can already be proved while its receipt publication still awaits storage.
     def closure_verified(self, local: int) -> bool:
         j = self.controller.session.journal
@@ -387,11 +392,12 @@ class ManagedSessionStop:
         return STOP_CLOSURE_VERIFIED, ()
 
     # Keep the SQL settlement selector bound to each exact request and its validated local transaction.
-    def _buffered_closure_locals(self) -> str:
+    def _buffered_closure_locals(self, *, exact_only: bool = False) -> str:
         return encoded(
             {
                 request: proof if isinstance(proof, int) else proof[2]
                 for request, proof in self._verified_closures.items()
+                if not exact_only or isinstance(proof, tuple)
             }
         )
 
@@ -416,15 +422,21 @@ class ManagedSessionStop:
             return False
         return True
 
-    # The current observation can prove closure. A resumed checkpoint must match the original receipt and report.
+    # A fresh observation can settle pending receipts. A saved exact physical fact also survives rejection.
     def _matching_closures(
         self, rejections: StopRejections, *, observed: bool, local: int | None = None
     ) -> dict[str, int | VerifiedStopClosure]:
-        where = f"{rejections.closed_receipts} AND NOT {STOP_CLOSURE_VERIFIED}"
+        where = rejections.closed_receipts
         bindings: tuple[str | int, ...] = (STOP_SESSION,)
-        if not observed:
-            where += f" AND {STOP_BUFFERED_CLOSURE}"
-            bindings += (self._buffered_closure_locals(),)
+        if observed and local is not None:
+            where = (
+                "action=? AND (state IN ('accepted','running','uncertain') "
+                "OR (state='failed' AND json_extract(result,'$.classification')='stop_rejected'))"
+            )
+        elif not observed:
+            where = f"({where} AND {STOP_BUFFERED_CLOSURE} OR (action=? AND {STOP_BUFFERED_CLOSURE}))"
+            bindings += (self._buffered_closure_locals(), STOP_SESSION, self._buffered_closure_locals(exact_only=True))
+        where += f" AND json_type(result,'$._session_stop.local')='integer' AND NOT {STOP_CLOSURE_VERIFIED}"
         if local is not None:
             where += " AND transactions.local=?"
             bindings += (local,)
@@ -446,18 +458,19 @@ class ManagedSessionStop:
                 closures[request] = saved
         return closures
 
-    # Save verified closure separately so a refused completion cannot roll back the observation.
-    def _checkpoint_closure(self, rejections: StopRejections, *, observed: bool) -> None:
-        if not observed and not self._verified_closures:
-            self._retain_closures()
-            return
-        self._verified_closures = self._matching_closures(rejections, observed=observed)
+    # Publish the physical proof without changing the command outcome. Keep it if publication is refused.
+    def _checkpoint_closure(
+        self, rejections: StopRejections, *, observed: bool, scheduled_local: int | None = None
+    ) -> None:
+        if self._verified_closures:
+            self._verified_closures = self._matching_closures(rejections, observed=False)
+        if observed:
+            self._verified_closures.update(self._matching_closures(rejections, observed=True, local=scheduled_local))
         if self._verified_closures and self._update_receipts(
             STOP_CLOSURE_FIELDS,
             (),
-            f"{rejections.closed_receipts} AND {STOP_BUFFERED_CLOSURE} AND NOT {STOP_CLOSURE_VERIFIED}",
+            f"action=? AND {STOP_BUFFERED_CLOSURE} AND NOT {STOP_CLOSURE_VERIFIED}",
             (STOP_SESSION, self._buffered_closure_locals()),
-            rejections=rejections,
             retry_after_rollback=True,
         ):
             self._verified_closures.clear()

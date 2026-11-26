@@ -480,6 +480,7 @@ class LocalSchedule:
         except sqlite3.Error:
             if j.db.in_transaction:
                 raise
+            self.controller.session_stop.retain_scheduled_closure(occurrence["local"])
 
     # The session Stop owner can preserve the same physical proof across process replacement.
     def closure_known(self, occurrence: dict[str, Any]) -> bool:

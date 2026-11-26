@@ -69,6 +69,9 @@ async def current_peer():
             result = receipts[value["request_id"]]
         elif command in ("set_current", "start"):
             fields = {"id", "command", "revision"} | ({"current_a"} if command == "set_current" else set())
+            if "canvas_owner" in value:
+                fields.add("canvas_owner")
+                assert value["canvas_owner"] == state["canvas_owner"]
             assert set(value) == fields
             permitted = state["can_set_current"] if command == "set_current" else state["can_start"]
             if command == "set_current":
@@ -134,6 +137,7 @@ async def test_selector_lifecycle_is_passive_and_has_integer_current_metadata(ac
 # Why: choosing a future resume current is distinct from starting or returning authority to the app.
 @pytest.mark.parametrize("paused", [False, True], ids=["app", "paused"])
 async def test_explicit_current_selection_uses_receipt_and_does_not_start(actual_hass, current_peer, paused):
+    current_peer["state"].update(canvas_owner="b" * 64, management_owner_binding=True)
     if paused:
         current_peer["state"].update(
             desired_control="paused", local_hold_verified=True, owner_control_enabled=False, station_ceiling_a=0
@@ -146,7 +150,8 @@ async def test_explicit_current_selection_uses_receipt_and_does_not_start(actual
     )
     assert hass.states.get("number.ics_proxy_charge_current_a").state == "16"
     request = next(v for v in current_peer["requests"] if v["command"] == "set_current")
-    assert set(request) == {"id", "command", "revision", "current_a"}
+    assert set(request) == {"id", "command", "revision", "current_a", "canvas_owner"}
+    assert request["canvas_owner"] == current_peer["state"]["canvas_owner"]
     assert request["revision"] == 0 and type(request["current_a"]) is int and request["current_a"] == 16
     assert current_peer["commands"].count("set_current") == current_peer["commands"].count("receipt") == 1
     assert set(current_peer["commands"]) <= {"status", "set_current", "receipt"}

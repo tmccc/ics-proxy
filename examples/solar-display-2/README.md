@@ -56,7 +56,7 @@ display, touch and brightness components, its fallback dashboard, and the render
    template, touch automation and iCS Home Assistant integration together so the render timestamp is checked
    through the action. Update the managed proxy and iCS Home Assistant integration for destination binding.
    A canvas action needs a valid `canvas_owner` marker in status, so an older proxy leaves a tap unconfirmed.
-   Ordinary Home Assistant controls and older management clients can omit the marker. When upgrading an earlier
+   Older management clients can omit the marker. When upgrading an earlier
    example, add the feedback expiry script from [request-helper.yaml](request-helper.yaml), keep the request
    helper and its options, and remove `initial: idle` if the earlier example set it.
 4. Confirm that the automation entity ID used by the view and the firmware's `canvas_ics_automation_entity`

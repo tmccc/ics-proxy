@@ -68,7 +68,7 @@ class ProxyCurrent(ProxyEntity, NumberEntity):
         if not self.available:
             raise HomeAssistantError(translation_domain=DOMAIN, translation_key="current_unavailable")
         try:
-            await self.coordinator.client.command(
+            await self.coordinator.async_command(
                 "set_current", self.coordinator.data["control_revision"], current_a=int(value)
             )
         except ProxyError as error:

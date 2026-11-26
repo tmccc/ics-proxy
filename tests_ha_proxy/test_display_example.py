@@ -12,6 +12,7 @@ from homeassistant import bootstrap, loader
 from homeassistant.config_entries import ConfigEntries
 from homeassistant.const import EVENT_CALL_SERVICE
 from homeassistant.core import HomeAssistant, SupportsResponse, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import condition, trigger
 from homeassistant.helpers.template import Template
 from homeassistant.setup import async_setup_component
@@ -712,6 +713,56 @@ async def call_session_command(hass, action, **fields):
     )
 
 
+# Intent: a management command already in flight stays tied to the status that enabled it.
+# Why: a replacement proxy can advertise the same revision and Start capability at the same address.
+@pytest.mark.parametrize("surface", ["session_action", "start_button"])
+async def test_ordinary_start_does_not_reach_a_replacement_destination(actual_hass, canvas_peer, surface):
+    hass, peer = actual_hass, canvas_peer
+    peer["state"]["control_revision"] = REVISION
+    entry = await setup_proxy(hass, peer["port"])
+
+    # The active coordinator can learn the new owner before the waiting connection can write.
+    async def replace_owner():
+        peer["state"]["canvas_owner"] = REPLACEMENT_OWNER
+        await entry.runtime_data.async_refresh()
+
+    peer["before_handshake"] = replace_owner
+    if surface == "session_action":
+        result = await call_session_command(hass, "start", revision=REVISION)
+        assert result["confirmed"] is False and result["request_reference"] is not None
+    else:
+        with pytest.raises(HomeAssistantError, match="could not confirm this request"):
+            await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True)
+    (refused,) = [request for request in peer["requests"] if request["command"] == "start"]
+    assert refused["canvas_owner"] == CANVAS_OWNER and refused["revision"] == REVISION
+    assert entry.runtime_data.canvas_owner == REPLACEMENT_OWNER
+    assert peer["state"]["charging_session_open"] is False
+
+    assert (await call_session_command(hass, "start"))["confirmed"] is True
+    assert peer["state"]["charging_session_open"] is True
+    assert [request["canvas_owner"] for request in peer["requests"] if request["command"] == "start"] == [
+        CANVAS_OWNER,
+        REPLACEMENT_OWNER,
+    ]
+
+
+# Intent: a bound Pause still uses the restrictive path when the proxy revision has advanced.
+# Why: a stale dashboard can still pause the same charger, including with earlier proxy versions.
+@pytest.mark.parametrize("binding", [True, None], ids=["all-commands", "canvas-only"])
+async def test_pause_keeps_its_stale_revision_behavior_with_owner_status(actual_hass, canvas_peer, binding):
+    hass, peer = actual_hass, canvas_peer
+    if binding:
+        peer["state"]["management_owner_binding"] = True
+    await setup_proxy(hass, peer["port"])
+    peer["state"]["control_revision"] = REVISION
+
+    await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
+    (pause,) = [request for request in peer["requests"] if request["command"] == "pause"]
+    assert pause["revision"] == 0
+    assert pause.get("canvas_owner") == (CANVAS_OWNER if binding else None)
+    assert peer["state"]["local_hold_verified"] is True
+
+
 # Intent: an unchanged HA entry rejects a fresh frame or an in-flight write for its previous proxy.
 # Why: independent destinations at the same address can advertise the same revision and capabilities.
 @pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
@@ -811,7 +862,7 @@ async def test_canvas_start_requires_the_displayed_revision(actual_hass, canvas_
     assert result["request_reference"] is not None
     (command,) = [request for request in peer["requests"] if request["command"] == "start"]
     assert command["revision"] == 0
-    assert "canvas_owner" not in command
+    assert command["canvas_owner"] == CANVAS_OWNER
 
 
 # Intent: require fresh native session evidence for the displayed Stop target, even with the vendor offline.

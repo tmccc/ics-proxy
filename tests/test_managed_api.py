@@ -38,11 +38,18 @@ async def test_management_pause_overtakes_queued_current(tmp_path, tls, unused_t
     async with adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
         c = b.controller
         before = list(b.rig.bench.received_limits)
-        api = ManagementServer(ManagementSettings(19001, tmp_path / "unused", TOKEN), c, lambda: {})
+        published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
+        api = ManagementServer(ManagementSettings(19001, tmp_path / "unused", TOKEN), c, lambda: published)
         current, pause = uuid.uuid4().hex, uuid.uuid4().hex
         revision = c.requests.intent().revision
+        owner = api.read_only(uuid.uuid4().hex, "status")["result"]["canvas_owner"]
+        another_owner = ("1" if owner[0] != "1" else "2") + owner[1:]
+        selection = {"id": current, "command": "set_current", "revision": revision, "current_a": 16}
+        with pytest.raises(managed_api.UnavailableError, match="management owner has changed"):
+            await api.dispatch(json.dumps({**selection, "canvas_owner": another_owner}))
+        assert c.requests.receipt(current)["state"] == "not_found"
         ordinary = asyncio.create_task(
-            api.dispatch(json.dumps({"id": current, "command": "set_current", "revision": revision, "current_a": 16})),
+            api.dispatch(json.dumps({**selection, "canvas_owner": owner})),
             eager_start=True,
         )
         restrictive = asyncio.create_task(
@@ -125,8 +132,11 @@ async def test_management_connections_leave_pause_available(tmp_path, tls, unuse
                 await release.wait()
             return await dispatch(text, pause_only=pause_only)
 
-        monkeypatch.setattr(api, "dispatch", delayed_dispatch)
         try:
+            async with connect(url, **options) as dashboard:
+                status = (await call(dashboard, "status"))["result"]
+            assert status["management_owner_binding"] is True
+            monkeypatch.setattr(api, "dispatch", delayed_dispatch)
             async with AsyncExitStack() as clients:
                 dashboards = [await clients.enter_async_context(connect(url, **options)) for _ in range(4)]
                 if busy:
@@ -137,7 +147,13 @@ async def test_management_connections_leave_pause_available(tmp_path, tls, unuse
                     await until(lambda: len(api.idle) == 4)
                 identifier = uuid.uuid4().hex
                 async with connect(url, **options) as owner:
-                    reply = await call(owner, "pause", id=identifier, revision=c.requests.intent().revision)
+                    reply = await call(
+                        owner,
+                        "pause",
+                        id=identifier,
+                        revision=c.requests.intent().revision,
+                        canvas_owner=status["canvas_owner"],
+                    )
                     assert reply["ok"] and reply["result"]["state"] == "accepted"
                     assert (await healthy(c))["local_hold_verified"]
                     assert c.requests.receipt(identifier)["state"] == "completed"
