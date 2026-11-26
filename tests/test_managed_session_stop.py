@@ -325,6 +325,75 @@ async def test_session_stop_shares_the_vendor_wire_in_either_order(
         assert bench.firmware.effective_limit() == 6 and c.requests.intent().mode == "app"
 
 
+# Intent: a queued local Stop can join the vendor Stop that reached the charger ahead of it.
+# Why: the join records the earlier acceptance without replacing the wire diagnostics or inflating the send count.
+async def test_session_stop_join_at_dispatch_preserves_rpc_diagnostics(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        local = await positive_flow(t, "daily")
+        await healthy(c)
+        target, vendor = c.session_stop.target(), j.vendor_id(local)
+        assert isinstance(target, str) and vendor is not None
+        peer = t.session.gateway.charger
+        request = uuid.uuid4().hex
+        before = peer.diagnostics.snapshot()
+
+        async with peer.gate.enter(0):
+            vendor_stop = asyncio.create_task(
+                bench.cloud_call("queued-vendor-stop", "RemoteStopTransaction", {"transactionId": vendor})
+            )
+            await until(lambda: len(peer.gate._waiting) == 1)
+            c.command(request, "stop_session", c.requests.intent().revision, target=target)
+            assert c.requests.receipt(request)["state"] == "accepted"
+            await until(lambda: len(peer.gate._waiting) == 2)
+
+        assert (await vendor_stop)[2] == {"status": "Accepted"}
+        assert c.session_stop.worker is not None
+        await asyncio.wait_for(c.session_stop.worker, 3)
+        wire = stop_incident_report(j.path, tmp_path / "events.jsonl", request_reference=reference(request))["wire"]
+        assert wire["dispatch"] == "joined" and wire["joined_attempts"][0]["reply"] == "accepted"
+        assert [frame[3] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
+
+        after = peer.diagnostics.snapshot()
+        assert after["action"] == "RemoteStopTransaction" and after["phase"] == "complete"
+        assert after["failed_phase"] == before["failed_phase"]
+        assert after["send_attempts"] == before["send_attempts"] + 1
+        assert after["matched_replies"] == before["matched_replies"] + 1
+
+
+# Intent: a real journal refusal prevents the admitted Stop from reaching the charger sender.
+# Why: diagnostics must keep the last actual exchange when durable dispatch cannot proceed.
+async def test_session_stop_dispatch_storage_refusal_preserves_rpc_diagnostics(
+    tmp_path, tls, unused_tcp_port, monkeypatch
+):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        local = await positive_flow(t, "daily")
+        await healthy(c)
+        target = c.session_stop.target()
+        assert isinstance(target, str)
+        request = uuid.uuid4().hex
+        refused = asyncio.Event()
+        j.db.create_function("note_stop_dispatch_refusal", 0, refused.set)
+        j.db.execute(
+            "CREATE TEMP TRIGGER refuse_stop_dispatch BEFORE UPDATE ON managed_requests "
+            f"WHEN NEW.id='{request}' AND NEW.state='running' "
+            "BEGIN SELECT note_stop_dispatch_refusal(); SELECT RAISE(ABORT, 'dispatch storage unavailable'); END"
+        )
+        diagnostics = t.session.gateway.charger.diagnostics
+        before = diagnostics.snapshot()
+        c.command(request, "stop_session", c.requests.intent().revision, target=target)
+        assert c.session_stop.worker is not None
+        await asyncio.wait_for(c.session_stop.worker, 3)
+
+        assert refused.is_set() and not bench.remote_stop.is_set()
+        assert not j.outcomes.session_stop_dispatched(local)
+        assert c.requests.receipt(request)["state"] == "accepted"
+        assert diagnostics.snapshot() == before
+
+
 # Intent: a local session can physically close before its real Stop report arrives.
 # Why: this is a temporary disagreement about the exact stopped session, not proof of a new identity fault.
 @pytest.mark.parametrize("cloud_connected", [False, True])

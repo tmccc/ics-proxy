@@ -224,12 +224,17 @@ async def test_shutdown_keeps_stop_unissued_if_dispatch_proof_fails(tmp_path, tl
         b.controller.request_stop()
         try:
             attempt = uuid.uuid4().hex
+            calls_before = len(bench.device_calls)
+            sends_before = g.charger.diagnostics.send_attempts
             with pytest.raises(sqlite3.IntegrityError, match="shutdown dispatch proof unavailable"):
                 await g.controls.decisions.stop_for_shutdown(g, b.controller.native, attempt, local)
             shutdown = j.get("trial_shutdown_attempt")
             assert shutdown["id"] == attempt and shutdown["local"] == local and shutdown["stop_wire"] is None
             assert j.active() == local and not j.db.in_transaction
             assert not bench.remote_stop.is_set() and bench.firmware.effective_limit() == 0
+            assert g.charger.diagnostics.send_attempts == sends_before + len(bench.device_calls) - calls_before
+            assert g.charger.diagnostics.action == bench.device_calls[-1][2]
+            assert g.charger.diagnostics.phase == "complete"
         finally:
             j.db.execute("DROP TRIGGER refuse_shutdown_stop_dispatch")
         stop = {"transactionId": local, "timestamp": START["timestamp"], "meterStop": 1100}

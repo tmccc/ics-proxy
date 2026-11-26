@@ -49,6 +49,7 @@ class ScheduleControl:
                     catalogue.setdefault(fingerprint(tag.casefold()), []).append(identifier)
             if catalogue != j.get("managed_schedule_tags"):
                 j.put("managed_schedule_tags", catalogue)
+            c.local_schedule.observe_native_occurrence(n)
         self.attest_bound_vendor(n, original)
         self.bind_deferred_start(gateway, charging, n, original)
 

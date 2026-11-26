@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -170,6 +170,83 @@ async def test_offline_schedule_uses_exact_owner_session_once(tmp_path, tls, unu
             for _ in range(3):
                 await replacement.controller.tick()
             assert len(starts(rig)) == 1 and replacement.session.journal.active() is None
+
+
+# Intent: a completed native run uses the same window as the outage fallback, including after a vendor-app Stop.
+# Why: a later outage must not restart that day's run, and a different source must not block today's scheduled Start.
+@pytest.mark.parametrize("restart", [False, True], ids=["same-process", "replacement"])
+@pytest.mark.parametrize("scheduled", [False, True], ids=["different-plan-marker", "native-schedule"])
+async def test_native_daily_start_uses_the_outage_window(
+    tmp_path, tls, unused_tcp_port, monkeypatch, restart, scheduled
+):
+    clock = SchedulerClock(MIDNIGHT - 60)
+    monotonic = time.monotonic()
+    monkeypatch.setattr(
+        local_schedule, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: monotonic + clock.elapsed)
+    )
+    async with managed_bench(
+        tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
+    ) as rig, AsyncExitStack() as connections:
+        rig.prepared.config = replace(rig.prepared.config, owner_start_tag=OWNER_TAG, owner_schedule_timezone=ZONE.key)
+        bench, peer = rig.bench, rig.peer
+        test = await connections.enter_async_context(connection(rig, "online-for-native", online=True))
+        c, j = test.controller, test.session.journal
+        await healthy(c)
+        clock.now = MIDNIGHT
+        start = START | {"idTag": NATIVE_TAG, "timestamp": datetime.fromtimestamp(clock.now, UTC).isoformat()}
+        reported = await bench.call(test.charger, uuid.uuid4().hex, "StartTransaction", start)
+        assert reported[0] == 3 and reported[2]["idTagInfo"]["status"] == "Accepted"
+        local = reported[2]["transactionId"]
+        peer.plan_session = (local, ORIGINAL_PLAN["planId"] if scheduled else 987654)
+        peer.paused, peer.permission_enabled = False, True
+        bench.cp, bench.connection = "C", "Charging"
+        bench.firmware.requested_current = 32
+        await until(lambda: j.vendor_id(local) is not None)
+        assert (await healthy(c))["power_w"] == 1440
+        assert (j.get(local_schedule.NATIVE_OCCURRENCE) is not None) is scheduled
+        assert j.get(LOCAL_SCHEDULE_OCCURRENCE) is None
+
+        clock.now = MIDNIGHT + 60
+        stopped = await bench.cloud_call(
+            "vendor-app-stop", "RemoteStopTransaction", {"transactionId": j.vendor_id(local)}
+        )
+        assert stopped[0] == 3 and stopped[2]["status"] == "Accepted"
+        peer.permission_enabled = False
+        bench.cp, bench.connection = "B", "Plug"
+        stop = {
+            "transactionId": local,
+            "meterStop": start["meterStart"],
+            "timestamp": datetime.fromtimestamp(clock.now, UTC).isoformat(),
+        }
+        assert (await bench.call(test.charger, uuid.uuid4().hex, "StopTransaction", stop))[0] == 3
+        bench.firmware.requested_current = 0
+        await until(lambda: j.next_delivery() is None)
+        await healthy(c)
+        assert j.active() is None and not starts(rig)
+        await bench.vendor_outage()
+        if restart:
+            await connections.aclose()
+            test = await connections.enter_async_context(connection(rig, "offline-after-native"))
+            c, j = test.controller, test.session.journal
+
+        if scheduled:
+            ready = await status(
+                test, lambda value: value["cloud_connected"] is False and value.get("normal_start_ready") or starts(rig)
+            )
+            assert ready["normal_start_ready"] and not starts(rig)
+            for _ in range(3):
+                await c.tick()
+            assert j.get(LOCAL_SCHEDULE_OCCURRENCE) is None
+            assert not starts(rig)
+            clock.now = MIDNIGHT + 24 * 3600
+
+        await status(test, lambda _: bool(starts(rig)))
+        occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
+        assert occurrence["window"]["starts_at"] == MIDNIGHT + (24 * 3600 if scheduled else 0)
+        assert [frame[3] for frame in starts(rig)] == [{"connectorId": 1, "idTag": OWNER_TAG}]
+        assert [frame[3] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
 
 
 # Intent: the freshly rechecked connector briefly refuses a midnight Start before any command is attempted.

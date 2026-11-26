@@ -614,7 +614,6 @@ class Peer:
                     if isinstance(permitted, Pending):
                         return permitted
                 message = build_call(unique_id, action, actual)
-                self.diagnostics.sending(action, len(unique_id))
                 if on_dispatch is not None:
                     on_dispatch(action)
                 if owner_scope is not None:
@@ -636,6 +635,7 @@ class Peer:
                 dispatched = True
                 if on_receive is not None or owner_wire is not None:
                     self._receivers[unique_id] = (priority, received)
+                self.diagnostics.sending(action, len(unique_id))
                 await sender(message)
                 if on_sent is not None:
                     sent = on_sent

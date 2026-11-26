@@ -27,7 +27,7 @@ from .current_policy import (
     current_source_decision,
     original_current_plan,
 )
-from .local_schedule import ScheduleCloudReturnedError
+from .local_schedule import SCHEDULE_CUTOFF, ScheduleCloudReturnedError, ScheduleCutoffError
 from .local_schedule_cutoff import scheduled_cutoff_target
 from .managed_facts import ManagedFacts
 from .managed_intent import (
@@ -1346,7 +1346,6 @@ class ControlDecisions:
             # The original request must still own a live lease.
             charging.lease is not lease
             or c.stopping
-            or monotonic() >= lease.deadline
             or c.requests.intent() != ControlIntent(lease.mode, lease.revision)
             # The same charger connection and commissioned scope must still be current.
             or g._charger_epoch != lease.epoch
@@ -1382,6 +1381,8 @@ class ControlDecisions:
                 ).fetchone()
             )
         ):
+            raise DeniedError("managed test Start permission expired or was superseded")
+        if monotonic() >= lease.deadline and not c.local_schedule.cutoff_elapsed(lease):
             raise DeniedError("managed test Start permission expired or was superseded")
         # Reconnection can revoke charging while the initial hold still verifies zero on its own ticket.
         c.local_schedule.require_lease(lease, finishing_initial_zero=stopping and lease.initial_zero_ticket is not None)
@@ -1474,14 +1475,17 @@ class ControlDecisions:
             charging.changed.set()
             j.starts.retire_refused()
         else:
+            c = charging.controller
+            cutoff = isinstance(error, ScheduleCutoffError) and (result is None or not result.remote_start_dispatched)
+            cloud_returned = isinstance(error, ScheduleCloudReturnedError) and c.session.runtime.vendor_registered
             charging.stop(
                 lease,
-                "start_not_confirmed",
+                SCHEDULE_CUTOFF if cutoff else "start_not_confirmed",
                 failure=cause,
                 allow_schedule_return=(
-                    isinstance(error, ScheduleCloudReturnedError)
+                    (cutoff or cloud_returned)
                     and (result is None or result.failure is error)
-                    and charging.controller.local_schedule.verified_unsent_zero(lease, result)
+                    and c.local_schedule.verified_unsent_zero(lease, result)
                 ),
             )
         charging.record_failure_diagnostic(cause)
@@ -1594,6 +1598,17 @@ class ControlDecisions:
             return False
         with j.atomic():
             intent = c.requests.intent()
+            # The lease timer can revoke the Start before the wire worker verifies its own zero.
+            if (
+                reason == "deadline"
+                and intent == ControlIntent("app", lease.revision)
+                and lease.mode == "app"
+                and state.get("start_rpc_accepted") is False
+                and c.local_schedule.cutoff_elapsed(lease)
+            ):
+                receipt = j.starts.receipt()
+                if receipt.get("request_id") != lease.identifier or receipt.get("stage") in ("prepared", "unsent"):
+                    reason = SCHEDULE_CUTOFF
             preserve = (
                 lease.normal
                 and intent.mode == "app"
@@ -2892,6 +2907,9 @@ class ControlDecisions:
                         complete_record(c, record)
                     if internal:
                         g.controls._complete(j.get("control")["ticket"], uncertain=False)
+                        intent = c.requests.intent()
+                        if c.local_schedule.cutoff_pause_unsent(intent):
+                            record_automatic_pause(j, intent, "local_charge")
                 if any(isinstance(record, RetirementCandidate) for record in records):
                     j.starts.set_lease(None)
                     c.charging.changed.set()

@@ -4,24 +4,29 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
 from ics_proxy_core.constants import HUB_PROFILE_ID
+from ics_proxy_core.engine import local_schedule, managed_charging
 from ics_proxy_core.engine.local_schedule_cutoff import scheduled_cutoff_target
 from ics_proxy_core.engine.managed_current import capability_value
 from ics_proxy_core.engine.managed_intent import AUTOMATIC_PAUSE_CAUSE, LOCAL_SCHEDULE_OCCURRENCE
 from ics_proxy_core.engine.managed_sources import ORDINARY_HOLD
 from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
-from tests.managed_rig import introduced, starts
+from tests.managed_rig import healthy, introduced, managed_bench, starts
+from tests.native_schedule_support import ZONE, SchedulePeer, SchedulerClock
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.test_managed_local_schedule import MIDNIGHT, connection, overnight, status
 from tests.test_managed_offline_owner import OWNER_TAG
+from tests.test_managed_vendor_catchup import CatchupBench
 from tests.tls_support import tls as tls
 
 
@@ -190,6 +195,84 @@ async def test_cutoff_uses_elapsed_time_after_scheduled_receipt_read(
             await c.tick()
             assert bench.firmware.effective_limit() == 0
             assert stops(bench) == [{"transactionId": local}]
+
+
+# Intent: a scheduled profile reply arrives after 06:00 without a RemoteStart on the charger wire.
+# Why: only the same, now verified hold can permit the next day's plan or Return to iCS.
+@pytest.mark.parametrize("timer_first", [False, True], ids=["wire-guard-first", "lease-timer-first"])
+@pytest.mark.parametrize("resume", ["next-window", "cloud-restored", "explicit-pause"])
+async def test_unsent_schedule_cutoff_recovers_app_authority(
+    tmp_path, tls, unused_tcp_port, monkeypatch, timer_first, resume
+):
+    clock = SchedulerClock(MIDNIGHT - 60)
+    base = time.monotonic()
+    monkeypatch.setattr(
+        local_schedule, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: base + clock.elapsed)
+    )
+    if timer_first:
+        monkeypatch.setattr(
+            managed_charging,
+            "time",
+            SimpleNamespace(time=time.time, monotonic=lambda: time.monotonic() + clock.elapsed),
+        )
+    async with managed_bench(
+        tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
+    ) as rig:
+        rig.prepared.config = replace(rig.prepared.config, owner_start_tag=OWNER_TAG, owner_schedule_timezone=ZONE.key)
+        async with connection(rig, "cutoff-starting-in-app", online=True) as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            await healthy(c)
+            await bench.vendor_outage()
+            await c.tick()
+            assert c.requests.intent().mode == "app" and not test.session.runtime.vendor_registered
+            reached, release = asyncio.Event(), asyncio.Event()
+
+            # The real positive profile has reached the simulated charger, whose reply is still in flight.
+            async def wait_for_profile_reply(action, payload):
+                if action == "SetChargingProfile" and not reached.is_set():
+                    period = payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"]
+                    if period[0]["limit"] > 0:
+                        reached.set()
+                        await release.wait()
+
+            bench.before_reply = wait_for_profile_reply
+            clock.now = MIDNIGHT + 6 * 3600 - 7
+            await c.tick()
+            try:
+                await asyncio.wait_for(reached.wait(), 5)
+                assert bench.firmware.effective_limit() == 6 and not starts(rig)
+                clock.now = MIDNIGHT + 6 * 3600
+                clock.step_wall(MIDNIGHT + 6 * 3600 - 60)
+                if timer_first:
+                    c.charging.changed.set()
+                    await until(lambda: c.requests.intent().mode == "paused")
+                    assert j.get(AUTOMATIC_PAUSE_CAUSE) is None
+                if resume == "explicit-pause":
+                    c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+            finally:
+                release.set()
+            await c.charging.settle()
+            bench.before_reply = None
+            await status(test, lambda view: view.get("local_hold_verified") is True)
+            occurrence, intent = j.get(LOCAL_SCHEDULE_OCCURRENCE), c.requests.intent()
+            assert occurrence["local"] is None and j.active() is None
+            assert not starts(rig) and not stops(bench) and bench.firmware.effective_limit() == 0
+            assert j.starts.receipt()["stage"] == "unsent"
+            assert c.requests.offline_pause_current(intent) is (resume != "explicit-pause")
+
+            if resume == "cloud-restored":
+                bench.vendor_available = True
+                await status(test, lambda view: view.get("owner_control_enabled") is True)
+                assert c.requests.intent().mode == "app" and not starts(rig)
+            else:
+                clock.now = MIDNIGHT + 24 * 3600
+                if resume == "next-window":
+                    await status(test, lambda view: len(starts(rig)) == 1)
+                    await c.charging.settle()
+                    assert j.get(LOCAL_SCHEDULE_OCCURRENCE)["request"] != occurrence["request"]
+                else:
+                    await c.tick()
+                    assert c.requests.intent() == intent and not starts(rig)
 
 
 # Intent: the native session ID can lag behind the genuine cutoff Stop report, even across process replacement.
