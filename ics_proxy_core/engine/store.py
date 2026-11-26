@@ -734,6 +734,17 @@ class Journal:
         ).fetchone()
         return int(row[0]) if row is not None else None
 
+    # A closed owner session can explain a lagging native ID only until the next connector lifecycle.
+    def latest_owner_stop_id(self) -> int | None:
+        if not self._has_owner_schema():
+            return None
+        row = self.db.execute(
+            "SELECT latest.local FROM ("
+            "SELECT local, stop, vendor FROM transactions WHERE connector=1 ORDER BY local DESC LIMIT 1"
+            ") AS latest JOIN owner_sessions USING(local) WHERE latest.stop IS NOT NULL AND latest.vendor IS NULL"
+        ).fetchone()
+        return int(row[0]) if row is not None else None
+
     # A complete Start and Stop advances the allocation even when the connector is idle again.
     def lifecycle_position(self) -> tuple[int, int | None]:
         return self.get("next_transaction", 1000), self.active()

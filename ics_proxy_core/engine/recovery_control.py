@@ -273,6 +273,21 @@ class RecoveryControl:
             and j.vendor_id(local) is None
         )
 
+    # A genuine owner-session Stop allows only a wait for the matching independent zero reading to catch up.
+    def closed_owner_session_wait(self, native: HandoverEvidence) -> bool:
+        j, physical = self.journal, native.physical
+        local = physical.native_transaction_id
+        return (
+            physical.transaction_open
+            and type(local) is int
+            and native.is_fresh(5)
+            and native.output_limit_a == 0
+            and physical.power_w == 0
+            and all(value == 0 for value in native.currents_a + native.powers_w)
+            and j.active() is None
+            and j.latest_owner_stop_id() == local
+        )
+
     # Either channel can close a proven session first; disagreement grants only a restrictive wait.
     def ordinary_closure_gap(self, ordinary: OrdinaryRecovery, native: HandoverEvidence) -> bool:
         j, physical = self.journal, native.physical
@@ -293,7 +308,11 @@ class RecoveryControl:
         if not physical.transaction_open or known is not None:
             return False
         # OCPP closed first. Only the latest connector lifecycle can explain an open native report at zero.
-        return j.latest_mapped_stop(local) or self.closed_session_stop_wait(native)
+        return (
+            j.latest_mapped_stop(local)
+            or self.closed_session_stop_wait(native)
+            or self.closed_owner_session_wait(native)
+        )
 
     # The same exact ordinary source and owner prerequisites apply before and inside the outgoing gate.
     def ordinary_authority(
@@ -736,6 +755,7 @@ class RecoveryControl:
             return None
         if (
             self.closed_session_stop_wait(native)
+            or self.closed_owner_session_wait(native)
             or j.get("managed_mode")
             and j.get("managed_control_intent", {}).get("mode") == "app"
             or handover.recovery_zero_only is not None
@@ -873,7 +893,9 @@ class RecoveryControl:
                 and all(value == 0 for value in native.currents_a + native.powers_w)
             ):
                 return  # Keep reception and restrictive recovery available while native closure catches up.
-            if handover.commissioned_binding_matches(native) and self.closed_session_stop_wait(native):
+            if handover.commissioned_binding_matches(native) and (
+                self.closed_session_stop_wait(native) or self.closed_owner_session_wait(native)
+            ):
                 return
             if (
                 j.current_change.read().recovering
@@ -915,5 +937,7 @@ class RecoveryControl:
     # A known unplugged session at zero may wait for its exact device and ledger closure.
     def unplugged_closure(self, c: ManagedController, error: NativeReadinessError) -> bool:
         return error.unplugged_at_zero and (
-            error.native.physical.native_transaction_id == self.journal.active() or c.ordinary.closure_gap(error.native)
+            error.native.physical.native_transaction_id == self.journal.active()
+            or self.closed_owner_session_wait(error.native)
+            or c.ordinary.closure_gap(error.native)
         )

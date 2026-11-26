@@ -106,6 +106,55 @@ async def test_cutoff_owns_exact_stop_until_real_closure(tmp_path, tls, unused_t
             assert j.get(LOCAL_SCHEDULE_OCCURRENCE)["request"] != occurrence["request"]
 
 
+# Intent: the native session ID can lag behind the genuine cutoff Stop report, even across process replacement.
+# Why: the exact closed owner session should wait at zero without an additional Stop or a lasting fault.
+@pytest.mark.parametrize("unplugged", [False, True], ids=["plugged", "unplugged"])
+async def test_cutoff_waits_for_native_closure_across_replacement(
+    tmp_path, tls, unused_tcp_port, monkeypatch, unplugged
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        bench = rig.bench
+        async with connection(rig, "cutoff-before-native-close") as test:
+            local, meter_start = await begin(test, clock)
+            clock.now = MIDNIGHT + 6 * 3600
+            await test.controller.local_schedule.stop_if_due()
+            assert stops(bench) == [{"transactionId": local}]
+            assert test.session.journal.outcomes.accepted_stop(local)
+            await close(test, clock, local, meter_start)
+
+            # The separate native HTTP getter can still carry this ID with zero physical draw.
+            bench.firmware.active = local
+            bench.cp, bench.connection = ("A", "Unplug") if unplugged else ("B", "Plug")
+            for _ in range(3):
+                assert (await test.controller.tick())["state"] == "reconciling"
+            assert not test.session.journal.fault.latched()
+            assert bench.firmware.effective_limit() == 0
+            assert stops(bench) == [{"transactionId": local}]
+
+        first_reconnect_call = len(bench.device_calls)
+        async with connection(rig, "cutoff-native-close-pending") as replacement:
+            journal = replacement.session.journal
+            assert journal.active() is None and journal.outcomes.stop_report_closed(local)
+            assert journal.latest_owner_stop_id() == local
+            assert journal.outcomes.latest_closed_session_stop_id() is None
+            waiting = await status(replacement, lambda value: value["state"] == "reconciling")
+            assert not waiting["can_start"] and waiting["stop_target"] is None
+            assert not waiting["local_hold_verified"]
+            assert bench.firmware.effective_limit() == 0
+            assert all(
+                frame[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0
+                for frame in bench.device_calls[first_reconnect_call:]
+                if frame[2] == "SetChargingProfile"
+            )
+
+            bench.firmware.active = None
+            await status(replacement, lambda value: value["local_hold_verified"] is True)
+            assert not journal.fault.latched()
+            assert bench.firmware.effective_limit() == 0
+            assert stops(bench) == [{"transactionId": local}]
+            assert len(starts(rig)) == 1
+
+
 # Intent: a different active journal session can arrive while the exact cutoff is verifying its charger proof.
 # Why: neither the old cutoff nor its automatic Pause may inherit a new transaction as their Stop target.
 async def test_cutoff_cannot_stop_replacement_while_reading_native(tmp_path, tls, unused_tcp_port, monkeypatch):
@@ -131,6 +180,7 @@ async def test_cutoff_cannot_stop_replacement_while_reading_native(tmp_path, tls
                     await asyncio.wait_for(reading.wait(), 5)
                     assert bench.firmware.effective_limit() == 0 and not stops(bench)
                     await close(test, clock, local, meter_start)
+                    assert j.latest_owner_stop_id() == local
 
                     # Inject a competing journal report at this boundary to exercise the last-resort exact guard.
                     replacement = j.start(
@@ -142,6 +192,7 @@ async def test_cutoff_cannot_stop_replacement_while_reading_native(tmp_path, tls
                         },
                     )["transactionId"]
                     assert local != replacement and j.active() == replacement
+                    assert j.latest_owner_stop_id() is None
                 finally:
                     resume.set()
             await c._stop_requested()

@@ -367,10 +367,14 @@ class NativeBoundedHandover:
                 if repair is not None:
                     repair.finish(attempt, "readiness" if applicable else "superseded")
                 if applicable and as_result and isinstance(error, NativeReadinessError) and error.unplugged_at_zero:
-                    local = error.native.physical.native_transaction_id
-                    active = gateway.journal.active()
-                    known = local == active or active is None and gateway.journal.latest_mapped_stop(local)
-                    if known or gateway.controls.decisions.recovery.closed_session_stop_wait(error.native):
+                    recovery, journal = gateway.controls.decisions.recovery, gateway.journal
+                    local, active = error.native.physical.native_transaction_id, journal.active()
+                    known = local == active or active is None and journal.latest_mapped_stop(local)
+                    if (
+                        known
+                        or recovery.closed_session_stop_wait(error.native)
+                        or recovery.closed_owner_session_wait(error.native)
+                    ):
                         return Pending(Prerequisite.LIFECYCLE, str(error), error)
                 raise
             except sqlite3.Error as error:
@@ -395,6 +399,8 @@ class NativeBoundedHandover:
                 self._remember_stop_sample(native, sequence)
             if not stop_only and self.observation_listener is not None:
                 self.observation_listener(native)
+            if as_result and gateway.controls.decisions.recovery.closed_owner_session_wait(native):
+                return Pending(Prerequisite.LIFECYCLE, "owner session Stop awaits independent native closure")
             # A valid open source remains fresh while this particular operation awaits a closed station.
             if closed:
                 if as_result:
@@ -776,7 +782,11 @@ class NativeBoundedHandover:
         journal = self.gateway.journal
         active = journal.active()
         if active is None and journal.get("managed_mode"):
-            return journal.latest_mapped_stop_id() or journal.outcomes.latest_closed_session_stop_id()
+            return (
+                journal.latest_mapped_stop_id()
+                or journal.latest_owner_stop_id()
+                or journal.outcomes.latest_closed_session_stop_id()
+            )
         return active
 
     # A physical/ledger closure gap is ordinary pending evidence and never authority to adopt or stop a session.
