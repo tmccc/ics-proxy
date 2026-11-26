@@ -331,6 +331,54 @@ async def test_session_stop_shares_the_vendor_wire_in_either_order(
         assert bench.firmware.effective_limit() == 6 and c.requests.intent().mode == "app"
 
 
+# Intent: live status learns the exact predecessor's acceptance even when the Stop joined before its reply.
+# Why: the reply and physical closure are different facts for both local and vendor Stop requests.
+@pytest.mark.parametrize("first", ["local", "vendor"])
+async def test_live_diagnostics_learn_joined_stop_reply(tmp_path, tls, unused_tcp_port_factory, monkeypatch, first):
+    async with running_service(tmp_path, tls, unused_tcp_port_factory, monkeypatch, 6) as service:
+        charge = service.charge
+        c, journal, bench = charge.controller, charge.session.journal, charge.rig.bench
+        local = await positive_flow(charge, "daily")
+        await until(lambda: c.session_stop.target() is not None)
+        status = (await call(service.api, "status"))["result"]
+        target, revision = status["stop_target"], status["control_revision"]
+        assert isinstance(target, str)
+        predecessor, request = uuid.uuid4().hex, uuid.uuid4().hex
+        send, held, entered = delay_reply(monkeypatch, charge.rig, charge.charger, "RemoteStopTransaction")
+        monkeypatch.setattr(charge.session.gateway.charger, "timeout", 5)
+        if first == "local":
+            direct = await call(service.api, "stop_session", id=predecessor, revision=revision, target=target)
+            assert direct["result"]["state"] == "accepted"
+            earlier = c.session_stop.worker
+        else:
+            vendor_id = journal.vendor_id(local)
+            assert vendor_id is not None
+            earlier = asyncio.create_task(
+                bench.cloud_call(predecessor, "RemoteStopTransaction", {"transactionId": vendor_id})
+            )
+        await asyncio.wait_for(entered.wait(), 3)
+        joined = await call(service.api, "stop_session", id=request, revision=revision, target=target)
+        assert joined["result"]["state"] == "accepted"
+        binding = journal.outcomes.owner(request).result["_session_stop"]
+        assert binding["joined"] == 1 and "accepted_attempt" not in binding
+        before = (await call(service.api, "status"))["result"]["diagnostics"]["pending_commands"][0]
+        assert (before["action"], before["state"], before["confirmation"]) == ("stop_session", "running", "pending")
+
+        await send(build_call_result(decode(held[0])[1], {"status": "Accepted"}))
+        answer = await asyncio.wait_for(earlier, 3)
+        if first == "vendor":
+            assert answer[0] == 3 and answer[2] == {"status": "Accepted"}
+        status = (await call(service.api, "status"))["result"]
+        assert status["charging_session_open"] is True
+        after = status["diagnostics"]["pending_commands"][0]
+        assert (after["action"], after["state"], after["confirmation"]) == ("stop_session", "running", "reply_received")
+        assert (await call(service.api, "receipt", request_id=request))["result"]["state"] == "running"
+
+        await service.close_daily(local)
+        await until(lambda: c.requests.receipt(request)["state"] == "completed")
+        assert sum(frame[2] == "RemoteStopTransaction" for frame in bench.device_calls) == 1
+
+
 # Intent: a queued local Stop can join the vendor Stop that reached the charger ahead of it.
 # Why: the join records the earlier acceptance without replacing the wire diagnostics or inflating the send count.
 async def test_session_stop_join_at_dispatch_preserves_rpc_diagnostics(tmp_path, tls, unused_tcp_port, monkeypatch):
@@ -738,6 +786,10 @@ async def test_session_stop_joins_unanswered_pause(tmp_path, tls, unused_tcp_por
                     )
                 await send(build_call_result(wire, {"status": "Accepted" if outcome == "Accepted" else "Rejected"}))
                 await until(lambda: wire not in peer.reply_windows())
+                if outcome == "Accepted":
+                    pending_commands = snapshot(c, observed)["pending_commands"]
+                    (accepted,) = [row for row in pending_commands if row["action"] == "stop_session"]
+                    assert (accepted["state"], accepted["confirmation"]) == ("running", "reply_received")
             c.session_stop.expire()
         receipt = c.requests.receipt(request)
         if outcome.startswith("rejected") or outcome == "Rejected":
@@ -783,7 +835,7 @@ async def test_session_stop_joins_protective_pause_and_earlier_stop(
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
         c, j, peer = t.controller, t.session.journal, t.session.gateway.charger
         local = await positive_flow(t, "daily")
-        await healthy(c)
+        observed = await healthy(c)
         monkeypatch.setattr(peer, "timeout", 0.25)
         first = first_wire = None
         if earlier in ("session_stop", "vendor_stop"):
@@ -864,6 +916,8 @@ async def test_session_stop_joins_protective_pause_and_earlier_stop(
             if earlier == "session_stop":
                 assert c.requests.receipt(first)["result"]["classification"] == "stop_rejected"
             assert c.requests.receipt(request)["state"] == "running"
+            (waiting,) = [row for row in snapshot(c, observed)["pending_commands"] if row["action"] == "stop_session"]
+            assert (waiting["state"], waiting["confirmation"]) == ("running", "pending")
 
         await send(build_call_result(pause_wire, {"status": pause_reply}))
         await until(lambda: pause_wire not in peer.reply_windows())

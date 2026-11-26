@@ -5,15 +5,16 @@ from __future__ import annotations
 import math
 import sqlite3
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from .managed_intent import unfinished_owner_requests
 from .managed_native_repair import AUDITS, REVOCATIONS, repair_pending, repair_revoked, repair_sources
 from .security import SecurityError
-from .stop_settlement import STOP_SESSION, joined_stop_acceptance
+from .stop_settlement import STOP_SESSION, joined_stop_acceptance, joined_stop_session
 from .store import RecoveryRequiredError, fingerprint
 
 if TYPE_CHECKING:
+    from .command_outcomes import CommandOutcomes
     from .managed import ManagedController
 
 FAULTS = frozenset(
@@ -134,6 +135,37 @@ def fault_summary(c: ManagedController) -> tuple[dict[str, Any] | None, list[str
     return summary, blockers, recovery
 
 
+# An unanswered predecessor can accept after the joining receipt was saved. Use only its exact session and send.
+def joined_stop_accepted(outcomes: CommandOutcomes, request: str, binding: object) -> bool:
+    if not isinstance(binding, dict) or (local := joined_stop_session(binding)) is None:
+        return False
+    if joined_stop_acceptance(binding, request) is not None:
+        return True
+    owner_bindings: tuple[tuple[str, Literal["request", "wire"]], ...] = (
+        ("local_attempts", "request"),
+        ("owner_wire_attempts", "wire"),
+    )
+    for field, key in owner_bindings:
+        attempts = binding.get(field)
+        if isinstance(attempts, list) and any(
+            wire.local == local and wire.action == "RemoteStopTransaction" and wire.reply == "Accepted"
+            for attempt in attempts
+            if isinstance(attempt, str) and attempt.isprintable() and attempt != request
+            for wire in outcomes.owner_wires(key, attempt)
+        ):
+            return True
+    attempts = binding.get("vendor_attempts")
+    return isinstance(attempts, list) and any(
+        vendor.action == "RemoteStopTransaction"
+        and vendor.wire is not None
+        and vendor.session is not None
+        and vendor.session.local == local
+        and vendor.status == "Accepted"
+        for attempt in attempts
+        if isinstance(attempt, str) and attempt.isprintable() and (vendor := outcomes.vendor(attempt)) is not None
+    )
+
+
 # Receipt states remain durable facts; neither a completed worker nor an old accepted time proves physical success.
 def pending_commands(c: ManagedController, now: float) -> tuple[list[dict[str, Any]], int]:
     intent = c.requests.intent()
@@ -149,15 +181,16 @@ def pending_commands(c: ManagedController, now: float) -> tuple[list[dict[str, A
         )
     ]
     commands = []
+    outcomes = c.session.journal.outcomes
     for row in rows[:5]:
-        command = c.session.journal.outcomes.owner(row["id"], include_wires=True, row=row)
+        command = outcomes.owner(row["id"], include_wires=True, row=row)
         if command is None:
             raise ValueError("diagnostic receipt metadata is unavailable")
         accepted = timestamp(command.result.get("accepted_at"))
         age = now - accepted if accepted is not None and accepted <= now else None
         reply_known = command.reply_known or (
             command.action == STOP_SESSION
-            and joined_stop_acceptance(command.result.get("_session_stop"), command.identifier) is not None
+            and joined_stop_accepted(outcomes, command.identifier, command.result.get("_session_stop"))
         )
         confirmation = "reply_received" if reply_known else "unknown" if command.state == "uncertain" else "pending"
         commands.append(

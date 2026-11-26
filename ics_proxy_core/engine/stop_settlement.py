@@ -64,21 +64,28 @@ class StopAcceptance:
     wire: str | None
 
 
-# Read only the accepted predecessor saved when this exact receipt joined its session's Stop.
-def joined_stop_acceptance(binding: object, request: str) -> StopAcceptance | None:
+# The joining receipt owns a single session and must have delegated its send.
+def joined_stop_session(binding: object) -> int | None:
     if not isinstance(binding, dict):
         return None
     local, joined, dispatched = binding.get("local"), binding.get("joined"), binding.get("dispatched")
-    attempt = binding.get("accepted_attempt")
     if (
         type(local) is not int
         or not 0 < local < 2**63
         or type(joined) not in (int, bool)
         or joined != 1
         or (dispatched is not None and dispatched is not False)
-        or not isinstance(attempt, dict)
-        or attempt.keys() != {"origin", "identifier", "wire"}
     ):
+        return None
+    return local
+
+
+# Read only the accepted predecessor saved when this exact receipt joined its session's Stop.
+def joined_stop_acceptance(binding: object, request: str) -> StopAcceptance | None:
+    if not isinstance(binding, dict) or joined_stop_session(binding) is None:
+        return None
+    attempt = binding.get("accepted_attempt")
+    if not isinstance(attempt, dict) or attempt.keys() != {"origin", "identifier", "wire"}:
         return None
     origin, predecessor, wire = attempt["origin"], attempt["identifier"], attempt["wire"]
     if (
