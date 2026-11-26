@@ -67,10 +67,12 @@ flowchart LR
    [Command evidence](../ics_proxy_core/engine/command_outcomes.py) · [Stop settlement](../ics_proxy_core/engine/stop_settlement.py)
 
 Session Stop leaves app or schedule mode in place. Pause claims a zero hold and can also stop the exact session.
-With current independent zero evidence, Pause, the vendor app and Home Assistant session Stop can wait for an
-unanswered Stop on the same charger connection. A newer Pause can act after reconnecting. Lost zero or fresh
-draw can require a separately authorized protective Stop. A distinct vendor request for a still-open session can
-send another Stop if the proxy lacks a verified zero hold and no unresolved Stop already covers it. The
+With current independent zero evidence, Pause, scheduled cutoff, managed shutdown, the vendor app, and Home
+Assistant session Stop can wait for an unanswered Stop on the same charger connection. A confirmed forwarded
+reply is available to these decisions from its original wire record, memory, or an exact journal checkpoint.
+A newer Pause can act after reconnecting. Lost zero or fresh draw can require a separately authorized protective
+Stop. A distinct vendor request for a still-open session can send another Stop if the proxy lacks a verified zero
+hold and no unresolved Stop already covers it. The
 [settlement checks](../tools/check_control_settlement.py) cover both local and vendor request orders, including
 lost replies and overlapping Pause.
 

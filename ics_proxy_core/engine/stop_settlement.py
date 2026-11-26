@@ -170,32 +170,6 @@ def bound_owner_stops(
     )
 
 
-# A prepared or unrelated vendor mutation cannot lend its reply to a joined Stop.
-def bound_vendor_stop(
-    outcomes: CommandOutcomes,
-    local: int,
-    identifier: str,
-    retained: dict[tuple[str, str], TransactionReplyStatus],
-) -> tuple[StopAttempt, TransactionReplyStatus] | None:
-    vendor = outcomes.vendor(identifier)
-    if (
-        vendor is None
-        or vendor.action != "RemoteStopTransaction"
-        or vendor.wire is None
-        or vendor.session is None
-        or vendor.session.local != local
-    ):
-        return None
-    reply = vendor.status
-    if reply == "Accepted":
-        return StopAttempt("vendor", identifier, vendor.wire), "Accepted"
-    if reply == "Rejected":
-        return StopAttempt("vendor", identifier, vendor.wire), "Rejected"
-    if reply is None and (saved := retained.get((identifier, vendor.wire))) is not None:
-        return StopAttempt("vendor", identifier, vendor.wire), saved
-    return None
-
-
 # A logical predecessor with several wires refuses only when every represented wire has refused.
 def owner_stop_reply(wires: tuple[OwnerWire, ...]) -> TransactionReplyStatus | None:
     replies = {wire.reply for wire in wires}
@@ -212,17 +186,17 @@ def predecessor_stop_reply(
         return None
     if earlier.accepted is not None:
         return "Accepted"
-    retained = outcomes.retained_vendor_stop_replies() if earlier.vendor_mutations else {}
+    vendor_replies = {
+        attempt.identifier: status
+        for attempt, status in outcomes.forwarded_stop_replies(local, earlier.vendor_mutations)
+    }
     replies = [
         *(
             owner_stop_reply(bound_owner_stops(outcomes, local, "request", request))
             for request in earlier.local_requests
         ),
         *(owner_stop_reply(bound_owner_stops(outcomes, local, "wire", wire)) for wire in earlier.owner_wires),
-        *(
-            reply[1] if (reply := bound_vendor_stop(outcomes, local, token, retained)) is not None else None
-            for token in earlier.vendor_mutations
-        ),
+        *(vendor_replies.get(token) for token in earlier.vendor_mutations),
     ]
     if "Accepted" in replies:
         return "Accepted"
@@ -250,13 +224,7 @@ def joined_stop_replies(
                         yield StopAttempt("local", predecessor, wire.wire), "Accepted"
                     elif wire.reply == "Rejected":
                         yield StopAttempt("local", predecessor, wire.wire), "Rejected"
-    attempts = bound_stop_ids(binding, "vendor_attempts", request)
-    if attempts:
-        retained = outcomes.retained_vendor_stop_replies()
-        for attempt in attempts:
-            reply = bound_vendor_stop(outcomes, local, attempt, retained)
-            if reply is not None:
-                yield reply
+    yield from outcomes.forwarded_stop_replies(local, bound_stop_ids(binding, "vendor_attempts", request))
 
 
 # One genuine acceptance supplies the wire side of a joined Stop; closure is established independently.

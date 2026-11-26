@@ -6,7 +6,7 @@ import json
 import logging
 import sqlite3
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -767,28 +767,60 @@ class CommandOutcomes:
         ).fetchone()
         if saved is not None:
             return StopAttempt("local", saved[0], saved[1])
-        return self._accepted_forwarded_stop(local) if ticket is None else None
+        if ticket is not None:
+            return None
+        return next((attempt for attempt, reply in self.forwarded_stop_replies(local) if reply == "Accepted"), None)
 
-    # A forwarded Stop has the same session effect while its exact reply is being saved or already durable.
-    def _accepted_forwarded_stop(self, local: int) -> StopAttempt | None:
+    # Apply the same exact Stop binding to accepted predecessors and named reply reads.
+    def forwarded_stop_replies(
+        self, local: int, mutations: tuple[str, ...] | None = None
+    ) -> Iterator[tuple[StopAttempt, TransactionReplyStatus]]:
+        if mutations == ():
+            return
+        if mutations is None:
+            selection = "AND s.wire_result IN ('Accepted','dispatched') ORDER BY m.rowid"
+            bindings: tuple[int | str, ...] = (local,)
+        else:
+            selection = (
+                "AND s.wire_request IS NOT NULL "
+                "AND EXISTS (SELECT 1 FROM transactions t WHERE t.local=s.local) "
+                "AND m.token IN (SELECT value FROM json_each(?))"
+            )
+            bindings = (local, encoded(mutations))
         rows = self.journal.db.execute(
-            "SELECT token,wire_request,wire_result FROM vendor_command_scope JOIN mutations ON mutation=token "
-            "WHERE local=? AND origin='vendor' AND action='RemoteStopTransaction' "
-            "AND wire_result IN ('Accepted','dispatched') ORDER BY mutations.rowid",
-            (local,),
+            "SELECT m.token,s.wire_request,s.wire_result FROM vendor_command_scope s "
+            "JOIN mutations m ON s.mutation=m.token WHERE s.local=? AND m.origin='vendor' "
+            f"AND m.action='RemoteStopTransaction' {selection}",
+            bindings,
         )
-        for row in rows:
-            if row["wire_result"] == "Accepted":
-                return StopAttempt("vendor", row["token"], row["wire_request"])
-            reply = self._received(row["token"])
-            if (
-                isinstance(reply, ForwardedReply)
-                and reply.action == "RemoteStopTransaction"
-                and reply.wire == row["wire_request"]
-                and reply.status == "Accepted"
+        scoped = {row["token"]: row for row in rows}
+        retained = None
+        for mutation in scoped if mutations is None else mutations:
+            row = scoped.get(mutation)
+            if row is None:
+                continue
+            wire, saved = row["wire_request"], row["wire_result"]
+            attempt = StopAttempt("vendor", mutation, wire)
+            if saved == "Accepted":
+                yield attempt, "Accepted"
+                continue
+            if saved == "Rejected":
+                yield attempt, "Rejected"
+                continue
+            if wire is None:
+                continue
+            reply = self._received(mutation)
+            if isinstance(reply, ForwardedReply) and (reply.mutation, reply.action, reply.wire) == (
+                mutation,
+                "RemoteStopTransaction",
+                wire,
             ):
-                return StopAttempt("vendor", reply.mutation, reply.wire)
-        return None
+                yield attempt, reply.status
+                continue
+            if retained is None:
+                retained = self.retained_vendor_stop_replies()
+            if (status := retained.get((mutation, wire))) is not None:
+                yield attempt, status
 
     # Bind live reply windows to the exact local or vendor request and allocated session.
     def open_stop_replies(self, windows: tuple[str, ...]) -> tuple[tuple[str, str, int], ...]:

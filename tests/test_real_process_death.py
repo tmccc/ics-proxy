@@ -491,6 +491,108 @@ async def test_process_cut_after_verified_stop_closure(
         assert len(child.kills) == 1 and child.kills[0]["pid"] != child.process.pid
 
 
+# Intent: a real late rejection remains the original Stop result after both closure observations and process death.
+# Why: verified physical closure cannot convert an independently retained rejection into command success.
+@pytest.mark.recovery_replay
+async def test_process_recovers_checkpointed_late_stop_rejection(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory
+):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path, tls_for_case(tmp_path, model_tls), ports(), ports(), monkeypatch, timing="fast-poll"
+    ) as child:
+        rig, bench = child.rig, child.rig.bench
+        await child.start()
+        await child.status()
+        start = START | {"idTag": "NATIVE_TIMER"}
+        answer = await bench.call(child.socket, uuid.uuid4().hex, "StartTransaction", start)
+        assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted"
+        local = answer[2]["transactionId"]
+        await child.delivered(local)
+        active = await child.status(lambda status: bool(status.get("stop_target")))
+        target, revision = active["stop_target"], active["control_revision"]
+        identifier, path = uuid.uuid4().hex, rig.prepared.config.journal
+        intent = child.durable()["metadata"]["managed_control_intent"]
+        with closing(sqlite3.connect(path, isolation_level=None)) as db:
+            db.execute(
+                "CREATE TRIGGER refuse_late_stop_reply BEFORE INSERT ON owner_command_wires "
+                f"WHEN NEW.request='{identifier}' AND NEW.action='RemoteStopTransaction' AND NEW.reply='Rejected' "
+                "BEGIN SELECT RAISE(ABORT,'Stop reply publication unavailable'); END"
+            )
+            db.execute(
+                "CREATE TRIGGER refuse_late_stop_receipt BEFORE UPDATE ON managed_requests "
+                f"WHEN NEW.id='{identifier}' AND NEW.state='failed' "
+                "BEGIN SELECT RAISE(ABORT,'Stop receipt publication unavailable'); END"
+            )
+
+        send, device_answer = child.socket.send, bench.firmware.answer
+        held = asyncio.get_running_loop().create_future()
+
+        # The independent simulated charger rejects the original Stop, then withholds only that exact response.
+        def reject_stop(action, payload):
+            if action == "RemoteStopTransaction":
+                assert payload == {"transactionId": local}
+                return {"status": "Rejected"}
+            return device_answer(action, payload)
+
+        async def hold_stop_reply(raw):
+            frame = json.loads(raw)
+            if frame[0] == 3 and frame[2] == {"status": "Rejected"} and any(
+                call[1] == frame[1] and call[2] == "RemoteStopTransaction" for call in bench.device_calls
+            ):
+                held.set_result((frame[1], raw))
+                return
+            await send(raw)
+
+        with monkeypatch.context() as peer:
+            peer.setattr(child.socket, "send", hold_stop_reply)
+            peer.setattr(bench.firmware, "answer", reject_stop)
+            response = await child.request("stop_session", id=identifier, revision=revision, target=target)
+            assert response["ok"] and response["result"]["state"] == "accepted"
+            wire, rejected = await asyncio.wait_for(held, 3)
+            stop = {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"}
+            assert (await bench.call(child.socket, uuid.uuid4().hex, "StopTransaction", stop))[0] == 3
+            closed = await child.delivered(local, closed=True)
+            await child.status(lambda status: status.get("charging_session_open") is False)
+            row = next(row for row in child.durable()["requests"] if row["id"] == identifier)
+            assert row["state"] == "running" and json.loads(row["result"])["_session_stop"]["closure_verified"] is True
+
+            checkpoint = f"retained_transaction_reply_owner:{wire}"
+            await send(rejected)
+            await until(lambda: checkpoint in child.durable()["metadata"])
+            durable = child.durable()
+            saved = durable["metadata"][checkpoint]
+            assert (saved["request"], saved["wire"], saved["local"], saved["reply"]) == (
+                identifier, wire, local, "Rejected"
+            )
+            assert next(row for row in durable["requests"] if row["id"] == identifier)["state"] == "running"
+            assert durable["transactions"] == [closed] and json.loads(closed["stop"]) == stop
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                assert not db.execute(
+                    "SELECT 1 FROM owner_command_wires WHERE request=? AND reply='Rejected'", (identifier,)
+                ).fetchone()
+            await child.kill()
+
+        with closing(sqlite3.connect(path, isolation_level=None)) as db:
+            db.execute("DROP TRIGGER refuse_late_stop_reply")
+            db.execute("DROP TRIGGER refuse_late_stop_receipt")
+        await child.start()
+        await child.status(lambda status: status.get("healthy") and status.get("charging_session_open") is False)
+        failed = (await child.request("receipt", request_id=identifier))["result"]
+        assert (failed["id"], failed["action"], failed["revision"], failed["target"]) == (
+            identifier, "stop_session", revision, target
+        )
+        assert failed["state"] == "failed" and failed["result"]["classification"] == "stop_rejected"
+        assert failed["result"]["accepted_at"] == response["result"]["result"]["accepted_at"]
+        assert "session_stopped" not in failed["result"]
+        assert (await child.delivered(local, closed=True)) == closed
+        assert child.durable()["metadata"]["managed_control_intent"] == intent
+        assert [(frame[1], frame[3]) for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
+            (wire, {"transactionId": local})
+        ]
+        assert len(child.kills) == 1 and child.kills[0]["pid"] != child.process.pid
+
+
 # Intent: only a shutdown Stop proved unissued can be followed by another Stop after process death.
 # Why: an older claim or an actual dispatch without a saved reply can still own the same physical session.
 @pytest.mark.recovery_replay

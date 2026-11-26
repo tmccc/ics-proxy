@@ -3047,6 +3047,7 @@ class ControlDecisions:
                 on_claim=bind,
                 owner=("shutdown", attempt, local, connection),
                 priority=CommandPriority.SHUTDOWN,
+                stop_zero=native,
             )
         except StopReplyUnconfirmedError:
             # The independent final checks may still establish actual closure and an owned physical zero.
