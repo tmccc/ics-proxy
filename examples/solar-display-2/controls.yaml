@@ -20,6 +20,9 @@ triggers:
   - trigger: homeassistant
     id: discard_restored_feedback
     event: start
+  - trigger: event
+    id: feedback_expired
+    event_type: general_display_2_ics_feedback_expired
 variables:
   touch_data: "{{ trigger.event.data if trigger.id == 'touch' else {} }}"
   touch_x: "{{ touch_data.get('x', '') | int(-1) }}"
@@ -36,16 +39,19 @@ conditions:
       - condition: and
         conditions:
           - condition: trigger
-            id: [clear_feedback, discard_restored_feedback]
+            id: [clear_feedback, discard_restored_feedback, feedback_expired]
           - condition: template
             value_template: >-
               {% set feedback = states.input_select.general_display_2_ics_request %}
               {% if request_feedback in ['starting_timeout', 'stopping_timeout'] %}
-                {# A cleanup tick during startup may already have published fresh feedback with this automation's context. #}
-                {% set age = as_timestamp(now()) - as_timestamp(feedback.last_changed) %}
-                {{ (trigger.id == 'discard_restored_feedback'
-                    and (this is not mapping or feedback.context.id != this.context.id))
-                   or (trigger.id == 'clear_feedback' and (age < 0 or age >= 20)) }}
+                {% if trigger.id == 'feedback_expired' %}
+                  {{ trigger.event.data.get('feedback_context') == feedback.context.id }}
+                {% else %}
+                  {# The expiry script runs only for live feedback in this HA process. #}
+                  {% set expiry = states.script.general_display_2_ics_feedback_expiry %}
+                  {{ not is_state('script.general_display_2_ics_feedback_expiry', 'on')
+                     or expiry.context.id != feedback.context.id }}
+                {% endif %}
               {% else %}
                 {{ trigger.id == 'clear_feedback' and request_feedback in ['starting', 'stopping']
                    and this is mapping and this.attributes.current | int(-1) == 0 }}
@@ -100,34 +106,45 @@ conditions:
 actions:
   - if:
       - condition: trigger
-        id: [clear_feedback, discard_restored_feedback]
+        id: [clear_feedback, discard_restored_feedback, feedback_expired]
     then:
+      - variables:
+          next_feedback: >-
+            {{ request_feedback ~ '_timeout' if request_feedback in ['starting', 'stopping'] else 'idle' }}
+    else:
+      - variables:
+          starting: "{{ 20 <= touch_x < 232 }}"
+          pending_request: "{{ 'starting' if starting else 'stopping' }}"
+          proxy_result: {}
       - action: input_select.select_option
         target:
           entity_id: input_select.general_display_2_ics_request
         data:
-          option: >-
-            {{ request_feedback ~ '_timeout' if request_feedback in ['starting', 'stopping'] else 'idle' }}
-      - stop: Update touchscreen feedback after interruption or expiry
-  - variables:
-      starting: "{{ 20 <= touch_x < 232 }}"
-      pending_request: "{{ 'starting' if starting else 'stopping' }}"
-      stop_target: "{{ frame_control[5:] if not starting else none }}"
-      proxy_result: {}
+          option: "{{ pending_request }}"
+      # Only this action's exact proxy receipt can clear the pending state successfully.
+      - action: ics_proxy.session_command
+        continue_on_error: true
+        data: >-
+          {{ {'action': 'start', 'revision': start_revision}
+             if starting else {'action': 'stop_session', 'target': frame_control[5:]} }}
+        response_variable: proxy_result
+      - variables:
+          next_feedback: >-
+            {{ 'idle' if proxy_result is mapping and proxy_result.get('confirmed') is sameas true
+               else pending_request ~ '_timeout' }}
   - action: input_select.select_option
     target:
       entity_id: input_select.general_display_2_ics_request
     data:
-      option: "{{ pending_request }}"
-  # Only this action's exact proxy receipt can clear the pending state successfully.
-  - action: ics_proxy.session_command
-    continue_on_error: true
-    data: "{{ {'action': 'start', 'revision': start_revision} if starting else {'action': 'stop_session', 'target': stop_target} }}"
-    response_variable: proxy_result
-  - action: input_select.select_option
-    target:
-      entity_id: input_select.general_display_2_ics_request
-    data:
-      option: >-
-        {{ 'idle' if proxy_result is mapping and proxy_result.get('confirmed') is sameas true
-           else pending_request ~ '_timeout' }}
+      option: "{{ next_feedback }}"
+  - if:
+      - condition: template
+        value_template: "{{ next_feedback in ['starting_timeout', 'stopping_timeout'] }}"
+    then:
+      # A background delay leaves the touch automation available for the next request.
+      - action: script.turn_on
+        target:
+          entity_id: script.general_display_2_ics_feedback_expiry
+        data:
+          variables:
+            feedback_context: "{{ states.input_select.general_display_2_ics_request.context.id }}"

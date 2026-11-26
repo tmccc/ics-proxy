@@ -13,11 +13,15 @@ from homeassistant.config_entries import ConfigEntries
 from homeassistant.core import HomeAssistant, SupportsResponse
 from homeassistant.helpers.template import Template
 from homeassistant.setup import async_setup_component
+from homeassistant.util import dt as dt_util
 
 PROJECT = Path(__file__).resolve().parents[1] / "examples" / "solar-display-2"
 SESSION = "binary_sensor.ics_proxy_session_open"
 PENDING = "input_select.general_display_2_ics_request"
 AUTOMATION = "automation.general_display_2_ics_charger_buttons"
+EXPIRY = "script.general_display_2_ics_feedback_expiry"
+EXPIRY_EVENT = "general_display_2_ics_feedback_expired"
+CLEANUP_TICK = "test_display_cleanup_tick"
 IMAGE = "image.ics_display_preview"
 VIEW = "replace-with-editor-view-id"
 TARGET = "b" * 64
@@ -177,9 +181,8 @@ async def test_public_display_example_with_actual_ha(tmp_path):
     assert await bootstrap.async_load_base_functionality(hass)
     config = yaml.safe_load((PROJECT / "controls.yaml").read_text())
     config["triggers"][1]["seconds"] = "/1"
-    age_check = config["conditions"][0]["conditions"][0]["conditions"][1]
-    age_check["value_template"] = age_check["value_template"].replace(">= 20", ">= 1")
     helper = yaml.safe_load((PROJECT / "request-helper.yaml").read_text())
+    helper["script"][EXPIRY.split(".")[1]]["sequence"][0]["delay"]["seconds"] = 1
     calls = []
     gate = asyncio.Event()
     outcome = True
@@ -200,6 +203,7 @@ async def test_public_display_example_with_actual_ha(tmp_path):
 
     hass.services.async_register("ics_proxy", "session_command", request, supports_response=SupportsResponse.ONLY)
     assert await async_setup_component(hass, "input_select", helper)
+    assert await async_setup_component(hass, "script", helper)
     assert await async_setup_component(hass, "automation", {"automation": [config]})
     await hass.async_start()
     await hass.async_block_till_done()
@@ -360,7 +364,8 @@ async def test_public_display_example_with_actual_ha(tmp_path):
             gate.clear()
             previous_calls = len(calls)
             hass.states.async_set(
-                SESSION, "off" if starting else "on",
+                SESSION,
+                "off" if starting else "on",
                 {"can_start": True, "control_revision": REVISION} if starting else {"stop_target": TARGET},
             )
             tap(starting)
@@ -411,15 +416,20 @@ async def test_public_display_example_with_actual_ha(tmp_path):
 
 
 @asynccontextmanager
-async def run_display_core(config_dir, request):
+async def run_display_core(config_dir, request, *, expiry_seconds=None, cleanup_event=None):
     hass = HomeAssistant(str(config_dir))
     loader.async_setup(hass)
     hass.config_entries = ConfigEntries(hass, {})
     assert await bootstrap.async_load_base_functionality(hass)
     config = yaml.safe_load((PROJECT / "controls.yaml").read_text())
     helper = yaml.safe_load((PROJECT / "request-helper.yaml").read_text())
+    if expiry_seconds is not None:
+        helper["script"][EXPIRY.split(".")[1]]["sequence"][0]["delay"]["seconds"] = expiry_seconds
+    if cleanup_event is not None:
+        config["triggers"][1] = {"trigger": "event", "event_type": cleanup_event, "id": "clear_feedback"}
     hass.services.async_register("ics_proxy", "session_command", request, supports_response=SupportsResponse.ONLY)
     assert await async_setup_component(hass, "input_select", helper)
+    assert await async_setup_component(hass, "script", helper)
     assert await async_setup_component(hass, "automation", {"automation": [config]})
     await hass.async_start()
     await hass.async_block_till_done()
@@ -427,6 +437,37 @@ async def run_display_core(config_dir, request):
         yield hass
     finally:
         await hass.async_stop(force=True)
+
+
+def send_display_tap(hass, starting):
+    hass.states.async_set("sensor.ics_display_screen_source", "Home Assistant")
+    hass.states.async_set(
+        IMAGE,
+        datetime.now(UTC).isoformat(),
+        {"assigned_views": [VIEW], "current_view_id": VIEW, "rendered_view_id": VIEW, "notification_active": False},
+    )
+    hass.states.async_set(
+        SESSION,
+        "off" if starting else "on",
+        {"can_start": True, "control_revision": REVISION} if starting else {"stop_target": TARGET},
+    )
+    hass.bus.async_fire(
+        "esphome.general_display_touch",
+        {
+            "display": "general_display_2",
+            "device_id": "replace-with-esphome-device-id",
+            "x": "120" if starting else "352",
+            "y": "396",
+            "canvas_age_seconds": "1",
+            "frame_control": START_MARKER if starting else "stop:" + TARGET,
+        },
+    )
+
+
+async def wait_for_feedback(hass, feedback):
+    async with asyncio.timeout(6):
+        while hass.states.get(PENDING).state != feedback or hass.states.get(AUTOMATION).attributes["current"]:
+            await asyncio.sleep(0.02)
 
 
 # Intent: a Home Assistant restart carries an interrupted request into the existing unconfirmed feedback.
@@ -448,40 +489,19 @@ async def test_display_restores_interrupted_feedback_after_ha_restart(tmp_path, 
 
     async with run_display_core(tmp_path, request) as hass:
         assert hass.states.get(PENDING).state == "idle"
-        hass.states.async_set("sensor.ics_display_screen_source", "Home Assistant")
-        hass.states.async_set(
-            IMAGE,
-            datetime.now(UTC).isoformat(),
-            {"assigned_views": [VIEW], "current_view_id": VIEW, "rendered_view_id": VIEW, "notification_active": False},
-        )
-        hass.states.async_set(
-            SESSION,
-            "off" if starting else "on",
-            {"can_start": True, "control_revision": REVISION} if starting else {"stop_target": TARGET},
-        )
-        hass.bus.async_fire(
-            "esphome.general_display_touch",
-            {
-                "display": "general_display_2",
-                "device_id": "replace-with-esphome-device-id",
-                "x": "120" if starting else "352",
-                "y": "396",
-                "canvas_age_seconds": "1",
-                "frame_control": START_MARKER if starting else "stop:" + TARGET,
-            },
-        )
+        send_display_tap(hass, starting)
         await asyncio.wait_for(request_started.wait(), 3)
         assert hass.states.get(PENDING).state == pending
         assert hass.states.get(AUTOMATION).attributes["current"] == 1
 
     unconfirmed = pending + "_timeout"
-    async with run_display_core(tmp_path, request) as hass:
-        assert hass.states.get(PENDING).state in (pending, unconfirmed)
-        async with asyncio.timeout(6):
-            while hass.states.get(PENDING).state != unconfirmed or hass.states.get(AUTOMATION).attributes["current"]:
-                await asyncio.sleep(0.02)
+    async with run_display_core(tmp_path, request, cleanup_event=CLEANUP_TICK) as hass:
+        assert hass.states.get(PENDING).state == pending
+        hass.bus.async_fire(CLEANUP_TICK)
+        await wait_for_feedback(hass, unconfirmed)
         assert hass.states.get(PENDING).context.id == hass.states.get(AUTOMATION).context.id
-        await asyncio.sleep(5.1)
+        hass.bus.async_fire(CLEANUP_TICK)
+        await asyncio.sleep(0.1)
         assert hass.states.get(PENDING).state == unconfirmed
         assert calls == [original_request]
 
@@ -506,20 +526,110 @@ async def test_display_discards_restored_unconfirmed_message(tmp_path, feedback)
         assert hass.states.get(PENDING).state == "idle"
 
 
-# Intent: a future-dated live message retires on the next cleanup tick.
-# Why: otherwise a backward wall-clock step extends the time taken to clear feedback by the size of the step.
-async def test_display_discards_unconfirmed_message_after_backward_clock_step(tmp_path):
+# Intent: a disabled touch automation retires old feedback when it resumes after a Core restart.
+# Why: the input select restores its old value with a new state timestamp.
+async def test_display_discards_restored_feedback_after_reenabling(tmp_path):
+    calls = []
+
     async def request(call):
-        pytest.fail("Cleanup submitted a charger request")
+        calls.append(dict(call.data))
+        return {"confirmed": False}
 
     async with run_display_core(tmp_path, request) as hass:
-        # Model an automation result written with the old, faster wall clock.
-        hass.states.async_set(
-            PENDING,
-            "starting_timeout",
-            hass.states.get(PENDING).attributes,
-            timestamp=(datetime.now(UTC) + timedelta(minutes=2)).timestamp(),
-        )
-        async with asyncio.timeout(6):
-            while hass.states.get(PENDING).state != "idle":
-                await asyncio.sleep(0.02)
+        send_display_tap(hass, starting=True)
+        await wait_for_feedback(hass, "starting_timeout")
+        assert hass.states.get(EXPIRY).state == "on"
+        await hass.services.async_call("automation", "turn_off", {"entity_id": AUTOMATION}, blocking=True)
+
+    async with run_display_core(tmp_path, request) as hass:
+        assert hass.states.get(AUTOMATION).state == "off"
+        assert hass.states.get(PENDING).state == "starting_timeout"
+        assert hass.states.get(EXPIRY).state == "off"
+        await hass.services.async_call("automation", "turn_on", {"entity_id": AUTOMATION}, blocking=True)
+        await wait_for_feedback(hass, "idle")
+        assert calls == [{"action": "start", "revision": REVISION}]
+
+
+# Intent: a live timeout expires with elapsed time after a backward clock step.
+# Why: the written timestamp can stay in the past while still appearing younger than 20 seconds.
+async def test_display_feedback_uses_elapsed_time_after_clock_step(tmp_path, monkeypatch):
+    async def request(call):
+        return {"confirmed": False}
+
+    async with run_display_core(tmp_path, request, expiry_seconds=1, cleanup_event=CLEANUP_TICK) as hass:
+        send_display_tap(hass, starting=True)
+        await wait_for_feedback(hass, "starting_timeout")
+        assert hass.states.get(EXPIRY).state == "on"
+
+        # The corrected wall clock remains just after the publication timestamp throughout the delay.
+        corrected = hass.states.get(PENDING).last_changed + timedelta(milliseconds=100)
+        monkeypatch.setattr(dt_util, "now", lambda *args: corrected)
+        hass.bus.async_fire(CLEANUP_TICK)
+        await asyncio.sleep(0.1)
+        assert hass.states.get(PENDING).state == "starting_timeout"
+        await wait_for_feedback(hass, "idle")
+
+
+# Intent: a cleanup tick cannot interrupt publication, and an old delay cannot clear a newer request.
+# Why: the touch automation stays available while the feedback delay runs in the background.
+async def test_display_expiry_follows_only_its_timeout(tmp_path):
+    calls = []
+    release_stop = asyncio.Event()
+    expiry_starting = asyncio.Event()
+    release_expiry_start = asyncio.Event()
+    first_expiry = asyncio.Event()
+
+    async def request(call):
+        calls.append(dict(call.data))
+        if call.data["action"] == "stop_session":
+            await release_stop.wait()
+        return {"confirmed": False}
+
+    async with run_display_core(tmp_path, request, expiry_seconds=2, cleanup_event=CLEANUP_TICK) as hass:
+        original = hass.services.async_services()["script"]["turn_on"]
+
+        async def hold_first_expiry_start(call):
+            if not expiry_starting.is_set():
+                expiry_starting.set()
+                await release_expiry_start.wait()
+            await original.job.target(call)
+
+        async def note_expiry(event):
+            first_expiry.set()
+
+        hass.services.async_register("script", "turn_on", hold_first_expiry_start, schema=original.schema)
+        hass.bus.async_listen(EXPIRY_EVENT, note_expiry)
+        try:
+            send_display_tap(hass, starting=True)
+            await asyncio.wait_for(expiry_starting.wait(), 3)
+            first_timeout = hass.states.get(PENDING)
+            assert first_timeout.state == "starting_timeout"
+            assert hass.states.get(EXPIRY).state == "off"
+            assert hass.states.get(AUTOMATION).attributes["current"] == 1
+            hass.bus.async_fire(CLEANUP_TICK)
+            await asyncio.sleep(0.1)
+            assert hass.states.get(PENDING) is first_timeout
+            release_expiry_start.set()
+            await wait_for_feedback(hass, "starting_timeout")
+
+            send_display_tap(hass, starting=False)
+            async with asyncio.timeout(1):
+                while len(calls) != 2:
+                    await asyncio.sleep(0.02)
+            assert not first_expiry.is_set()
+            await asyncio.wait_for(first_expiry.wait(), 3)
+            assert hass.states.get(PENDING).state == "stopping"
+
+            release_stop.set()
+            await wait_for_feedback(hass, "stopping_timeout")
+            hass.bus.async_fire(EXPIRY_EVENT, {"feedback_context": first_timeout.context.id})
+            await asyncio.sleep(0.1)
+            assert hass.states.get(PENDING).state == "stopping_timeout"
+            await wait_for_feedback(hass, "idle")
+            assert calls == [
+                {"action": "start", "revision": REVISION},
+                {"action": "stop_session", "target": TARGET},
+            ]
+        finally:
+            release_expiry_start.set()
+            release_stop.set()

@@ -11,9 +11,9 @@ The Home Assistant automation verifies the device, screen, frame age, position a
 a request. Start also requires the current control revision and permission to start. Stop requires the target to
 match the current open session. The touchscreen shows pending and unconfirmed feedback for the exact request from
 the live Home Assistant helper, including between image downloads. While the automation is enabled, an
-unconfirmed message clears on the first five-second cleanup tick after 20 seconds, or when a new request
-replaces it. If a clock correction makes the message timestamp later than the current time, the next cleanup tick
-clears it. A charger tap must begin and end while the button is available and no request is pending.
+unconfirmed message clears after 20 elapsed seconds or when a new request replaces it. Home Assistant clock
+corrections do not extend the delay. A charger tap must begin and end while the button is available and no request
+is pending.
 When Home Assistant reports the automation as off or unavailable, the touchscreen immediately greys out both
 charger buttons and ignores taps on them. If Home Assistant removes the automation without sending a state
 update, the previous button image can remain until the next render or the offline timeout. Home Assistant
@@ -25,14 +25,16 @@ The offline dashboard hides request feedback.
 
 If disabling the automation or restarting Home Assistant interrupts a Start or Stop wait, the first cleanup tick
 after the automation resumes marks a saved pending request unconfirmed. The charger buttons wait for that feedback
-to update before accepting another tap. Home Assistant startup clears restored unconfirmed messages. An abrupt exit
-can lose display feedback that Home Assistant has yet to save. The proxy can still settle the original request.
+to update before accepting another tap. Home Assistant clears restored unconfirmed messages on startup when the
+automation is enabled, or at the first cleanup tick after it is enabled. An abrupt exit can lose display feedback
+that Home Assistant has yet to save. The proxy can still settle the original request.
 
 Use this with a compatible 480 × 480 ESPHome/LVGL touchscreen whose Home Assistant renderer provides the assigned
 view and display image. The canvas example is a package for an existing board configuration. The board supplies its
 display, touch and brightness components, its fallback dashboard, and the renderer integration.
 
-1. Add the [request helper](request-helper.yaml) and [touch automation](controls.yaml) to Home Assistant.
+1. Merge both the `input_select` and `script` entries from [request-helper.yaml](request-helper.yaml) into your
+   Home Assistant configuration and install the [touch automation](controls.yaml).
    Set the actual ESPHome device ID, image entity, screen-source sensor and view ID in the automation.
 2. Use [view.html.jinja](view.html.jinja) as the paired preview template. Its two optional vehicle cards expect
    the example battery and cable entity names near the top. Leave them unavailable or use local equivalents.
@@ -41,8 +43,9 @@ display, touch and brightness components, its fallback dashboard, and the render
    The package synchronizes its Home Assistant clock every 10 seconds to check render times. Set the renderer to
    update every 25 seconds or less with the example's 10-second download interval and 5-second HTTP timeout.
    This leaves time for clock rounding and processing before the picture expires. Update the firmware, preview
-   template and touch automation together. Keep the request helper and its options and remove `initial: idle`
-   if an earlier example set it.
+   template and touch automation together. When upgrading an earlier example, add the new feedback expiry script
+   from [request-helper.yaml](request-helper.yaml), keep the request helper and its options, and remove `initial: idle`
+   if the earlier example set it.
 4. Confirm that the automation entity ID used by the view and the firmware's `canvas_ics_automation_entity`
    substitution matches the installed automation.
    In the view, write the quoted entity ID directly in both `is_state()` and `state_attr()` so GeekMagic

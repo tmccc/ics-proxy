@@ -7,3 +7,13 @@ input_select:
       - stopping
       - starting_timeout
       - stopping_timeout
+script:
+  general_display_2_ics_feedback_expiry:
+    alias: General Display 2 ICS Feedback Expiry
+    mode: restart
+    sequence:
+      - delay:
+          seconds: 20
+      - event: general_display_2_ics_feedback_expired
+        event_data:
+          feedback_context: "{{ feedback_context }}"
