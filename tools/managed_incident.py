@@ -285,28 +285,44 @@ def saved_start_reply(db: sqlite3.Connection, request: str, ticket: str, stage: 
     return retained_start_reply(db, request, ticket, pending_wire) if stage in ("issued", "reconciled") else UNKNOWN
 
 
+# Confirm that the file or directory still has the identity and contents observed before copying.
+def same_snapshot_version(before: os.stat_result, current: os.stat_result) -> bool:
+    return os.path.samestat(before, current) and before.st_ctime_ns == current.st_ctime_ns
+
+
+# Copies of private state must start from ordinary files owned by the reporting account.
+def private_snapshot_file(info: os.stat_result) -> bool:
+    return stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077
+
+
 # Read one private WAL snapshot with no service lock, normalization, socket or recovery call.
 @contextmanager
 def read_journal(path: Path) -> Iterator[sqlite3.Connection]:
     info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+    if not private_snapshot_file(info):
         raise ValueError("incident requires a private regular journal file")
     with ExitStack() as resources:
-        sidecars = tuple(Path(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal"))
         parent = path.parent.stat()
-        read_only = not parent.st_mode & 0o222 or not os.access(path.parent, os.W_OK)
-        if read_only and not any(os.path.lexists(sidecar) for sidecar in sidecars):
-            # SQLite may need a WAL index even to read a checkpointed backup. Build it only on the private copy.
+        sidecars = {suffix: Path(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal")}
+        present = {suffix for suffix, source in sidecars.items() if os.path.lexists(source)}
+        if not {"-wal", "-shm"} <= present:
+            # Build any needed WAL index on a private copy, even beside a writable stopped journal.
             directory = resources.enter_context(tempfile.TemporaryDirectory(prefix="ics-incident-"))
             copy = Path(directory) / "journal.sqlite"
-            shutil.copyfile(path, copy)
-            current, current_parent = path.lstat(), path.parent.stat()
+            copied = [("", path, info)]
+            for suffix in ("-wal", "-journal"):
+                if suffix in present:
+                    source = sidecars[suffix]
+                    source_info = source.lstat()
+                    if not private_snapshot_file(source_info):
+                        raise ValueError("incident requires private regular journal sidecars")
+                    copied.append((suffix, source, source_info))
+            for suffix, source, _ in copied:
+                shutil.copyfile(source, Path(str(copy) + suffix))
             if (
-                not os.path.samestat(info, current)
-                or info.st_ctime_ns != current.st_ctime_ns
-                or not os.path.samestat(parent, current_parent)
-                or parent.st_ctime_ns != current_parent.st_ctime_ns
-                or any(os.path.lexists(sidecar) for sidecar in sidecars)
+                any(not same_snapshot_version(saved, source.lstat()) for _, source, saved in copied)
+                or not same_snapshot_version(parent, path.parent.stat())
+                or any(os.path.lexists(source) != (suffix in present) for suffix, source in sidecars.items())
             ):
                 raise ValueError("incident backup changed while being copied")
             path = copy

@@ -4,9 +4,11 @@
 import asyncio
 import hashlib
 import json
+import shutil
 import socket
 import uuid
 from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +26,7 @@ from tests.tls_support import tls as tls
 from tests.trial_helpers import config_files
 from tools import managed_proxy
 from tools.managed_incident import MAX_REPORT_EVENTS, incident_report, reference
+from tools.managed_stop_incident import stop_incident_report
 
 
 # Obtain the exact same read-only report as the CLI for this independent process fixture.
@@ -282,26 +285,40 @@ def test_incident_cli_uses_local_read_only_sources(tmp_path, tls, capsys, monkey
     assert not config.journal.exists() and sorted(tmp_path.iterdir()) == before
 
 
-# Intent: read the saved request from a checkpointed journal in a read-only backup directory.
-# Why: SQLite must not need to create a WAL index in the archive to report its contents.
-def test_incident_reads_a_read_only_checkpointed_backup(tmp_path):
+# Intent: read stopped journal snapshots with and without uncheckpointed records.
+# Why: reporting must retain committed WAL records without creating sidecars or changing source files.
+@pytest.mark.parametrize("read_only", [False, True], ids=["writable", "read-only"])
+@pytest.mark.parametrize("sidecar", ["", "-wal", "-shm"], ids=["checkpointed", "uncheckpointed", "index-only"])
+def test_incident_reads_stopped_journal_without_writes(tmp_path, read_only, sidecar):
     archive = tmp_path / "backup"
     archive.mkdir(mode=0o700)
     path = archive / "journal.sqlite"
     request = uuid.uuid4().hex
-    journal = Journal(path, "OFFLINE001")
+    source = tmp_path / "fixture.sqlite" if sidecar else path
+    journal = Journal(source, "OFFLINE001")
     try:
-        ManagedRequests(journal).accept(request, "start", 0)
+        requests = ManagedRequests(journal)
+        journal.db.execute("PRAGMA wal_autocheckpoint=0")
+        if sidecar == "-wal":
+            journal.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        requests.accept(request, "start", 0)
+        if sidecar == "-shm":
+            journal.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        if sidecar:
+            shutil.copy2(source, path)
+            shutil.copy2(Path(str(source) + sidecar), Path(str(path) + sidecar))
     finally:
         journal.close()
-    files_before = sorted(archive.iterdir())
-    assert files_before == [path, archive / "journal.sqlite.lock"]
-    archived_bytes = path.read_bytes()
-    archive.chmod(0o500)
+    files_before = {file.name: file.read_bytes() for file in archive.iterdir()}
+    if read_only:
+        archive.chmod(0o500)
     try:
-        saved = incident_report(path, archive / "events.jsonl")["journal"]
+        events = archive / "events.jsonl"
+        saved = incident_report(path, events)["journal"]
         assert saved["available"] is True and saved["request"]["request"] == reference(request)
-        assert sorted(archive.iterdir()) == files_before and path.read_bytes() == archived_bytes
+        assert {file.name: file.read_bytes() for file in archive.iterdir()} == files_before
+        assert stop_incident_report(path, events)["journal"]["available"] is True
+        assert {file.name: file.read_bytes() for file in archive.iterdir()} == files_before
     finally:
         archive.chmod(0o700)
 

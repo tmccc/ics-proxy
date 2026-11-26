@@ -178,6 +178,7 @@ def snapshot(c: ManagedController, status: dict[str, Any], now: float | None = N
         fault, blockers, recovery = fault_summary(c)
         commands, count = pending_commands(c, current)
         gateway, journal = c.session.gateway, c.session.journal
+        reconciliation = status.get("operator_reconciliation_required", False)
         owner_closure_pending = False
         if (
             fault is None
@@ -205,7 +206,8 @@ def snapshot(c: ManagedController, status: dict[str, Any], now: float | None = N
                 "pause_verification_pending",
             ),
             (bool(status.get("pending_lifecycle_events")), "lifecycle_acknowledgement_pending"),
-            (bool(status.get("operator_reconciliation_required")), "command_outcome_unknown"),
+            (reconciliation is True, "command_outcome_unknown"),
+            (type(reconciliation) is not bool, "status_unavailable"),
             (bool(status.get("vendor_reply_storage_pending")), "vendor_reply_storage_pending"),
             (c.session.runtime.status.delivery_blocked_cause == "storage", "delivery_storage_pending"),
             (

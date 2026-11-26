@@ -741,12 +741,21 @@ async def test_explicit_pause_retries_an_unplugged_owner_stop(tmp_path, tls, unu
             assert c.requests.receipt(request)["state"] == "completed"
 
 
-# Intent: restore the exact unplugged hold before the charger sends its genuine Stop.
-# Why: replacing the listener must leave the reported session and any later explicit Pause independent.
-@pytest.mark.parametrize("native_open", [False, True], ids=["native-closed", "native-id-retained"])
+# Intent: restore the exact native closure hold before the charger sends its genuine Stop.
+# Why: replacing the listener must preserve the next automatic occurrence and any later explicit Pause.
+@pytest.mark.parametrize(
+    ("connector", "old_poll", "native_open"),
+    [
+        pytest.param("Unplug", True, False, id="unplug-held-native-closed"),
+        pytest.param("Unplug", True, True, id="unplug-held-native-id-retained"),
+        pytest.param("Plug", True, False, id="plugged-held-native-closed"),
+        pytest.param("Unplug", False, False, id="unplug-startup-native-closed"),
+        pytest.param("Plug", False, False, id="plugged-startup-native-closed"),
+    ],
+)
 @pytest.mark.parametrize("operator_pause", [False, True], ids=["next-schedule", "newer-pause"])
-async def test_replacement_after_unplug_before_owner_stop(
-    tmp_path, tls, unused_tcp_port, monkeypatch, native_open, operator_pause
+async def test_replacement_after_native_closure_before_owner_stop(
+    tmp_path, tls, unused_tcp_port, monkeypatch, connector, old_poll, native_open, operator_pause
 ):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
         bench = rig.bench
@@ -759,22 +768,30 @@ async def test_replacement_after_unplug_before_owner_stop(
             occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
             receipt = c.requests.receipt(occurrence["request"])
             clock.now = MIDNIGHT + 30
-            bench.cp, bench.connection = "A", "Unplug"
+            bench.cp, bench.connection = "A" if connector == "Unplug" else "B", connector
             if not native_open:
                 bench.firmware.active = None
             bench.firmware.requested_current = 0
             rig.peer.permission_enabled = False
             offered = 6
-            assert (await c.tick())["state"] == "reconciling"
+            if old_poll:
+                assert (await c.tick())["state"] == "reconciling"
             saved = j.get(ORDINARY_HOLD)
-            assert saved["local"] == local and saved["start"] and bench.firmware.effective_limit() == 0
+            if old_poll:
+                assert saved["local"] == local and saved["start"] and bench.firmware.effective_limit() == 0
+            else:
+                assert saved is None
 
         async with connection(rig, "before-owner-stop-replacement-boot") as test:
             c, j = test.controller, test.session.journal
+            hold = j.get(ORDINARY_HOLD)
+            assert hold["local"] == local and hold["start"]
+            if saved is not None:
+                assert hold == saved
             for _ in range(3):
                 waiting = await c.tick()
                 assert waiting["state"] == "reconciling" and not waiting["local_hold_verified"]
-            assert c.requests.intent() == intent and j.get(ORDINARY_HOLD) == saved
+            assert c.requests.intent() == intent and j.get(ORDINARY_HOLD) == hold
             assert j.active() == local and not j.outcomes.stop_report_closed(local)
             assert len(starts(rig)) == 1 and not stops(bench) and bench.firmware.effective_limit() == 0
 
@@ -976,16 +993,16 @@ async def test_natural_owner_stop_recovers_after_replacement_before_first_poll(
 
 # Intent: keep the restrictive startup outcome for an open session or a newer explicit Pause.
 # Why: the earlier Start or Stop cannot replace a current operator Pause or prove that an open session closed.
-@pytest.mark.parametrize("operator_pause", [False, True], ids=["open-session", "operator-pause"])
+@pytest.mark.parametrize("situation", ["open-session", "car-paused", "operator-pause"])
 async def test_owner_closure_replacement_keeps_restrictive_winner(
-    tmp_path, tls, unused_tcp_port, monkeypatch, operator_pause
+    tmp_path, tls, unused_tcp_port, monkeypatch, situation
 ):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
         async with connection(rig, "before-restrictive-replacement") as test:
             c, j = test.controller, test.session.journal
             local, meter_start = await begin(test, clock)
             original = c.requests.intent()
-            if operator_pause:
+            if situation == "operator-pause":
                 clock.now = MIDNIGHT + 30
                 await close(test, clock, local, meter_start)
                 assert j.latest_owner_stop_id() == local
@@ -994,6 +1011,13 @@ async def test_owner_closure_replacement_keeps_restrictive_winner(
                 await status(test, lambda view: view.get("local_hold_verified") is True)
             else:
                 assert j.active() == local
+                if situation == "car-paused":
+                    bench = rig.bench
+                    bench.cp, bench.connection = "B", "Plug"
+                    bench.firmware.requested_current = 0
+                    rig.peer.permission_enabled = False
+                    view = await status(test, lambda value: value["power_w"] == 0)
+                    assert view["charging_session_open"] and bench.firmware.active == local
             assert j.get(ORDINARY_HOLD) is None
 
         async with connection(rig, "after-restrictive-replacement") as replacement:
@@ -1001,7 +1025,7 @@ async def test_owner_closure_replacement_keeps_restrictive_winner(
             intent = c.requests.intent()
             assert intent.mode == "paused" and intent.revision == original.revision + 1
             assert not c.requests.offline_pause_current(intent) and j.get(ORDINARY_HOLD) is None
-            if operator_pause:
+            if situation == "operator-pause":
                 assert c.requests.receipt(pause)["state"] == "completed"
                 assert (await c.tick())["local_hold_verified"]
             else:

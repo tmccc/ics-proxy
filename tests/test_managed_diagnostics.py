@@ -36,6 +36,18 @@ def test_health_explains_pending_cloud_start():
     assert result["health_blockers"] == ["cloud_start_pending"]
 
 
+# Intent: a legacy status file may omit the evidence field and an explicit unknown requires verification.
+# Why: a file health check must distinguish compatibility from a failed journal read.
+def test_health_distinguishes_unreadable_from_absent_vendor_command_evidence():
+    legacy = healthy_status(10000)
+    assert "operator_reconciliation_required" not in legacy
+    assert health_snapshot(legacy, 10000)["healthy"]
+    for evidence, blocker in ((None, "status_unavailable"), (True, "command_outcome_unknown")):
+        result = health_snapshot(legacy | {"operator_reconciliation_required": evidence}, 10000)
+        assert result["healthy"] is False and result["local_healthy"] is False
+        assert result["health_blockers"] == [blocker]
+
+
 # Intent: a cloud outage and a simultaneous local verification failure both remain visible without changing health.
 # Why: the connection symptom cannot hide an independent recovery/preservation/native-limit prerequisite.
 @pytest.mark.parametrize("change", [{"phase": "recovering"}, {"preservation_failed": True}, {"native_limit_a": 32}])

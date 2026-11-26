@@ -83,6 +83,8 @@ def health_snapshot(
     native_age = current - native if native is not None else math.inf
     remaining = finite_number(value.get("certificate_remaining_seconds"))
     certificate_valid = remaining is not None and remaining - max(age, 0) > 1800
+    # Older reports omitted this field. An explicit null means the current command evidence could not be read.
+    reconciliation = value.get("operator_reconciliation_required", False)
     paused = value.get("desired_control") == "paused"
     selected = finite_number(value.get("requested_current_a", 6))
     native_ceiling = 32 if value.get("current_capability") is True else 6
@@ -109,7 +111,7 @@ def health_snapshot(
         and value.get("preservation_failed") is False
         and not delivery_blocked
         and value.get("cloud_start_pending") is not True
-        and value.get("operator_reconciliation_required") is not True
+        and reconciliation is False
         and selected is not None
         and 6 <= selected <= native_ceiling
         and value.get("native_limit_a") == native_ceiling
@@ -124,7 +126,8 @@ def health_snapshot(
             (value.get("charger_connected") is not False, "charger_disconnected"),
             (value.get("boot_verified") is not False, "boot_unverified"),
             (value.get("cloud_start_pending") is not True, "cloud_start_pending"),
-            (value.get("operator_reconciliation_required") is not True, "command_outcome_unknown"),
+            (reconciliation is not True, "command_outcome_unknown"),
+            (type(reconciliation) is bool, "status_unavailable"),
             (bool(authority), "control_verification_pending"),
             (certificate_valid, "certificate_validity_insufficient"),
             (value.get("cloud_connected") is not False, "cloud_disconnected"),
@@ -578,8 +581,8 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
             test_charge=None,
         )
     result.setdefault("last_session_energy_kwh", None)
-    uncertain = result.get("operator_reconciliation_required") is True
-    supervising = not c.stopping and not j.fault.latched() and not station_lost and not uncertain
+    command_evidence_clear = result["operator_reconciliation_required"] is False
+    supervising = not c.stopping and not j.fault.latched() and not station_lost and command_evidence_clear
     scope_current = same_session and current == observed and supervising
     intent_current = result.get("desired_control") == intent.mode and result.get("control_revision") == intent.revision
     if not (scope_current and intent_current):

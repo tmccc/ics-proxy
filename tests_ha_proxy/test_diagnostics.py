@@ -164,6 +164,7 @@ async def test_actual_control_mode_explains_unconfirmed_return(actual_hass, peer
         ),
         ("not_assessed", "pause_verification_pending", None, "physical zero output has not yet been verified"),
         ("not_assessed", "command_outcome_unknown", None, "unresolved outcome"),
+        ("not_assessed", "status_unavailable", None, "could not read all of its current status"),
         ("not_assessed", "cloud_start_pending", None, "cloud Start is awaiting its matching session"),
         ("verification_pending", "fault_latched", "measured_output_limit_exceeded", "validated measurements exceeded"),
     ],

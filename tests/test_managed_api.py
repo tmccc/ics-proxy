@@ -19,9 +19,12 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import InvalidStatus
 
 from ics_proxy_core.engine import managed_api
+from ics_proxy_core.engine.gateway import decode
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
+from ics_proxy_core.engine.managed_diagnostics import snapshot
 from ics_proxy_core.engine.store import RecoveryRequiredError
+from tests.charge_rig import positive_flow, ready
 from tests.current_rig import adjustable
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
 from tests.management_peer import TOKEN, call
@@ -226,6 +229,96 @@ async def test_real_management_socket_reads_and_idempotent_pause(
                     assert controller.requests.intent().mode == "paused"
             finally:
                 await api.close()
+
+
+# Intent: a status read cannot restore control hints when it cannot read the outcome of a forwarded command.
+# Why: a temporary journal read failure must never appear to resolve a live unanswered Stop.
+async def test_management_withholds_authority_when_vendor_command_evidence_cannot_be_read(
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch
+):
+    async with ready(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+        c, g, j, bench = b.controller, b.session.gateway, b.session.journal, b.rig.bench
+        g.charger.timeout = 0.25
+        local = await positive_flow(b, "daily")
+        published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
+        published["diagnostics"] = snapshot(c, published)
+        send, delayed = b.charger.send, None
+
+        # Retain the real reply after the simulated charger answered the exact forwarded Stop.
+        async def delay_reply(raw):
+            nonlocal delayed
+            frame = decode(raw)
+            if frame[0] == 3 and any(
+                message[1] == frame[1] and message[2] == "RemoteStopTransaction" for message in bench.device_calls
+            ):
+                delayed = raw
+                return
+            await send(raw)
+
+        # Refuse only the real query's read of the command binding table.
+        def deny_scope(action, first, second, database, trigger):
+            return (
+                sqlite3.SQLITE_DENY
+                if action == sqlite3.SQLITE_READ and first == "vendor_command_scope"
+                else sqlite3.SQLITE_OK
+            )
+
+        monkeypatch.setattr(b.charger, "send", delay_reply)
+        port = unused_tcp_port_factory()
+        api = ManagementServer(ManagementSettings(port, tmp_path / "unused", TOKEN), c, lambda: published)
+        await api.start()
+        try:
+            async with connect(
+                f"ws://127.0.0.1:{port}/management",
+                additional_headers={"Authorization": "Bearer " + TOKEN},
+                subprotocols=["ics-proxy.v1"],
+                proxy=None,
+            ) as socket:
+                initial = (await call(socket, "status"))["result"]
+                assert initial["healthy"] and initial["stop_target"]
+                reply = await bench.cloud_call(
+                    "unanswered-stop", "RemoteStopTransaction", {"transactionId": j.vendor_id(local)}
+                )
+                assert reply[:3] == [4, "unanswered-stop", "InternalError"] and delayed is not None
+                uncertain = (await call(socket, "status"))["result"]
+                assert not uncertain["healthy"] and uncertain["operator_reconciliation_required"] is True
+                assert "command_outcome_unknown" in uncertain["diagnostics"]["blockers"]
+
+                j.db.set_authorizer(deny_scope)
+                try:
+                    unreadable = (await call(socket, "status"))["result"]
+                finally:
+                    j.db.set_authorizer(None)
+                for key in (
+                    "vendor_write_uncertain",
+                    "vendor_reply_storage_pending",
+                    "operator_reconciliation_required",
+                ):
+                    assert unreadable[key] is None
+                assert unreadable["state"] == "degraded" and unreadable["control_mode"] == "attention"
+                assert unreadable["stop_target"] is None and unreadable["can_pause"]
+                for key in (
+                    "healthy",
+                    "local_healthy",
+                    "owner_control_enabled",
+                    "can_start",
+                    "can_set_current",
+                    "can_return",
+                ):
+                    assert unreadable[key] is False
+                for blockers in (unreadable["health_blockers"], unreadable["diagnostics"]["blockers"]):
+                    assert "status_unavailable" in blockers and "command_outcome_unknown" not in blockers
+
+                readable = (await call(socket, "status"))["result"]
+                assert not readable["healthy"] and readable["operator_reconciliation_required"] is True
+                await send(delayed)
+                await until(lambda: not g.vendor_write_evidence().unresolved)
+                restored = (await call(socket, "status"))["result"]
+                assert restored["healthy"] and restored["operator_reconciliation_required"] is False
+                assert j.active() == local
+                assert sum(frame[2] == "RemoteStopTransaction" for frame in bench.device_calls) == 1
+        finally:
+            await api.close()
 
 
 # Intent: missing/wrong/duplicate credentials, browser origins and modified paths cannot reach command dispatch.

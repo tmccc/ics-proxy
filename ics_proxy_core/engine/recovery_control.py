@@ -187,12 +187,15 @@ class RecoveryControl:
 
     # A verified normal local Start may join ordinary supervision only after its exact request really completed.
     def verified_normal(self, charging: ManagedCharging) -> bool:
+        return charging.lease is None and self._verified_normal_start(charging.state()) is not None
+
+    # Cold startup can verify the same durable Start before the managed controller is constructed.
+    def _verified_normal_start(self, state: dict[str, Any]) -> str | None:
         j = self.journal
-        state, receipt = charging.state(), j.starts.receipt()
+        receipt = j.starts.receipt()
         local = state.get("local_transaction")
         if (
-            charging.lease is not None
-            or state.get("kind") != "normal"
+            state.get("kind") != "normal"
             or state.get("source") != "local"
             or state.get("state") != "running"
             or state.get("start_rpc_accepted") is not True
@@ -203,20 +206,40 @@ class RecoveryControl:
             or receipt.get("request_id") not in (None, state.get("id"))
             or j.get("control", {}).get("start_pending")
         ):
-            return False
+            return None
         request = j.db.execute(
             "SELECT revision,result FROM managed_requests WHERE id=? AND action='start' AND state='completed'",
             (state.get("id"),),
         ).fetchone()
         transaction = j.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()
         if request is None or transaction is None or request["revision"] + 1 != state.get("revision"):
-            return False
-        result = json.loads(request["result"])
-        return (
-            result.get("local_session_verified") is True
-            and result.get("timed") is False
-            and fingerprint(json.loads(transaction["start"])["idTag"].casefold()) == state.get("tag_digest")
-        )
+            return None
+        result, start = json.loads(request["result"]), json.loads(transaction["start"])
+        if (
+            result.get("local_session_verified") is not True
+            or result.get("timed") is not False
+            or fingerprint(start["idTag"].casefold()) != state.get("tag_digest")
+        ):
+            return None
+        return fingerprint(start)
+
+    # An active owner Start may wait at zero after native closure without adopting a different session.
+    def _closing_owner_start(
+        self, handover: NativeBoundedHandover, native: HandoverEvidence, local: int | None
+    ) -> str | None:
+        j, physical = self.journal, native.physical
+        plugged = physical.cp == "B" and physical.connection == "Plug"
+        if local is None or not self.owner_closure_gap(handover, native, local, allow_plugged_close=plugged):
+            return None
+        state = j.get("managed_test_charge", {})
+        if (
+            state.get("local_transaction") != local
+            or j.get("managed_control_intent") != {"mode": "app", "revision": state.get("revision")}
+            or j.starts.lease is not None
+            or j.current_change.read().unresolved
+        ):
+            return None
+        return self._verified_normal_start(state)
 
     # Timer/current/test state machines retain exclusive ownership of their own restoration obligations.
     def ordinary(self, charging: ManagedCharging) -> bool:
@@ -288,7 +311,7 @@ class RecoveryControl:
         native: HandoverEvidence,
         local: int | None = None,
         *,
-        held_plugged: bool = False,
+        allow_plugged_close: bool = False,
     ) -> bool:
         j, physical = self.journal, native.physical
         active = j.active()
@@ -307,7 +330,7 @@ class RecoveryControl:
             or not (
                 active_unplugged_owner
                 or (local == closed and unplugged)
-                or (held_plugged and local == active and j.is_owner_session(local))
+                or (allow_plugged_close and local == active and j.is_owner_session(local))
             )
             or (local == closed and native.output_limit_a == 0)
         ):
@@ -336,6 +359,8 @@ class RecoveryControl:
         if self.owner_closure_gap(ordinary.c.native, native, known):
             return True
         if not physical.transaction_open and local is None and type(known) is int:
+            if self._closing_owner_start(ordinary.c.native, native, known) is not None:
+                return True
             return (
                 j.db.execute(
                     "SELECT 1 FROM transactions WHERE local=? AND stop IS NULL AND vendor IS NOT NULL", (known,)
@@ -408,6 +433,21 @@ class RecoveryControl:
         return ALLOW
 
     # Journal the same restrictive hold whether startup or a live observation first finds the closure.
+    @staticmethod
+    def _new_ordinary_hold(
+        reason: str, revision: int, local: int | None, start: str | None, selected_a: int
+    ) -> dict[str, Any]:
+        return {
+            "state": "holding",
+            "revision": revision,
+            "local": local,
+            "start": start,
+            "selected_a": selected_a,
+            "reason": reason,
+            "at_epoch": time.time(),
+        }
+
+    # Maintain the existing hold while its exact pending lifecycle advances.
     def _save_ordinary_hold(
         self, c: ManagedController, reason: str, local: int | None, start: str | None, owner_closure: int | None
     ) -> dict[str, Any]:
@@ -415,15 +455,7 @@ class RecoveryControl:
         previous: dict[str, Any] = j.get(KEY, {})
         current = previous
         if not self.ordinary_active(c):
-            current = {
-                "state": "holding",
-                "revision": c.requests.intent().revision,
-                "local": local,
-                "start": start,
-                "selected_a": c.current.selected(),
-                "reason": reason,
-                "at_epoch": time.time(),
-            }
+            current = self._new_ordinary_hold(reason, c.requests.intent().revision, local, start, c.current.selected())
         elif current.get("local") is not None and local is None:
             old = j.db.execute("SELECT stop FROM transactions WHERE local=?", (current["local"],)).fetchone()
             if old is not None and old["stop"] is not None:
@@ -846,31 +878,50 @@ class RecoveryControl:
             self.journal.phase.activate()
             self.journal.phase.begin_introduction()
         else:
-            self.recognize_owner_closure(session.native_bounded, native, inventory_audited=True)
-            self.journal.phase.recover()
+            with self.journal.atomic():
+                self.recognize_owner_closure(
+                    session.native_bounded,
+                    native,
+                    inventory_audited=True,
+                    startup_current=session._commissioned_selection(),
+                )
+                self.journal.phase.recover()
 
-    # A fresh audit can recognize closure after a native outage has already claimed this owner session.
+    # A fresh audit can recognize closure during startup or after a native outage has already claimed this session.
     def recognize_owner_closure(
-        self, handover: NativeBoundedHandover, native: HandoverEvidence, *, inventory_audited: bool
+        self,
+        handover: NativeBoundedHandover,
+        native: HandoverEvidence,
+        *,
+        inventory_audited: bool,
+        startup_current: int | None = None,
     ) -> None:
         j = self.journal
         hold, local = j.get(KEY, {}), j.active()
         intent, revision = j.get("managed_control_intent"), hold.get("revision")
         plugged = native.physical.cp == "B" and native.physical.connection == "Plug"
-        if (
+        reason = "native_closure_pending" if plugged else "unplugged_session_pending"
+        holding = (
             hold.get("state") == "holding"
-            and hold.get("reason") == "native_observation_unavailable"
             and type(revision) is int
             and intent is not None
             and decode_intent(intent) == ControlIntent("app", revision)
+        )
+        if (
+            holding
+            and hold.get("reason") == "native_observation_unavailable"
             and self._owner_hold_matches(hold, local)
-            and self.owner_closure_gap(handover, native, local, held_plugged=plugged)
+            and self.owner_closure_gap(handover, native, local, allow_plugged_close=plugged)
         ):
             if not inventory_audited:
                 handover.book.owned_present(native.physical)
             if recorded_station_profile(j, handover.spec.digest, handover.spec.boot_digest):
-                reason = "native_closure_pending" if plugged else "unplugged_session_pending"
                 j.put(KEY, {**hold, "reason": reason})
+        elif not holding and startup_current is not None:
+            start = self._closing_owner_start(handover, native, local)
+            if start is not None and recorded_station_profile(j, handover.spec.digest, handover.spec.boot_digest):
+                revision = decode_intent(intent).revision
+                j.put(KEY, self._new_ordinary_hold(reason, revision, local, start, startup_current))
 
     # Bind the new observation to the admitted installation before any native wait.
     def begin_introduction(self, handover: NativeBoundedHandover) -> IntroductionClaim:
