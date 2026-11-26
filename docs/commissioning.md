@@ -112,8 +112,9 @@ The proxy requires fresh evidence of the exact saved single-connector Fast plan.
 within the plan and commissioned ceiling. The endpoints are local civil time, including on clock-change days.
 
 The proxy can start from app and schedule mode or from a clean automatic outage hold. A Pause requested by
-the owner stays in effect. The journal permits one scheduled Start attempt per window, including across
-replacement and after a manual Stop. On the first control pass at or after 06:00 the proxy requests a zero
+the owner stays in effect. The journal permits one scheduled charger Start per window, including across
+replacement and after a manual Stop. It can retry a preflight once after verifying it had no charger effects.
+On the first control pass at or after 06:00 the proxy requests a zero
 hold and Stop for the exact session it started. It verifies closure separately from the charger’s reply.
 Normal iCS app and native schedule authorization apply when iCS is connected.
 

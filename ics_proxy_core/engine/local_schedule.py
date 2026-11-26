@@ -45,10 +45,17 @@ class LocalSchedule:
         window = schedule_window(native, c.native.spec.saved_schedule_digest, self.timezone, now)
         if window is None or c.current.selected() > window.limit_a or not c.charging.available(native, normal=True):
             return
+        identifier = fingerprint(["local-schedule", c.native.spec.digest, asdict(window)])[:32]
         previous = self.journal.get(OCCURRENCE, {})
         if previous and previous["window"]["starts_at"] >= window.starts_at:
-            return
-        identifier = fingerprint(["local-schedule", c.native.spec.digest, asdict(window)])[:32]
+            if (
+                previous["window"] != asdict(window)
+                or previous.get("local") is not None
+                or previous.get("request") != identifier
+                or not self._proved_unsent(identifier, intent.revision)
+            ):
+                return
+            identifier = fingerprint(["local-schedule-unsent-retry", identifier])[:32]
         try:
             c.charging.accept(identifier, "start", intent.revision, schedule=window)
         except DeniedError, RecoveryRequiredError:
@@ -58,6 +65,29 @@ class LocalSchedule:
                 raise
             return  # No positive work was launched before the admission commit.
         self.deadline = identifier, time.monotonic() + window.ends_at - now
+
+    # A single replacement admission is safe only when the original Start had no physical effects or wire.
+    def _proved_unsent(self, identifier: str, revision: int) -> bool:
+        j = self.journal
+        request, state = j.outcomes.owner(identifier), self.controller.charging.state()
+        failure = state.get("failure", {})
+        return bool(
+            request is not None
+            and request.action == "start"
+            and request.revision == revision
+            and request.state == "failed"
+            and request.result.get("classification") == "preflight_refused_unsent"
+            and state.get("id") == identifier
+            and state.get("state") == "completed"
+            and state.get("start_attempted") is False
+            and state.get("start_rpc_accepted") is False
+            and state.get("local_transaction") is None
+            and isinstance(failure, dict)
+            and failure.get("id") == identifier
+            and failure.get("effects_started") is False
+            and j.starts.receipt().get("request_id") != identifier
+            and not j.outcomes.owner_wires("request", identifier)
+        )
 
     # A late admission cannot keep the existing Start worker alive beyond the scheduled cutoff.
     def remaining(self, window: ScheduleWindow) -> float:

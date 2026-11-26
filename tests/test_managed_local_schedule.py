@@ -18,6 +18,7 @@ from ics_proxy_core.engine.auth_info import tag_key
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_intent import LOCAL_SCHEDULE_OCCURRENCE
 from ics_proxy_core.engine.managed_view import refresh_for_read
+from ics_proxy_core.engine.policy import DeniedError
 from tests.current_rig import ChargeRig
 from tests.handover_helpers import crash
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
@@ -71,7 +72,10 @@ async def status(test, predicate):
 @asynccontextmanager
 async def overnight(tmp_path, tls, unused_tcp_port, monkeypatch, *, manual_pause=False, expired=True):
     clock = SchedulerClock(MIDNIGHT - 60)
-    monkeypatch.setattr(local_schedule, "time", SimpleNamespace(time=lambda: clock.now, monotonic=time.monotonic))
+    monotonic = time.monotonic()
+    monkeypatch.setattr(
+        local_schedule, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: monotonic + clock.elapsed)
+    )
     async with managed_bench(
         tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
     ) as rig:
@@ -166,6 +170,63 @@ async def test_offline_schedule_uses_exact_owner_session_once(tmp_path, tls, unu
             for _ in range(3):
                 await replacement.controller.tick()
             assert len(starts(rig)) == 1 and replacement.session.journal.active() is None
+
+
+# Intent: the freshly rechecked connector briefly refuses a midnight Start before any command is attempted.
+# Why: the proved-unsent request can retire while the same approved occurrence receives one fresh attempt.
+async def test_offline_schedule_retries_an_unsent_native_preflight(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "offline-retry-boot") as test:
+            c, j = test.controller, test.session.journal
+            await status(test, lambda value: value.get("local_hold_verified") is True)
+            decisions = test.session.gateway.controls.decisions
+            require_idle = decisions.require_idle_start
+            refused_request = None
+
+            # The later independent preflight can briefly see a different connector state from admission.
+            def refuse_first_preflight(charging, lease, native):
+                nonlocal refused_request
+                if refused_request is None and lease.schedule is not None:
+                    refused_request = lease.identifier
+                    rig.bench.cp, rig.bench.connection = "A", "Unplug"
+                    raise DeniedError("test requires a freshly connected idle vehicle")
+                require_idle(charging, lease, native)
+
+            monkeypatch.setattr(decisions, "require_idle_start", refuse_first_preflight)
+            clock.now = MIDNIGHT
+            refused = await status(
+                test,
+                lambda value: (
+                    refused_request is not None
+                    and c.requests.receipt(refused_request)["state"] == "failed"
+                    and value.get("local_hold_verified") is True
+                    and value.get("vehicle_connected") is False
+                ),
+            )
+            assert c.requests.receipt(refused_request)["result"] == {"classification": "preflight_refused_unsent"}
+            original = j.get(LOCAL_SCHEDULE_OCCURRENCE)
+            assert original["request"] == refused_request and original["local"] is None
+            assert refused["local_hold_verified"] and refused["station_ceiling_a"] == refused["power_w"] == 0
+            assert not starts(rig)
+            assert not j.db.execute(
+                "SELECT 1 FROM owner_command_wires WHERE request=? AND action='RemoteStartTransaction'",
+                (refused_request,),
+            ).fetchone()
+
+            rig.bench.cp, rig.bench.connection = "B", "Plug"
+            clock.now = MIDNIGHT + 20
+            await status(test, lambda value: bool(starts(rig)))
+            await c.charging.settle()
+            retry = j.get(LOCAL_SCHEDULE_OCCURRENCE)
+            assert retry["request"] != refused_request and retry["window"] == original["window"]
+            assert [frame[3] for frame in starts(rig)] == [{"connectorId": 1, "idTag": OWNER_TAG}]
+            assert (
+                j.db.execute(
+                    "SELECT reply FROM owner_command_wires WHERE request=? AND action='RemoteStartTransaction'",
+                    (retry["request"],),
+                ).fetchone()[0]
+                == "Accepted"
+            )
 
 
 # Intent: pass through an eligible civil boundary without local authorization if the owner paused or it is too late.
