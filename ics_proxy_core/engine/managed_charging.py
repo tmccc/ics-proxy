@@ -721,9 +721,18 @@ class ManagedCharging:
         return self.scoped_normal_stop() or self.timed_pause_leaves_session(self.journal.active())
 
     # Schedule restrictive execution after the shared owner commits the exact expiry.
-    def stop(self, lease: ChargeLease, reason: str, *, failure: dict[str, Any] | None = None) -> None:
+    def stop(
+        self,
+        lease: ChargeLease,
+        reason: str,
+        *,
+        failure: dict[str, Any] | None = None,
+        allow_schedule_return: bool = False,
+    ) -> None:
         c = self.controller
-        if c.session.gateway.controls.decisions.expire_start(self, lease, reason, failure):
+        if c.session.gateway.controls.decisions.expire_start(
+            self, lease, reason, failure, allow_schedule_return=allow_schedule_return
+        ):
             c.schedule_pause()
             self.changed.set()
 

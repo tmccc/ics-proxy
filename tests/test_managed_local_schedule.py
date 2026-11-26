@@ -229,6 +229,72 @@ async def test_offline_schedule_retries_an_unsent_native_preflight(tmp_path, tls
             )
 
 
+# A restored cloud connection can give back the initial verified hold without sending the scheduled Start.
+@pytest.mark.parametrize("explicit_pause", [False, True], ids=["automatic-return", "new-explicit-pause"])
+async def test_cloud_returns_before_local_schedule_sends_start(
+    tmp_path, tls, unused_tcp_port, monkeypatch, explicit_pause
+):
+    clock = SchedulerClock(MIDNIGHT - 60)
+    monotonic = time.monotonic()
+    monkeypatch.setattr(
+        local_schedule, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: monotonic + clock.elapsed)
+    )
+    async with managed_bench(
+        tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
+    ) as rig:
+        rig.prepared.config = replace(rig.prepared.config, owner_start_tag=OWNER_TAG, owner_schedule_timezone=ZONE.key)
+        async with connection(rig, "cloud-return-before-scheduled-start", online=True) as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            await healthy(c)
+            await bench.vendor_outage()
+            assert not test.session.runtime.vendor_registered
+            await c.tick()
+            assert c.requests.intent().mode == "app"
+            controls = test.session.gateway.controls
+            stop = controls.stop
+            initial_zero, release = asyncio.Event(), asyncio.Event()
+
+            async def wait_after_initial_zero(**kwargs):
+                result = await stop(**kwargs)
+                lease = c.charging.lease
+                if not initial_zero.is_set() and lease is not None and lease.schedule is not None:
+                    initial_zero.set()
+                    await release.wait()
+                return result
+
+            monkeypatch.setattr(controls, "stop", wait_after_initial_zero)
+            clock.now = MIDNIGHT
+            await c.tick()
+            try:
+                await asyncio.wait_for(initial_zero.wait(), 5)
+                assert controls.ready and bench.firmware.effective_limit() == 0
+                assert not starts(rig)
+                if explicit_pause:
+                    pause = uuid.uuid4().hex
+                    c.command(pause, "pause", c.requests.intent().revision)
+                bench.vendor_available = True
+                await until(lambda: test.session.runtime.vendor_registered, timeout=20)
+            finally:
+                release.set()
+
+            await c.charging.settle()
+            expected = "paused" if explicit_pause else "app"
+            result = await status(
+                test,
+                lambda value: value.get("cloud_connected") is True
+                and c.requests.intent().mode == expected
+                and value.get("station_ceiling_a") == (0 if explicit_pause else 6),
+            )
+            occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
+            assert occurrence["local"] is None and not starts(rig) and j.active() is None
+            assert c.charging.state()["start_attempted"] is False
+            assert c.charging.state()["start_rpc_accepted"] is False
+            assert result["power_w"] == 0
+            if explicit_pause:
+                assert not c.requests.offline_pause_current(c.requests.intent())
+                assert c.requests.receipt(pause)["state"] == "completed"
+
+
 # Intent: pass through an eligible civil boundary without local authorization if the owner paused or it is too late.
 # Why: schedule configuration cannot override the current manual hold or begin a session at the tariff cutoff.
 @pytest.mark.parametrize(("manual_pause", "offset"), [(True, 0), (False, 6 * 3600)], ids=["manual-pause", "cutoff"])

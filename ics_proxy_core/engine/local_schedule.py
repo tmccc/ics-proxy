@@ -21,6 +21,10 @@ if TYPE_CHECKING:
     from .trial_handover_evidence import HandoverEvidence
 
 
+class ScheduleCloudReturnedError(DeniedError):
+    """The current iCS connection superseded an unissued scheduled Start."""
+
+
 class LocalSchedule:
     """An outage can delegate an unchanged native plan to the normal local owner once per window."""
 
@@ -109,10 +113,38 @@ class LocalSchedule:
             or occurrence.get("window") != asdict(window)
             or lease.owner_start_tag is None
             or self._due(occurrence)
-            or c.session.runtime.vendor_registered
-            and not original_dispatched
         ):
             raise DeniedError("local schedule occurrence no longer owns Start")
+        if c.session.runtime.vendor_registered and not original_dispatched:
+            raise ScheduleCloudReturnedError("iCS returned before the local schedule issued Start")
+
+    # An automatic Return can retire the exact initial zero, but never a possible Start or a newer hold.
+    def verified_initial_zero(self, lease: ChargeLease) -> bool:
+        c, j = self.controller, self.journal
+        controls = c.session.gateway.controls
+        occurrence, control = j.get(OCCURRENCE, {}), j.get("control", {})
+        state = c.charging.state()
+        return bool(
+            lease.schedule is not None
+            and c.session.runtime.vendor_registered
+            and occurrence.get("request") == lease.identifier
+            and occurrence.get("local") is None
+            and state.get("id") == lease.identifier
+            and state.get("start_attempted") is False
+            and state.get("start_rpc_accepted") is False
+            and state.get("local_transaction") is None
+            and j.active() is None
+            and not control.get("start_pending")
+            and j.starts.receipt().get("request_id") != lease.identifier
+            and not any(
+                wire.action == "RemoteStartTransaction" for wire in j.outcomes.owner_wires("request", lease.identifier)
+            )
+            and lease.initial_zero_ticket is not None
+            and control.get("ticket") == lease.initial_zero_ticket
+            and controls.boot() == lease.initial_zero_boot
+            and controls.ready
+            and controls.desired() == 0
+        )
 
     # Fence only the competing native plan tag while the local schedule owns its Start handoff.
     def blocks_tag(self, tag: str, occurred: float | None) -> bool:

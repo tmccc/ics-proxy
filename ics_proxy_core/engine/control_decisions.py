@@ -27,6 +27,7 @@ from .current_policy import (
     current_source_decision,
     original_current_plan,
 )
+from .local_schedule import ScheduleCloudReturnedError
 from .local_schedule_cutoff import scheduled_cutoff_target
 from .managed_facts import ManagedFacts
 from .managed_intent import (
@@ -1462,7 +1463,12 @@ class ControlDecisions:
             charging.changed.set()
             j.starts.retire_refused()
         else:
-            charging.stop(lease, "start_not_confirmed", failure=cause)
+            charging.stop(
+                lease,
+                "start_not_confirmed",
+                failure=cause,
+                allow_schedule_return=isinstance(error, ScheduleCloudReturnedError),
+            )
         charging.record_failure_diagnostic(cause)
 
     # The held listener consumes an existing receipt under verified zero and cannot authorize another Start.
@@ -1552,7 +1558,13 @@ class ControlDecisions:
 
     # Retire only the timed test's target, or the matching normal Start's own pending evidence.
     def expire_start(
-        self, charging: ManagedCharging, lease: ChargeLease, reason: str, failure: dict[str, Any] | None
+        self,
+        charging: ManagedCharging,
+        lease: ChargeLease,
+        reason: str,
+        failure: dict[str, Any] | None,
+        *,
+        allow_schedule_return: bool = False,
     ) -> bool:
         state = charging.state()
         if charging.lease is not lease or state.get("state") == "stopping":
@@ -1572,7 +1584,14 @@ class ControlDecisions:
                 and charging.state().get("independent_seen") is True
             )
             if intent.mode != "paused" and not preserve:
+                automatic_return = (
+                    allow_schedule_return
+                    and intent == ControlIntent("app", lease.revision)
+                    and c.local_schedule.verified_initial_zero(lease)
+                )
                 self._claim_test_pause(c, intent, lease.identifier)
+                if automatic_return:
+                    j.put(OFFLINE_PAUSE, c.requests.intent().revision)
             elif self.failed_start_zero_needed(charging, lease, reason, failure):
                 c.session.gateway.controls._claim(True)
             j.starts.expire(lease, reason, preserve, failure, target=target)
