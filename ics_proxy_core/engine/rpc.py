@@ -504,15 +504,22 @@ class Peer:
         cancellation: asyncio.CancelledError | None = None
         try:
             async with asyncio.timeout(self.validation_timeout):
-                done, _ = await asyncio.wait((validation, restrictive, future), return_when=asyncio.FIRST_COMPLETED)
-                if validation.done():
-                    validation.result()  # A completed strict/storage refusal precedes simultaneous preemption.
-                if signal.is_set():
-                    raise ValidationPreemptedError("request was not sent; restrictive control superseded validation")
-                if future in done:
-                    future.result()  # A retired peer's exception must terminate its audit before any dispatch.
-                    raise UnavailableError("request was not sent; peer replied before dispatch")
-                decision = await validation
+                while True:
+                    done, _ = await asyncio.wait((validation, restrictive, future), return_when=asyncio.FIRST_COMPLETED)
+                    # A completed strict/storage refusal precedes simultaneous preemption.
+                    validated = validation in done
+                    decision = validation.result() if validated else None
+                    if signal.is_set():
+                        raise ValidationPreemptedError(
+                            "request was not sent; restrictive control superseded validation"
+                        )
+                    if future in done:
+                        future.result()  # A retired peer's exception must terminate its audit before any dispatch.
+                        raise UnavailableError("request was not sent; peer replied before dispatch")
+                    if validated:
+                        break
+                    # The Stop that woke this wait canceled. Keep watching for the next Stop or disconnect.
+                    restrictive = asyncio.create_task(signal.wait())
         except asyncio.CancelledError as error:
             cancellation = error
             raise

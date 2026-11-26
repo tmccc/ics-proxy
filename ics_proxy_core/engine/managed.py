@@ -97,6 +97,7 @@ class ManagedController:
         self.latest_native_lifecycle: tuple[int, int | None] | None = None
         self.latest_native_scope: ControlScope | None = None
         self.status_authority: AuthorityStamp | None = None
+        self.status_native_sequence: int | None = None
         self.status_latest_closed: int | None = None
         self.status_vendor_epoch: int | None = None
 

@@ -52,6 +52,7 @@ def render_poll(
         return observed_status(c, poll_base(c), native, verdict)
     except sqlite3.Error:
         c.status_authority = None
+        c.status_native_sequence = None
         c.status_latest_closed = None
         c.status_vendor_epoch = None
         return {
@@ -292,6 +293,7 @@ def poll_status(
 ) -> dict[str, Any]:
     value = poll_base(c, pending=pending) if base is None else dict(base)
     gateway = c.session.gateway
+    c.status_native_sequence = None
     c.status_vendor_epoch = gateway._vendor_epoch
     value["cloud_connected"] = c.session.runtime.vendor_registered
     value["state"] = result.state
@@ -362,6 +364,7 @@ def observed_status(
         can_set_current = test_start_ready = normal_start_ready = False
     c.status_latest_closed = closed
     c.status_authority = c.authority()
+    c.status_native_sequence = c.native.last_resolved_read
     c.status_vendor_epoch = g._vendor_epoch
     return {
         **base,
@@ -545,7 +548,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         pending_fault = "owner_release_pending"
     pause_pending = c.requests.pending_pause()
     station_lost = c.session.book.station_ceiling_lost()
-    # A pending Pause may show the last sample for the same session, but a new lifecycle needs a new reading.
+    # A pending Pause can retain the published sample until a newer audit or lifecycle supersedes it.
     native = c.latest_native
     sample_available = (
         result.get("charger_connected") is True
@@ -556,6 +559,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         and native is not None
         and native.is_fresh(15)
         and c.native.last_verified_at != 0
+        and c.status_native_sequence == c.native.last_resolved_read
         and pending_fault is None
         and not station_lost
     )

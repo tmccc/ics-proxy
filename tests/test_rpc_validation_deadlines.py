@@ -12,7 +12,7 @@ import pytest
 from ics_proxy_core import commands
 from ics_proxy_core.engine.connection_scope import current_control_scope
 from ics_proxy_core.engine.gateway import decode
-from ics_proxy_core.engine.rpc import Peer, UnavailableError
+from ics_proxy_core.engine.rpc import Peer, UnavailableError, ValidationPreemptedError
 from ics_proxy_core.frames import build_call_result
 from tests.charge_rig import owner_rig
 from tests.handover_helpers import NativeVehiclePeer
@@ -376,6 +376,61 @@ async def test_priority_stop_preempts_only_validation(boundary):
         if boundary == "reply" and sent:
             peer.receive(decode(build_call_result(sent[0][1], {"status": "Accepted"})))
         await asyncio.gather(positive, *([] if stopped is None else [stopped]), return_exceptions=True)
+
+
+# A canceled Stop leaves the ordinary audit running and able to observe the next Stop or disconnect.
+@pytest.mark.parametrize("interruption", ["stop", "disconnect"])
+async def test_validation_keeps_watching_after_queued_stop_cancels(interruption):
+    peer = Peer("charger", 2)
+    entered, release, retired = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    sent = []
+
+    async def validate(action, payload):
+        if action == "RemoteStartTransaction":
+            entered.set()
+            try:
+                await release.wait()
+            finally:
+                retired.set()
+
+    async def sender(raw):
+        frame = decode(raw)
+        sent.append(frame[2])
+        peer.receive(decode(build_call_result(frame[1], {"status": "Accepted"})))
+
+    peer.validate_send, peer.sender = validate, sender
+    positive = asyncio.create_task(peer.call("RemoteStartTransaction", {"idTag": "SYNTHETIC"}))
+    stops = []
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        first = asyncio.create_task(
+            peer.call("RemoteStopTransaction", {"transactionId": 1}, priority=0), eager_start=True
+        )
+        stops.append(first)
+        assert peer.gate.restrictive_waiting.is_set()
+        await asyncio.sleep(0)  # Let the signal waiter finish before the validating call handles the wakeup.
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert not peer.gate.restrictive_waiting.is_set() and not retired.is_set()
+
+        if interruption == "stop":
+            second = asyncio.create_task(peer.call("RemoteStopTransaction", {"transactionId": 1}, priority=0))
+            stops.append(second)
+            assert (await asyncio.wait_for(asyncio.shield(second), 1))[2] == {"status": "Accepted"}
+            with pytest.raises(ValidationPreemptedError):
+                await positive
+            assert sent == ["RemoteStopTransaction"]
+        else:
+            peer.detach()
+            with pytest.raises(UnavailableError, match="peer disconnected"):
+                await asyncio.wait_for(asyncio.shield(positive), 1)
+            assert not sent
+        assert retired.is_set() and not release.is_set()
+        assert_retired(peer)
+    finally:
+        release.set()
+        await asyncio.gather(positive, *stops, return_exceptions=True)
 
 
 # Intent: a queued zero at equal priority cannot cancel the current restrictive validation before its own reply.
