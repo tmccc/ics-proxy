@@ -15,6 +15,7 @@ import pytest
 from ics_proxy_core.engine import managed_session_stop
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_debt_recovery import KEY
+from ics_proxy_core.engine.managed_session_stop import ManagedSessionStop
 from ics_proxy_core.engine.managed_stop_delivery import REJECTION, WIRE_ACK
 from ics_proxy_core.engine.managed_view import session_history
 from ics_proxy_core.engine.security import SecurityError
@@ -86,6 +87,77 @@ async def test_queued_stop_awaits_matching_report_after_native_closure(
         assert receipt["state"] == "completed" and receipt["result"]["session_stopped"] is True
         assert receipt["target"] == target and receipt["revision"] == intent.revision
         assert c.requests.intent() == intent and bench.received_limits[mark:] == []
+        assert not bench.remote_stop.is_set()
+
+
+# Intent: retain an exact native closure if its receipt marker rolls back before the genuine Stop report arrives.
+# Why: expiry and replacement must leave the receipt eligible without declaring completion or sending another Stop.
+@pytest.mark.parametrize("restore", ["before_expiry", "after_expiry", "after_replacement"])
+async def test_queued_stop_retains_native_closure_when_marker_write_rolls_back(
+    tmp_path, tls, unused_tcp_port, monkeypatch, restore
+):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        local = await positive_flow(t, "daily")
+        await mp.healthy(c)
+        target, intent = c.session_stop.target(), c.requests.intent()
+        assert target is not None
+        request = uuid.uuid4().hex
+        limits_before = list(bench.received_limits)
+        gateway = t.session.gateway
+        metadata_revision = gateway.boot_metadata_revision
+        async with gateway.charger.gate.enter(10):
+            c.command(request, "stop_session", intent.revision, target=target)
+            await asyncio.wait_for(gateway.charger.gate.restrictive_waiting.wait(), 3)
+            j.db.execute(
+                "CREATE TEMP TRIGGER refuse_native_first BEFORE UPDATE OF result ON managed_requests "
+                "WHEN json_type(NEW.result,'$._session_stop.native_closed_first') IS 'true' "
+                "BEGIN SELECT RAISE(ABORT,'native-first marker unavailable'); END"
+            )
+            bench.firmware.active = None
+            bench.firmware.requested_current = 0
+            bench.cp, bench.connection = "B", "Plug"
+            t.rig.peer.permission_enabled = False
+            assert (await c.tick())["state"] == "reconciling"
+            assert j.active() == local and c.native.owner_closure_observed(local, time.time())
+            assert c.requests.receipt(request)["state"] == "accepted"
+            assert "native_closed_first" not in j.outcomes.owner(request).result["_session_stop"]
+
+            if restore == "before_expiry":
+                j.db.execute("DROP TRIGGER refuse_native_first")
+            if restore != "after_replacement":
+                clock = SimpleNamespace(time=time.time, monotonic=lambda: time.monotonic() + 21)
+                with monkeypatch.context() as confirmation:
+                    confirmation.setattr(managed_session_stop, "time", clock)
+                    c.session_stop.expire()
+                assert c.requests.receipt(request)["state"] == "uncertain"
+                assert (await c.tick())["state"] == "reconciling"
+                if restore == "after_expiry":
+                    assert "native_closed_first" not in j.outcomes.owner(request).result["_session_stop"]
+                    j.db.execute("DROP TRIGGER refuse_native_first")
+            else:
+                monkeypatch.setattr(gateway, "boot_metadata_revision", metadata_revision + 1)
+
+        assert c.session_stop.worker is not None
+        await asyncio.wait_for(c.session_stop.worker, 3)
+        if restore == "after_replacement":
+            assert c.requests.receipt(request)["state"] == "accepted"
+            monkeypatch.setattr(gateway, "boot_metadata_revision", metadata_revision)
+            c.session_stop = ManagedSessionStop(c)
+            t.session.managed_session_stop = c.session_stop
+            receipt = c.requests.receipt(request)
+            assert receipt["state"] == "uncertain" and receipt["result"]["classification"] == "process_replaced"
+            j.db.execute("DROP TRIGGER refuse_native_first")
+        assert (await c.tick())["state"] == "reconciling"
+        assert j.outcomes.owner(request).result["_session_stop"]["native_closed_first"] is True
+        assert c.requests.receipt(request)["state"] == "uncertain"
+
+        await natural_stop(t, local)
+        assert (await mp.healthy(c))["charging_session_open"] is False
+        receipt = c.requests.receipt(request, include_binding=True)
+        assert receipt["state"] == "completed" and receipt["result"]["session_stopped"] is True
+        assert receipt["target"] == target and receipt["revision"] == intent.revision
+        assert c.requests.intent() == intent and bench.received_limits == limits_before
         assert not bench.remote_stop.is_set()
 
 

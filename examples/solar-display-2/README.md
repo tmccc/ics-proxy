@@ -8,7 +8,8 @@ A new render can restore the dashboard after a Home Assistant clock correction. 
 and the renderer serves an older image again, a previously expired image can reappear.
 
 The Home Assistant automation verifies the device, screen, position and original marker before sending a request.
-It passes the displayed frame’s render time to the iCS action, which also checks its age against elapsed time.
+It passes the render time of the frame shown when the button was pressed to the iCS action, which also checks its
+age against elapsed time. A refresh with the same control leaves that press bound to the original render time.
 The action requires a new frame after iCS integration setup. After it detects a backward clock adjustment, it
 requires a frame timestamp beyond the preceding clock range. The charger buttons may appear available while
 the Home Assistant clock catches up and the display receives a new frame.

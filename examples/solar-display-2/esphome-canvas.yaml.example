@@ -476,15 +476,19 @@ lvgl:
                   id(canvas_pressed_control).clear();
                   const auto clock = id(canvas_ha_time).now();
                   const uint32_t now = millis();
+                  auto &frame = solar_display::canvas_frame();
+                  auto &freshness = frame.freshness();
                   if (button != solar_display::ChargerButton::NONE && id(canvas_ics_touch_automation).state == "on" &&
                       id(canvas_ha_connections) == 1 && id(canvas_ics_feedback_missing) == 0 &&
                       solar_display::charger_request_idle(id(canvas_ics_request_state).state,
                                                          id(canvas_ics_pending_runs).state) &&
                       id(canvas_showing) && id(canvas_image_ready) && clock.is_valid() &&
                       api::global_api_server->is_connected_with_state_subscription() &&
-                      solar_display::canvas_frame().freshness().fresh(now, clock.timestamp) &&
+                      freshness.fresh(now, clock.timestamp) &&
                       uint32_t(now - id(canvas_frame_control_changed_ms)) >= 100) {
                     id(canvas_pressed_control) = id(canvas_frame_control);
+                    // A refresh with the same target must preserve the age and epoch of the pressed image.
+                    frame.pressed_freshness() = freshness;
                   }
             on_click:
               - if:
@@ -517,11 +521,14 @@ lvgl:
                           !api::global_api_server->is_connected_with_state_subscription() ||
                           (id(canvas_touch_event_count) != 0 &&
                            uint32_t(now - id(canvas_last_touch_ms)) < 500)) return false;
+                      auto &touch_frame = charger_button ? frame.pressed_freshness() : frame.freshness();
+                      const uint32_t touch_age = touch_frame.render_age_ms(now, clock.timestamp);
+                      if (touch_age >= solar_display::CanvasFreshness::MAX_AGE_MS) return false;
                       id(canvas_last_touch_ms) = now;
                       id(canvas_touch_x) = point.x;
                       id(canvas_touch_y) = point.y;
-                      id(canvas_touch_age_seconds) = frame.freshness().render_age_ms(now, clock.timestamp) / 1000;
-                      id(canvas_touch_rendered_at_epoch) = frame.freshness().rendered_at();
+                      id(canvas_touch_age_seconds) = touch_age / 1000;
+                      id(canvas_touch_rendered_at_epoch) = touch_frame.rendered_at();
                       ++id(canvas_touch_event_count);
                       return true;
                   then:

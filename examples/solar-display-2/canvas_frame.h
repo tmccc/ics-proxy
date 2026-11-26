@@ -230,6 +230,7 @@ class StableCanvasFrame : public esphome::image::Image {
   size_t last_copy_bytes() const { return this->last_copy_bytes_; }
   const std::array<DirtyRegion, DIRTY_REGION_COUNT> &dirty_regions() const { return this->dirty_regions_; }
   CanvasFreshness &freshness() { return this->freshness_; }
+  CanvasFreshness &pressed_freshness() { return this->pressed_freshness_; }
 
  protected:
   static bool valid_picture_(const esphome::image::Image &source) {
@@ -282,6 +283,7 @@ class StableCanvasFrame : public esphome::image::Image {
   size_t last_copy_bytes_{0};
   std::array<DirtyRegion, DIRTY_REGION_COUNT> dirty_regions_{};
   CanvasFreshness freshness_{};
+  CanvasFreshness pressed_freshness_{};
 };
 
 inline StableCanvasFrame &canvas_frame() {

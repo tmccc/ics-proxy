@@ -161,6 +161,28 @@ def test_display_retires_held_tap_before_a_reconnect_or_frame_refresh():
     assert download.index("!frame.freshness().fresh(") < download.index("if (!cached)")
 
 
+# Intent: a same-control refresh preserves the render epoch and age of the original press.
+# Why: replacing either value with the new frame's can make an expired or rewound tap look current.
+def test_display_sends_the_freshness_of_the_pressed_frame():
+    package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
+    page = next(page for page in package["lvgl"]["pages"] if page["id"] == "canvas_dashboard")
+    touch = next(
+        widget["button"] for widget in page["widgets"] if widget.get("button", {}).get("id") == "canvas_touch_button"
+    )
+    press = touch["on_press"][0]["lambda"]
+    assert press.index("freshness.fresh(now, clock.timestamp)") < press.index("frame.pressed_freshness() = freshness")
+    click = touch["on_click"][0]["if"]
+    guard = click["condition"]["lambda"]
+    assert "charger_button ? frame.pressed_freshness() : frame.freshness()" in guard
+    assert "const uint32_t touch_age = touch_frame.render_age_ms(now, clock.timestamp);" in guard
+    assert guard.index("touch_age >= solar_display::CanvasFreshness::MAX_AGE_MS") < guard.index("return true")
+    assert "id(canvas_touch_age_seconds) = touch_age / 1000;" in guard
+    assert "id(canvas_touch_rendered_at_epoch) = touch_frame.rendered_at();" in guard
+    event = click["then"][0]["homeassistant.event"]["data"]
+    assert event["canvas_age_seconds"] == "return to_string(id(canvas_touch_age_seconds));"
+    assert event["canvas_rendered_at_epoch"] == "return to_string(id(canvas_touch_rendered_at_epoch));"
+
+
 # Intent: charger controls wait for the surviving client's values after a connection overlap.
 # Why: a sample received during overlap may belong to the connection that has just closed.
 def test_display_waits_for_feedback_after_an_overlapping_disconnect():

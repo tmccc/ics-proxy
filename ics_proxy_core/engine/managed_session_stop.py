@@ -38,6 +38,17 @@ if TYPE_CHECKING:
 
 CONFIRMATION_SECONDS = 20
 _RETAINED_STOP_CLOSURES = "retained_session_stop_closures"
+_RETAINED_NATIVE_FIRST_CLOSURES = "retained_session_stop_native_first_closures"
+_NATIVE_FIRST = "json_type(result,'$._session_stop.native_closed_first') IS 'true'"
+_UNSENT = (
+    "json_type(result,'$._session_stop.dispatched')='false' AND json_type(result,'$._session_stop.joined') IS NULL"
+)
+_BUFFERED_NATIVE_FIRST = (
+    "EXISTS (SELECT 1 FROM json_each(?) proof WHERE proof.key=managed_requests.id "
+    "AND json_extract(proof.value,'$[0]')=managed_requests.revision "
+    "AND json_extract(proof.value,'$[1]')=json_extract(managed_requests.result,'$.target') "
+    "AND json_extract(proof.value,'$[2]')=json_extract(managed_requests.result,'$._session_stop.local'))"
+)
 
 
 @dataclass(frozen=True)
@@ -69,7 +80,30 @@ class ManagedSessionStop:
             else {}
         )
         self._verified_closures = self._retained_closures.copy()
+        self._retained_native_first = self._saved_native_first()
+        self._native_first = self._retained_native_first.copy()
         self.expire(replaced=True)
+
+    # An independent checkpoint can outlive a refused write to the receipt itself.
+    def _saved_native_first(self) -> dict[str, tuple[int, str, int]]:
+        try:
+            saved = self.controller.session.journal.get(_RETAINED_NATIVE_FIRST_CLOSURES, {})
+        except ValueError, RecursionError:
+            return {}
+        if not isinstance(saved, dict):
+            return {}
+        return {
+            request: (revision, target, local)
+            for request, binding in saved.items()
+            if isinstance(binding, list)
+            and len(binding) == 3
+            and type(revision := binding[0]) is int
+            and 0 <= revision < 2**63
+            and isinstance(target := binding[1], str)
+            and len(target) == 64
+            and type(local := binding[2]) is int
+            and 0 < local < 2**63
+        }
 
     # Expose an opaque target only for a verified sample of the exact current open session.
     def target(self) -> str | None:
@@ -213,14 +247,13 @@ class ManagedSessionStop:
 
     # A pre-dispatch refusal is final while the original receipt has no possible send, join or native closure.
     def _fail_unsent(self, scope: SessionStop) -> None:
+        self._checkpoint_native_first()
+        native_first, proofs = self._native_first_proof()
         self._update_receipts(
             "state='failed',result=json_set(result,'$.classification','stop_not_sent')",
             (),
-            "id=? AND action=? AND revision=? AND state='accepted' "
-            "AND json_type(result,'$._session_stop.dispatched')='false' "
-            "AND json_type(result,'$._session_stop.joined') IS NULL "
-            "AND json_type(result,'$._session_stop.native_closed_first') IS NOT 'true'",
-            (scope.identifier, STOP_SESSION, scope.intent.revision),
+            f"id=? AND action=? AND revision=? AND state='accepted' AND {_UNSENT} AND NOT {native_first}",
+            (scope.identifier, STOP_SESSION, scope.intent.revision, *proofs),
             retry_after_rollback=True,
         )
 
@@ -238,18 +271,19 @@ class ManagedSessionStop:
 
     # Retire the client wait without resending or erasing a Stop that might still take effect.
     def expire(self, *, replaced: bool = False) -> None:
+        self._checkpoint_native_first()
         rejections = stop_rejections(self.controller.session.journal)
         self._publish_rejections(rejections)
         self._settle_closure(rejections)
         verified, proofs = self._closure_proof()
+        native_first, native_proofs = self._native_first_proof()
         # The same rejection evidence also excludes a receipt from closure while its failure write awaits retry.
         self._update_receipts(
             "state=CASE WHEN json_extract(result,'$._session_stop.dispatched') "
             "OR json_extract(result,'$._session_stop.joined') "
-            "OR json_type(result,'$._session_stop.native_closed_first') IS 'true' "
-            f"OR {verified} "
+            f"OR {native_first} OR {verified} "
             "THEN 'uncertain' ELSE 'failed' END,result=json_set(result,'$.classification',?)",
-            (*proofs, "process_replaced" if replaced else "stop_not_confirmed"),
+            (*native_proofs, *proofs, "process_replaced" if replaced else "stop_not_confirmed"),
             f"action=? AND state IN ('accepted','running') AND NOT {rejections.receipts} "
             "AND (? OR COALESCE(json_extract(result,'$._session_stop.confirmation_deadline')<=?, "
             "json_extract(result,'$.accepted_at')<=?))",
@@ -308,6 +342,7 @@ class ManagedSessionStop:
             and (native.physical.power_w != 0 or any(value != 0 for value in native.currents_a + native.powers_w))
         ):
             return
+        self._checkpoint_native_first()
         self._settle_closure(stop_rejections(j), observed=True)
 
     # A refused receipt write can leave the same exact closure in memory or in the separate checkpoint.
@@ -320,17 +355,22 @@ class ManagedSessionStop:
     def _retain_closures(self) -> None:
         if self._verified_closures == self._retained_closures:
             return
+        if self._save_checkpoint(_RETAINED_STOP_CLOSURES, self._verified_closures):
+            self._retained_closures = self._verified_closures.copy()
+
+    # The checkpoint is independent of the receipt write that may have rolled back.
+    def _save_checkpoint(self, key: str, proofs: dict[str, Any]) -> bool:
         j = self.controller.session.journal
         try:
-            if self._verified_closures:
-                j.put(_RETAINED_STOP_CLOSURES, self._verified_closures)
+            if proofs:
+                j.put(key, proofs)
             else:
-                j.db.execute("DELETE FROM meta WHERE key=?", (_RETAINED_STOP_CLOSURES,))
+                j.db.execute("DELETE FROM meta WHERE key=?", (key,))
         except sqlite3.Error:
             if j.db.in_transaction:
                 raise
-        else:
-            self._retained_closures = self._verified_closures.copy()
+            return False
+        return True
 
     # Save verified closure separately so a refused completion cannot roll back the observation.
     def _checkpoint_closure(self, rejections: StopRejections, *, observed: bool) -> None:
@@ -406,6 +446,28 @@ class ManagedSessionStop:
         ):
             pass  # Neither an unavailable local reading nor a cloud fault proves closure.
 
+    # Native-first evidence can keep a receipt eligible to learn its outcome from both observations.
+    def _native_first_proof(self) -> tuple[str, tuple[str, ...]]:
+        if self._native_first:
+            return f"({_NATIVE_FIRST} OR {_BUFFERED_NATIVE_FIRST})", (encoded(self._native_first),)
+        return _NATIVE_FIRST, ()
+
+    # Retry the original marker even if the connection, intent or receipt state has since advanced.
+    def _checkpoint_native_first(self) -> None:
+        if self._native_first and self._update_receipts(
+            "result=json_set(result,'$._session_stop.native_closed_first',json('true'))",
+            (),
+            f"action=? AND state IN ('accepted','uncertain') AND {_UNSENT} "
+            f"AND {_BUFFERED_NATIVE_FIRST} AND NOT ({_NATIVE_FIRST})",
+            (STOP_SESSION, encoded(self._native_first)),
+            retry_after_rollback=True,
+        ):
+            self._native_first.clear()
+        if self._native_first != self._retained_native_first and self._save_checkpoint(
+            _RETAINED_NATIVE_FIRST_CLOSURES, self._native_first
+        ):
+            self._retained_native_first = self._native_first.copy()
+
     # Remember a verified native-first closure while its exact unsent receipt still owns the wait.
     def _queued_stop(self, local: int, native: HandoverEvidence) -> bool:
         c = self.controller
@@ -414,15 +476,19 @@ class ManagedSessionStop:
             return False
         exact = (
             "action=? AND revision=? AND json_extract(result,'$.target')=? "
-            "AND json_extract(result,'$._session_stop.local')=? "
-            "AND json_type(result,'$._session_stop.dispatched')='false'"
+            f"AND json_extract(result,'$._session_stop.local')=? AND {_UNSENT}"
         )
         where = f"{exact} AND state='accepted'"
-        bindings = STOP_SESSION, c.requests.intent().revision, self._bound_target(connection, local), local
-        if not self._has_receipts(where, bindings, SAVED_STOP_REJECTIONS):
+        revision, target = c.requests.intent().revision, self._bound_target(connection, local)
+        bindings = STOP_SESSION, revision, target, local
+        rows = c.session.journal.db.execute(
+            f"SELECT id,({_NATIVE_FIRST}) FROM managed_requests WHERE {where}", bindings
+        ).fetchall()
+        if not rows:
+            native_first, proofs = self._native_first_proof()
             return self._has_receipts(
-                f"{exact} AND state='uncertain' AND json_type(result,'$._session_stop.native_closed_first') IS 'true'",
-                bindings,
+                f"{exact} AND state='uncertain' AND {native_first}",
+                (*bindings, *proofs),
                 SAVED_STOP_REJECTIONS,
             )
         if (
@@ -431,13 +497,8 @@ class ManagedSessionStop:
             and native.physical.power_w == 0
             and c.native.owner_closure_observed(local, time.time())
         ):
-            self._update_receipts(
-                "result=json_set(result,'$._session_stop.native_closed_first',json('true'))",
-                (),
-                f"{where} AND json_type(result,'$._session_stop.native_closed_first') IS NOT 'true'",
-                bindings,
-                retry_after_rollback=True,
-            )
+            self._native_first.update({request: (revision, target, local) for request, saved in rows if not saved})
+            self._checkpoint_native_first()
         return True
 
     # During a pending Stop, either of the two observations can confirm closure before the other.
