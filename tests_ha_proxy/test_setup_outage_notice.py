@@ -5,6 +5,7 @@ import sys
 import time
 
 import pytest
+from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntryDisabler, ConfigEntryState
 from homeassistant.exceptions import HomeAssistantError
 
@@ -145,6 +146,31 @@ async def test_reenable_requires_new_outage_evidence(actual_hass, peer, monkeypa
     assert await actual_hass.config_entries.async_set_disabled_by(entry.entry_id, None)
     await actual_hass.async_block_till_done()
     assert entry.state is ConfigEntryState.LOADED and writes == []
+
+
+# Explicit disable ends the old notice even if the same failure is observed on the next setup.
+@pytest.mark.parametrize("dismiss_first", [False, True], ids=["visible", "dismissed"])
+async def test_reenable_can_notify_for_the_same_failure(actual_hass, peer, monkeypatch, dismiss_first):
+    entry = await setup(actual_hass, peer)
+    coordinator = entry.runtime_data
+    notice = coordinator.notice
+    monkeypatch.setattr(sys.modules["custom_components.ics_proxy.notification"], "NOTICE_DELAY", 0.05)
+    peer["status_failure"] = True
+    await coordinator.async_refresh()
+    await wait_for_notice(actual_hass, notice.notification_id)
+    if dismiss_first:
+        persistent_notification.async_dismiss(actual_hass, notice.notification_id)
+
+    assert await actual_hass.config_entries.async_set_disabled_by(entry.entry_id, ConfigEntryDisabler.USER)
+    await actual_hass.async_block_till_done()
+    assert notice.problem_since is None and not notice.notified
+    assert notice.notification_id not in _async_get_or_create_notifications(actual_hass)
+
+    await actual_hass.config_entries.async_set_disabled_by(entry.entry_id, None)
+    await actual_hass.async_block_till_done()
+    assert entry.disabled_by is None and entry.state is ConfigEntryState.SETUP_RETRY
+    await wait_for_notice(actual_hass, notice.notification_id)
+    assert set(peer["commands"]) == {"status"}
 
 
 # Intent: actual failed unload retains a working coordinator and its independent outage monitor.

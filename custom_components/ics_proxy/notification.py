@@ -70,8 +70,11 @@ class ProxyNotice:
         self.cancel_deadline()
         self.active = False
         if self.entry.disabled_by is not None:
+            if self.notified or self.cleanup_pending:
+                persistent_notification.async_dismiss(self.hass, self.notification_id)
             self.problem_since = None
-            self.detail = None
+            self.detail = self.shown_detail = None
+            self.notified = self.cleanup_pending = False
 
     # Setup generations revoke stale reads; an unsuccessful unload can resume its still-current coordinator.
     @callback
