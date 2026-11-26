@@ -245,6 +245,7 @@ class NativeBoundedHandover:
         def settle(sample: HandoverEvidence | BaseException) -> HandoverEvidence | Pending:
             content_current = False
             strict_complete = False
+            owner_closure_wait = False
             resource_error: NativeContentError | None = None
             observed_route = route
 
@@ -317,11 +318,9 @@ class NativeBoundedHandover:
                 if measured.exceeded:
                     raise _NativeMeasurementError(native, measured, self.authority(), sequence)
                 recovery = gateway.controls.decisions.recovery
-                if (
-                    closing_local is None
-                    or closing_local != native.physical.native_transaction_id
-                    or not recovery.owner_closure_gap(self, native)
-                ):
+                if closing_local is not None or as_result:
+                    owner_closure_wait = recovery.owner_closure_gap(self, native, closing_local)
+                if closing_local is None or not owner_closure_wait:
                     _require_ready(native, False, self.allow_unplugged, closing_local)
             except NativeContentError as error:
                 invalidate()
@@ -377,7 +376,7 @@ class NativeBoundedHandover:
                     local, active = error.native.physical.native_transaction_id, journal.active()
                     known = local == active or active is None and journal.latest_mapped_stop(local)
                     if (
-                        recovery.owner_closure_gap(self, error.native)
+                        owner_closure_wait
                         or error.unplugged_at_zero
                         and (known or recovery.closed_session_stop_wait(error.native))
                     ):
@@ -405,8 +404,8 @@ class NativeBoundedHandover:
                 self._remember_stop_sample(native, sequence)
             if not stop_only and self.observation_listener is not None:
                 self.observation_listener(native)
-            if as_result and gateway.controls.decisions.recovery.owner_closure_gap(self, native):
-                return Pending(Prerequisite.LIFECYCLE, "owner session Stop awaits independent native closure")
+            if as_result and owner_closure_wait:
+                return Pending(Prerequisite.LIFECYCLE, "owner session awaits a matching Stop report and native zero")
             # A valid open source remains fresh while this particular operation awaits a closed station.
             if closed:
                 if as_result:
@@ -495,13 +494,17 @@ class NativeBoundedHandover:
 
     # Renew a retained ceiling after Boot without rewriting it or creating a missing station profile.
     async def require_retained_station(self, limit: float) -> None:
-        closing_local = self.gateway.journal.latest_owner_stop_id() if limit == 0 else None
+        j = self.gateway.journal
+        closing_local = None
+        if limit == 0:
+            active = j.active()
+            closing_local = active if j.is_owner_session(active) else j.latest_owner_stop_id()
         try:
             native = await self.read(owned=True, closing_local=closing_local)
         except _NativeMeasurementError as error:
             raise UnavailableError("retained station awaits a settled measurement") from error
         owner_closure = closing_local is not None and self.gateway.controls.decisions.recovery.owner_closure_gap(
-            self, native
+            self, native, closing_local
         )
         if not owner_closure:
             self.require_known_session(native)

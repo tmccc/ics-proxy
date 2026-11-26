@@ -113,12 +113,7 @@ class OrdinaryRecovery:
         c = self.c
         await self.hold("native_closure_pending", owner_closure=local)
         authority = c.authority()
-        try:
-            native = await c.native.read(closing_local=local)
-        except NativeReadinessError as error:
-            if error.native.physical.transaction_open or error.native.output_limit_a == 0:
-                raise
-            native = error.native  # A closed unplugged sample may still carry the previous offer.
+        native = await c.native.read(closing_local=local)
         sequence = c.native.last_resolved_read
         return c.commands.decide(
             lambda: self.control.complete_owner_closure(self, local, native, authority, sequence),

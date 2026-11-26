@@ -276,21 +276,36 @@ class RecoveryControl:
             and j.vendor_id(local) is None
         )
 
-    # A genuine owner-session Stop can explain a lagging ID at zero draw, even before its offer reaches zero.
-    def owner_closure_gap(self, handover: NativeBoundedHandover, native: HandoverEvidence) -> bool:
+    # A known owner session can explain disagreement between the native connector and the Stop report.
+    def owner_closure_gap(
+        self, handover: NativeBoundedHandover, native: HandoverEvidence, local: int | None = None
+    ) -> bool:
         j, physical = self.journal, native.physical
-        local = physical.native_transaction_id
-        selected = j.get("control", {}).get("resume_limit", handover.gateway.policy.max_current_a)
+        active = j.active()
+        closed = j.latest_owner_stop_id() if active is None else None
+        if local is None:
+            local = closed
+        if type(local) is not int or local not in (active, closed):
+            return False
+        if physical.transaction_open:
+            if local != closed or physical.native_transaction_id != local:
+                return False
+        elif (
+            physical.native_transaction_id is not None
+            or physical.cp != "A"
+            or physical.connection != "Unplug"
+            or (local == active and not j.is_owner_session(local))
+            or (local == closed and native.output_limit_a == 0)
+        ):
+            return False
+        selected = j.get("control", {}).get("resume_limit", 6)
         return (
-            physical.transaction_open
-            and type(local) is int
-            and native.is_fresh(5)
+            native.is_fresh(5)
             and type(selected) in (int, float)
+            and 6 <= selected <= handover.gateway.policy.max_current_a
             and 0 <= native.output_limit_a <= selected
             and physical.power_w == 0
             and all(value == 0 for value in native.currents_a + native.powers_w)
-            and j.active() is None
-            and j.latest_owner_stop_id() == local
             and handover.commissioned_binding_matches(native)
         )
 
@@ -304,6 +319,8 @@ class RecoveryControl:
             or any(value != 0 for value in native.currents_a + native.powers_w)
         ):
             return False
+        if self.owner_closure_gap(ordinary.c.native, native, known):
+            return True
         if not physical.transaction_open and local is None and type(known) is int:
             return (
                 j.db.execute(
@@ -314,11 +331,7 @@ class RecoveryControl:
         if not physical.transaction_open or known is not None:
             return False
         # OCPP closed first. Only the latest connector lifecycle can explain an open native report at zero.
-        return (
-            j.latest_mapped_stop(local)
-            or self.closed_session_stop_wait(native)
-            or self.owner_closure_gap(ordinary.c.native, native)
-        )
+        return j.latest_mapped_stop(local) or self.closed_session_stop_wait(native)
 
     # The same exact ordinary source and owner prerequisites apply before and inside the outgoing gate.
     def ordinary_authority(
@@ -465,7 +478,7 @@ class RecoveryControl:
             or not self.verified_normal(charging)
         ):
             return False
-        if self.held_owner_closure(c) == local:
+        if self.ordinary_active(c) and j.get(KEY, {}).get("owner_closure") == local:
             return True
         if not self.ordinary(charging) or not recorded_station_profile(
             j, c.native.spec.digest, c.native.spec.boot_digest
@@ -478,16 +491,34 @@ class RecoveryControl:
     def held_owner_closure(self, c: ManagedController) -> int | None:
         j = self.journal
         hold, intent = j.get(KEY, {}), c.requests.intent()
-        local = hold.get("owner_closure")
         if (
-            type(local) is int
-            and hold.get("state") == "holding"
-            and intent == ControlIntent("app", hold.get("revision"))
-            and j.active() is None
-            and j.latest_owner_stop_id() == local
+            hold.get("state") != "holding"
+            or intent != ControlIntent("app", hold.get("revision"))
+            or j.active() is not None
+            or (local := j.latest_owner_stop_id()) is None
         ):
+            return None
+        if hold.get("owner_closure") == local:
+            return local
+        # A prior unplugged observation can own the same session before its genuine Stop is recorded.
+        if hold.get("local") != local:
+            return None
+        session = j.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()
+        if session is not None and hold.get("start") == fingerprint(json.loads(session["start"])):
             return local
         return None
+
+    # An unplugged owner session still needs its genuine Stop even while iCS is unavailable.
+    def held_owner_stop_pending(self, c: ManagedController) -> bool:
+        j = self.journal
+        hold = j.get(KEY, {})
+        local = j.active()
+        return (
+            self.ordinary_active(c)
+            and hold.get("reason") in ("unplugged_session_pending", "native_closure_pending")
+            and hold.get("local") == local
+            and j.is_owner_session(local)
+        )
 
     # Independent closed zero and settled reports can hand the exact hold over to the usual automatic Pause.
     def complete_owner_closure(
@@ -1042,8 +1073,8 @@ class RecoveryControl:
 
     # A known unplugged session at zero may wait for its exact device and ledger closure.
     def unplugged_closure(self, c: ManagedController, error: NativeReadinessError) -> bool:
-        return error.unplugged_at_zero and (
-            error.native.physical.native_transaction_id == self.journal.active()
-            or self.owner_closure_gap(c.native, error.native)
-            or c.ordinary.closure_gap(error.native)
+        active = self.journal.active()
+        return self.owner_closure_gap(c.native, error.native, active) or (
+            error.unplugged_at_zero
+            and (error.native.physical.native_transaction_id == active or c.ordinary.closure_gap(error.native))
         )

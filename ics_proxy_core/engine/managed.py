@@ -493,9 +493,7 @@ class ManagedController:
                 return True
 
             if not self.commands.decide(accept):
-                owner_closure = (
-                    native.physical.native_transaction_id if recovery.owner_closure_gap(self.native, native) else None
-                )
+                owner_closure = j.latest_owner_stop_id() if recovery.owner_closure_gap(self.native, native) else None
                 await self.ordinary.hold("native_closure_pending", owner_closure=owner_closure)
                 raise RecoveryRequiredError("ordinary zero hold awaits exact lifecycle closure")
             return native
