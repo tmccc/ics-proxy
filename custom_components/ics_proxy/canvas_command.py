@@ -52,7 +52,6 @@ class CanvasCommands:
         self._awaiting_refresh: dict[str, Any] | None = None
         self._retired = False
 
-    # A current local snapshot is required even for a Stop during a cloud outage.
     def _scope(self) -> tuple[str, int] | None:
         coordinator = self.coordinator
         data = coordinator.data or {}
@@ -61,7 +60,6 @@ class CanvasCommands:
             self._retired
             or not coordinator.entry_is_current()
             or not coordinator.last_update_success
-            or not coordinator.fresh_native
             or owner is None
             or data.get("canvas_owner") != owner
             or type(revision) is not int
@@ -70,8 +68,9 @@ class CanvasCommands:
             return None
         return owner, revision
 
+    # A current local snapshot is required even for a Stop during a cloud outage.
     def _binding(self, scope: tuple[str, int] | None) -> CanvasBinding | None:
-        if scope is None:
+        if scope is None or not self.coordinator.fresh_native:
             return None
         owner, revision = scope
         data = self.coordinator.data or {}
@@ -98,11 +97,17 @@ class CanvasCommands:
 
     @property
     def state(self) -> str:
-        if self._scope() is None:
+        scope = self._scope()
+        if scope is None:
             return "v2:unavailable:none:-"
+        owner, _ = scope
+        timeout = self._timeout
+        feedback = timeout[1] if timeout is not None and timeout[0] == owner else None
+        if not self.coordinator.fresh_native:
+            return f"v2:{feedback or 'unavailable'}:none:-"
         if self.pending is not None:
             return f"v2:{self.pending.binding.pending_feedback}:none:-"
-        feedback = self._timeout[1] if self._timeout is not None else "idle"
+        feedback = feedback or "idle"
         offer = self.offer
         return f"v2:{feedback}:{offer.binding.action}:{offer.generation}" if offer else f"v2:{feedback}:none:-"
 

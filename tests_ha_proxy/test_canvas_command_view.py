@@ -127,8 +127,8 @@ async def test_canvas_claim_stays_retired_after_status_reconnect(actual_hass, pe
     assert offer(actual_hass, "start", feedback="starting_timeout") != previous
 
 
-# Intent: keep unconfirmed feedback for the elapsed display interval, then retire only its message.
-# Why: wall clock changes do not extend feedback, and a fresh valid offer remains usable.
+# Intent: retain unconfirmed feedback while a native telemetry gap disables display controls.
+# Why: the user still needs the outcome even if the charger cannot provide a fresh reading.
 async def test_canvas_feedback_expires_after_an_unconfirmed_same_revision(actual_hass, peer, frame_clock, monkeypatch):
     from custom_components.ics_proxy import canvas_command
 
@@ -140,12 +140,21 @@ async def test_canvas_feedback_expires_after_an_unconfirmed_same_revision(actual
         return lambda: None
 
     monkeypatch.setattr(canvas_command, "async_call_later", schedule)
-    peer["state"].update(canvas_owner=OWNER, charging_session_open=True, stop_target=TARGET, can_start=False)
-    await setup_proxy(actual_hass, peer["port"])
+    fresh = dict(native_age_seconds=0, charging_session_open=True, stop_target=TARGET)
+    withdrawn = dict.fromkeys(fresh)
+    peer["state"].update(canvas_owner=OWNER, can_start=False, **fresh)
+    entry = await setup_proxy(actual_hass, peer["port"])
     previous = offer(actual_hass, "stop")
     frame_clock.now = 1002
     peer["pre_admission_close"] = "Busy"
+    peer["state"].update(withdrawn)
     assert await submit(actual_hass, "stop_session", previous, canvas_rendered_at_epoch=1001) == {"confirmed": False}
+    assert actual_hass.states.get(ENTITY).state == "v2:stopping_timeout:none:-"
+    assert await submit(actual_hass, "stop_session", previous, canvas_rendered_at_epoch=1001) == {"confirmed": False}
+    assert peer["commands"].count("stop_session") == 1
+
+    peer["state"].update(fresh)
+    await entry.runtime_data.async_refresh()
     replacement = offer(actual_hass, "stop", feedback="stopping_timeout")
     assert replacement != previous
     assert peer["state"]["control_revision"] == 0

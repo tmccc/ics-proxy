@@ -129,6 +129,11 @@ class ScheduleControl:
         catalogue = j.get("managed_schedule_tags")
         if catalogue is None:
             return
+        plan = original_current_plan(n, original)
+        if plan is not None and plan["kindType"] == "Recurring" and plan["idTag"].casefold() == tag.casefold():
+            # This exact report belongs to the commissioned schedule. Its command candidates remain outstanding.
+            j.put("managed_deferred_start", {})
+            return
         digest = fingerprint(tag.casefold())
         if known_plan_source(j, n) or digest in catalogue and n.session_plan_id is None:
             return

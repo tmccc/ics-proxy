@@ -128,6 +128,36 @@ async def test_same_tag_recovery(tmp_path, tls, unused_tcp_port, monkeypatch, be
             assert (await healthy(b.c))["power_w"] == 0
 
 
+# Intent: once identified as daily, the same report cannot consume the owner Start after its marker changes.
+# Why: the newer Pause still owes zero and closure for the separate owner Start.
+async def test_identified_same_tag_daily_cannot_bind_owner_after_pause(tmp_path, tls, unused_tcp_port):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        j = b.session.journal
+        b.clock.now = int(datetime(2026, 11, 11, tzinfo=ZONE).timestamp())
+        b.c.command(uuid.uuid4().hex, "start", b.c.requests.intent().revision)
+        await b.c.charging.settle()
+        assert starts(b.rig)[0][3]["idTag"] == b.device.plans[9]["idTag"]
+        daily = await b.start_plan(9, demand=False)
+        assert (await b.c.native.read()).session_plan_id == 9
+        owner_receipt = j.get("local_start_receipt")
+        assert owner_receipt["local"] is None and owner_receipt["stage"] == "accepted"
+
+        pause = uuid.uuid4().hex
+        b.c.command(pause, "pause", b.c.requests.intent().revision)
+        await b.c.pause_task
+        assert j.active() == daily and b.device.effective_limit() == 0
+        b.rig.peer.plan_session = (daily, 987654)
+        assert (await b.c.native.read()).session_plan_id == 987654
+
+        assert j.get("local_start_receipt") == owner_receipt
+        assert j.get("control")["start_pending"]
+        assert not j.get("managed_deferred_start")
+        await b.close_transaction(daily)
+        for _ in range(3):
+            await b.c.tick()
+        assert b.c.requests.receipt(pause)["state"] != "completed"
+
+
 # Intent: retain an older accepted owner command when a distinct native daily plan reports on the same tag.
 # Why: the candidate explicitly supports older acknowledgements while a daily plan can share its native tag.
 @pytest.mark.parametrize("same_tag", [False, True])
