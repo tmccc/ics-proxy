@@ -86,6 +86,8 @@ class ProxySensor(ProxyEntity, SensorEntity):
     def native_value(self) -> Any:
         data = self.coordinator.data
         if self.key == "control_mode":
+            if not self.service_fresh:
+                return CONTROL_MODE_LABELS["waiting"]
             if "control_mode" not in data:
                 return self.legacy_control_mode()
             mode = data["control_mode"]

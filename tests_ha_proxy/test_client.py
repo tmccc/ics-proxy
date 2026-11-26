@@ -746,6 +746,47 @@ async def test_pending_operation_label_does_not_invent_pause(actual_hass, peer, 
     assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "Waiting for verification"
 
 
+# A current service snapshot can report pending work even without native evidence. Its label expires with it.
+@pytest.mark.parametrize("legacy", [False, True], ids=["published-mode", "legacy-facts"])
+@pytest.mark.parametrize(
+    "mode,label,legacy_fields",
+    [
+        ("start_pending", "Start pending", {"fault": "start_operation_pending"}),
+        ("updating_current", "Updating current", {"fault": "current_update_pending"}),
+        ("pause_requested", "Pause requested", {"desired_control": "paused", "pause_pending": True}),
+        ("return_requested", "Return requested", {"desired_control": "paused", "return_pending": True}),
+    ],
+)
+async def test_pending_operation_label_expires_with_service_status(
+    actual_hass, peer, mode, label, legacy_fields, legacy
+):
+    peer["state"].update(
+        healthy=False,
+        local_healthy=False,
+        state="reconciling",
+        owner_control_enabled=False,
+        status_age_seconds=14,
+        native_age_seconds=None,
+        can_start=False,
+        can_start_test=False,
+        can_return=False,
+    )
+    if legacy:
+        peer["state"].update(legacy_fields)
+    else:
+        peer["state"]["control_mode"] = mode
+    await setup(actual_hass, peer)
+    entity_id = "sensor.ics_proxy_control_mode"
+    assert actual_hass.states.get(entity_id).state == label
+    calls = len(peer["commands"])
+
+    async with asyncio.timeout(3):
+        while actual_hass.states.get(entity_id).state != "Waiting for verification":
+            await asyncio.sleep(0.02)
+    assert len(peer["commands"]) == calls
+    assert "status is unavailable or stale" in actual_hass.states.get(entity_id).attributes["diagnostic_summary"]
+
+
 # Intent: the config flow rejects invalid credentials without sending controls or printing their content.
 # Why: connection setup may authenticate and read only; it is not an implicit user command.
 async def test_bad_token_cannot_configure_or_issue_controls(actual_hass, peer):
