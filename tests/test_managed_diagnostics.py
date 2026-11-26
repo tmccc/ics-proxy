@@ -5,9 +5,11 @@ import json
 import sqlite3
 import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
+from ics_proxy_core.engine import trial_handover_evidence
 from ics_proxy_core.engine.managed_diagnostics import snapshot
 from ics_proxy_core.engine.managed_native_repair import AUDITS, REVOCATIONS, NativeRepairAudits
 from ics_proxy_core.engine.managed_view import health_snapshot, publish_poll, refresh_for_read, with_reporting
@@ -16,7 +18,7 @@ from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
 from ics_proxy_core.engine.store import fingerprint
 from tests.current_rig import adjustable
 from tests.managed_rig import healthy
-from tests.prototype_rig import START
+from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.test_managed_local_schedule import MIDNIGHT, connection, overnight, status
 from tests.test_managed_local_schedule_cutoff import begin, close
@@ -141,7 +143,22 @@ async def test_exact_owner_closure_has_a_fresh_lifecycle_blocker(
             assert reason in live["diagnostics"]["blockers"]
             assert not live["local_hold_verified"] and live["native_observed_at"] is None
             assert reason not in snapshot(c, live, now=c.native.last_verified_at + 6)["blockers"]
+            with monkeypatch.context() as elapsed:
+                elapsed.setattr(
+                    trial_handover_evidence, "time",
+                    SimpleNamespace(time=time.time, monotonic=lambda: time.monotonic() + 6),
+                )
+                assert reason not in snapshot(c, live)["blockers"]
             assert (journal.db.total_changes, bench.device_calls) == before
+
+            gateway = test.session.gateway
+            boot, sequence = gateway.boot_observation, c.native.last_resolved_read
+            assert (await bench.call(test.charger, "new-boot-same-configuration", "BootNotification", BOOT))[0] == 3
+            assert gateway.boot_observation != boot and c.native.last_resolved_read == sequence
+            live = refresh_for_read(c, published)
+            assert live["boot_verified"] and reason not in live["diagnostics"]["blockers"]
+            poll = await c.tick()
+            assert c.native.last_resolved_read > sequence and reason in snapshot(c, poll)["blockers"]
 
             if not ocpp_first:
                 await close(test, clock, local, meter_start)

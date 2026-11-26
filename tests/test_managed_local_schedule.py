@@ -16,7 +16,7 @@ import pytest
 from ics_proxy_core.engine import local_schedule
 from ics_proxy_core.engine.auth_info import tag_key
 from ics_proxy_core.engine.managed import ManagedController
-from ics_proxy_core.engine.managed_intent import LOCAL_SCHEDULE_OCCURRENCE
+from ics_proxy_core.engine.managed_intent import AUTOMATIC_PAUSE_CAUSE, LOCAL_SCHEDULE_OCCURRENCE
 from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.policy import DeniedError
 from tests.current_rig import ChargeRig
@@ -295,6 +295,10 @@ async def test_cloud_returns_before_local_schedule_sends_start(
                 release.set()
 
             await c.charging.settle()
+            if reply_limit == 6 and not explicit_pause:
+                pending_intent = c.requests.intent()
+                assert pending_intent.mode == "paused" and c.requests.offline_pause_current(pending_intent)
+                assert j.get(AUTOMATIC_PAUSE_CAUSE) == {"revision": pending_intent.revision, "cause": "local_charge"}
             expected = "paused" if explicit_pause else "app"
             result = await status(
                 test,

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 from .command_processor import CommandPriority
 from .connection_scope import current_control_scope
 from .managed_intent import LOCAL_SCHEDULE_OCCURRENCE as OCCURRENCE
-from .managed_intent import OFFLINE_PAUSE, decode_intent, write_intent
+from .managed_intent import OFFLINE_PAUSE, decode_intent, record_automatic_pause, write_intent
 from .native_faults import _NativeMeasurementError
 from .policy import DeniedError
 from .rpc import UnavailableError
@@ -56,7 +56,7 @@ def _claim_cutoff(
             paused = write_intent(j, intent, "paused")
             occurrence = {**occurrence, "stop_revision": paused.revision}
             j.put(OCCURRENCE, occurrence)
-            j.put(OFFLINE_PAUSE, paused.revision)
+            record_automatic_pause(j, paused, "local_charge")
             g.controls._claim(True, stopping=True)
         else:
             return None  # An explicit Pause or newer intent already owns any further effects.

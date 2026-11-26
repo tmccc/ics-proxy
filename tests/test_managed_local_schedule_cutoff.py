@@ -12,7 +12,7 @@ import pytest
 from ics_proxy_core.constants import HUB_PROFILE_ID
 from ics_proxy_core.engine.local_schedule_cutoff import scheduled_cutoff_target
 from ics_proxy_core.engine.managed_current import capability_value
-from ics_proxy_core.engine.managed_intent import LOCAL_SCHEDULE_OCCURRENCE
+from ics_proxy_core.engine.managed_intent import AUTOMATIC_PAUSE_CAUSE, LOCAL_SCHEDULE_OCCURRENCE
 from ics_proxy_core.engine.managed_sources import ORDINARY_HOLD
 from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
@@ -113,7 +113,7 @@ async def test_cutoff_owns_exact_stop_until_real_closure(tmp_path, tls, unused_t
             assert not stops(bench) and bench.firmware.effective_limit() > 0
 
             clock.now = MIDNIGHT + 6 * 3600
-            await c.tick()
+            cutoff_poll = await c.tick()
             assert stops(bench) == [expected] and bench.firmware.effective_limit() == 0
             assert j.outcomes.accepted_stop(local) is not reject_first
             assert j.active() == local and not j.outcomes.stop_report_closed(local)
@@ -121,6 +121,8 @@ async def test_cutoff_owns_exact_stop_until_real_closure(tmp_path, tls, unused_t
             assert occurrence["stop_revision"] == c.requests.intent().revision
             assert scheduled_cutoff_target(j) == local
             assert c.requests.offline_pause_current(c.requests.intent())
+            view = refresh_for_read(c, cutoff_poll)
+            assert view["cloud_connected"] is False and "pause_reason" not in view
 
             # Rewinding calendar time cannot resurrect the occurrence after its durable cutoff.
             clock.step_wall(MIDNIGHT + 6 * 3600 - 1)
@@ -131,7 +133,8 @@ async def test_cutoff_owns_exact_stop_until_real_closure(tmp_path, tls, unused_t
 
             clock.now = MIDNIGHT + 6 * 3600 + 1
             await close(test, clock, local, meter_start)
-            await status(test, lambda value: value.get("local_hold_verified") is True)
+            settled = await status(test, lambda value: value.get("local_hold_verified") is True)
+            assert "pause_reason" not in settled
             assert j.outcomes.stop_report_closed(local) and j.active() is None
             assert stops(bench) == [expected] * (1 + reject_first)
 
@@ -182,7 +185,8 @@ async def test_cutoff_waits_for_native_closure_across_replacement(
             )
 
             bench.firmware.active = None
-            await status(replacement, lambda value: value["local_hold_verified"] is True)
+            settled = await status(replacement, lambda value: value["local_hold_verified"] is True)
+            assert settled["cloud_connected"] is False and "pause_reason" not in settled
             assert not journal.fault.latched()
             assert bench.firmware.effective_limit() == 0
             assert stops(bench) == [{"transactionId": local}]
@@ -256,13 +260,16 @@ async def test_natural_owner_stop_waits_for_native_closure(
             assert public["can_start"] and not j.fault.latched() and not stops(bench)
             if after_closure == "online-handback":
                 assert public["desired_control"] == "app" and public["station_ceiling_a"] == 6
+                assert j.get(AUTOMATIC_PAUSE_CAUSE) is None
             elif after_closure == "offline-start":
                 assert public["local_hold_verified"] and public["station_ceiling_a"] == 0
+                assert public["cloud_connected"] is False and "pause_reason" not in public
                 assert c.requests.offline_pause_current(c.requests.intent())
                 request = c.command(uuid.uuid4().hex, "start", public["control_revision"])
                 assert request["state"] == "accepted"
                 await until(lambda: len(starts(rig)) == 2)
                 await c.charging.settle()
+                assert j.get(AUTOMATIC_PAUSE_CAUSE) is None
             else:
                 assert public["local_hold_verified"] and public["station_ceiling_a"] == 0
                 assert not c.requests.offline_pause_current(c.requests.intent())
@@ -516,10 +523,13 @@ async def test_native_outage_owner_hold_reports_station_fault(
             assert j.outcomes.stop_report_closed(local) and (await c.tick())["fault"] == expected
 
 
-# Intent: retain a verified unplug that follows a native outage and detect a different session after replugging.
+# Intent: retain independent closure after a native outage and detect a different session afterward.
 # Why: an earlier generic zero hold still needs the exact owner's genuine Stop and independent closure.
 @pytest.mark.parametrize("cloud_returned", [False, True], ids=["offline", "cloud-returned"])
-async def test_live_native_outage_recognizes_owner_unplug(tmp_path, tls, unused_tcp_port, monkeypatch, cloud_returned):
+@pytest.mark.parametrize("plugged", [False, True], ids=["unplugged", "plugged-native-closed"])
+async def test_live_native_outage_recognizes_owner_closure(
+    tmp_path, tls, unused_tcp_port, monkeypatch, cloud_returned, plugged
+):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
         async with connection(rig, "outage-before-owner-unplug") as test:
             c, j, bench = test.controller, test.session.journal, rig.bench
@@ -535,12 +545,15 @@ async def test_live_native_outage_recognizes_owner_unplug(tmp_path, tls, unused_
             hold = j.get(ORDINARY_HOLD)
             assert hold["reason"] == "native_observation_unavailable" and hold["local"] == j.active() == local
 
-            bench.cp, bench.connection = "A", "Unplug"
+            bench.cp, bench.connection = ("B", "Plug") if plugged else ("A", "Unplug")
+            if plugged:
+                bench.firmware.active = None
             bench.firmware.requested_current = 0
             rig.peer.permission_enabled = False
             view = await c.tick()
             assert view["state"] == "reconciling" and not view["local_hold_verified"]
-            assert j.get(ORDINARY_HOLD) == {**hold, "reason": "unplugged_session_pending"}
+            reason = "native_closure_pending" if plugged else "unplugged_session_pending"
+            assert j.get(ORDINARY_HOLD) == {**hold, "reason": reason}
             assert j.phase.read().value == "recovering" and bench.firmware.effective_limit() == 0
 
             bench.cp, bench.connection = "B", "Plug"
@@ -791,14 +804,18 @@ async def test_replacement_after_unplug_before_owner_stop(
             assert not stops(bench)
 
 
-# Intent: recognize unplugged owner closure at startup after an ordinary native telemetry outage.
-# Why: the saved outage hold identifies the session, and the new native sample establishes whether it unplugged.
-@pytest.mark.parametrize("connector", ["plugged", "unplugged-native-closed", "unplugged-id-retained"])
-async def test_replacement_after_owner_unplugs_during_native_outage(
+# Intent: recognize owner closure at startup after an ordinary native telemetry outage.
+# Why: the saved hold identifies the owner's Start while independent closure and its genuine Stop settle separately.
+@pytest.mark.parametrize(
+    "connector", ["plugged-id-retained", "plugged-native-closed", "unplugged-native-closed", "unplugged-id-retained"]
+)
+async def test_replacement_recognizes_owner_closure_after_native_outage(
     tmp_path, tls, unused_tcp_port, monkeypatch, connector
 ):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
         bench = rig.bench
+        offered = None
+        monkeypatch.setattr(rig.peer, "native", report_offer(rig.peer, lambda: offered))
         async with connection(rig, "owner-unplug-outage-original") as test:
             c, j = test.controller, test.session.journal
             local, meter_start = await begin(test, clock)
@@ -816,28 +833,36 @@ async def test_replacement_after_owner_unplugs_during_native_outage(
 
             bench.firmware.requested_current = 0
             rig.peer.permission_enabled = False
-            if connector == "plugged":
+            if connector.startswith("plugged-"):
                 bench.cp, bench.connection = "B", "Plug"
             else:
                 bench.cp, bench.connection = "A", "Unplug"
-                if connector == "unplugged-native-closed":
-                    bench.firmware.active = None
+            if connector.endswith("native-closed"):
+                bench.firmware.active = None
+            if connector == "plugged-native-closed":
+                offered = 6
 
         async with connection(rig, "owner-unplug-outage-replacement") as test:
             c, j = test.controller, test.session.journal
             assert j.active() == local and not j.outcomes.stop_report_closed(local)
-            if connector == "plugged":
+            if connector == "plugged-id-retained":
                 assert c.requests.intent().mode == "paused"
                 assert c.charging.state()["state"] == "interrupted"
                 assert j.get(ORDINARY_HOLD) == saved
                 return
 
             assert c.requests.intent() == intent
-            assert j.get(ORDINARY_HOLD) == {**saved, "reason": "unplugged_session_pending"}
+            reason = "native_closure_pending" if connector == "plugged-native-closed" else "unplugged_session_pending"
+            assert j.get(ORDINARY_HOLD) == {**saved, "reason": reason}
             assert (await c.tick())["state"] == "reconciling"
             assert bench.firmware.effective_limit() == 0 and not stops(bench)
             await close(test, clock, local, meter_start)
             bench.firmware.active = None
+            if offered is not None:
+                assert (await c.tick())["state"] == "reconciling"
+                assert j.outcomes.stop_report_closed(local) and not stops(bench)
+                assert c.requests.intent() == intent and bench.firmware.effective_limit() == 0
+                offered = None
             await status(test, lambda view: view["local_hold_verified"])
             assert j.outcomes.stop_report_closed(local) and not j.fault.latched()
             assert c.requests.receipt(occurrence["request"]) == receipt

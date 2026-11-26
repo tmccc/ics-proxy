@@ -727,17 +727,30 @@ class NativeBoundedHandover:
             self._stop_sample = sequence, scope, native
 
     # Reuse only the latest resolved sample of this session on the current commissioned charger connection.
-    def _current_stop_sample(self, local: int | None) -> HandoverEvidence | None:
+    def _current_stop_sample(self, local: int | None, *, include_closed: bool = False) -> HandoverEvidence | None:
         latest = self._stop_sample
+        markers = (local, None) if include_closed else (local,)
         if (
             latest is None
             or latest[0] != self.last_resolved_read
             or not control_scope_matches(self.gateway, latest[1])
-            or latest[2].physical.native_transaction_id != local
+            or latest[2].physical.native_transaction_id not in markers
             or not self.commissioned_binding_matches(latest[2])
         ):
             return None
         return latest[2]
+
+    # Either report can close first. Diagnostics require a fresh audit of the exact session or its closed marker.
+    def owner_closure_observed(self, local: int, now: float) -> bool:
+        sample = self._current_stop_sample(local, include_closed=True)
+        verified_at = self.last_verified_at
+        return (
+            sample is not None
+            and sample.physical.observed_at == verified_at
+            and 0 < verified_at <= now <= verified_at + 5
+            and sample.is_fresh(5)
+            and not any(sample.currents_a + sample.powers_w)
+        )
 
     # An ordinary Stop needs current verified open evidence. A protective Stop can use separate proof.
     def session_stop_verified(self, local: int) -> bool:

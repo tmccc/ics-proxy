@@ -10,9 +10,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import stat
 import sys
+import tempfile
 import time
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
@@ -173,7 +175,7 @@ def schema_digest(db: sqlite3.Connection) -> str:
     return hashlib.sha256(json.dumps([version, application, objects], separators=(",", ":")).encode()).hexdigest()
 
 
-# Take the existing single-owner lock without creating it, then read real WAL contents in one SQLite snapshot.
+# Lock the stopped owner and read a private copy so SQLite cannot modify the journal's sidecars.
 @contextmanager
 def stopped_journal(path: Path):
     info = path.lstat()
@@ -200,10 +202,18 @@ def stopped_journal(path: Path):
             os.path.samestat(info, path.lstat()) and os.path.samestat(held, lock_path.lstat()),
             "journal_unavailable",
         )
-        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as db:
-            db.execute("PRAGMA query_only=ON")
-            db.execute("BEGIN")
-            yield db
+        with tempfile.TemporaryDirectory(prefix="ics-rollback-") as directory:
+            snapshot = Path(directory) / "journal.sqlite"
+            shutil.copyfile(path, snapshot)
+            # Retain uncheckpointed WAL and interrupted rollback evidence. SQLite rebuilds shared memory locally.
+            for suffix in ("-wal", "-journal"):
+                source = Path(str(path) + suffix)
+                if source.exists():
+                    shutil.copyfile(source, Path(str(snapshot) + suffix))
+            with closing(sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as db:
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                yield db
 
 
 # Keep known allocation and both configured identities tied to the preserved transaction ledger.

@@ -62,6 +62,55 @@ async def test_healthy_proxy_pause_shows_notice_on_setup(actual_hass, peer):
     assert set(peer["commands"]) == {"status"}
 
 
+# Intent: HA handles natural session closure as a local hold even when the vendor connection remains unavailable.
+# Why: the ordinary connection warning can still appear without claiming the outage stopped the charge.
+async def test_natural_schedule_closure_keeps_the_ordinary_outage_notice(
+    actual_hass, tmp_path, tls, unused_tcp_port_factory, monkeypatch
+):
+    from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
+    from ics_proxy_core.engine.managed_diagnostics import snapshot
+    from tests.test_managed_local_schedule import MIDNIGHT, connection, overnight, status
+    from tests.test_managed_local_schedule_cutoff import begin, close, stops
+    from tests_ha_proxy.test_client import TOKEN
+
+    async with overnight(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as (rig, clock):
+        async with connection(rig, "natural-closure-ha-notice") as test:
+            controller, bench = test.controller, rig.bench
+            local, meter_start = await begin(test, clock)
+            clock.now = MIDNIGHT + 30
+            await close(test, clock, local, meter_start)
+            bench.firmware.active = local
+            bench.cp, bench.connection = "B", "Plug"
+            bench.firmware.requested_current = 0
+            assert (await controller.tick())["state"] == "reconciling"
+            bench.firmware.active = None
+            await status(test, lambda view: view.get("local_hold_verified") is True)
+            published = dict(await controller.tick(), running=True, certificate_remaining_seconds=86400)
+            published["diagnostics"] = snapshot(controller, published)
+            assert published["cloud_connected"] is False and not stops(bench)
+
+            server = ManagementServer(
+                ManagementSettings(unused_tcp_port_factory(), tmp_path / "unused", TOKEN),
+                controller,
+                lambda: published,
+            )
+            await server.start()
+            try:
+                entry = await setup(actual_hass, {"port": server.settings.port})
+                coordinator = entry.runtime_data
+                notifications = _async_get_or_create_notifications(actual_hass)
+                assert coordinator.data["local_hold_verified"] and not coordinator.notified
+                assert coordinator.notification_id not in notifications
+                coordinator.problem_since -= 61
+                await coordinator.async_refresh()
+                await actual_hass.async_block_till_done()
+                notice = notifications[coordinator.notification_id]["message"]
+                assert "manufacturer cloud connection is unavailable" in notice
+                assert "requested Pause after it could not connect" not in notice
+            finally:
+                await server.close()
+
+
 # Intent: health flags and fresh ages need a running service to restore controls or resolve an outage.
 # Why: stale readiness flags cannot prove recovery when the running evidence is missing, false or malformed.
 @pytest.mark.parametrize("running", [None, False, "true"], ids=["missing", "false", "string"])

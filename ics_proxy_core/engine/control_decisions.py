@@ -31,11 +31,12 @@ from .local_schedule import ScheduleCloudReturnedError
 from .local_schedule_cutoff import scheduled_cutoff_target
 from .managed_facts import ManagedFacts
 from .managed_intent import (
-    OFFLINE_PAUSE,
     ControlIntent,
     ManagedRequests,
     PauseRequest,
     ReturnSettlement,
+    automatic_pause_cause,
+    record_automatic_pause,
     request_pending,
     write_intent,
 )
@@ -714,10 +715,10 @@ class ControlDecisions:
         # This verified idle sample already saw these attempts, regardless of when their records were created.
         prior_attempts = [attempt_key(record) for record in native.history if record["transactionId"] == -1]
         with j.atomic():
-            outage_pause = c.requests.offline_pause_current(intent)
+            automatic_pause = c.requests.offline_pause_current(intent)
             expected = write_intent(j, intent, intent.mode)
-            if outage_pause:
-                j.put(OFFLINE_PAUSE, expected.revision)
+            if automatic_pause:
+                record_automatic_pause(j, expected, automatic_pause_cause(j, intent))
             j.current_change.accept(
                 identifier, value, previous_value, intent, j.get("next_transaction"), prior_attempts
             )
@@ -1599,7 +1600,7 @@ class ControlDecisions:
                 automatic_return = allow_schedule_return and intent == ControlIntent("app", lease.revision)
                 self._claim_test_pause(c, intent, lease.identifier)
                 if automatic_return:
-                    j.put(OFFLINE_PAUSE, c.requests.intent().revision)
+                    record_automatic_pause(j, c.requests.intent(), "local_charge")
             elif self.failed_start_zero_needed(charging, lease, reason, failure):
                 c.session.gateway.controls._claim(True)
             j.starts.expire(lease, reason, preserve, failure, target=target)

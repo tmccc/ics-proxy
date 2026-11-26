@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 OWNER_PAUSE = "managed_owner_pause"
 OWNER_STOP = "managed_owner_stop"
 OFFLINE_PAUSE = "managed_offline_pause"
+AUTOMATIC_PAUSE_CAUSE = "managed_automatic_pause_cause"
 LOCAL_SCHEDULE_OCCURRENCE = "managed_owner_schedule_occurrence"
 RELEASE_PAUSE_ACK = "managed_release_pause_acknowledgement"
 PAUSE_RELEASE_PROOF = "_release_ack"
@@ -31,6 +32,7 @@ RETURN_OUTCOME = (
 )
 
 type ReturnFailure = Literal["return_not_sent", "return_not_confirmed"]
+type AutomaticPauseCause = Literal["cloud_connection_failed", "local_charge"]
 
 
 # Use the same durable receipt format for each command; the domain owner supplies its acceptance evidence.
@@ -142,8 +144,27 @@ def write_intent(journal: Journal, current: ControlIntent, mode: str, *, coalesc
     intent = current.next(mode, coalesce=coalesce)
     journal.put("managed_control_intent", {"mode": intent.mode, "revision": intent.revision})
     if current.mode == "paused" and mode == "app":
-        journal.db.execute("DELETE FROM meta WHERE key=?", (OFFLINE_PAUSE,))
+        journal.db.execute("DELETE FROM meta WHERE key IN (?,?)", (OFFLINE_PAUSE, AUTOMATIC_PAUSE_CAUSE))
     return intent
+
+
+# Keep the existing automatic Return marker and bind any known cause to that same revision.
+def record_automatic_pause(journal: Journal, intent: ControlIntent, cause: AutomaticPauseCause | None) -> None:
+    journal.put(OFFLINE_PAUSE, intent.revision)
+    if cause is not None:
+        journal.put(AUTOMATIC_PAUSE_CAUSE, {"revision": intent.revision, "cause": cause})
+
+
+# Legacy records can lack cause evidence. Ignore any evidence belonging to a different revision.
+def automatic_pause_cause(journal: Journal, intent: ControlIntent) -> AutomaticPauseCause | None:
+    value = journal.get(AUTOMATIC_PAUSE_CAUSE)
+    if isinstance(value, dict) and type(value.get("revision")) is int and value["revision"] == intent.revision:
+        cause = value.get("cause")
+        if cause == "cloud_connection_failed":
+            return "cloud_connection_failed"
+        if cause == "local_charge":
+            return "local_charge"
+    return None
 
 
 # Finish only the original live request and keep an already settled receipt intact.
@@ -439,7 +460,7 @@ class ManagedRequests:
                     (json.dumps({"classification": "superseded_by_pause", "superseded_by": identifier}),),
                 )
                 write_intent(self.journal, current, "paused")
-                self.journal.db.execute("DELETE FROM meta WHERE key=?", (OFFLINE_PAUSE,))
+                self.journal.db.execute("DELETE FROM meta WHERE key IN (?,?)", (OFFLINE_PAUSE, AUTOMATIC_PAUSE_CAUSE))
                 if on_pause is not None:
                     on_pause()
                     hold = read_pause_claim(self.journal)

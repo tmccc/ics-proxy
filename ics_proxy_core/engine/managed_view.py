@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from .managed_diagnostics import snapshot as diagnostic_snapshot
 from .managed_facts import ManagedFacts
-from .managed_intent import OFFLINE_PAUSE
+from .managed_intent import OFFLINE_PAUSE, automatic_pause_cause
 from .managed_release_wait import awaiting_known_stops, awaiting_observations
 from .native_faults import STATION_CEILING_LOST
 from .native_history import latest_completion_available
@@ -625,11 +625,13 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         owner_control_enabled=proof.shared,
         local_hold_verified=proof.hold_verified,
     )
-    # Legacy markers retain their historical cause. Automatic handback can also follow local session closure.
+    # Keep the cause of the current Pause separate from today's cloud connectivity.
+    automatic = intent.mode == "paused" and c.requests.offline_pause_current(intent)
+    pause_cause = automatic_pause_cause(j, intent) if automatic else None
     if intent.mode == "paused" and (
         j.get(OFFLINE_PAUSE) is True
-        or not c.session.runtime.vendor_registered
-        and c.requests.offline_pause_current(intent)
+        or pause_cause == "cloud_connection_failed"
+        or (automatic and pause_cause is None and not c.session.runtime.vendor_registered)
     ):
         result["pause_reason"] = "cloud_connection_failed"
     else:

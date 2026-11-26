@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from ..constants import HUB_PROFILE_ID
 from .connection_scope import CloudAttemptScope, control_scope_matches, current_control_scope, current_scope
 from .control_state import ControlState
-from .managed_intent import OFFLINE_PAUSE, ControlIntent, decode_intent, write_intent
+from .managed_intent import OFFLINE_PAUSE, ControlIntent, decode_intent, record_automatic_pause, write_intent
 from .managed_recovery import local_recovery_binding
 from .managed_settlement import require_settled_debt
 from .managed_sources import ORDINARY_HOLD as KEY
@@ -114,7 +114,10 @@ class RecoveryControl:
             with j.atomic(retry_busy=True):
                 can_restore = not isinstance(self.offline_return_decision(c), Pending)
                 paused = write_intent(j, intent, "paused")
-                j.put(OFFLINE_PAUSE, paused.revision if can_restore else True)
+                if can_restore:
+                    record_automatic_pause(j, paused, "cloud_connection_failed")
+                else:
+                    j.put(OFFLINE_PAUSE, True)
                 g.controls._claim(True, stopping=True)
 
     # Automatic Return never assumes authority over an outstanding owner operation or an unsettled session.
@@ -280,7 +283,12 @@ class RecoveryControl:
 
     # A known owner session can explain disagreement between the native connector and the Stop report.
     def owner_closure_gap(
-        self, handover: NativeBoundedHandover, native: HandoverEvidence, local: int | None = None
+        self,
+        handover: NativeBoundedHandover,
+        native: HandoverEvidence,
+        local: int | None = None,
+        *,
+        held_plugged: bool = False,
     ) -> bool:
         j, physical = self.journal, native.physical
         active = j.active()
@@ -296,7 +304,11 @@ class RecoveryControl:
                 return False
         elif (
             physical.native_transaction_id is not None
-            or not (active_unplugged_owner or local == closed and unplugged)
+            or not (
+                active_unplugged_owner
+                or (local == closed and unplugged)
+                or (held_plugged and local == active and j.is_owner_session(local))
+            )
             or (local == closed and native.output_limit_a == 0)
         ):
             return False
@@ -523,7 +535,7 @@ class RecoveryControl:
         local = j.active()
         return self.ordinary_active(c) and j.is_owner_session(local) and self._owner_hold_matches(j.get(KEY, {}), local)
 
-    # An unplugged owner session still needs its genuine Stop even while iCS is unavailable.
+    # An owner closure still needs its genuine Stop even while iCS is unavailable.
     def held_owner_stop_pending(self, c: ManagedController) -> bool:
         return self._held_active_owner(c) and self.journal.get(KEY, {}).get("reason") in (
             "unplugged_session_pending",
@@ -579,7 +591,7 @@ class RecoveryControl:
             return decision
         with j.atomic(retry_busy=True):
             paused = write_intent(j, authority.intent, "paused")
-            j.put(OFFLINE_PAUSE, paused.revision)
+            record_automatic_pause(j, paused, "local_charge")
             j.control.complete(authority.ticket, uncertain=False)
         return None
 
@@ -837,13 +849,14 @@ class RecoveryControl:
             self.recognize_owner_closure(session.native_bounded, native, inventory_audited=True)
             self.journal.phase.recover()
 
-    # A fresh audit can recognize unplugging after a native outage has already claimed this owner session.
+    # A fresh audit can recognize closure after a native outage has already claimed this owner session.
     def recognize_owner_closure(
         self, handover: NativeBoundedHandover, native: HandoverEvidence, *, inventory_audited: bool
     ) -> None:
         j = self.journal
         hold, local = j.get(KEY, {}), j.active()
         intent, revision = j.get("managed_control_intent"), hold.get("revision")
+        plugged = native.physical.cp == "B" and native.physical.connection == "Plug"
         if (
             hold.get("state") == "holding"
             and hold.get("reason") == "native_observation_unavailable"
@@ -851,12 +864,13 @@ class RecoveryControl:
             and intent is not None
             and decode_intent(intent) == ControlIntent("app", revision)
             and self._owner_hold_matches(hold, local)
-            and self.owner_closure_gap(handover, native, local)
+            and self.owner_closure_gap(handover, native, local, held_plugged=plugged)
         ):
             if not inventory_audited:
                 handover.book.owned_present(native.physical)
             if recorded_station_profile(j, handover.spec.digest, handover.spec.boot_digest):
-                j.put(KEY, {**hold, "reason": "unplugged_session_pending"})
+                reason = "native_closure_pending" if plugged else "unplugged_session_pending"
+                j.put(KEY, {**hold, "reason": reason})
 
     # Bind the new observation to the admitted installation before any native wait.
     def begin_introduction(self, handover: NativeBoundedHandover) -> IntroductionClaim:
