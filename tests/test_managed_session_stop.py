@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 from websockets.asyncio.client import connect
 
+from ics_proxy_core import commands
 from ics_proxy_core.engine import managed_session_stop, rpc
 from ics_proxy_core.engine.command_outcomes import ForwardedReply, OwnerWire
 from ics_proxy_core.engine.gateway import Gateway, decode
@@ -331,10 +332,14 @@ async def test_session_stop_shares_the_vendor_wire_in_either_order(
         assert bench.firmware.effective_limit() == 6 and c.requests.intent().mode == "app"
 
 
-# Intent: live status learns the exact predecessor's acceptance even when the Stop joined before its reply.
-# Why: the reply and physical closure are different facts for both local and vendor Stop requests.
+# Intent: keep a late acceptance with the completed receipt in either order with independent closure.
+# Why: routine rotation can discard the original vendor mutation while the exact local receipt still exists.
 @pytest.mark.parametrize("first", ["local", "vendor"])
-async def test_live_diagnostics_learn_joined_stop_reply(tmp_path, tls, unused_tcp_port_factory, monkeypatch, first):
+@pytest.mark.parametrize("closure_first", [False, True], ids=["reply-first", "closure-first"])
+async def test_live_diagnostics_learn_joined_stop_reply(
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch, first, closure_first
+):
+    monkeypatch.setattr(managed_proxy, "_SUPERVISION_POLL_SECONDS", 0.25)
     async with running_service(tmp_path, tls, unused_tcp_port_factory, monkeypatch, 6) as service:
         charge = service.charge
         c, journal, bench = charge.controller, charge.session.journal, charge.rig.bench
@@ -363,19 +368,56 @@ async def test_live_diagnostics_learn_joined_stop_reply(tmp_path, tls, unused_tc
         assert binding["joined"] == 1 and "accepted_attempt" not in binding
         before = (await call(service.api, "status"))["result"]["diagnostics"]["pending_commands"][0]
         assert (before["action"], before["state"], before["confirmation"]) == ("stop_session", "running", "pending")
+        predecessor_id = predecessor if first == "local" else binding["vendor_attempts"][0]
+        wire = decode(held[0])[1]
 
-        await send(build_call_result(decode(held[0])[1], {"status": "Accepted"}))
+        if closure_first:
+            await service.close_daily(local)
+            await until(lambda: journal.outcomes.owner(request).result["_session_stop"].get("closure_verified") is True)
+            assert c.requests.receipt(request)["state"] == "running"
+        await send(build_call_result(wire, {"status": "Accepted"}))
         answer = await asyncio.wait_for(earlier, 3)
         if first == "vendor":
             assert answer[0] == 3 and answer[2] == {"status": "Accepted"}
-        status = (await call(service.api, "status"))["result"]
-        assert status["charging_session_open"] is True
-        after = status["diagnostics"]["pending_commands"][0]
-        assert (after["action"], after["state"], after["confirmation"]) == ("stop_session", "running", "reply_received")
-        assert (await call(service.api, "receipt", request_id=request))["result"]["state"] == "running"
+        if not closure_first:
+            status = (await call(service.api, "status"))["result"]
+            assert status["charging_session_open"] is True
+            after = status["diagnostics"]["pending_commands"][0]
+            assert (after["action"], after["state"], after["confirmation"]) == (
+                "stop_session",
+                "running",
+                "reply_received",
+            )
+            assert (await call(service.api, "receipt", request_id=request))["result"]["state"] == "running"
+            await service.close_daily(local)
 
-        await service.close_daily(local)
         await until(lambda: c.requests.receipt(request)["state"] == "completed")
+        assert journal.outcomes.owner(request).result["_session_stop"]["accepted_attempt"] == {
+            "origin": first,
+            "identifier": predecessor_id,
+            "wire": wire,
+        }
+        # Shrink only the capacity so the next genuine vendor command exercises ordinary bounded rotation.
+        if first == "vendor":
+            with monkeypatch.context() as rotation:
+                rotation.setattr(journal, "capacity", 1)
+                result = await bench.cloud_call(
+                    "rotate-confirmed-stop",
+                    "SetChargingProfile",
+                    commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 6, 1001, stack_level=0),
+                )
+                assert result[0] == 3 and result[2] == {"status": "Accepted"}
+            assert journal.outcomes.vendor(predecessor_id) is None
+        report = stop_incident_report(journal.path, tmp_path / "events.jsonl", request_reference=reference(request))
+        assert report["journal"]["request"]["state"] == "completed"
+        (attempt,) = report["wire"]["joined_attempts"]
+        assert (attempt["origin"], attempt["request"], attempt["reply"]) == (
+            first,
+            reference(predecessor_id),
+            "accepted",
+        )
+        if first == "vendor":
+            assert attempt["reply_source"] == "joined_receipt"
         assert sum(frame[2] == "RemoteStopTransaction" for frame in bench.device_calls) == 1
 
 
@@ -1561,6 +1603,13 @@ async def test_service_retries_session_stop_receipt_updates(
                 closed = await service.published(before["checked_at"], state="healthy", desired="app")
                 assert closed["charging_session_open"] is False
                 assert controller.requests.receipt(request)["state"] == "running"
+                status = (await call(service.api, "status"))["result"]
+                confirmations = [
+                    row["confirmation"]
+                    for row in status["diagnostics"]["pending_commands"]
+                    if row["action"] == "stop_session"
+                ]
+                assert confirmations == ["reply_received"] * (2 if request != dispatched else 1)
         finally:
             if not service.task.done():
                 journal.db.execute("DROP TRIGGER refuse_stop_receipt_update")

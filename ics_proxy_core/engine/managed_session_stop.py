@@ -23,10 +23,10 @@ from .stop_settlement import (
     STOP_BUFFERED_CLOSURE,
     STOP_CLOSURE_FIELDS,
     STOP_CLOSURE_VERIFIED,
-    STOP_COMPLETION_FIELDS,
     STOP_REJECTION_FIELDS,
     STOP_SESSION,
     StopRejections,
+    stop_completion_fields,
     stop_rejections,
     stop_reply_window_predicate,
 )
@@ -353,11 +353,13 @@ class ManagedSessionStop:
             return
         session = self.controller.session
         pending, windows = stop_reply_window_predicate(session.journal, session.gateway.charger.reply_windows())
+        where, bindings = f"{closed} AND NOT {pending}", (STOP_SESSION, *proofs, *windows)
+        fields, accepted = stop_completion_fields(session.journal, rejections, where, bindings)
         self._update_receipts(
-            STOP_COMPLETION_FIELDS,
-            (),
-            f"{closed} AND NOT {pending}",
-            (STOP_SESSION, *proofs, *windows),
+            fields,
+            accepted,
+            where,
+            bindings,
             rejections=rejections,
             retry_after_rollback=True,
         )

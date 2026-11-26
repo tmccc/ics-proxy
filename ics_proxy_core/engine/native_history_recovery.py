@@ -35,10 +35,10 @@ from .native_history import (
 )
 from .native_start_attempts import split_attempts
 from .stop_settlement import (
-    STOP_COMPLETION_FIELDS,
     STOP_SESSION,
     StopRejections,
     settle_saved_stop_rejections,
+    stop_completion_fields,
     stop_rejections,
 )
 from .store import Journal, RecoveryRequiredError, fingerprint
@@ -123,9 +123,11 @@ def _unrelated_history_requests(journal: Journal, allow_closed_stop_receipts: bo
 
 # Project already verified closure inside the caller's history transaction.
 def _complete_history_stops(journal: Journal, rejections: StopRejections) -> None:
+    where, bindings = rejections.closed_receipts, (STOP_SESSION,)
+    fields, accepted = stop_completion_fields(journal, rejections, where, bindings)
     journal.db.execute(
-        f"{rejections.prefix}UPDATE managed_requests SET {STOP_COMPLETION_FIELDS} WHERE {rejections.closed_receipts}",
-        (*rejections.bindings, STOP_SESSION),
+        f"{rejections.prefix}UPDATE managed_requests SET {fields} WHERE {where}",
+        (*rejections.bindings, *accepted, *bindings),
     )
 
 

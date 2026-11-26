@@ -233,24 +233,18 @@ def joined_attempts(
     db: sqlite3.Connection, tables: set[str], request: str, local: int, binding: dict[str, Any]
 ) -> list[dict[str, Any]]:
     attempts = []
+    saved = None
     if (accepted := joined_stop_acceptance(binding, request)) is not None:
-        attempts.append(
-            {
-                "origin": accepted.origin,
-                "request": reference(accepted.identifier),
-                "reply": "accepted",
-                "reply_source": "joined_receipt",
-            }
-        )
+        saved = {"request": reference(accepted.identifier), "reply": "accepted", "reply_source": "joined_receipt"}
     for origin, key in (("local", "local_attempts"), ("vendor", "vendor_attempts")):
         tokens = binding.get(key)
         if not isinstance(tokens, list):
             continue
         unique = dict.fromkeys(token for item in tokens if (token := identifier(item)) is not None and token != request)
         for token in tuple(unique)[:MAX_REPORT_EVENTS]:
-            wire = wire_fields()
+            reply = wire_fields()
             if origin == "local":
-                wire = owner_reply(db, tables, token, local)
+                reply = owner_reply(db, tables, token, local)
             elif (
                 "mutations" in tables
                 and db.execute(
@@ -259,13 +253,19 @@ def joined_attempts(
             ):
                 scope_local, call, result = vendor_scope(db, tables, token)
                 if scope_local == local:
-                    wire = vendor_reply(db, tables, token, call, result)
+                    reply = vendor_reply(db, tables, token, call, result)
+            if accepted is not None and (accepted.origin, accepted.identifier) == (origin, token):
+                if saved is None:
+                    continue
+                if reply["reply"] != "accepted":
+                    reply = saved
+                saved = None
             attempts.append(
                 {
                     "origin": origin,
                     "request": reference(token),
-                    "reply": wire["reply"],
-                    "reply_source": wire["reply_source"],
+                    "reply": reply["reply"],
+                    "reply_source": reply["reply_source"],
                 }
             )
     wires = binding.get("owner_wire_attempts")
@@ -273,8 +273,16 @@ def joined_attempts(
         unique_wires = dict.fromkeys(wire for item in wires if (wire := wire_id(item)) is not None)
         for wire in tuple(unique_wires)[:MAX_REPORT_EVENTS]:
             evidence = joined_owner_wire(db, tables, wire, local)
+            if accepted is not None and accepted.origin == "local" and accepted.wire == wire:
+                if saved is None:
+                    continue
+                if evidence is None or evidence["reply"] != "accepted":
+                    evidence = saved
+                saved = None
             if evidence is not None:
                 attempts.append({"origin": "local", **evidence})
+    if accepted is not None and saved is not None:
+        attempts.insert(0, {"origin": accepted.origin, **saved})
     return attempts
 
 
