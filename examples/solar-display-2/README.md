@@ -8,7 +8,10 @@ A new render can restore the dashboard after a Home Assistant clock correction. 
 and the renderer serves an older image again, a previously expired image can reappear.
 
 The Home Assistant automation verifies the device, screen, position and original marker before sending a request.
-It checks the displayed frame’s render time when it receives the tap, so a delayed tap expires with that frame.
+It passes the displayed frame’s render time to the iCS action, which also checks its age against elapsed time.
+The action requires a new frame after iCS integration setup. After it detects a backward clock adjustment, it
+requires a frame timestamp beyond the preceding clock range. The charger buttons may appear available while
+the Home Assistant clock catches up and the display receives a new frame.
 Start also requires the current control revision and permission to start. Stop requires the target to
 match the current open session. The touchscreen shows pending and unconfirmed feedback for the exact request from
 the live Home Assistant helper, including between image downloads. While the automation is enabled, an
@@ -44,8 +47,9 @@ display, touch and brightness components, its fallback dashboard, and the render
    The package synchronizes its Home Assistant clock every 10 seconds to check render times. Set the renderer to
    update every 25 seconds or less with the example's 10-second download interval and 5-second HTTP timeout.
    This leaves time for clock rounding and processing before the picture expires. Update the firmware, preview
-   template and touch automation together so the tap includes the required render timestamp. When upgrading an
-   earlier example, add the new feedback expiry script from [request-helper.yaml](request-helper.yaml), keep the
+   template, touch automation and iCS Home Assistant integration together so the render timestamp is checked
+   through the action. When upgrading an earlier example, add the feedback expiry script from
+   [request-helper.yaml](request-helper.yaml), keep the
    request helper and its options, and remove `initial: idle` if the earlier example set it.
 4. Confirm that the automation entity ID used by the view and the firmware's `canvas_ics_automation_entity`
    substitution matches the installed automation.

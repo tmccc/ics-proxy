@@ -8,9 +8,11 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
+from ics_proxy_core.engine import managed_session_stop
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_debt_recovery import KEY
 from ics_proxy_core.engine.managed_stop_delivery import REJECTION, WIRE_ACK
@@ -31,8 +33,11 @@ from tools import reconcile_managed_debt as operator
 
 
 # Intent: accept the real closure of a session that ends while its Stop is still waiting for the wire.
-# Why: a fresh native close may withdraw the Stop target before the matching OCPP report reaches the proxy.
-async def test_queued_stop_awaits_matching_report_after_native_closure(tmp_path, tls, unused_tcp_port, monkeypatch):
+# Why: a fresh native close may withdraw the Stop target before the matching report, expiry, or replacement.
+@pytest.mark.parametrize("wait_end", ["report_first", "expired", "replaced", "scope_lost"])
+async def test_queued_stop_awaits_matching_report_after_native_closure(
+    tmp_path, tls, unused_tcp_port, monkeypatch, wait_end
+):
     async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
         c, j, bench = t.controller, t.session.journal, t.rig.bench
         local = await positive_flow(t, "daily")
@@ -41,7 +46,9 @@ async def test_queued_stop_awaits_matching_report_after_native_closure(tmp_path,
         assert target is not None
         request = uuid.uuid4().hex
         mark = len(bench.received_limits)
-        gate = t.session.gateway.charger.gate
+        gateway = t.session.gateway
+        gate = gateway.charger.gate
+        metadata_revision = gateway.boot_metadata_revision
         async with gate.enter(10):
             assert c.command(request, "stop_session", intent.revision, target=target)["state"] == "accepted"
             await asyncio.wait_for(gate.restrictive_waiting.wait(), 3)
@@ -54,12 +61,25 @@ async def test_queued_stop_awaits_matching_report_after_native_closure(tmp_path,
             assert status["state"] == "reconciling"
             assert j.active() == local and c.session_stop.target() is None
             assert c.requests.receipt(request)["state"] == "accepted"
+            assert j.outcomes.owner(request).result["_session_stop"]["native_closed_first"] is True
+            if wait_end == "scope_lost":
+                monkeypatch.setattr(gateway, "boot_metadata_revision", metadata_revision + 1)
+            elif wait_end != "report_first":
+                clock = SimpleNamespace(time=time.time, monotonic=lambda: time.monotonic() + 21)
+                with monkeypatch.context() as confirmation:
+                    confirmation.setattr(managed_session_stop, "time", clock)
+                    c.session_stop.expire(replaced=wait_end == "replaced")
+                assert c.requests.receipt(request)["state"] == "uncertain"
+                assert (await asyncio.wait_for(c.tick(), 3))["state"] == "reconciling"
 
         assert c.session_stop.worker is not None
         await asyncio.wait_for(c.session_stop.worker, 3)
-        assert c.requests.receipt(request)["state"] == "accepted"
+        expected = "uncertain" if wait_end in ("expired", "replaced") else "accepted"
+        assert c.requests.receipt(request)["state"] == expected
         assert not bench.remote_stop.is_set()
 
+        if wait_end == "scope_lost":
+            monkeypatch.setattr(gateway, "boot_metadata_revision", metadata_revision)
         await natural_stop(t, local)
         assert (await mp.healthy(c))["charging_session_open"] is False
         receipt = c.requests.receipt(request, include_binding=True)

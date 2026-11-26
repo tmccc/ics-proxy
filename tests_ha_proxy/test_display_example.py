@@ -10,10 +10,15 @@ import pytest
 import yaml
 from homeassistant import bootstrap, loader
 from homeassistant.config_entries import ConfigEntries
-from homeassistant.core import HomeAssistant, SupportsResponse
+from homeassistant.const import EVENT_CALL_SERVICE
+from homeassistant.core import HomeAssistant, SupportsResponse, callback
+from homeassistant.helpers import condition, trigger
 from homeassistant.helpers.template import Template
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
+
+from tests_ha_proxy.conftest import setup_proxy
+from tests_ha_proxy.test_client import peer as peer
 
 PROJECT = Path(__file__).resolve().parents[1] / "examples" / "solar-display-2"
 SESSION = "binary_sensor.ics_proxy_session_open"
@@ -27,6 +32,13 @@ VIEW = "replace-with-editor-view-id"
 TARGET = "b" * 64
 REVISION = 42
 START_MARKER = f"start:{REVISION:014x}"
+
+
+# These tests of display feedback observe the charger command separately from its image timestamp.
+def command_fields(call):
+    fields = dict(call.data)
+    assert type(fields.pop("canvas_rendered_at_epoch")) is int
+    return fields
 
 
 # Decode the produced cells at the firmware's sample locations after RGB565 conversion.
@@ -191,7 +203,7 @@ async def test_public_display_example_with_actual_ha(tmp_path):
     async def request(call):
         direction = call.data["action"]
         assert hass.states.get(PENDING).state == ("starting" if direction == "start" else "stopping")
-        calls.append(dict(call.data))
+        calls.append(command_fields(call))
         await gate.wait()
         if outcome:
             hass.states.async_set(
@@ -491,7 +503,7 @@ async def test_display_rejects_expired_tap_after_clock_step(tmp_path, monkeypatc
 
     # Record the action only if the actual automation admits the tap.
     async def request(call):
-        calls.append(dict(call.data))
+        calls.append(command_fields(call))
         called.set()
         return {"confirmed": True}
 
@@ -514,6 +526,76 @@ async def test_display_rejects_expired_tap_after_clock_step(tmp_path, monkeypatc
         assert calls == [expected]
 
 
+# Intent: a delayed tap cannot outlive its frame across a clock rewind or reuse an old epoch.
+# Why: both wall ages can agree even while the rendered frame has expired in elapsed time.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+async def test_display_service_rejects_pre_rewind_frames(actual_hass, peer, monkeypatch, starting):
+    from custom_components.ics_proxy import session_service
+
+    hass = actual_hass
+    base = int(datetime.now(UTC).timestamp())
+    wall, elapsed = base, 100
+    monkeypatch.setattr(session_service, "_frame_clock", lambda: (wall, elapsed))
+    if not starting:
+        peer["state"].update(charging_session_open=True, can_start=False, stop_target=TARGET)
+    peer["state"]["control_revision"] = REVISION
+    await asyncio.gather(condition.async_setup(hass), trigger.async_setup(hass))
+    await setup_proxy(hass, peer["port"])
+    helper = yaml.safe_load((PROJECT / "request-helper.yaml").read_text())
+    config = yaml.safe_load((PROJECT / "controls.yaml").read_text())
+    config["triggers"][1] = {"trigger": "event", "event_type": CLEANUP_TICK, "id": "clear_feedback"}
+    assert await async_setup_component(hass, "input_select", helper)
+    assert await async_setup_component(hass, "script", helper)
+    assert await async_setup_component(hass, "automation", {"automation": [config]})
+    await hass.async_start()
+    await hass.async_block_till_done()
+
+    monkeypatch.setattr(dt_util, "now", lambda *args: datetime.fromtimestamp(wall, UTC))
+    action = "start" if starting else "stop_session"
+    unconfirmed = "starting_timeout" if starting else "stopping_timeout"
+    submitted: asyncio.Queue[int] = asyncio.Queue()
+
+    # Verify the automation passed each exact timestamp to the service, including the refused frames.
+    @callback
+    def note_action(event):
+        data = event.data
+        if data["domain"] == "ics_proxy" and data["service"] == "session_command":
+            submitted.put_nowait(data["service_data"]["canvas_rendered_at_epoch"])
+
+    hass.bus.async_listen(EVENT_CALL_SERVICE, note_action)
+
+    # Wait for this tap's action and feedback without also waiting for the background feedback expiration.
+    async def tap_frame(epoch, age, feedback):
+        send_display_tap(hass, starting, canvas_age=age, frame_rendered_at=datetime.fromtimestamp(epoch, UTC))
+        assert await asyncio.wait_for(submitted.get(), 3) == epoch
+        await wait_for_feedback(hass, feedback)
+
+    # A cached image from before integration setup has no elapsed-time baseline.
+    wall, elapsed = base + 2, 102
+    await tap_frame(base - 1, 4, unconfirmed)
+    assert action not in peer["commands"]
+
+    # This tap was sent when its frame was five seconds old and arrives 50 seconds after render.
+    # A backward step leaves a fresh looking wall age and matches the automation's check.
+    wall, elapsed = base + 31, 151
+    await tap_frame(base + 1, 6, unconfirmed)
+    assert action not in peer["commands"]
+
+    # A rerendered marker at the old range boundary may still identify an earlier tap.
+    wall, elapsed = base + 51, 171
+    await tap_frame(base + 51, 1, unconfirmed)
+    assert action not in peer["commands"]
+
+    # The display may legitimately be one download behind the newest preview after the clock catches up.
+    wall, elapsed = base + 63, 183
+    await tap_frame(base + 52, 12, "idle")
+    (command,) = [request for request in peer["requests"] if request["command"] == action]
+    assert command["revision"] == REVISION
+    assert command.get("target") == (None if starting else TARGET)
+    assert "canvas_rendered_at_epoch" not in command
+    await hass.services.async_call("script", "turn_off", {"entity_id": EXPIRY}, blocking=True)
+
+
 # Intent: a Home Assistant restart carries an interrupted request into the existing unconfirmed feedback.
 # Why: the independent proxy can still settle that request after the original Home Assistant run ends.
 @pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
@@ -527,7 +609,7 @@ async def test_display_restores_interrupted_feedback_after_ha_restart(tmp_path, 
 
     # Hold the service response until Core shuts down this automation run.
     async def request(call):
-        calls.append(dict(call.data))
+        calls.append(command_fields(call))
         request_started.set()
         return await asyncio.Future()
 
@@ -578,7 +660,7 @@ async def test_display_discards_restored_feedback_after_reenabling(tmp_path):
 
     # Save a real unconfirmed result before disabling the automation.
     async def request(call):
-        calls.append(dict(call.data))
+        calls.append(command_fields(call))
         return {"confirmed": False}
 
     async with run_display_core(tmp_path, request) as hass:
@@ -628,7 +710,7 @@ async def test_display_expiry_follows_only_its_timeout(tmp_path):
 
     # Keep the replacement Stop pending until the first expiry has fired.
     async def request(call):
-        calls.append(dict(call.data))
+        calls.append(command_fields(call))
         if call.data["action"] == "stop_session":
             await release_stop.wait()
         return {"confirmed": False}

@@ -233,6 +233,24 @@ def joined_owner_wire(db: sqlite3.Connection, tables: set[str], wire: str, local
     return None
 
 
+# Terminal replies survive journal rotation only for the original joined request or wire named by the receipt.
+def saved_joined_replies(
+    binding: dict[str, Any], request: str
+) -> tuple[dict[tuple[str, str], str], dict[str, tuple[str, str]]]:
+    requests: dict[tuple[str, str], str] = {}
+    wires: dict[str, tuple[str, str]] = {}
+    for field, status in (("additional_accepted_attempts", "accepted"), ("rejected_attempts", "rejected")):
+        items = binding.get(field)
+        if not isinstance(items, list):
+            continue
+        for item in items[:MAX_REPORT_EVENTS]:
+            if (attempt := saved_stop_attempt(item, request)) is not None:
+                requests.setdefault((attempt.origin, attempt.identifier), status)
+                if attempt.origin == "local" and attempt.wire is not None:
+                    wires.setdefault(attempt.wire, (attempt.identifier, status))
+    return requests, wires
+
+
 # An overlap borrows evidence only from attempts explicitly named in this receipt and bound to the same session.
 def joined_attempts(
     db: sqlite3.Connection, tables: set[str], request: str, local: int, binding: dict[str, Any]
@@ -241,18 +259,7 @@ def joined_attempts(
     saved = None
     if (accepted := joined_stop_acceptance(binding, request)) is not None:
         saved = {"request": reference(accepted.identifier), "reply": "accepted", "reply_source": "joined_receipt"}
-    rejected_attempts = binding.get("rejected_attempts")
-    rejected = (
-        {
-            attempt
-            for item in rejected_attempts[:MAX_REPORT_EVENTS]
-            if (attempt := saved_stop_attempt(item, request)) is not None
-        }
-        if isinstance(rejected_attempts, list)
-        else set()
-    )
-    rejected_requests = {(attempt.origin, attempt.identifier) for attempt in rejected}
-    rejected_wires = {attempt.wire: attempt.identifier for attempt in rejected if attempt.origin == "local"}
+    saved_requests, saved_wires = saved_joined_replies(binding, request)
     for origin, key in (("local", "local_attempts"), ("vendor", "vendor_attempts")):
         tokens = binding.get(key)
         if not isinstance(tokens, list):
@@ -277,8 +284,8 @@ def joined_attempts(
                 if reply["reply"] != "accepted":
                     reply = saved
                 saved = None
-            elif (origin, token) in rejected_requests and reply["reply"] != "rejected":
-                reply = {"reply": "rejected", "reply_source": "joined_receipt"}
+            elif (known := saved_requests.get((origin, token))) is not None and reply["reply"] != known:
+                reply = {"reply": known, "reply_source": "joined_receipt"}
             attempts.append(
                 {
                     "origin": origin,
@@ -298,12 +305,10 @@ def joined_attempts(
                 if evidence is None or evidence["reply"] != "accepted":
                     evidence = saved
                 saved = None
-            elif wire in rejected_wires and (evidence is None or evidence["reply"] != "rejected"):
-                evidence = {
-                    "request": reference(rejected_wires[wire]),
-                    "reply": "rejected",
-                    "reply_source": "joined_receipt",
-                }
+            elif (checkpoint := saved_wires.get(wire)) is not None:
+                predecessor, status = checkpoint
+                if evidence is None or evidence["reply"] != status:
+                    evidence = {"request": reference(predecessor), "reply": status, "reply_source": "joined_receipt"}
             if evidence is not None:
                 attempts.append({"origin": "local", **evidence})
     if accepted is not None and saved is not None:

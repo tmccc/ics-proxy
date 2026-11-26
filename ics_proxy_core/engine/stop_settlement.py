@@ -234,12 +234,14 @@ def stop_completion_fields(
     for request, raw_binding in rows:
         binding = json.loads(raw_binding)
         patch = joined_stop_rejection_patch(journal.outcomes, request, binding)
-        if (
-            joined_stop_acceptance(binding, request) is None
-            and (acceptance := next(joined_stop_replies(journal.outcomes, request, binding, "Accepted"), None))
-            is not None
-        ):
-            patch["accepted_attempt"] = asdict(acceptance)
+        accepted = dict.fromkeys(joined_stop_replies(journal.outcomes, request, binding, "Accepted"))
+        primary = joined_stop_acceptance(binding, request)
+        if primary is None and (primary := next(iter(accepted), None)) is not None:
+            patch["accepted_attempt"] = asdict(primary)
+        if primary is not None:
+            accepted.pop(primary, None)
+        if accepted:
+            patch["additional_accepted_attempts"] = [asdict(attempt) for attempt in accepted]
         if patch:
             patches[request] = {"_session_stop": patch}
     if not patches:

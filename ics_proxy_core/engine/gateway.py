@@ -12,7 +12,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from datetime import UTC, datetime
 from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
@@ -991,6 +991,7 @@ class Gateway:
         other_reply: VendorWriteReply | None = None
         other_answer: Frame | None = None
         dispatched = False
+        retained_predecessors = ExitStack()
         wire = "c-" + uuid.uuid4().hex
         priority = CommandPriority.RESTRICT if action == "RemoteStopTransaction" else CommandPriority.NORMAL
 
@@ -1118,13 +1119,20 @@ class Gateway:
                     raise DeniedError("cloud command no longer owns its original control scope")
                 require_transaction()
 
-            # Bind any earlier Stop attempts before queued work can outlast this session.
-            def admit() -> StopPredecessors | None:
+            # Bind and retain earlier Stop attempts before queued work can outlast this session.
+            def admit() -> None:
+                nonlocal stop_predecessors
                 require_origin()
                 if stop_evidence is None:
-                    return None
+                    return
                 assert local_transaction is not None and connection is not None
-                return self.controls.decisions.vendor_stop_predecessors(local_transaction, connection[0].boot)
+                stop_predecessors = self.controls.decisions.vendor_stop_predecessors(
+                    local_transaction, connection[0].boot
+                )
+                if stop_predecessors is not None and stop_predecessors.vendor_mutations:
+                    retained_predecessors.enter_context(
+                        self.journal.retain_vendor_stop_predecessors(stop_predecessors.vendor_mutations)
+                    )
 
             # The existing mutation owns the bound request and its translated physical target.
             def prepare_mutation(profile: int | None) -> str:
@@ -1142,9 +1150,9 @@ class Gateway:
                 return token_id
 
             if supervised and self.command_processor is not None:
-                stop_predecessors = await self.command_processor.run(admit, priority=priority)
+                await self.command_processor.run(admit, priority=priority)
             elif stop_evidence is not None:
-                stop_predecessors = self.decide(admit, priority=priority)
+                self.decide(admit, priority=priority)
             if write and action != "RemoteStopTransaction":
                 await self.controls.ensure_ceiling(guard=require_origin)
             if action == "RemoteStartTransaction":
@@ -1261,6 +1269,7 @@ class Gateway:
                 return reply_as(other_answer, token)
             text = build_call_error(token, "InternalError", "charger outcome is unconfirmed; request was not replayed")
         finally:
+            retained_predecessors.close()
             self.decide(finish, priority=priority)
         return text
 

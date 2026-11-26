@@ -131,8 +131,9 @@ actions:
       - action: ics_proxy.session_command
         continue_on_error: true
         data: >-
-          {{ {'action': 'start', 'revision': start_revision}
-             if starting else {'action': 'stop_session', 'target': frame_control[5:]} }}
+          {{ {'action': 'start', 'revision': start_revision, 'canvas_rendered_at_epoch': canvas_rendered_at}
+             if starting else {'action': 'stop_session', 'target': frame_control[5:],
+                               'canvas_rendered_at_epoch': canvas_rendered_at} }}
         response_variable: proxy_result
       - variables:
           next_feedback: >-

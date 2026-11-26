@@ -170,6 +170,9 @@ class ManagedSessionStop:
                     and not native.physical.transaction_open
                     and c.native.owner_closure_observed(scope.local, time.time())
                 ):
+                    c.commands.decide(
+                        partial(self._queued_stop, scope.local, native), priority=CommandPriority.RESTRICT
+                    )
                     raise StopAlreadyHandledError  # The fresh native closure still needs the genuine Stop report.
                 raise RecoveryRequiredError("Stop lost its current session")
             if time.monotonic() >= scope.confirmation_deadline:
@@ -208,14 +211,15 @@ class ManagedSessionStop:
         except sqlite3.Error:
             pass  # Preserve the receipt for expiry if the original store operation failed.
 
-    # A pre-dispatch refusal is final only while the original receipt proves no send and no join.
+    # A pre-dispatch refusal is final while the original receipt has no possible send, join or native closure.
     def _fail_unsent(self, scope: SessionStop) -> None:
         self._update_receipts(
             "state='failed',result=json_set(result,'$.classification','stop_not_sent')",
             (),
             "id=? AND action=? AND revision=? AND state='accepted' "
             "AND json_type(result,'$._session_stop.dispatched')='false' "
-            "AND json_type(result,'$._session_stop.joined') IS NULL",
+            "AND json_type(result,'$._session_stop.joined') IS NULL "
+            "AND json_type(result,'$._session_stop.native_closed_first') IS NOT 'true'",
             (scope.identifier, STOP_SESSION, scope.intent.revision),
             retry_after_rollback=True,
         )
@@ -242,6 +246,7 @@ class ManagedSessionStop:
         self._update_receipts(
             "state=CASE WHEN json_extract(result,'$._session_stop.dispatched') "
             "OR json_extract(result,'$._session_stop.joined') "
+            "OR json_type(result,'$._session_stop.native_closed_first') IS 'true' "
             f"OR {verified} "
             "THEN 'uncertain' ELSE 'failed' END,result=json_set(result,'$.classification',?)",
             (*proofs, "process_replaced" if replaced else "stop_not_confirmed"),
@@ -401,26 +406,52 @@ class ManagedSessionStop:
         ):
             pass  # Neither an unavailable local reading nor a cloud fault proves closure.
 
-    # A native-first closure can arrive before the exact pending Stop gets the wire.
-    def _queued_stop(self, local: int) -> bool:
+    # Remember a verified native-first closure while its exact unsent receipt still owns the wait.
+    def _queued_stop(self, local: int, native: HandoverEvidence) -> bool:
         c = self.controller
         connection = current_control_scope(c.session.gateway)
-        return connection is not None and self._has_receipts(
-            "action=? AND state='accepted' AND revision=? AND json_extract(result,'$.target')=? "
+        if connection is None or c.session.journal.active() != local:
+            return False
+        exact = (
+            "action=? AND revision=? AND json_extract(result,'$.target')=? "
             "AND json_extract(result,'$._session_stop.local')=? "
-            "AND json_type(result,'$._session_stop.dispatched')='false'",
-            (STOP_SESSION, c.requests.intent().revision, self._bound_target(connection, local), local),
-            SAVED_STOP_REJECTIONS,
+            "AND json_type(result,'$._session_stop.dispatched')='false'"
         )
+        where = f"{exact} AND state='accepted'"
+        bindings = STOP_SESSION, c.requests.intent().revision, self._bound_target(connection, local), local
+        if not self._has_receipts(where, bindings, SAVED_STOP_REJECTIONS):
+            return self._has_receipts(
+                f"{exact} AND state='uncertain' AND json_type(result,'$._session_stop.native_closed_first') IS 'true'",
+                bindings,
+                SAVED_STOP_REJECTIONS,
+            )
+        if (
+            native is c.native._current_stop_sample(None)
+            and not native.physical.transaction_open
+            and native.physical.power_w == 0
+            and c.native.owner_closure_observed(local, time.time())
+        ):
+            self._update_receipts(
+                "result=json_set(result,'$._session_stop.native_closed_first',json('true'))",
+                (),
+                f"{where} AND json_type(result,'$._session_stop.native_closed_first') IS NOT 'true'",
+                bindings,
+                retry_after_rollback=True,
+            )
+        return True
 
     # During a pending Stop, either of the two observations can confirm closure before the other.
     def closure_pending(self, native: HandoverEvidence) -> bool:
-        j, physical = self.controller.session.journal, native.physical
+        c, physical = self.controller, native.physical
+        j = c.session.journal
         if physical.power_w != 0 or any(value != 0 for value in native.currents_a + native.powers_w):
             return False
         active = j.active()
         if not physical.transaction_open and physical.native_transaction_id is None and active is not None:
-            return j.outcomes.session_stop_tracks_closure(active) or (native.is_fresh(5) and self._queued_stop(active))
+            return j.outcomes.session_stop_tracks_closure(active) or (
+                native.is_fresh(5)
+                and c.commands.decide(partial(self._queued_stop, active, native), priority=CommandPriority.RESTRICT)
+            )
         local = physical.native_transaction_id
         if not physical.transaction_open or local is None or active is not None:
             return False

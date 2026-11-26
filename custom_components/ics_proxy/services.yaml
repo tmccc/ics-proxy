@@ -23,6 +23,14 @@ session_command:
           min: 0
           max: 9007199254740991
           mode: box
+    canvas_rendered_at_epoch:
+      name: Canvas render epoch
+      description: Optional whole-second Unix timestamp encoded in the image displayed when the button was pressed.
+      selector:
+        number:
+          min: 1
+          max: 4294967295
+          mode: box
     include_request_reference:
       name: Include request reference
       description: Return a redacted reference for the attempted request. Use it to look up a local Stop incident.

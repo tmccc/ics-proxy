@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -83,6 +84,7 @@ class Journal:
         self.path = path
         self.identity = identity
         self.capacity = capacity
+        self._vendor_stop_followers: Counter[str] = Counter()
         if require_existing and not path.is_file():
             raise RecoveryRequiredError("the existing charger journal is required")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -462,6 +464,18 @@ class Journal:
             self.put("connection_epoch", epoch)
         return epoch
 
+    # Keep the exact earlier mutation while a queued vendor Stop can still need its reply after closure.
+    @contextmanager
+    def retain_vendor_stop_predecessors(self, mutations: tuple[str, ...]) -> Iterator[None]:
+        self._vendor_stop_followers.update(mutations)
+        try:
+            yield
+        finally:
+            for mutation in mutations:
+                self._vendor_stop_followers[mutation] -= 1
+                if self._vendor_stop_followers[mutation] == 0:
+                    del self._vendor_stop_followers[mutation]
+
     # Retain only a digest of a mutating RPC, never its possibly secret proprietary body.
     def mutation_intent(self, origin: str, action: str, payload: dict[str, Any]) -> str:
         digest = fingerprint(payload)
@@ -479,6 +493,7 @@ class Journal:
                 if entry.get("completed") is None
                 and entry["proof"]["kind"] in ("vendor-write", "vendor-start", "vendor-start-mapping")
             }
+            protected.update(self._vendor_stop_followers)
             grant = self.get("vendor_start_grant", {})
             if grant.get("mutation"):
                 protected.add(grant["mutation"])

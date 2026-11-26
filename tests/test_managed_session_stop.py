@@ -912,20 +912,22 @@ async def test_session_stop_joins_unanswered_pause(tmp_path, tls, unused_tcp_por
 
 
 # Intent: retain a protective Pause's reply alongside the ordinary Stop or older shutdown it overlapped.
-# Why: a late refusal cannot erase an acceptance or complete the join while an exact reply can still arrive.
+# Why: all definite replies have independent evidence and must remain available after bounded rotation.
 @pytest.mark.parametrize(
-    ("earlier", "pause_reply", "state", "age_zero"),
+    ("earlier", "earlier_reply", "pause_reply", "state", "age_zero", "pause_first"),
     [
-        ("session_stop", "Accepted", "completed", False),
-        ("session_stop", "Accepted", "completed", True),
-        ("session_stop", "Rejected", "failed", False),
-        ("vendor_stop", "Accepted", "completed", False),
-        ("shutdown", "Rejected", "completed", False),
-        ("legacy_shutdown", "Rejected", "completed", False),
+        ("session_stop", "Rejected", "Accepted", "completed", False, False),
+        ("session_stop", "Rejected", "Accepted", "completed", True, False),
+        ("session_stop", "Rejected", "Rejected", "failed", False, False),
+        ("vendor_stop", "Rejected", "Accepted", "completed", False, False),
+        ("vendor_stop", "Accepted", "Accepted", "completed", False, False),
+        ("vendor_stop", "Accepted", "Accepted", "completed", False, True),
+        ("shutdown", None, "Rejected", "completed", False, False),
+        ("legacy_shutdown", None, "Rejected", "completed", False, False),
     ],
 )
 async def test_session_stop_joins_protective_pause_and_earlier_stop(
-    tmp_path, tls, unused_tcp_port, monkeypatch, earlier, pause_reply, state, age_zero
+    tmp_path, tls, unused_tcp_port, monkeypatch, earlier, earlier_reply, pause_reply, state, age_zero, pause_first
 ):
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
         c, j, peer = t.controller, t.session.journal, t.session.gateway.charger
@@ -1004,19 +1006,29 @@ async def test_session_stop_joins_protective_pause_and_earlier_stop(
         await c.session_stop.confirm_while_blocked()
         assert j.outcomes.owner(request).result["_session_stop"]["closure_verified"] is True
         assert c.requests.receipt(request)["state"] == "running"
+        if pause_first:
+            await send(build_call_result(pause_wire, {"status": pause_reply}))
+            await until(lambda: pause_wire not in peer.reply_windows())
+            c.session_stop.expire()
+            assert c.requests.receipt(request)["state"] == "running"
         if first_wire is not None:
-            await send(build_call_result(first_wire, {"status": "Rejected"}))
+            await send(build_call_result(first_wire, {"status": earlier_reply}))
             await until(lambda: first_wire not in peer.reply_windows())
             c.session_stop.expire()
             if earlier == "session_stop":
                 assert c.requests.receipt(first)["result"]["classification"] == "stop_rejected"
-            assert c.requests.receipt(request)["state"] == "running"
-            (waiting,) = [row for row in snapshot(c, observed)["pending_commands"] if row["action"] == "stop_session"]
-            assert (waiting["state"], waiting["confirmation"]) == ("running", "pending")
+            if not pause_first:
+                assert c.requests.receipt(request)["state"] == "running"
+                (waiting,) = [
+                    row for row in snapshot(c, observed)["pending_commands"] if row["action"] == "stop_session"
+                ]
+                expected_confirmation = "pending" if earlier_reply == "Rejected" else "reply_received"
+                assert (waiting["state"], waiting["confirmation"]) == ("running", expected_confirmation)
 
-        await send(build_call_result(pause_wire, {"status": pause_reply}))
-        await until(lambda: pause_wire not in peer.reply_windows())
-        c.session_stop.expire()
+        if not pause_first:
+            await send(build_call_result(pause_wire, {"status": pause_reply}))
+            await until(lambda: pause_wire not in peer.reply_windows())
+            c.session_stop.expire()
         receipt = c.requests.receipt(request)
         assert receipt["state"] == state
         if state == "failed":
@@ -1026,7 +1038,7 @@ async def test_session_stop_joins_protective_pause_and_earlier_stop(
         report = stop_incident_report(
             j.path, t.session.prepared.config.incident_events, request_reference=reference(request)
         )
-        expected = [(reference(first), "rejected")] if first is not None else []
+        expected = [(reference(first), earlier_reply.lower())] if first is not None else []
         expected.append((reference(pause), pause_reply.lower()))
         assert [(item["request"], item["reply"]) for item in report["wire"]["joined_attempts"]] == expected
         if earlier == "vendor_stop":
