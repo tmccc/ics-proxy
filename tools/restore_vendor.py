@@ -21,7 +21,7 @@ from ics_proxy_core.engine.native_bounded import MANAGED_RESTORE_INTENT, ROUTE_F
 from ics_proxy_core.engine.native_bounded_handover import NativeBoundedHandover, NativePatch  # noqa: E402
 from ics_proxy_core.engine.native_history import audit_history  # noqa: E402
 from ics_proxy_core.engine.native_history_recovery import history_recovery_idle  # noqa: E402
-from ics_proxy_core.engine.native_http import read_native  # noqa: E402
+from ics_proxy_core.engine.native_http import NativeTransportUnavailableError, read_native  # noqa: E402
 from ics_proxy_core.engine.policy import Policy  # noqa: E402
 from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError  # noqa: E402
 from ics_proxy_core.engine.station import StationChoice  # noqa: E402
@@ -36,6 +36,61 @@ from ics_proxy_core.engine.trial_session import (  # noqa: E402
     preflight_native,
 )
 from tools.trial_proxy import emit, native_spec  # noqa: E402
+
+
+def emit_stage(stage: str) -> None:
+    emit({"restore_stage": stage})
+
+
+# Match only known failures. Native and configuration exception text can contain private values.
+RESTORE_GUIDANCE = {
+    (RecoveryRequiredError, "journal already has an active owner"): (
+        "journal_in_use",
+        "Verify the car is unplugged and the charger is idle. Stop the proxy service or wait for the other "
+        "restore to finish before retrying.",
+    ),
+    (SecurityError, "trial requires fresh matching unplugged zero-power evidence and a closed session"): (
+        "unplugged_idle_required",
+        "Verify the session is closed and the charger is at zero output, then unplug the car before retrying.",
+    ),
+    (RecoveryRequiredError, "restoration requires the charger unplugged with closed zero output"): (
+        "unplugged_idle_required",
+        "Keep the car unplugged and confirm the session is closed and the charger is at zero output before retrying.",
+    ),
+    (RecoveryRequiredError, "restoration needs a settled managed Pause at a selected 6 A"): (
+        "settled_pause_required",
+        "Resolve any pending recovery and verify a settled Pause with 6 A selected before running restore again.",
+    ),
+    (RecoveryRequiredError, "cleanup does not belong to this managed restoration"): (
+        "restore_record_mismatch",
+        "Check that the journal and commissioning files are the matching set for this installation.",
+    ),
+}
+
+
+def restore_guidance(stage: str, error: Exception) -> tuple[str, str]:
+    detail = error.args[0] if len(error.args) == 1 and isinstance(error.args[0], str) else ""
+    known = RESTORE_GUIDANCE.get((type(error), detail))
+    if known is not None:
+        return known
+    if isinstance(error, StaleEvidenceError | NativeTransportUnavailableError):
+        return (
+            "native_evidence_unavailable",
+            "Check that the charger is powered and reachable locally. Keep the car unplugged and verify the "
+            "charger is idle before retrying.",
+        )
+    if stage == "verify_vendor_connection" and isinstance(error, TimeoutError):
+        return (
+            "vendor_connection_unverified",
+            "Keep the proxy stopped and the car unplugged. Check that the charger can reach iCS, then retry "
+            "with the same restore files and journal.",
+        )
+    if stage == "validate_inputs":
+        return "inputs_unverified", "Check that the configuration and commissioning files are present and valid."
+    return (
+        "restore_stage_failed",
+        "Keep the proxy stopped and the car unplugged. Review the restore instructions for this stage before retrying.",
+    )
 
 
 # Freeze managed operation before lowering the independently enforced USER limit or removing any profile.
@@ -83,12 +138,20 @@ async def prepare_cleanup(
 
 # A restart after profile cleanup can finish on native HTTP without loading either OCPP peer's TLS files.
 async def finish_restore(
-    handover: NativeBoundedHandover, patch: NativePatch, close_listener: Callable[[], Awaitable[None]] | None = None
+    handover: NativeBoundedHandover,
+    patch: NativePatch,
+    close_listener: Callable[[], Awaitable[None]] | None = None,
+    *,
+    report_stage: Callable[[str], None] = emit_stage,
 ) -> dict[str, Any]:
     journal = handover.gateway.journal
     phase = journal.phase.read().value
     if phase == "complete":
-        handover.require_normal_restoration(await handover.observe())
+        try:
+            handover.require_normal_restoration(await handover.observe())
+        except Exception:
+            report_stage("verify_restored_configuration")
+            raise
         return {"original_configuration_restored": True, "native_backend_connected": True, "complete": True}
     if phase != "backend_restore_pending":
         raise RecoveryRequiredError("restoration requires verified profile cleanup")
@@ -103,19 +166,19 @@ async def finish_restore(
     async with asyncio.timeout(90):
         state = journal.get("native_bounded_handover", {})
         if not state.get("route_restored"):
-            emit({"restore_stage": "restore_original_route"})
+            report_stage("restore_original_route")
             await handover.restore_route(patch, retire)
         if journal.get("native_bounded_handover", {}).get("stage") != "settings_intent":
-            emit({"restore_stage": "verify_vendor_connection"})
+            report_stage("verify_vendor_connection")
             while not (await handover.observe_backend())["original_backend_connected"]:
                 await asyncio.sleep(1)
-        emit({"restore_stage": "restore_original_current"})
+        report_stage("restore_original_current")
         return await handover.restore_settings(patch)
 
 
 # While the maintenance listener owns the journal, the existing cleanup is the only available charger action.
-async def cleanup_profiles(session: TrialSession) -> None:
-    emit({"restore_stage": "verify_6_a_and_remove_proxy_profiles"})
+async def cleanup_profiles(session: TrialSession, report_stage: Callable[[str], None]) -> None:
+    report_stage("verify_6_a_and_remove_proxy_profiles")
     handover, gateway = session.native_bounded, session.gateway
     async with asyncio.timeout(90):
         await session.start()
@@ -131,7 +194,14 @@ async def cleanup_profiles(session: TrialSession) -> None:
 
 
 # Both stages use one private installation, and a stopped journal remains exclusive during every write.
-async def run(action: str, config_path: Path, spec_path: Path, native_port: int = 80) -> int:
+async def run(
+    action: str,
+    config_path: Path,
+    spec_path: Path,
+    native_port: int = 80,
+    *,
+    report_stage: Callable[[str], None] = emit_stage,
+) -> int:
     prepared = preflight_native(config_path)
     spec = native_spec(spec_path, prepared)
     if action == "check":
@@ -170,7 +240,7 @@ async def run(action: str, config_path: Path, spec_path: Path, native_port: int 
             before_send=lambda: require_unplugged(native),
         )
 
-    emit({"restore_stage": "verify_unplugged_managed_pause"})
+    report_stage("verify_unplugged_managed_pause")
     with closing(open_native_journal(config.journal, config.identity, spec, require_existing=True)) as journal:
         book = ResourceBook(journal, prepared.baseline)
         if journal.phase.read().value in ("backend_restore_pending", "complete"):
@@ -186,7 +256,7 @@ async def run(action: str, config_path: Path, spec_path: Path, native_port: int 
                 observe_profiles=observer.observe_profiles,
                 allow_unplugged=True,
             )
-            emit(await finish_restore(handover, patch))
+            emit(await finish_restore(handover, patch, report_stage=report_stage))
             return 0
         tls = prepare_tls(config)
         await prepare_cleanup(book, spec, observe, patch)
@@ -203,15 +273,18 @@ async def run(action: str, config_path: Path, spec_path: Path, native_port: int 
         if session.journal.get(MANAGED_RESTORE_INTENT) != spec.digest:
             raise RecoveryRequiredError("cleanup does not belong to this managed restoration")
         if session.journal.phase.read().value == "rollback":
-            await cleanup_profiles(session)
-        result = await finish_restore(session.native_bounded, patch, session.runtime.close)
+            await cleanup_profiles(session, report_stage)
+        result = await finish_restore(session.native_bounded, patch, session.runtime.close, report_stage=report_stage)
     finally:
-        await session.close()
+        try:
+            await session.close()
+        except Exception:
+            report_stage("close_maintenance_session")
+            raise
     emit(result)
     return 0
 
 
-# Configuration and native exception bodies can contain private values, so report only the failure class.
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("check", "restore"), nargs="?", default="check")
@@ -220,10 +293,26 @@ def main() -> int:
     parser.add_argument("--native-port", type=int, default=80)
     args = parser.parse_args()
     os.umask(0o077)
+    stage = "validate_inputs"
+
+    def report_stage(current: str) -> None:
+        nonlocal stage
+        stage = current
+        emit_stage(stage)
+
     try:
-        return asyncio.run(run(args.action, args.config, args.native_bounded_spec, args.native_port))
+        return asyncio.run(
+            run(args.action, args.config, args.native_bounded_spec, args.native_port, report_stage=report_stage)
+        )
     except Exception as error:
-        emit({"restore_failed": type(error).__name__, "complete": False})
+        reason, next_step = restore_guidance(stage, error)
+        emit({
+            "restore_failed": type(error).__name__,
+            "complete": False,
+            "restore_stage": stage,
+            "restore_reason": reason,
+            "next_step": next_step,
+        })
         return 1
 
 

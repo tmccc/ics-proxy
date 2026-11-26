@@ -7,6 +7,7 @@ import asyncio
 import copy
 import json
 import sqlite3
+import sys
 import time
 import uuid
 from contextlib import closing
@@ -143,6 +144,32 @@ def journal_facts(path):
     return rows, json.loads(phase[0])
 
 
+async def failed_restore_cli(action, config, spec, native_port=80):
+    child = await asyncio.create_subprocess_exec(
+        sys.executable, "-B", restore_vendor.__file__, action,
+        "--config", str(config), "--native-bounded-spec", str(spec), "--native-port", str(native_port),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(child.communicate(), 8)
+    finally:
+        if child.returncode is None:
+            child.kill()
+            await child.wait()
+    assert child.returncode == 1 and not stderr
+    assert str(config).encode() not in stdout and str(spec).encode() not in stdout
+    report = json.loads(stdout.splitlines()[-1])
+    assert report["complete"] is False
+    return report
+
+
+async def test_invalid_restore_inputs_report_the_stage_without_private_paths(tmp_path):
+    report = await failed_restore_cli("check", tmp_path / "private-config.json", tmp_path / "private-spec.json")
+    assert report["restore_stage"] == "validate_inputs"
+    assert report["restore_reason"] == "inputs_unverified"
+    assert "configuration and commissioning files" in report["next_step"]
+
+
 # Intent: input checks run offline and restoration refuses an already-owned journal before contacting the charger.
 # Why: a running proxy can keep operating while an installer checks inputs, and it must remain the only owner.
 async def test_restore_check_is_offline(tmp_path, tls, unused_tcp_port, monkeypatch):
@@ -156,6 +183,11 @@ async def test_restore_check_is_offline(tmp_path, tls, unused_tcp_port, monkeypa
         assert await run("check", config, spec, port) == 0
         with pytest.raises(RecoveryRequiredError, match="journal already has an active owner"):
             await run("restore", config, spec, port)
+        report = await failed_restore_cli("restore", config, spec, port)
+        assert report["restore_failed"] == "RecoveryRequiredError"
+        assert report["restore_stage"] == "verify_unplugged_managed_pause"
+        assert report["restore_reason"] == "journal_in_use"
+        assert "Stop the proxy service" in report["next_step"]
         assert peer.requests == reads and not peer.writes
 
 
@@ -167,10 +199,15 @@ async def test_restore_refuses_plugged_vehicle_before_any_write(tmp_path, tls, u
     ) as test:
         await stop_paused(test, unplug=False)
         peers_before = list(test.rig.bench.device_calls)
+        config, spec = tmp_path / "trial.json", spec_file(tmp_path, test.rig)
+        port = test.rig.prepared.observer.port
         with pytest.raises((SecurityError, RecoveryRequiredError)):
-            await run(
-                "restore", tmp_path / "trial.json", spec_file(tmp_path, test.rig), test.rig.prepared.observer.port
-            )
+            await run("restore", config, spec, port)
+        report = await failed_restore_cli("restore", config, spec, port)
+        assert report["restore_failed"] == "SecurityError"
+        assert report["restore_stage"] == "verify_unplugged_managed_pause"
+        assert report["restore_reason"] == "unplugged_idle_required"
+        assert "unplug the car" in report["next_step"]
         assert not test.rig.peer.writes and test.rig.bench.device_calls == peers_before
         assert test.rig.peer.configuration["AmpLmt"] == "32"
 
