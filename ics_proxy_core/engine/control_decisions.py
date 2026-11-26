@@ -1075,14 +1075,18 @@ class ControlDecisions:
         g = c.session.gateway
         if worker._settling_overlap is not None and not c.stopping:
             identifier, authority, local = worker._settling_overlap
-            if identifier == change["id"] and c.authority() == authority and j.active() == local and g.controls.ready:
+            lifecycle = j.lifecycle_position()
+            if identifier == change["id"] and c.authority() == authority and lifecycle[1] == local and g.controls.ready:
                 native = await c.native.read_result(owned=True)
                 if c.stopping or c.requests.intent() != expected:
                     return True, Pending(Prerequisite.SUPERSEDED, "current recovery yielded to newer control")
+                same_authority = c.authority() == authority
+                if same_authority and j.lifecycle_position() != lifecycle:
+                    worker._settling_overlap = None
+                    return False, Pending(Prerequisite.LIFECYCLE, "charger lifecycle changed during current recovery")
                 if (
                     not isinstance(native, Pending)
-                    and c.authority() == authority
-                    and j.active() == local
+                    and same_authority
                     and g.controls.ready
                     and g.controls.desired() == change["previous_a"]
                 ):

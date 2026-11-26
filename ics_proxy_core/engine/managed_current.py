@@ -267,11 +267,7 @@ class ManagedCurrentLimits:
         if pending is not None and pending.reason in (Prerequisite.SOURCE, Prerequisite.LIFECYCLE):
             # Fresh contradictory evidence revokes the previous release while that exact authority still owns it.
             reclaim = c.commands.decide(
-                lambda: (
-                    c.authority() == published
-                    and self.journal.active() == local
-                    and decisions.reclaim_current_recovery(self, change, expected)
-                ),
+                lambda: c.authority() == published and decisions.reclaim_current_recovery(self, change, expected),
                 priority=CommandPriority.RESTRICT,
             )
             if reclaim:
