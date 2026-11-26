@@ -286,7 +286,7 @@ class RecoveryCoordinator:
         result = await g.controls.release_result(
             attempt,
             guard=guard,
-            context=c.session.book.positive_release_guard(guard),
+            context=c.session.book.positive_release_guard(partial(decisions.release_send_decision, c, attempt)),
             rollback_guard=partial(decisions.require_release_boot, g, attempt),
             handoff=ReleaseHandoff(partial(decisions.publish_release, c, attempt, offline_pause), committed),
         )

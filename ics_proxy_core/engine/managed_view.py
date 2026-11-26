@@ -169,11 +169,11 @@ def session_history(journal: Journal) -> list[dict[str, Any]]:
 
 @dataclass(frozen=True)
 class ChargerHistorySummary:
-    """Redacted history, valid Stop times by transaction, and the last session's energy."""
+    """Redacted history, valid Stop and Start times by transaction, and the last session's energy."""
 
     sessions: list[dict[str, Any]]
     complete: bool
-    completed: dict[int, int]
+    completed: dict[int, tuple[int, int]]
     last_energy: float | None
     latest_completion_known: bool
 
@@ -183,7 +183,7 @@ def summarize_charger_history(
     records: tuple[dict[str, Any], ...], latest_closed: int | None = None
 ) -> ChargerHistorySummary:
     summaries: list[dict[str, Any]] = []
-    completed: dict[int, int] = {}
+    completed: dict[int, tuple[int, int]] = {}
     energy: dict[int, float] = {}
     latest_times = (0, 0)
     latest_energy: float | None = None
@@ -218,9 +218,9 @@ def summarize_charger_history(
                 unreadable_recent = True
             continue
         if stop:
-            completed[identifier] = stop
-            energy[identifier] = (last - first) / 1000
             times = stop, start
+            completed[identifier] = times
+            energy[identifier] = (last - first) / 1000
             if times > latest_times:
                 latest_times, latest_energy = times, energy[identifier]
             elif times == latest_times and latest_energy != energy[identifier]:

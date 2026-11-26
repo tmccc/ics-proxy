@@ -52,8 +52,8 @@ def test_latest_archive_uses_known_closure_order(history_journal: Journal) -> No
     archive = NativeHistoryArchive(history_journal)
     archive.observe([], [older, latest], allow_missing=True)
     archive.observe([], [latest], allow_missing=True)
-    assert latest_completion_available(history_journal, {1002: latest["stopTime"]}, 1002)
-    assert not latest_completion_available(history_journal, {1001: older["stopTime"]}, 1001)
+    assert latest_completion_available(history_journal, summarize_charger_history((latest,)).completed, 1002)
+    assert not latest_completion_available(history_journal, summarize_charger_history((older,)).completed, 1001)
 
 
 # Intent: identify the latest native completion even when starts and stops have different orders.
@@ -97,6 +97,25 @@ def test_native_completion_resolves_timestamp_ties(start: int, meter_stop: int, 
         assert history.last_energy == expected_energy
         managed = summarize_charger_history(records, latest_closed=1002)
         assert managed.latest_completion_known and managed.last_energy == 7.0
+
+
+# Intent: order an absent archive row sharing the visible latest Stop time by its recorded Start.
+# Why: a provably earlier record cannot hide the latest energy, while ties and uncertain times still can.
+@pytest.mark.parametrize(
+    ("archived_start", "available"),
+    [(1000, True), (1100, False), (1150, False), (None, False), (1300, False)],
+    ids=["earlier", "exact-tie", "later", "missing-start", "reversed-clock"],
+)
+def test_latest_native_completion_resolves_retained_timestamp_ties(
+    history_journal: Journal, archived_start: int | None, available: bool
+) -> None:
+    archived = row(1001) | {"startTime": archived_start, "stopTime": 1250}
+    visible = row(1002) | {"startTime": 1100, "stopTime": 1250, "meterStop": 12000}
+    archive = NativeHistoryArchive(history_journal)
+    archive.observe([], [archived, visible], allow_missing=True)
+    assert archive.observe([], [visible], allow_missing=True)["missing_records"] == 1
+    visible_history = summarize_charger_history((visible,))
+    assert latest_completion_available(history_journal, visible_history.completed) is available
 
 
 # Intent: any number of absent original records is archived and reported without rewriting original admission data.

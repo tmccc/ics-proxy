@@ -62,6 +62,11 @@ RESTORE_GUIDANCE = {
         "settled_pause_required",
         "Resolve any pending recovery and verify a settled Pause with 6 A selected before running restore again.",
     ),
+    (RecoveryRequiredError, "restoration needs an explicit managed Pause"): (
+        "settled_pause_required",
+        "Keep the car unplugged. Start the proxy service and request Pause charger in Home Assistant. "
+        "When Home Assistant reports Paused locally, stop the proxy service and rerun restore.",
+    ),
     (RecoveryRequiredError, "cleanup does not belong to this managed restoration"): (
         "restore_record_mismatch",
         "Check that the journal and commissioning files are the matching set for this installation.",
@@ -125,6 +130,8 @@ async def prepare_cleanup(
             or journal.get("control", {}).get("resume_limit") != 6
         ):
             raise RecoveryRequiredError("restoration needs a settled managed Pause at a selected 6 A")
+        if journal.get("managed_control_intent", {}).get("mode") == "app":
+            raise RecoveryRequiredError("restoration needs an explicit managed Pause")
         require_original_zero(journal, book, spec, native)
         with journal.atomic():
             journal.put(MANAGED_RESTORE_INTENT, spec.digest)

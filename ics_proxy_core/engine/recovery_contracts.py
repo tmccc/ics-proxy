@@ -21,6 +21,7 @@ class Prerequisite(Enum):
     LIFECYCLE = "lifecycle"
     CLOUD = "cloud"
     CLOUD_ACK = "cloud_ack"
+    CLOUD_DELIVERY = "cloud_delivery"
     ZERO_PROOF = "zero_proof"
     RECONCILIATION = "reconciliation"
     OWNER_RETURN = "owner_return"

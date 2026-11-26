@@ -188,8 +188,10 @@ class NativeHistoryArchive:
 
 
 # The latest completed charge is unknown if an absent archive entry could be as recent as the displayed one.
-def latest_completion_available(journal: Journal, completed: dict[int, int], closed: int | None = None) -> bool:
-    latest = max(completed.values(), default=0)
+def latest_completion_available(
+    journal: Journal, completed: dict[int, tuple[int, int]], closed: int | None = None
+) -> bool:
+    latest_times = max(completed.values(), default=(0, 0))
     try:
         for identifier, body in journal.db.execute("SELECT transaction_id,body FROM native_history_records"):
             if identifier in completed or (closed is not None and identifier < closed):
@@ -198,7 +200,12 @@ def latest_completion_available(journal: Journal, completed: dict[int, int], clo
             if not isinstance(record, dict) or type(stop := record.get("stopTime")) is not int:
                 return False
             start = record.get("startTime")
-            if stop > 0 and (closed is not None or type(start) is not int or not 0 < start < latest or stop >= latest):
+            if stop > 0 and (
+                closed is not None
+                or type(start) is not int
+                or not 0 < start < latest_times[0]
+                or (stop, start) >= latest_times
+            ):
                 return False
     except sqlite3.Error, ValueError:
         # A failed display check must not interrupt charger supervision or present a plausible older value.

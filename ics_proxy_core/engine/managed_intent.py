@@ -366,7 +366,7 @@ class ReturnSettlement:
         operation, pending = progress.operation, progress.pending
         if progress.state is RestoreState.REQUEST_NOT_SENT:
             return cls.failed(identifier, intent, possibly_sent=False), progress
-        await_cloud = False
+        await_cloud = pending is not None and pending.reason is Prerequisite.CLOUD_DELIVERY
         if (operation is None or not operation.claimed) and pending is not None:
             if preflight_disposition("explicit", pending) is PreflightDisposition.NOT_SENT:
                 return cls.failed(identifier, intent, possibly_sent=False), RestoreProgress(

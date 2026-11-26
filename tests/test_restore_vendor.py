@@ -26,7 +26,7 @@ from ics_proxy_core.frames import basic_auth_header
 from tests.charge_rig import actual_stop, positive_flow, ready
 from tests.current_rig import commissioned
 from tests.handover_helpers import NativeVehiclePeer
-from tests.managed_rig import starts
+from tests.managed_rig import healthy, starts
 from tests.prototype_rig import BOOT
 from tests.tls_support import tls as tls
 from tools import restore_vendor
@@ -276,6 +276,56 @@ async def test_restore_reports_missing_maintenance_credentials(tmp_path, tls, un
         assert "private key" in report["next_step"]
         assert str(private_key) not in json.dumps(report)
         assert rig.peer.requests == reads and not rig.peer.writes
+
+
+# Intent: tell the operator how to establish Pause before any restore change has been made.
+# Why: starting the proxy to request Pause is only possible before restoration begins.
+async def test_restore_reports_missing_managed_pause(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
+    ) as test:
+        rig = test.rig
+        assert (await healthy(test.controller))["owner_control_enabled"]
+        await test.session.close()
+        rig.bench.online = False
+        rig.bench.cp, rig.bench.connection = "A", "Unplug"
+        records, phase = journal_facts(rig.prepared.config.journal)
+
+        report = await failed_restore_cli(
+            "restore", tmp_path / "trial.json", spec_file(tmp_path, rig), rig.prepared.observer.port
+        )
+
+        assert report["restore_stage"] == "verify_unplugged_managed_pause"
+        assert report["restore_reason"] == "settled_pause_required"
+        assert "Start the proxy service and request Pause charger in Home Assistant" in report["next_step"]
+        assert "stop the proxy service and rerun restore" in report["next_step"]
+        assert journal_facts(rig.prepared.config.journal) == (records, phase)
+        assert not rig.peer.writes
+
+
+# Intent: keep the service retired when a resumed restore cannot verify the native current.
+# Why: an interrupted current write has already committed cleanup intent even if it never returned a reply.
+async def test_restore_keeps_proxy_stopped_after_interrupted_write(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
+    ) as test:
+        rig = test.rig
+        await stop_paused(test)
+        peer = rig.peer
+        args = ("restore", tmp_path / "trial.json", spec_file(tmp_path, rig), rig.prepared.observer.port)
+        peer.lost_patch = {"AmpLmt": "6"}
+        assert (await failed_restore_cli(*args))["restore_reason"] == "native_evidence_unavailable"
+        records, phase = journal_facts(rig.prepared.config.journal)
+        assert phase == "rollback"
+
+        assert peer.configuration["AmpLmt"] == "6"
+        peer.runtime_user = 320
+        report = await failed_restore_cli(*args)
+
+        assert report["restore_reason"] == "restore_stage_failed"
+        assert "Keep the proxy stopped" in report["next_step"]
+        assert journal_facts(rig.prepared.config.journal) == (records, phase)
+        assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}]
 
 
 # Intent: a plugged vehicle blocks managed restoration before any saved configuration or profile changes.

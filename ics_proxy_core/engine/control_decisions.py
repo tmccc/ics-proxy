@@ -359,6 +359,15 @@ class ControlDecisions:
 
         return guard
 
+    # A heartbeat or report can start waiting after native preflight and before the positive profile send.
+    def release_send_decision(self, controller: ManagedController, attempt: ReleaseAttempt) -> GateDecision:
+        decision = attempt.positive_guard()
+        if isinstance(decision, Pending):
+            return decision
+        if controller.session.gateway.vendor._pending or not ManagedFacts(controller).cloud_queue_empty():
+            return Pending(Prerequisite.CLOUD_DELIVERY, "shared control awaits the current cloud acknowledgement")
+        return ALLOW
+
     # Keep resource observations and their zero verdict together.
     def release_zero_decision(
         self, controller: ManagedController, native: HandoverEvidence, allow_offline: bool, continuing_local: int | None

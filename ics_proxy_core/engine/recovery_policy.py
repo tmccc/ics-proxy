@@ -110,7 +110,10 @@ def release_disposition(
     if (
         result.claimed
         and result.pending is not None
-        and (purpose == "automatic" or result.pending.reason in (Prerequisite.CLOUD_ACK, Prerequisite.SUPERSEDED))
+        and (
+            purpose == "automatic"
+            or result.pending.reason in (Prerequisite.CLOUD_ACK, Prerequisite.CLOUD_DELIVERY, Prerequisite.SUPERSEDED)
+        )
         and result.failure is None
         and not result.cancelled
         and not result.cleanup_failed
@@ -122,8 +125,10 @@ def release_disposition(
         and zero_ready
         and not faulted
     ):
-        # Once claimed, an explicit Return ends here; only automatic recovery can reuse the wait.
-        return ReleaseDisposition.WAIT if purpose == "automatic" else ReleaseDisposition.NOT_SENT
+        # Cloud delivery can defer the same Return after its unsent attempt has verified zero.
+        if purpose == "automatic" or result.pending.reason is Prerequisite.CLOUD_DELIVERY:
+            return ReleaseDisposition.WAIT
+        return ReleaseDisposition.NOT_SENT
     return ReleaseDisposition.FAULT
 
 
