@@ -253,12 +253,20 @@ async def test_natural_owner_stop_waits_for_native_closure(
 
 # The native connector can unplug first or clear its session before the separate Stop report arrives.
 @pytest.mark.parametrize(
-    ("report_order", "offered"),
-    [("unplug-first", 0), ("native-first", 0), ("native-first", 6), ("ocpp-first", 6)],
+    ("report_order", "offered", "cloud_returned"),
+    [
+        ("unplug-first", 0, False),
+        ("unplug-first", 6, False),
+        ("unplug-first", 6, True),
+        ("native-first", 0, False),
+        ("native-first", 6, False),
+        ("native-first", 6, True),
+        ("ocpp-first", 6, False),
+    ],
 )
-@pytest.mark.parametrize("operator_pause", [False, True], ids=["next-schedule", "operator-pause"])
+@pytest.mark.parametrize("operator_pause", [False, True], ids=["automatic", "operator-pause"])
 async def test_natural_owner_stop_with_unplugged_connector(
-    tmp_path, tls, unused_tcp_port, monkeypatch, report_order, offered, operator_pause
+    tmp_path, tls, unused_tcp_port, monkeypatch, report_order, offered, cloud_returned, operator_pause
 ):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
         async with connection(rig, "unplugged-owner-stop") as test:
@@ -267,6 +275,9 @@ async def test_natural_owner_stop_with_unplugged_connector(
             first_intent = c.requests.intent()
             occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
             start_receipt = c.requests.receipt(occurrence["request"])
+            if cloud_returned:
+                bench.vendor_available = True
+                await until(lambda: test.session.runtime.vendor_registered, timeout=20)
             clock.now = MIDNIGHT + 30
             if report_order == "ocpp-first":
                 await close(test, clock, local, meter_start)
@@ -281,6 +292,8 @@ async def test_natural_owner_stop_with_unplugged_connector(
                 for _ in range(4):
                     waiting = await c.tick()
                     assert waiting["state"] == "reconciling" and not waiting["local_hold_verified"]
+                    assert bench.firmware.effective_limit() == 0 and not j.fault.latched()
+                assert len(starts(rig)) == 1 and not stops(bench)
                 assert c.requests.intent() == first_intent
                 hold = j.get(ORDINARY_HOLD)
                 pause = None
@@ -310,6 +323,12 @@ async def test_natural_owner_stop_with_unplugged_connector(
                 assert bench.firmware.effective_limit() == 0
                 assert not j.fault.latched() and not stops(bench)
 
+            if cloud_returned and pause is None:
+                bench.cp, bench.connection = "B", "Plug"
+                await status(test, lambda value: value["normal_start_ready"])
+                assert c.requests.intent().mode == "app" and bench.firmware.effective_limit() == 6
+                assert len(starts(rig)) == 1 and not stops(bench)
+                return
             await status(test, lambda value: value["local_hold_verified"])
             bench.cp, bench.connection = "B", "Plug"
             clock.now = MIDNIGHT + 24 * 3600
@@ -321,6 +340,187 @@ async def test_natural_owner_stop_with_unplugged_connector(
             else:
                 assert c.requests.offline_pause_current(c.requests.intent())
                 await status(test, lambda value: len(starts(rig)) == 2)
+                await c.charging.settle()
+            assert not stops(bench)
+
+
+# Audits must still reject a different native ID or real draw while awaiting the genuine Stop.
+@pytest.mark.parametrize("activity", ["drawing", "foreign-id"])
+@pytest.mark.parametrize("cloud_returned", [False, True], ids=["offline", "cloud-returned"])
+async def test_unplugged_owner_wait_rejects_other_native_activity(
+    tmp_path, tls, unused_tcp_port, monkeypatch, activity, cloud_returned
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "contradictory-active-owner") as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            local, _ = await begin(test, clock)
+            if cloud_returned:
+                bench.vendor_available = True
+                await until(lambda: test.session.runtime.vendor_registered, timeout=20)
+            clock.now = MIDNIGHT + 30
+            bench.cp, bench.connection = "A", "Unplug"
+            bench.firmware.requested_current = 0
+            rig.peer.permission_enabled = False
+            monkeypatch.setattr(rig.peer, "native", report_offer(rig.peer, lambda: 6))
+            assert (await c.tick())["state"] == "reconciling"
+            assert bench.firmware.effective_limit() == 0
+
+            if activity == "foreign-id":
+                bench.firmware.active = local + 1
+            else:
+                native = rig.peer.native
+
+                def drawing(key):
+                    if key == "METER":
+                        return [{"meterData": {"cur": [10, 0, 0], "power": [240, 0, 0, 240]}}]
+                    return native(key)
+
+                monkeypatch.setattr(rig.peer, "native", drawing)
+
+            for _ in range(4):
+                view = await c.tick()
+            assert view["state"] == "attention" and view["fault"] == "native_authority_or_preservation_failed"
+            assert j.active() == local and not j.outcomes.stop_report_closed(local)
+            assert not stops(bench) and len(starts(rig)) == 1 and bench.firmware.effective_limit() == 0
+
+
+# A real Stop can supersede the native read before the earlier closure evidence resolves.
+async def test_genuine_owner_stop_can_arrive_during_unplug_audit(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "owner-stop-during-unplug-audit") as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            local, meter_start = await begin(test, clock)
+            bench.vendor_available = True
+            await until(lambda: test.session.runtime.vendor_registered, timeout=20)
+            clock.now = MIDNIGHT + 30
+            bench.cp, bench.connection = "A", "Unplug"
+            bench.firmware.active = None
+            bench.firmware.requested_current = 0
+            rig.peer.permission_enabled = False
+            observed, resume = asyncio.Event(), asyncio.Event()
+            observe = c.native.observe
+
+            async def delay_native():
+                observed.set()
+                await resume.wait()
+                return await observe()
+
+            with monkeypatch.context() as lag:
+                lag.setattr(rig.peer, "native", report_offer(rig.peer, lambda: 6))
+                assert (await c.tick())["state"] == "reconciling"
+                assert j.get(ORDINARY_HOLD)["local"] == local
+                lag.setattr(c.native, "observe", delay_native)
+                polling = asyncio.create_task(c.tick())
+                try:
+                    async with asyncio.timeout(5):
+                        await observed.wait()
+                    await close(test, clock, local, meter_start)
+                finally:
+                    resume.set()
+                assert (await polling)["state"] == "reconciling"
+                assert (await c.tick())["state"] == "reconciling"
+                assert j.get(ORDINARY_HOLD)["owner_closure"] == local
+                assert j.outcomes.stop_report_closed(local) and not j.fault.latched()
+                assert len(starts(rig)) == 1 and not stops(bench) and bench.firmware.effective_limit() == 0
+
+            bench.cp, bench.connection = "B", "Plug"
+            await status(test, lambda view: view["normal_start_ready"])
+            assert c.requests.intent().mode == "app" and bench.firmware.effective_limit() == 6
+            assert len(starts(rig)) == 1 and not stops(bench)
+
+
+# The owner's explicit Pause can retry a rejected Stop while the unplugged native ID still identifies its session.
+async def test_explicit_pause_retries_an_unplugged_owner_stop(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "pause-retry-exact-owner") as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            local, meter_start = await begin(test, clock)
+            clock.now = MIDNIGHT + 30
+            bench.cp, bench.connection = "A", "Unplug"
+            bench.firmware.requested_current = 0
+            rig.peer.permission_enabled = False
+            answer = bench.firmware.answer
+            expected = {"transactionId": local}
+
+            def reject_once(action, payload):
+                if action == "RemoteStopTransaction" and stops(bench) == [expected]:
+                    return {"status": "Rejected"}
+                return answer(action, payload)
+
+            monkeypatch.setattr(bench.firmware, "answer", reject_once)
+            request = uuid.uuid4().hex
+            c.command(request, "pause", c.requests.intent().revision)
+            await asyncio.wait_for(asyncio.shield(c.pause_task), 3)
+            assert stops(bench) == [expected] and not j.outcomes.accepted_stop(local)
+            assert bench.firmware.effective_limit() == 0
+
+            for _ in range(3):
+                assert (await c.tick())["state"] == "reconciling"
+            assert stops(bench) == [expected, expected] and j.outcomes.accepted_stop(local)
+            assert c.requests.receipt(request)["state"] != "completed"
+            await close(test, clock, local, meter_start)
+            await status(test, lambda value: value["local_hold_verified"])
+            assert c.requests.receipt(request)["state"] == "completed"
+
+
+# The saved unplugged hold must survive a replacement before the charger sends its genuine Stop.
+@pytest.mark.parametrize("native_open", [False, True], ids=["native-closed", "native-id-retained"])
+@pytest.mark.parametrize("operator_pause", [False, True], ids=["next-schedule", "newer-pause"])
+async def test_replacement_after_unplug_before_owner_stop(
+    tmp_path, tls, unused_tcp_port, monkeypatch, native_open, operator_pause
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        bench = rig.bench
+        offered = None
+        monkeypatch.setattr(rig.peer, "native", report_offer(rig.peer, lambda: offered))
+        async with connection(rig, "before-owner-stop-replacement") as test:
+            c, j = test.controller, test.session.journal
+            local, meter_start = await begin(test, clock)
+            intent = c.requests.intent()
+            occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
+            receipt = c.requests.receipt(occurrence["request"])
+            clock.now = MIDNIGHT + 30
+            bench.cp, bench.connection = "A", "Unplug"
+            if not native_open:
+                bench.firmware.active = None
+            bench.firmware.requested_current = 0
+            rig.peer.permission_enabled = False
+            offered = 6
+            assert (await c.tick())["state"] == "reconciling"
+            saved = j.get(ORDINARY_HOLD)
+            assert saved["local"] == local and saved["start"] and bench.firmware.effective_limit() == 0
+
+        async with connection(rig, "before-owner-stop-replacement-boot") as test:
+            c, j = test.controller, test.session.journal
+            for _ in range(3):
+                waiting = await c.tick()
+                assert waiting["state"] == "reconciling" and not waiting["local_hold_verified"]
+            assert c.requests.intent() == intent and j.get(ORDINARY_HOLD) == saved
+            assert j.active() == local and not j.outcomes.stop_report_closed(local)
+            assert len(starts(rig)) == 1 and not stops(bench) and bench.firmware.effective_limit() == 0
+
+            bench.firmware.active = None
+            pause = uuid.uuid4().hex if operator_pause else None
+            if pause is not None:
+                c.command(pause, "pause", intent.revision)
+                assert (await c.tick())["state"] == "reconciling"
+                assert c.requests.receipt(pause)["state"] != "completed"
+
+            await close(test, clock, local, meter_start)
+            offered = None
+            await status(test, lambda view: view["local_hold_verified"])
+            assert j.outcomes.stop_report_closed(local) and not j.fault.latched()
+            assert c.requests.receipt(occurrence["request"]) == receipt
+            bench.cp, bench.connection = "B", "Plug"
+            clock.now = MIDNIGHT + 24 * 3600
+            if pause is not None:
+                assert c.requests.receipt(pause)["state"] == "completed"
+                assert not c.requests.offline_pause_current(c.requests.intent())
+                await c.tick()
+                assert len(starts(rig)) == 1
+            else:
+                assert c.requests.offline_pause_current(c.requests.intent())
+                await status(test, lambda view: len(starts(rig)) == 2)
                 await c.charging.settle()
             assert not stops(bench)
 

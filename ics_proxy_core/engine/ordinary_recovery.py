@@ -124,8 +124,11 @@ class OrdinaryRecovery:
     async def recover(self) -> Pending | None:
         c = self.c
         await self.hold("restricted_introduction")
+        journal = c.session.journal
+        active = journal.active()
+        closing_local = active if journal.is_owner_session(active) else None
         try:
-            native = await c.native.read_result()
+            native = await c.native.read_result(closing_local=closing_local)
         except NativeReadinessError as error:
             if not error.unplugged_at_zero or not self.closure_gap(error.native):
                 raise

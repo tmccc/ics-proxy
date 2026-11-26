@@ -87,13 +87,11 @@ class RecoveryCoordinator:
                 owner_closure = decisions.held_owner_closure(c)
                 if owner_closure is not None:
                     pending = await c.ordinary.recover_owner_closure(owner_closure)
-                elif not decisions.cloud_ready(c):
-                    await c.ordinary.hold("restricted_introduction")
-                    if decisions.held_owner_stop_pending(c):
-                        return Pending(Prerequisite.LIFECYCLE, "owner closure awaits the exact charger Stop report")
-                    return Pending(Prerequisite.CLOUD, "ordinary recovery awaits the current cloud connection")
-                else:
+                elif decisions.cloud_ready(c) or decisions.held_owner_stop_pending(c):
                     pending = await c.ordinary.recover()
+                else:
+                    await c.ordinary.hold("restricted_introduction")
+                    return Pending(Prerequisite.CLOUD, "ordinary recovery awaits the current cloud connection")
                 if pending is not None:
                     return pending
             elif work is RecoveryWork.CONNECTION:

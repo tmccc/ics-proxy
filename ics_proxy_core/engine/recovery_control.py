@@ -108,6 +108,7 @@ class RecoveryControl:
             and c.native.acknowledged_lineage != scope.lineage
             and intent.mode == "app"
             and self.held_owner_closure(c) is None
+            and not self.held_owner_stop_pending(c)
         ):
             with j.atomic(retry_busy=True):
                 can_restore = not isinstance(self.offline_return_decision(c), Pending)
@@ -287,14 +288,14 @@ class RecoveryControl:
             local = closed
         if type(local) is not int or local not in (active, closed):
             return False
+        unplugged = handover.allow_unplugged and physical.cp == "A" and physical.connection == "Unplug"
+        active_unplugged_owner = local == active and unplugged and j.is_owner_session(local)
         if physical.transaction_open:
-            if local != closed or physical.native_transaction_id != local:
+            if physical.native_transaction_id != local or (local != closed and not active_unplugged_owner):
                 return False
         elif (
             physical.native_transaction_id is not None
-            or physical.cp != "A"
-            or physical.connection != "Unplug"
-            or (local == active and not j.is_owner_session(local))
+            or not (active_unplugged_owner or local == closed and unplugged)
             or (local == closed and native.output_limit_a == 0)
         ):
             return False
@@ -465,7 +466,7 @@ class RecoveryControl:
 
         return guard
 
-    # Preserve a completed normal Start when the process stopped after the report committed but before the zero hold.
+    # Recover the exact owner closure on either side of its genuine Stop report.
     def restore_owner_closure(self, charging: ManagedCharging, saved: dict[str, Any]) -> bool:
         c, j = charging.controller, self.journal
         local, revision = saved.get("local_transaction"), saved.get("revision")
@@ -473,19 +474,28 @@ class RecoveryControl:
             type(local) is not int
             or type(revision) is not int
             or c.requests.intent() != ControlIntent("app", revision)
-            or j.active() is not None
-            or j.latest_owner_stop_id() != local
             or not self.verified_normal(charging)
         ):
             return False
-        if self.ordinary_active(c) and j.get(KEY, {}).get("owner_closure") == local:
-            return True
         if not self.ordinary(charging) or not recorded_station_profile(
             j, c.native.spec.digest, c.native.spec.boot_digest
         ):
             return False
-        self._save_ordinary_hold(c, "native_closure_pending", None, None, local)
+        active = j.active()
+        if active is not None:
+            return active == local and self.held_owner_stop_pending(c)
+        if j.latest_owner_stop_id() != local:
+            return False
+        if not self.ordinary_active(c) or j.get(KEY, {}).get("owner_closure") != local:
+            self._save_ordinary_hold(c, "native_closure_pending", None, None, local)
         return True
+
+    # The existing hold must describe the immutable Start that the owner actually recorded.
+    def _owner_hold_matches(self, hold: dict[str, Any], local: int | None) -> bool:
+        if type(local) is not int or hold.get("local") != local:
+            return False
+        session = self.journal.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()
+        return session is not None and hold.get("start") == fingerprint(json.loads(session["start"]))
 
     # Only the saved closure of the latest owner session can use this zero hold without cloud registration.
     def held_owner_closure(self, c: ManagedController) -> int | None:
@@ -498,15 +508,8 @@ class RecoveryControl:
             or (local := j.latest_owner_stop_id()) is None
         ):
             return None
-        if hold.get("owner_closure") == local:
-            return local
         # A prior unplugged observation can own the same session before its genuine Stop is recorded.
-        if hold.get("local") != local:
-            return None
-        session = j.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()
-        if session is not None and hold.get("start") == fingerprint(json.loads(session["start"])):
-            return local
-        return None
+        return local if hold.get("owner_closure") == local or self._owner_hold_matches(hold, local) else None
 
     # An unplugged owner session still needs its genuine Stop even while iCS is unavailable.
     def held_owner_stop_pending(self, c: ManagedController) -> bool:
@@ -516,8 +519,8 @@ class RecoveryControl:
         return (
             self.ordinary_active(c)
             and hold.get("reason") in ("unplugged_session_pending", "native_closure_pending")
-            and hold.get("local") == local
             and j.is_owner_session(local)
+            and self._owner_hold_matches(hold, local)
         )
 
     # Independent closed zero and settled reports can hand the exact hold over to the usual automatic Pause.

@@ -404,7 +404,15 @@ class NativeBoundedHandover:
                 self._remember_stop_sample(native, sequence)
             if not stop_only and self.observation_listener is not None:
                 self.observation_listener(native)
-            if as_result and owner_closure_wait:
+            # Pause still needs concrete evidence to retry a Stop for its exact open session.
+            if (
+                as_result
+                and owner_closure_wait
+                and not (
+                    native.physical.transaction_open
+                    and native.physical.native_transaction_id == gateway.journal.active()
+                )
+            ):
                 return Pending(Prerequisite.LIFECYCLE, "owner session awaits a matching Stop report and native zero")
             # A valid open source remains fresh while this particular operation awaits a closed station.
             if closed:
