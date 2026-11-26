@@ -7,6 +7,7 @@ import time
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
+from .connection_scope import control_scope_matches
 from .local_schedule_cutoff import cutoff
 from .local_schedule_window import schedule_window
 from .managed_intent import LOCAL_SCHEDULE_OCCURRENCE as OCCURRENCE
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
     from .local_schedule_window import ScheduleWindow
     from .managed import ManagedController
     from .managed_charging import ChargeLease
+    from .start_handoff import OwnedStartResult
     from .trial_handover_evidence import HandoverEvidence
 
 
@@ -98,7 +100,7 @@ class LocalSchedule:
         return window.ends_at - time.time()
 
     # This restriction runs at each existing lease boundary, including nested charger authorization.
-    def require_lease(self, lease: ChargeLease) -> None:
+    def require_lease(self, lease: ChargeLease, *, finishing_initial_zero: bool = False) -> None:
         window = lease.schedule
         if window is None:
             return
@@ -115,35 +117,57 @@ class LocalSchedule:
             or self._due(occurrence)
         ):
             raise DeniedError("local schedule occurrence no longer owns Start")
-        if c.session.runtime.vendor_registered and not original_dispatched:
+        if c.session.runtime.vendor_registered and not original_dispatched and not finishing_initial_zero:
             raise ScheduleCloudReturnedError("iCS returned before the local schedule issued Start")
 
-    # An automatic Return can retire the exact initial zero, but never a possible Start or a newer hold.
-    def verified_initial_zero(self, lease: ChargeLease) -> bool:
+    # Verify the exact initial hold or rollback before the shared owner may request automatic Return.
+    def verified_unsent_zero(self, lease: ChargeLease, result: OwnedStartResult | None) -> bool:
         c, j = self.controller, self.journal
-        controls = c.session.gateway.controls
+        gateway = c.session.gateway
+        controls = gateway.controls
         occurrence, control = j.get(OCCURRENCE, {}), j.get("control", {})
-        state = c.charging.state()
-        return bool(
-            lease.schedule is not None
-            and c.session.runtime.vendor_registered
-            and occurrence.get("request") == lease.identifier
-            and occurrence.get("local") is None
-            and state.get("id") == lease.identifier
-            and state.get("start_attempted") is False
-            and state.get("start_rpc_accepted") is False
-            and state.get("local_transaction") is None
-            and j.active() is None
-            and not control.get("start_pending")
-            and j.starts.receipt().get("request_id") != lease.identifier
-            and not any(
+        receipt, state = j.starts.receipt(), c.charging.state()
+        if (
+            lease.schedule is None
+            or not c.session.runtime.vendor_registered
+            or occurrence.get("request") != lease.identifier
+            or occurrence.get("window") != asdict(lease.schedule)
+            or occurrence.get("local") is not None
+            or state.get("id") != lease.identifier
+            or state.get("start_rpc_accepted") is not False
+            or state.get("local_transaction") is not None
+            or j.active() is not None
+            or control.get("start_pending")
+            or not controls.ready
+            or controls.desired() != 0
+            or any(
                 wire.action == "RemoteStartTransaction" for wire in j.outcomes.owner_wires("request", lease.identifier)
             )
-            and lease.initial_zero_ticket is not None
-            and control.get("ticket") == lease.initial_zero_ticket
-            and controls.boot() == lease.initial_zero_boot
-            and controls.ready
-            and controls.desired() == 0
+        ):
+            return False
+        if result is None:
+            return (
+                state.get("start_attempted") is False
+                and receipt.get("request_id") != lease.identifier
+                and lease.initial_zero_ticket is not None
+                and control.get("ticket") == lease.initial_zero_ticket
+                and controls.boot() == lease.initial_zero_boot
+            )
+        return (
+            result.zero_verified
+            and not result.remote_start_dispatched
+            and result.answer is None
+            and result.publication is None
+            and state.get("start_attempted") is True
+            and lease.start_scope is not None
+            and control_scope_matches(gateway, (lease.start_scope, lease.control_revision))
+            and receipt.get("request_id") == lease.identifier
+            and receipt.get("digest") == state.get("tag_digest")
+            and receipt.get("owner_authorized") is True
+            and receipt.get("stage") == "unsent"
+            and receipt.get("local") is None
+            and isinstance(receipt.get("ticket"), str)
+            and receipt["ticket"] == receipt.get("settled_ticket") == control.get("ticket")
         )
 
     # Fence only the competing native plan tag while the local schedule owns its Start handoff.

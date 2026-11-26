@@ -229,10 +229,11 @@ async def test_offline_schedule_retries_an_unsent_native_preflight(tmp_path, tls
             )
 
 
-# A restored cloud connection can give back the initial verified hold without sending the scheduled Start.
+# A restored cloud connection can give back the verified hold without sending the scheduled Start.
 @pytest.mark.parametrize("explicit_pause", [False, True], ids=["automatic-return", "new-explicit-pause"])
+@pytest.mark.parametrize("reply_limit", [None, 0, 6], ids=["initial-zero-confirmed", "zero-reply", "positive-reply"])
 async def test_cloud_returns_before_local_schedule_sends_start(
-    tmp_path, tls, unused_tcp_port, monkeypatch, explicit_pause
+    tmp_path, tls, unused_tcp_port, monkeypatch, explicit_pause, reply_limit
 ):
     clock = SchedulerClock(MIDNIGHT - 60)
     monotonic = time.monotonic()
@@ -252,22 +253,36 @@ async def test_cloud_returns_before_local_schedule_sends_start(
             assert c.requests.intent().mode == "app"
             controls = test.session.gateway.controls
             stop = controls.stop
-            initial_zero, release = asyncio.Event(), asyncio.Event()
+            reached_boundary, release = asyncio.Event(), asyncio.Event()
 
             async def wait_after_initial_zero(**kwargs):
                 result = await stop(**kwargs)
                 lease = c.charging.lease
-                if not initial_zero.is_set() and lease is not None and lease.schedule is not None:
-                    initial_zero.set()
+                if not reached_boundary.is_set() and lease is not None and lease.schedule is not None:
+                    reached_boundary.set()
                     await release.wait()
                 return result
 
-            monkeypatch.setattr(controls, "stop", wait_after_initial_zero)
+            # The independent charger applies the profile before releasing its actual TLS reply.
+            async def wait_for_profile_reply(action, payload):
+                if reached_boundary.is_set() or action != "SetChargingProfile":
+                    return
+                schedule = payload["csChargingProfiles"]["chargingSchedule"]
+                if schedule["chargingSchedulePeriod"][0]["limit"] == reply_limit:
+                    reached_boundary.set()
+                    await release.wait()
+
+            if reply_limit is None:
+                monkeypatch.setattr(controls, "stop", wait_after_initial_zero)
+            else:
+                bench.before_reply = wait_for_profile_reply
             clock.now = MIDNIGHT
             await c.tick()
             try:
-                await asyncio.wait_for(initial_zero.wait(), 5)
-                assert controls.ready and bench.firmware.effective_limit() == 0
+                await asyncio.wait_for(reached_boundary.wait(), 5)
+                assert bench.firmware.effective_limit() == (reply_limit or 0)
+                if reply_limit is None:
+                    assert controls.ready
                 assert not starts(rig)
                 if explicit_pause:
                     pause = uuid.uuid4().hex
@@ -281,14 +296,23 @@ async def test_cloud_returns_before_local_schedule_sends_start(
             expected = "paused" if explicit_pause else "app"
             result = await status(
                 test,
-                lambda value: value.get("cloud_connected") is True
-                and c.requests.intent().mode == expected
-                and value.get("station_ceiling_a") == (0 if explicit_pause else 6),
+                lambda value: (
+                    value.get("cloud_connected") is True
+                    and c.requests.intent().mode == expected
+                    and value.get("station_ceiling_a") == (0 if explicit_pause else 6)
+                ),
             )
             occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
             assert occurrence["local"] is None and not starts(rig) and j.active() is None
-            assert c.charging.state()["start_attempted"] is False
+            assert c.charging.state()["start_attempted"] is (reply_limit == 6)
             assert c.charging.state()["start_rpc_accepted"] is False
+            assert not any(
+                wire.action == "RemoteStartTransaction"
+                for wire in j.outcomes.owner_wires("request", occurrence["request"])
+            )
+            if reply_limit == 6:
+                receipt = j.starts.receipt()
+                assert receipt["request_id"] == occurrence["request"] and receipt["stage"] == "unsent"
             assert result["power_w"] == 0
             if explicit_pause:
                 assert not c.requests.offline_pause_current(c.requests.intent())

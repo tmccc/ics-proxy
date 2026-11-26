@@ -1378,7 +1378,8 @@ class ControlDecisions:
             )
         ):
             raise DeniedError("managed test Start permission expired or was superseded")
-        c.local_schedule.require_lease(lease)
+        # Reconnection can revoke charging while the initial hold still verifies zero on its own ticket.
+        c.local_schedule.require_lease(lease, finishing_initial_zero=stopping and lease.initial_zero_ticket is not None)
 
     # Bind only the exact initial hold for the admitted lease on the current Boot.
     def bind_initial_start_zero(self, lease: ChargeLease) -> None:
@@ -1430,7 +1431,12 @@ class ControlDecisions:
 
     # Use the failed reply's lease and actual recorded effects before settling Start.
     def settle_failed_start(
-        self, charging: ManagedCharging, lease: ChargeLease, error: Exception, effects: bool
+        self,
+        charging: ManagedCharging,
+        lease: ChargeLease,
+        error: Exception,
+        effects: bool,
+        result: OwnedStartResult | None,
     ) -> None:
         j = self.journal
         record = j.starts.load(wire=False, request_id=lease.identifier)
@@ -1467,7 +1473,11 @@ class ControlDecisions:
                 lease,
                 "start_not_confirmed",
                 failure=cause,
-                allow_schedule_return=isinstance(error, ScheduleCloudReturnedError),
+                allow_schedule_return=(
+                    isinstance(error, ScheduleCloudReturnedError)
+                    and (result is None or result.failure is error)
+                    and charging.controller.local_schedule.verified_unsent_zero(lease, result)
+                ),
             )
         charging.record_failure_diagnostic(cause)
 
@@ -1584,11 +1594,7 @@ class ControlDecisions:
                 and charging.state().get("independent_seen") is True
             )
             if intent.mode != "paused" and not preserve:
-                automatic_return = (
-                    allow_schedule_return
-                    and intent == ControlIntent("app", lease.revision)
-                    and c.local_schedule.verified_initial_zero(lease)
-                )
+                automatic_return = allow_schedule_return and intent == ControlIntent("app", lease.revision)
                 self._claim_test_pause(c, intent, lease.identifier)
                 if automatic_return:
                     j.put(OFFLINE_PAUSE, c.requests.intent().revision)
