@@ -10,9 +10,11 @@ and the renderer serves an older image again, a previously expired image can rea
 The Home Assistant automation verifies the device, screen, position and original marker before sending a request.
 It passes the render time of the frame shown when the button was pressed to the iCS action, which also checks its
 age against elapsed time. A refresh with the same control leaves that press bound to the original render time.
-The action requires a new frame after iCS integration setup. After it detects a backward clock adjustment, it
-requires a frame timestamp beyond the preceding clock range. The charger buttons may appear available while
-the Home Assistant clock catches up and the display receives a new frame.
+The action requires a new frame after iCS integration setup. When it detects a clock step in either direction,
+it refuses that tap and requires a frame timestamp beyond both observed clock readings. The charger buttons
+may appear available while the clock catches up and the display receives a new frame. The action samples the
+clock when it handles the tap and again before writing. Clock adjustments that cancel out between samples can
+leave the offset unchanged.
 Start also requires the displayed control revision to match the current revision and permission to start.
 Stop requires the displayed target to match a fresh, verified open session. The action checks the pressed frame
 and current control again before sending the management request. The touchscreen shows pending and unconfirmed

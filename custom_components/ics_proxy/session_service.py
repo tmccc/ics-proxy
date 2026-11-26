@@ -13,7 +13,7 @@ from .coordinator import DOMAIN, ProxyCoordinator
 
 FRAME_MAX_AGE = 45
 FRAME_MAX_EPOCH = 2**32 - 1
-WALL_REWIND_TOLERANCE = 0.5
+WALL_STEP_TOLERANCE = 0.5
 
 
 # Pair the wall clock with elapsed time. A small sampling variation must not appear to be a clock step.
@@ -29,13 +29,13 @@ def register_session_service(hass: HomeAssistant) -> None:
     reject_through = int(first_wall)
     wall_offset = first_wall - first_elapsed
 
-    # A frame epoch in the old wall-clock range can be reused by the renderer after a rewind.
+    # An observed step makes frame epochs through either wall-clock reading ambiguous.
     def frame_is_current(epoch: int) -> bool:
         nonlocal reject_through, wall_offset
         wall, elapsed = _frame_clock()
         offset = wall - elapsed
-        if offset < wall_offset - WALL_REWIND_TOLERANCE:
-            reject_through = max(reject_through, int(elapsed + wall_offset))
+        if abs(offset - wall_offset) > WALL_STEP_TOLERANCE:
+            reject_through = max(reject_through, int(wall), int(elapsed + wall_offset))
             wall_offset = offset
         else:
             wall_offset = max(wall_offset, offset)

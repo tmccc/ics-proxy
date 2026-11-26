@@ -150,6 +150,102 @@ async def test_cutoff_owns_exact_stop_until_real_closure(tmp_path, tls, unused_t
             assert j.get(LOCAL_SCHEDULE_OCCURRENCE)["request"] != occurrence["request"]
 
 
+# Intent: hold zero when the Stop report arrives before cutoff but native closure is pending.
+# Why: the journal report alone cannot confirm physical closure or authorize a second Stop.
+@pytest.mark.parametrize("native_unavailable", [False, True], ids=["native-drawing", "native-unavailable"])
+async def test_cutoff_holds_zero_when_stop_report_arrives_first(
+    tmp_path, tls, unused_tcp_port, monkeypatch, native_unavailable
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "stop-report-before-cutoff") as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            local, meter_start = await begin(test, clock)
+            clock.now = MIDNIGHT + 6 * 3600 - 1
+            await close(test, clock, local, meter_start)
+            assert j.active() is None and j.latest_owner_stop_id() == local
+
+            bench.firmware.active = local
+            bench.firmware.requested_current = 32
+            bench.cp, bench.connection = "C", "Charging"
+            rig.peer.permission_enabled = True
+            assert rig.peer.native("METER")[0]["meterData"]["power"][0] == 1440
+
+            # Fail only the independent audit while retaining the actual charger wire and measurements.
+            async def unavailable():
+                raise NativeTransportUnavailableError("brief loss of native telemetry")
+
+            clock.now = MIDNIGHT + 6 * 3600
+            with monkeypatch.context() as outage:
+                if native_unavailable:
+                    outage.setattr(c.native, "observe", unavailable)
+                waiting = await c.tick()
+            assert not waiting["local_hold_verified"]
+            assert scheduled_cutoff_target(j) == local
+            assert bench.firmware.effective_limit() == 0 and not stops(bench)
+
+            bench.firmware.active = None
+            bench.cp, bench.connection = "B", "Plug"
+            rig.peer.permission_enabled = False
+            await status(test, lambda value: value.get("local_hold_verified") is True)
+            assert not stops(bench)
+
+
+# Intent: leave a fully observed early Stop in its unchanged app mode at cutoff.
+# Why: the spent occurrence has no remaining physical work after both channels establish closure.
+async def test_cutoff_leaves_settled_early_stop_in_app_mode(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "settled-stop-before-cutoff") as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            local, meter_start = await begin(test, clock)
+            clock.now = MIDNIGHT + 60
+            await close(test, clock, local, meter_start)
+            bench.cp, bench.connection = "B", "Plug"
+            await status(test, lambda value: value.get("normal_start_ready") is True)
+            assert j.get(LOCAL_SCHEDULE_OCCURRENCE)["native_closed"] is True
+            intent = c.requests.intent()
+            assert intent.mode == "app" and bench.firmware.effective_limit() == 6
+
+            before = len(bench.device_calls)
+            clock.now = MIDNIGHT + 6 * 3600
+            await c.tick()
+            assert c.requests.intent() == intent and scheduled_cutoff_target(j) is None
+            assert bench.firmware.effective_limit() == 6 and not stops(bench)
+            assert all(frame[2] != "SetChargingProfile" for frame in bench.device_calls[before:])
+
+
+# Intent: leave a newer Return in control even before another full status poll.
+# Why: an earlier schedule cannot supersede authority already restored after independent closure.
+async def test_cutoff_leaves_newer_return_in_control(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "return-before-cutoff") as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            local, meter_start = await begin(test, clock)
+            pause = uuid.uuid4().hex
+            c.command(pause, "pause", c.requests.intent().revision)
+            await until(lambda: stops(bench) == [{"transactionId": local}])
+            clock.now = MIDNIGHT + 60
+            await close(test, clock, local, meter_start)
+            bench.cp, bench.connection = "B", "Plug"
+            await c.maintain_pause()
+            assert c.requests.receipt(pause)["state"] == "completed"
+
+            bench.vendor_available = True
+            await until(lambda: test.session.runtime.vendor_registered, timeout=20)
+            identifier, revision = uuid.uuid4().hex, c.requests.intent().revision
+            c.command(identifier, "app_control", revision)
+            await c.return_requested(identifier, revision)
+            assert c.requests.receipt(identifier)["state"] == "completed"
+            assert j.get(LOCAL_SCHEDULE_OCCURRENCE).get("native_closed") is None
+            intent = c.requests.intent()
+            assert intent.mode == "app" and bench.firmware.effective_limit() == 6
+
+            before = len(bench.device_calls)
+            clock.now = MIDNIGHT + 6 * 3600
+            await c.local_schedule.stop_if_due()
+            assert c.requests.intent() == intent and scheduled_cutoff_target(j) is None
+            assert bench.firmware.effective_limit() == 6 and bench.device_calls[before:] == []
+
+
 # Intent: enforce the same elapsed cutoff when SQLite refuses the scheduled Start's first receipt read.
 # Why: a committed Start can charge after that read fails, and a backward clock adjustment cannot extend its window.
 @pytest.mark.parametrize("refuse_receipt", [False, True], ids=["read-works", "refused-post-commit-read"])

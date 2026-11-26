@@ -62,6 +62,7 @@ class LocalSchedule:
         self.process_deadline: tuple[str, float] | None = None
         self.clock_epoch = host_clock_epoch() if timezone is not None else None
         self.expired_request: str | None = None
+        self.closed_request: str | None = None
 
     # Record the exact source of a same-tag session while its independent plan marker is available.
     def observe_native_occurrence(self, native: HandoverEvidence) -> None:
@@ -438,6 +439,36 @@ class LocalSchedule:
             return occurrence
         return None
 
+    # Remember settled early closure so its spent window has no physical work left at cutoff.
+    def observe_closed(self, native: HandoverEvidence) -> None:
+        j, physical = self.journal, native.physical
+        if (
+            self.timezone is None
+            or physical.transaction_open
+            or physical.native_transaction_id is not None
+            or any((physical.power_w, *native.currents_a, *native.powers_w))
+        ):
+            return
+        occurrence = j.get(OCCURRENCE, {})
+        local = occurrence.get("local")
+        if (
+            type(local) is not int
+            or "stop_revision" in occurrence
+            or occurrence.get("native_closed") is True
+            or j.latest_owner_stop_id() != local
+        ):
+            return
+        self.closed_request = occurrence["request"]
+        try:
+            j.put(OCCURRENCE, {**occurrence, "native_closed": True})
+        except sqlite3.Error:
+            if j.db.in_transaction:
+                raise
+
+    # A refused journal write can still leave proof for this exact occurrence in the running owner.
+    def closure_known(self, occurrence: dict[str, Any]) -> bool:
+        return occurrence.get("native_closed") is True or self.closed_request == occurrence["request"]
+
     # Periodic restrictive work can stop its own session even when no complete native poll is available.
     async def stop_if_due(self) -> None:
         c, j = self.controller, self.journal
@@ -446,7 +477,7 @@ class LocalSchedule:
         active = j.active()
         if c.stopping or type(local) is not int or not self._due(occurrence):
             return
-        if active != local and not (active is None and occurrence.get("stop_revision") is not None):
+        if active != local and (active is not None or j.latest_owner_stop_id() != local):
             return
         if not j.is_owner_session(local):
             raise RecoveryRequiredError("local schedule lost its original owner session")

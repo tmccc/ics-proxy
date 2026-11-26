@@ -481,15 +481,20 @@ async def run_display_core(config_dir, request, *, expiry_seconds=None, cleanup_
         await hass.async_stop(force=True)
 
 
-# Send a tap carrying the displayed control marker and the current Home Assistant state.
-def send_display_tap(hass, starting, *, canvas_age=1, frame_rendered_at=None):
-    hass.states.async_set("sensor.ics_display_screen_source", "Home Assistant")
-    rendered_at = dt_util.now()
+# Publish the renderer state independently of touchscreen events.
+def publish_display_preview(hass, rendered_at):
     hass.states.async_set(
         IMAGE,
         rendered_at.isoformat(),
         {"assigned_views": [VIEW], "current_view_id": VIEW, "rendered_view_id": VIEW, "notification_active": False},
     )
+
+
+# Send a tap carrying the displayed control marker and the current Home Assistant state.
+def send_display_tap(hass, starting, *, canvas_age=1, frame_rendered_at=None):
+    hass.states.async_set("sensor.ics_display_screen_source", "Home Assistant")
+    rendered_at = dt_util.now()
+    publish_display_preview(hass, rendered_at)
     hass.states.async_set(
         SESSION,
         "off" if starting else "on",
@@ -548,10 +553,11 @@ async def test_display_rejects_expired_tap_after_clock_step(tmp_path, monkeypatc
         assert calls == [expected]
 
 
-# Intent: a delayed tap cannot outlive its frame across a clock rewind or reuse an old epoch.
-# Why: both wall ages can agree even while the rendered frame has expired in elapsed time.
+# Intent: a clock step invalidates frames through both observed wall-clock ranges.
+# Why: an earlier forward step can hide a later rewind even when a delayed tap has expired in elapsed time.
 @pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
-async def test_display_service_rejects_pre_rewind_frames(actual_hass, peer, monkeypatch, starting):
+@pytest.mark.parametrize("clock_change", ["rewind", "forward", "forward_then_rewind"])
+async def test_display_service_rejects_pre_adjustment_frames(actual_hass, peer, monkeypatch, starting, clock_change):
     from custom_components.ics_proxy import session_service
 
     hass = actual_hass
@@ -597,20 +603,30 @@ async def test_display_service_rejects_pre_rewind_frames(actual_hass, peer, monk
     await tap_frame(base - 1, 4, unconfirmed)
     assert action not in peer["commands"]
 
-    # This tap was sent when its frame was five seconds old and arrives 50 seconds after render.
-    # A backward step leaves a fresh looking wall age and matches the automation's check.
-    wall, elapsed = base + 31, 151
-    await tap_frame(base + 1, 6, unconfirmed)
+    # Publish the original frame and let its tap travel without an earlier session action observing the clock.
+    wall, elapsed = (base + 123 if clock_change == "forward_then_rewind" else base + 3), 103
+    original_frame = wall
+    publish_display_preview(hass, datetime.fromtimestamp(original_frame, UTC))
+    await asyncio.sleep(0)
+
+    # A rewind can leave a misleadingly recent wall timestamp. A partial rewind after a forward step
+    # can make a 51-second-old frame look five seconds old while the final offset is still ahead.
+    arrival = {"rewind": (base + 33, 154), "forward": (base + 23, 114), "forward_then_rewind": (base + 128, 154)}
+    wall, elapsed = arrival[clock_change]
+    await tap_frame(original_frame, 2, unconfirmed)
     assert action not in peer["commands"]
 
-    # A rerendered marker at the old range boundary may still identify an earlier tap.
-    wall, elapsed = base + 51, 171
-    await tap_frame(base + 51, 1, unconfirmed)
+    # A marker at either boundary may still identify a frame from before the adjustment.
+    fence = {"rewind": base + 54, "forward": base + 23, "forward_then_rewind": base + 128}[clock_change]
+    elapsed += fence - wall
+    wall = fence
+    await tap_frame(fence, 1, unconfirmed)
     assert action not in peer["commands"]
 
     # The display may legitimately be one download behind the newest preview after the clock catches up.
-    wall, elapsed = base + 63, 183
-    await tap_frame(base + 52, 12, "idle")
+    wall += 12
+    elapsed += 12
+    await tap_frame(fence + 1, 12, "idle")
     (command,) = [request for request in peer["requests"] if request["command"] == action]
     assert command["revision"] == REVISION
     assert command.get("target") == (None if starting else TARGET)

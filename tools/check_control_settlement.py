@@ -24,6 +24,7 @@ SCHEDULE = "tests/test_managed_local_schedule.py"
 SCHEDULE_CUTOFF = "tests/test_managed_local_schedule_cutoff.py"
 CUTOFF_REPLACEMENT = f"{SCHEDULE_CUTOFF}::test_cutoff_retains_elapsed_deadline_across_replacement"
 CUTOFF_REWIND = f"{SCHEDULE_CUTOFF}::test_observed_cutoff_survives_refused_claim_and_wall_rewind"
+CUTOFF_CLOSED_REPORT = f"{SCHEDULE_CUTOFF}::test_cutoff_holds_zero_when_stop_report_arrives_first"
 SCHEDULE_VENDOR_RETURN = f"{SCHEDULE}::test_cloud_returns_before_local_schedule_sends_start"
 STOP_INCIDENT = "tests/test_managed_stop_incident.py"
 INCIDENT_WAL = "tests/test_managed_incident.py::test_incident_respects_the_published_live_wal_boundary"
@@ -45,6 +46,7 @@ HA_TEST = "tests_ha_proxy/test_client.py::test_session_stop_shares_the_vendor_wi
 HA_DISPLAY = "tests_ha_proxy/test_display_example.py"
 HA_DISPLAY_STOP = f"{HA_DISPLAY}::test_canvas_stop_rechecks_the_local_session"
 HA_DISPLAY_HANDSHAKE = f"{HA_DISPLAY}::test_canvas_frame_can_expire_during_the_management_handshake"
+HA_DISPLAY_CLOCK_STEP = f"{HA_DISPLAY}::test_display_service_rejects_pre_adjustment_frames"
 
 SUITES = {
     "engine": (
@@ -110,6 +112,8 @@ SUITES = {
             f"{CUTOFF_REPLACEMENT}[legacy]",
             f"{CUTOFF_REWIND}[cutoff-saved]",
             f"{CUTOFF_REWIND}[cutoff-retained-in-memory]",
+            f"{CUTOFF_CLOSED_REPORT}[native-unavailable]",
+            f"{SCHEDULE_CUTOFF}::test_cutoff_leaves_settled_early_stop_in_app_mode",
             f"{SCHEDULE_VENDOR_RETURN}[vendor-lost-during-rollback-automatic-return]",
             f"{SCHEDULE}::test_overlapping_timezone_change_does_not_repeat_local_occurrence",
             "tests/test_vendor_stop_rotation.py::test_queued_vendor_stop_keeps_reply_through_rotation[Accepted]",
@@ -128,6 +132,8 @@ SUITES = {
             f"{HA_DISPLAY_STOP}[closed]",
             f"{HA_DISPLAY_HANDSHAKE}[start]",
             f"{HA_DISPLAY_HANDSHAKE}[stop]",
+            f"{HA_DISPLAY_CLOCK_STEP}[forward_then_rewind-start]",
+            f"{HA_DISPLAY_CLOCK_STEP}[forward_then_rewind-stop]",
         ),
     ),
 }

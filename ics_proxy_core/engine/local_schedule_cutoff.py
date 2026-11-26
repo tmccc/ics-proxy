@@ -61,13 +61,21 @@ def _claim_cutoff(
         ):
             return None
         intent, active = c.requests.intent(), j.active()
-        if scheduled_cutoff_target(j) == local:
-            if active != local and (active is not None or not j.outcomes.stop_report_closed(local)):
+        if active != local and (active is not None or j.latest_owner_stop_id() != local):
+            return None
+        if scheduled_cutoff_target(j) != local:
+            if intent.mode != "app" or "stop_revision" in occurrence:
                 return None
-        elif intent.mode == "app" and active == local and "stop_revision" not in occurrence:
+            if active is None:
+                # An independently closed occurrence or a newer release leaves no cutoff work.
+                start = c.charging.state()
+                if (
+                    c.local_schedule.closure_known(occurrence)
+                    or start.get("id") != occurrence["request"]
+                    or start.get("revision") != intent.revision
+                ):
+                    return None
             occurrence = record_cutoff_pause(c, occurrence, intent)
-        else:
-            return None  # An explicit Pause or newer intent already owns any further effects.
         return occurrence, g.controls.decisions.prepare_pause_stop(g, c.requests)
 
 
@@ -88,7 +96,12 @@ async def cutoff(c: ManagedController, local: int) -> None:
 
         # The shared ticket guard also fences a replacement Boot and a newer explicit owner Pause.
         def guard() -> None:
-            if occurrence != j.get(OCCURRENCE) or scheduled_cutoff_target(j) != local:
+            active = j.active()
+            if (
+                occurrence != j.get(OCCURRENCE)
+                or scheduled_cutoff_target(j) != local
+                or (active != local and (active is not None or j.latest_owner_stop_id() != local))
+            ):
                 raise RecoveryRequiredError("the scheduled Stop no longer owns this occurrence")
             controls.decisions.require_pause_stop(g, c.requests, scope, native.spec.boot_digest)
 

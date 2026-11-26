@@ -480,6 +480,8 @@ class ControlDecisions:
                 if not isinstance(ticket, str):
                     raise RecoveryRequiredError("Return requires its current zero hold ticket")
                 c.requests.bind_return(return_request, expected_intent, ticket, connection[0].boot)
+        elif continuing_local is None:
+            c.local_schedule.observe_closed(native)
         return attempt
 
     # Physical claim, publication and rollback

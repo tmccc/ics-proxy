@@ -732,6 +732,7 @@ class ManagedController:
             verified_pause = True
         previous_intent = self.requests.intent()
         self.charging.observed(native)
+        self.local_schedule.observe_closed(native)
         observed_intent = self.requests.intent()
         intent_changed = observed_intent != previous_intent
         self.failures = 0
