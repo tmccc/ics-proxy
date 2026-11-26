@@ -194,14 +194,18 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # API errors are classified before HA logs them; tokens and server payloads never appear in UpdateFailed.
     async def _async_update_data(self) -> dict[str, Any]:
+        if not self.entry_is_current():
+            raise UpdateFailed("The charger proxy status belongs to an inactive entry")
         started = time.monotonic()
         try:
             value = dict(await self.client.request("status"))
         except ProxyError:
-            self.update_notification(False, unavailable=True)
-            raise UpdateFailed("The local charger proxy is unavailable") from None
-        if not self.notice.active or self.notice.generation != self.notice_generation:
+            value = None
+        if not self.entry_is_current():
             raise UpdateFailed("The charger proxy status belongs to an inactive entry")
+        if value is None:
+            self.update_notification(False, unavailable=True)
+            raise UpdateFailed("The local charger proxy is unavailable")
         owner = value.get("canvas_owner")
         if not isinstance(owner, str) or not re.fullmatch(r"[a-f0-9]{64}", owner):
             owner = None

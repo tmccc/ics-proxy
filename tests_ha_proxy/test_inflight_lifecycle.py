@@ -271,3 +271,49 @@ async def test_held_status_after_terminal_cleanup_before_reactivation(actual_has
     finally:
         gate.release_all()
         await cleanup_tasks([read])
+
+
+# HA records the disable before taking the setup lock, so an outstanding reply can arrive before unload.
+@pytest.mark.parametrize("status_failure", [False, True], ids=["healthy-reply", "closed-socket"])
+async def test_held_status_after_disable_before_unload(actual_hass, peer, monkeypatch, status_failure):
+    hass = actual_hass
+    clock, callbacks, _ = observe_notice_callbacks(monkeypatch)
+    entry = await setup(hass, peer)
+    old = entry.runtime_data
+    if not status_failure:
+        await establish_outage(hass, peer, old, clock, callbacks, visible=True)
+
+    peer["state"].update(healthy=True, control_revision=1)
+    peer["status_failure"] = status_failure
+    gate = StatusGate()
+    peer["response_gate"] = gate
+    read = hass.async_create_background_task(old.async_refresh(), "ics-test-disabling-poll", eager_start=False)
+    tasks = [read]
+    try:
+        await asyncio.wait_for(gate.entered[0].wait(), 3)
+        data, received_at, expiry = old.data, old.received_at, old.cancel_timer
+        outage = (old.problem_since, old.notice.detail, old.notified, old.notice.cancel_timer)
+        notifications = dict(_async_get_or_create_notifications(hass))
+        async with entry.setup_lock:
+            disabling = asyncio.create_task(
+                hass.config_entries.async_set_disabled_by(entry.entry_id, ConfigEntryDisabler.USER)
+            )
+            tasks.append(disabling)
+            await asyncio.sleep(0)
+            assert entry.disabled_by is ConfigEntryDisabler.USER
+            assert entry.state is ConfigEntryState.LOADED and old.notice.active and not disabling.done()
+
+            clock.value += 1
+            gate.release[0].set()
+            await finished(read)
+            assert old.data is data and old.received_at == received_at and old.cancel_timer is expiry
+            assert (old.problem_since, old.notice.detail, old.notified, old.notice.cancel_timer) == outage
+            assert dict(_async_get_or_create_notifications(hass)) == notifications
+            gate.release[1].set()
+            await old.async_refresh()
+            assert not gate.entered[1].is_set()
+        assert await finished(disabling)
+        assert entry.state is ConfigEntryState.NOT_LOADED
+    finally:
+        gate.release_all()
+        await cleanup_tasks(tasks)
