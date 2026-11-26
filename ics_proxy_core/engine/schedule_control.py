@@ -362,6 +362,7 @@ class ScheduleControl:
             ordinary.require_authority(None)
         except (RecoveryRequiredError, UnavailableError, TimeoutError) as error:
             raise UnavailableError("ordinary daily report awaits fresh closed native zero") from error
+        observation = c.native.last_resolved_read
         source = j.get(ORDINARY_SOURCE)
         control = j.get("control", {})
         station = j.db.execute(
@@ -382,6 +383,9 @@ class ScheduleControl:
                 or not ordinary.active()
                 or j.get(ORDINARY_HOLD) != hold
                 or j.get(ORDINARY_SOURCE) != source
+                or c.native.last_resolved_read != observation
+                or c.native.last_verified_at != native.physical.observed_at
+                or not native.is_fresh(5)
                 or j.active() != identifier
                 or g._charger_epoch != epoch
                 or g.boot_observation != boot

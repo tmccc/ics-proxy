@@ -8,11 +8,13 @@ import sqlite3
 import time
 import uuid
 from contextlib import closing
+from dataclasses import asdict
 
 import pytest
 
+from ics_proxy_core.engine.managed_combined_start_recovery import combined_candidate
 from ics_proxy_core.engine.managed_debt_recovery import KEY
-from ics_proxy_core.engine.store import ConflictError, RecoveryRequiredError, fingerprint
+from ics_proxy_core.engine.store import ConflictError, Journal, RecoveryRequiredError, fingerprint
 from ics_proxy_core.engine.trial_session import save_private
 from ics_proxy_core.frames import build_call_error
 from tests import conftest as _core_setup  # noqa: F401 - load the HA-free source package.
@@ -31,6 +33,42 @@ from tools import reconcile_managed_debt as debt_tool
 from tools import reconcile_managed_delivery as delivery_tool
 
 KIND = "vendor-start-mapping"
+
+
+@pytest.mark.parametrize("owner_authorized", [True, False], ids=["closed-owner-session", "orphaned-cloud-session"])
+def test_combined_candidate_distinguishes_closed_owner_history_from_unmapped_cloud_debt(tmp_path, owner_authorized):
+    with closing(Journal(tmp_path / "state.db", "SYNTHETIC")) as journal:
+        prior = journal.start("prior-start", START, owner_authorized=owner_authorized)["transactionId"]
+        journal.stop("prior-stop", {"transactionId": prior, "timestamp": START["timestamp"], "meterStop": 1100})
+        if not owner_authorized:
+            # Isolate an unrelated unmapped transaction with no queued pair for the other checks to reject.
+            journal.db.execute("DELETE FROM outbox WHERE local=?", (prior,))
+        assert journal.vendor_id(prior) is None and journal.next_delivery() is None
+
+        start = START | {"idTag": "CLOUD_OWNER", "timestamp": "2026-01-01T00:20:00Z", "meterStart": 1200}
+        mutation = journal.mutation_intent("vendor", "RemoteStartTransaction", {"idTag": start["idTag"]})
+        journal.mutation_finished(mutation, False)
+        local = journal.start("cloud-start", start)["transactionId"]
+        journal.stop("cloud-stop", {"transactionId": local, "timestamp": "2026-01-01T00:21:00Z", "meterStop": 1300})
+        journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE local=? AND action='StartTransaction'", (local,))
+        head = journal.next_delivery()
+        assert head is not None
+        snapshot = {
+            "mutations": [dict(row) for row in journal.db.execute("SELECT * FROM mutations")],
+            "marker": None,
+            "grant": None,
+            "requests": [],
+            "deferred": None,
+            "fault": {"classification": "owner_control_or_delivery_uncertain"},
+            "head": asdict(head),
+            "outbox": [dict(row) for row in journal.db.execute("SELECT * FROM outbox ORDER BY seq")],
+            "transactions": [dict(row) for row in journal.db.execute("SELECT * FROM transactions ORDER BY local")],
+        }
+        if owner_authorized:
+            assert combined_candidate(journal, snapshot)["local_transaction_id"] == local
+        else:
+            with pytest.raises(RecoveryRequiredError, match="unrelated or unbound lifecycle"):
+                combined_candidate(journal, snapshot)
 
 
 class CompletedCommandReply:
