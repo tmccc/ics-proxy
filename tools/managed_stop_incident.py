@@ -106,7 +106,8 @@ def owner_reply(db: sqlite3.Connection, tables: set[str], request: str, local: i
         checkpoints = db.execute(
             "WITH candidates AS (SELECT key,CASE WHEN length(value)<=8192 AND json_valid(value) THEN value END AS v "
             "FROM meta WHERE key GLOB 'retained_stop_owner:*' OR key GLOB 'retained_transaction_reply_owner:*') "
-            "SELECT key,v FROM candidates WHERE json_extract(v,'$.request')=? AND json_extract(v,'$.ticket')=? "
+            "SELECT key,CAST(v AS BLOB) FROM candidates WHERE json_extract(v,'$.request')=? "
+            "AND json_extract(v,'$.ticket')=? "
             "AND json_extract(v,'$.action')=? AND json_extract(v,'$.local')=? LIMIT 3",
             (request, request, STOP_ACTION, local),
         ).fetchall()
@@ -160,7 +161,7 @@ def vendor_reply(db: sqlite3.Connection, tables: set[str], token: str, wire: obj
         legacy, current = checkpoint_keys("vendor", exact_wire)
         matches: set[str] = set()
         for key, value in db.execute(
-            "SELECT key,value FROM meta WHERE key IN (?,?) AND length(value)<=8192", (legacy, current)
+            "SELECT key,CAST(value AS BLOB) FROM meta WHERE key IN (?,?) AND length(value)<=8192", (legacy, current)
         ):
             saved = object_fields(value)
             status = saved.get("status")

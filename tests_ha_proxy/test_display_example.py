@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 from homeassistant import bootstrap, loader
-from homeassistant.config_entries import ConfigEntries
+from homeassistant.config_entries import ConfigEntries, ConfigEntryDisabler, ConfigEntryState
 from homeassistant.const import EVENT_CALL_SERVICE
 from homeassistant.core import HomeAssistant, SupportsResponse, callback
 from homeassistant.exceptions import HomeAssistantError
@@ -744,6 +744,69 @@ async def test_ordinary_start_does_not_reach_a_replacement_destination(actual_ha
         CANVAS_OWNER,
         REPLACEMENT_OWNER,
     ]
+
+
+# Intent: revoke an ordinary Start whose management handshake still belongs to a retired integration.
+# Why: the original endpoint can remain reachable and ready after a local disable or retarget.
+@pytest.mark.parametrize("surface", ["session_action", "start_button"])
+@pytest.mark.parametrize("change", ["retarget", "disable"])
+async def test_ordinary_start_cannot_write_after_entry_retirement(
+    actual_hass, canvas_peer, replacement_peer, surface, change
+):
+    hass, peer = actual_hass, canvas_peer
+    entry = await setup_proxy(hass, peer["port"])
+    original = entry.runtime_data
+
+    # Retire the entry before the original socket can write a Start.
+    async def retire_entry():
+        if change == "retarget":
+            hass.config_entries.async_update_entry(entry, data={**entry.data, "port": replacement_peer["port"]})
+            assert await hass.config_entries.async_reload(entry.entry_id)
+            assert entry.runtime_data is not original
+            assert entry.runtime_data.client.port == replacement_peer["port"]
+        else:
+            assert await hass.config_entries.async_set_disabled_by(entry.entry_id, ConfigEntryDisabler.USER)
+            assert entry.state is ConfigEntryState.NOT_LOADED
+        assert "start" not in peer["commands"]
+
+    peer["before_handshake"] = retire_entry
+    if surface == "session_action":
+        result = await call_session_command(hass, "start", revision=0)
+        assert result == {"confirmed": False, "request_reference": None}
+    else:
+        with pytest.raises(HomeAssistantError, match="charger control entry is no longer active"):
+            await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True)
+    assert "before_handshake" not in peer
+    assert "start" not in peer["commands"] and not peer["state"]["charging_session_open"]
+    assert "start" not in replacement_peer["commands"]
+
+
+# Intent: an already-issued command keeps its original receipt lookup across entry retirement.
+# Why: a change of integration endpoint cannot undo a proxy write or transfer its receipt to another endpoint.
+async def test_ordinary_start_reads_its_receipt_after_entry_retirement(actual_hass, canvas_peer, replacement_peer):
+    hass, peer = actual_hass, canvas_peer
+    entry = await setup_proxy(hass, peer["port"])
+    original = entry.runtime_data
+    peer["pending_receipt"] = True
+
+    # Schedule the reload on the next handshake once the old peer accepts the command.
+    async def retarget_entry():
+        hass.config_entries.async_update_entry(entry, data={**entry.data, "port": replacement_peer["port"]})
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        assert entry.runtime_data is not original
+
+    # The accepted reply schedules the reload before the old client's first receipt read.
+    def retarget_after_start(command, _request, result):
+        if command == "start":
+            peer["before_handshake"] = retarget_entry
+        return result
+
+    peer["result_filter"] = retarget_after_start
+    result = await call_session_command(hass, "start", revision=0)
+    assert result["confirmed"] is True and result["request_reference"] is not None
+    assert entry.runtime_data.client.port == replacement_peer["port"]
+    assert peer["commands"].count("start") == peer["commands"].count("receipt") == 1
+    assert set(replacement_peer["commands"]) == {"status"}
 
 
 # Intent: each other HA command keeps the commissioned destination in its initiating status.

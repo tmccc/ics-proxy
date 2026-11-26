@@ -448,13 +448,13 @@ class LocalSchedule:
             return occurrence
         return None
 
-    # An early closure still needs a native reading when normal supervision cannot finish.
+    # Restrictive polls can retry a refused closure write from a fresh sample.
     def closure_probe_needed(self) -> bool:
         occurrence = self._closed_occurrence()
         return (
             occurrence is not None
             and current_control_scope(self.controller.session.gateway) is not None
-            and not self.closure_known(occurrence)
+            and not self.closure_known(occurrence, require_durable=True)
         )
 
     # Remember settled early closure so its spent window has no physical work left at cutoff.
@@ -502,11 +502,11 @@ class LocalSchedule:
         return fingerprint((occurrence["request"], local, row["stop"]))
 
     # Either journal path can preserve the same physical proof across process replacement.
-    def closure_known(self, occurrence: dict[str, Any]) -> bool:
+    def closure_known(self, occurrence: dict[str, Any], *, require_durable: bool = False) -> bool:
         if (
             occurrence.get("native_closed") is True
-            or self.closed_request == occurrence["request"]
-            or self.controller.session_stop.closure_verified(occurrence["local"])
+            or (not require_durable and self.closed_request == occurrence["request"])
+            or self.controller.session_stop.closure_verified(occurrence["local"], require_durable=require_durable)
         ):
             return True
         try:

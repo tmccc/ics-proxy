@@ -76,7 +76,18 @@ async def test_scheduled_closure_survives_interrupted_poll(tmp_path, tls, unused
 # Why: only exact, independently verified closure can suppress cutoff after a process replacement.
 @pytest.mark.parametrize(
     "checkpoint",
-    ["exact", "other-occurrence", "other-session", "other-report", "not-observed", "refused", "stop-storage-refused"],
+    [
+        "exact",
+        "other-occurrence",
+        "other-session",
+        "other-report",
+        "not-observed",
+        "refused",
+        "marker-recovers",
+        "checkpoint-recovers",
+        "checkpoint-recovers-with-stop-receipt",
+        "stop-storage-refused",
+    ],
 )
 async def test_schedule_closure_checkpoint_survives_replacement(
     tmp_path, tls, unused_tcp_port, monkeypatch, checkpoint
@@ -88,11 +99,24 @@ async def test_schedule_closure_checkpoint_survives_replacement(
             c, j = test.controller, test.session.journal
             intent, occurrence = c.requests.intent(), j.get(LOCAL_SCHEDULE_OCCURRENCE)
             expected_stops = []
-            if checkpoint == "stop-storage-refused":
+            receipt_stays_volatile = checkpoint == "checkpoint-recovers-with-stop-receipt"
+            storage_recovers = receipt_stays_volatile or checkpoint in ("marker-recovers", "checkpoint-recovers")
+            if checkpoint == "stop-storage-refused" or receipt_stays_volatile:
+                answer = bench.firmware.answer
+
+                # A rejected receipt must not independently trigger the restricted closure poll.
+                def stop_answer(action, payload):
+                    if receipt_stays_volatile and action == "RemoteStopTransaction":
+                        return {"status": "Rejected"}
+                    return answer(action, payload)
+
+                monkeypatch.setattr(bench.firmware, "answer", stop_answer)
                 request = uuid.uuid4().hex
                 c.command(request, "stop_session", intent.revision, target=c.session_stop.target())
                 await c.session_stop.worker
                 expected_stops = [{"transactionId": local}]
+                if receipt_stays_volatile:
+                    assert c.requests.receipt(request)["state"] == "failed"
                 j.db.execute(
                     "CREATE TRIGGER refuse_stop_closure BEFORE UPDATE ON managed_requests "
                     f"WHEN NEW.id='{request}' AND json_extract(NEW.result,'$._session_stop.closure_verified') "
@@ -114,7 +138,7 @@ async def test_schedule_closure_checkpoint_survives_replacement(
                 f"WHEN NEW.key='{LOCAL_SCHEDULE_OCCURRENCE}' AND json_extract(NEW.value,'$.native_closed') "
                 "BEGIN SELECT RAISE(ABORT,'refuse scheduled closure marker'); END"
             )
-            if checkpoint == "refused":
+            if checkpoint == "refused" or storage_recovers:
                 j.db.execute(
                     "CREATE TRIGGER refuse_schedule_checkpoint BEFORE INSERT ON meta "
                     f"WHEN NEW.key='{_SCHEDULE_CLOSURE}' "
@@ -127,7 +151,24 @@ async def test_schedule_closure_checkpoint_survives_replacement(
             assert j.get(_RETAINED_STOP_CLOSURES) is None
             assert c.requests.intent() == intent and bench.firmware.effective_limit() == 6
 
+            if receipt_stays_volatile:
+                assert c.session_stop.closure_verified(local)
+                assert not c.session_stop.closure_verified(local, require_durable=True)
+            if storage_recovers:
+                # Restrictive polling can retry while normal supervision and both journal writes still fail.
+                await c.session_stop.confirm_while_blocked()
+                assert j.get(LOCAL_SCHEDULE_OCCURRENCE).get("native_closed") is None
+                assert j.get(_SCHEDULE_CLOSURE) is None
+                if checkpoint == "marker-recovers":
+                    j.db.execute("DROP TRIGGER refuse_schedule_closure")
+                else:
+                    j.db.execute("DROP TRIGGER refuse_schedule_checkpoint")
+                await poll_through_native_timeout(c, monkeypatch)
+
             if checkpoint in ("not-observed", "refused"):
+                assert j.get(_SCHEDULE_CLOSURE) is None
+            elif checkpoint == "marker-recovers":
+                assert j.get(LOCAL_SCHEDULE_OCCURRENCE)["native_closed"] is True
                 assert j.get(_SCHEDULE_CLOSURE) is None
             else:
                 request = occurrence["request"]
@@ -146,7 +187,7 @@ async def test_schedule_closure_checkpoint_survives_replacement(
             assert c.local_schedule.closed_request is None and c.requests.intent() == intent
             # Isolate the cutoff from the replacement connection's separate zero hold.
             await c.local_schedule.stop_if_due()
-            if checkpoint in ("exact", "stop-storage-refused"):
+            if checkpoint in ("exact", "stop-storage-refused") or storage_recovers:
                 assert c.requests.intent() == intent and scheduled_cutoff_target(j) is None
             else:
                 assert c.requests.intent().mode == "paused" and scheduled_cutoff_target(j) == local

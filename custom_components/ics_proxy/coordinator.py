@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections.abc import Callable
 from datetime import timedelta
 from sys import float_info
 from typing import Any
@@ -57,15 +58,25 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def mark_canvas_activation(self) -> None:
         self.canvas_activation = frame_clock() if self.canvas_owner is not None else None
 
-    # Keep a write bound to the status that supplied its revision, including across the WebSocket handshake.
-    async def async_command(self, action: str, revision: int, **fields: Any) -> None:
+    # Keep a write bound to its original status and integration generation across the WebSocket handshake.
+    async def async_command(
+        self, action: str, revision: int, *, before_write: Callable[[], None] | None = None, **fields: Any
+    ) -> None:
         status = self.data or {}
         owner = status.get("canvas_owner")
         if owner is not None and (
             action in ("start", "stop_session") or status.get("management_owner_binding") is True
         ):
             fields["canvas_owner"] = owner
-        await self.client.command(action, revision, **fields)
+
+        # A retired coordinator can read an issued receipt but must never send a new command.
+        def require_current_entry() -> None:
+            if not self.notice.active or self.notice.generation != self.notice_generation:
+                raise ProxyError("The charger control entry is no longer active")
+            if before_write is not None:
+                before_write()
+
+        await self.client.command(action, revision, before_write=require_current_entry, **fields)
 
     # Keep the existing coordinator inspection surface while its debounce belongs to the entry.
     @property

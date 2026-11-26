@@ -369,10 +369,10 @@ class ManagedSessionStop:
     def retain_scheduled_closure(self, local: int) -> bool:
         rejections = stop_rejections(self.controller.session.journal)
         self._checkpoint_closure(rejections, observed=True, scheduled_local=local)
-        return self._verified_closures == self._retained_closures and self.closure_verified(local)
+        return self.closure_verified(local, require_durable=True)
 
     # The exact closure can already be proved while its receipt publication still awaits storage.
-    def closure_verified(self, local: int) -> bool:
+    def closure_verified(self, local: int, *, require_durable: bool = False) -> bool:
         j = self.controller.session.journal
         receipt = j.db.execute(
             "SELECT 1 FROM managed_requests JOIN transactions "
@@ -381,9 +381,13 @@ class ManagedSessionStop:
             f"AND transactions.stop IS NOT NULL AND {STOP_CLOSURE_VERIFIED} LIMIT 1",
             (STOP_SESSION, local),
         ).fetchone()
-        return receipt is not None or (
-            bool(self._verified_closures)
-            and bool(self._matching_closures(stop_rejections(j), observed=False, local=local))
+        if receipt is not None:
+            return True
+        if not self._verified_closures:
+            return False
+        matching = self._matching_closures(stop_rejections(j), observed=False, local=local)
+        return any(
+            not require_durable or self._retained_closures.get(request) == proof for request, proof in matching.items()
         )
 
     # A refused receipt write can leave the same exact closure in memory or in the separate checkpoint.

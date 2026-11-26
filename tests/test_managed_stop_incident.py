@@ -64,6 +64,61 @@ def vendor_attempt(journal, local, wire, *, result="dispatched"):
     return token
 
 
+# Intent: keep valid lifecycle and sibling Stop evidence when an optional reply cannot be decoded.
+# Why: the read-only report can still explain the incident even if one retained checkpoint is unreadable.
+@pytest.mark.parametrize("vendor", [False, True], ids=["owner", "vendor"])
+@pytest.mark.parametrize("joined", [False, True], ids=["direct", "joined"])
+def test_unreadable_stop_checkpoint_preserves_incident_journal(tmp_path, vendor, joined):
+    path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"
+    with closing(Journal(path, "test-charger")) as journal:
+        ManagedRequests(journal)
+        local = journal.start("original-start", START)["transactionId"]
+        wire = uuid.uuid4().hex
+        if vendor:
+            token = vendor_attempt(journal, local, wire)
+            evidence = ForwardedReply(token, STOP_ACTION, wire, "Accepted")
+            damaged = json.dumps(asdict(evidence)).encode().replace(b"Accepted", b"Accepted\xff")
+        else:
+            token = write_request(journal, local, dispatched=True)
+            evidence = OwnerWire(wire, token, token, BOOT, STOP_ACTION, local, None, "Accepted")
+            damaged = json.dumps(asdict(evidence)).encode().replace(BOOT.encode(), b"private-boot\xff")
+        key = f"retained_stop_{'vendor' if vendor else 'owner'}:{wire}"
+        journal.db.execute("INSERT INTO meta VALUES(?,CAST(? AS TEXT))", (key, damaged))
+
+        if joined:
+            sibling = write_request(journal, local, dispatched=True)
+            journal.outcomes.record_owner_wire(
+                OwnerWire(uuid.uuid4().hex, sibling, sibling, BOOT, STOP_ACTION, local, None, "Accepted")
+            )
+            request = write_request(
+                journal,
+                local,
+                dispatched=False,
+                joined=True,
+                local_attempts=[sibling] if vendor else [sibling, token],
+                vendor_attempts=[token] if vendor else [],
+            )
+        journal.stop("original-stop", {"transactionId": local, "meterStop": 102, "timestamp": START["timestamp"]})
+
+    if joined:
+        report = stop_incident_report(path, events, request_reference=reference(request))
+        replies = {attempt["request"]: attempt["reply"] for attempt in report["wire"]["joined_attempts"]}
+        assert replies == {reference(sibling): "accepted", reference(token): "missing"}
+    else:
+        report = (
+            stop_incident_report(path, events, vendor=True)
+            if vendor
+            else stop_incident_report(path, events, request_reference=reference(token))
+        )
+        assert report["wire"]["dispatch"] == "possible_dispatch"
+        assert report["wire"]["reply"] == "missing"
+    assert report["journal"]["available"] is True
+    assert report["journal"]["lifecycle"] == "closed"
+
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT CAST(value AS BLOB) FROM meta WHERE key=?", (key,)).fetchone() == (damaged,)
+
+
 # Intent: follow only the original predecessor set even if another session has a definite reply.
 # Why: a closed follower needs an exact acceptance, or a refusal from every represented predecessor.
 @pytest.mark.parametrize(
