@@ -19,6 +19,7 @@ from .command_processor import CommandPriority
 from .gateway import Gateway
 from .local_control import join_retirement, recover_unreported_local_start
 from .managed_current import managed_current_ceiling
+from .managed_denial_faults import GENERIC
 from .native_bounded import NativeBoundedSpec, NativeReadinessError, readiness_decision
 from .native_bounded_handover import NativeBoundedHandover
 from .native_faults import (
@@ -511,19 +512,14 @@ class TrialSession:
             except MissingOriginalHistoryError as error:
                 j = self.journal
                 if j.get("managed_mode") and j.get("trial_binding"):
-                    fault = j.fault.read({})
-                    if not self.started and (
-                        not fault or matches_history_fault(fault, j.get("managed_native_failure", {}))
-                    ):
-                        # Finish a saved acknowledgement locally before history recovery checks the remaining queue.
-                        self.gateway.decide(lambda: self.runtime.settle_saved_delivery(cold_history=True))
+                    if not self.started:
                         try:
-                            self.gateway.decide(lambda: settle_saved_stop_rejections(j))
+                            self.gateway.decide(self._settle_cold_history_replies)
                         except sqlite3.Error:
                             if j.db.in_transaction:
                                 raise
                             raise error from None  # The unresolved receipt still prevents a history-only repair.
-                    if not fault and history_recovery_idle(
+                    if not j.fault.read({}) and history_recovery_idle(
                         j, retain_queued_reports=True, allow_closed_stop_receipts=True
                     ):
                         refusal = self._native_refusal(error)
@@ -541,6 +537,28 @@ class TrialSession:
             raise RecoveryRequiredError("native bounded restoration requires no new listener")
         await self.runtime.start()
         self.started = True
+
+    # A saved acknowledgement can retire its own late Start fault before history recovery checks the remaining queue.
+    def _settle_cold_history_replies(self) -> None:
+        j = self.journal
+        fault, failure = j.fault.read({}), j.get("managed_native_failure", {})
+        late_token = fault.get("late_delivery_token")
+        if (
+            not fault
+            or matches_history_fault(fault, failure)
+            or (
+                fault.get("classification") == GENERIC
+                and late_token is not None
+                and (head := j.next_delivery()) is not None
+                and head.action == "StartTransaction"
+                and head.state == "ambiguous"
+                and head.token == late_token
+            )
+        ):
+            self.runtime.settle_saved_delivery(cold_history=True)
+        fault = j.fault.read({})
+        if not fault or matches_history_fault(fault, failure):
+            settle_saved_stop_rejections(j)
 
     # Publish startup's checked session and restrictive hold through the shared owner.
     def _accept_startup_observation(self, native: HandoverEvidence, *, first_listener: bool = False) -> None:

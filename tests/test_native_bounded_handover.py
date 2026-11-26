@@ -7,14 +7,17 @@ import asyncio
 import copy
 import sqlite3
 import ssl
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from ics_proxy_core import commands
+from ics_proxy_core.engine import native_bounded_handover, trial_handover_evidence
 from ics_proxy_core.engine.native_bounded import NativeBoundedSpec
 from ics_proxy_core.engine.rpc import UnavailableError
 from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
@@ -383,7 +386,10 @@ async def test_lost_clear_ack_uses_actual_absence_without_reclear(
 # Intent: an original route readback and an already-online bit cannot stand in for actual fresh backend reconnection.
 # Why: the native OCPP online cache can still describe the old proxy connection during a route transition.
 async def test_backend_confirmation_requires_fresh_offline_then_online(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], unused_tcp_port: int
+    tmp_path: Path,
+    tls: tuple[ssl.SSLContext, ssl.SSLContext, Path],
+    unused_tcp_port: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async with native_ready(tmp_path, tls, unused_tcp_port) as (rig, session, charger):
         await session.command({"command": "native-bounded-handover"})
@@ -405,7 +411,29 @@ async def test_backend_confirmation_requires_fresh_offline_then_online(
         assert patches == [{key: rig.spec.original_configuration[key] for key in rig.spec.trial_route}]
         assert not (await session.native_bounded.observe_backend())["original_backend_connected"]
         assert session.journal.get("native_bounded_handover")["stage"] == "awaiting_backend"
-        await verify_original_backend(rig, session)
+
+        handover = session.native_bounded
+        observe = handover.observe
+        elapsed = 0
+
+        async def expired_online_observation() -> HandoverEvidence:
+            nonlocal elapsed
+            sample = await observe()
+            elapsed = 6
+            return sample
+
+        rig.bench.online = True
+        # The wall clock still places the observation inside its five-second window.
+        clock = SimpleNamespace(time=time.time, monotonic=lambda: time.monotonic() + elapsed)
+        with monkeypatch.context() as timing:
+            timing.setattr(native_bounded_handover, "time", clock)
+            timing.setattr(trial_handover_evidence, "time", clock)
+            timing.setattr(handover, "observe", expired_online_observation)
+            with pytest.raises(StaleEvidenceError):
+                await handover.observe_backend()
+        assert session.journal.get("native_bounded_handover")["stage"] == "awaiting_backend"
+
+        assert (await handover.observe_backend())["original_backend_connected"]
         assert session.journal.get("native_bounded_handover")["stage"] == "backend_verified"
         assert rig.peer.runtime_user == 60 and rig.peer.configuration["AmpLmt"] == "6"
 

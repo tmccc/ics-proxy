@@ -274,6 +274,8 @@ class NativeBoundedHandover:
                 content_current = True
                 observed_route = self.initial_listener_route(native) if allow_original_route else route
                 measured = self._inspect(native, route=observed_route)
+                if not native.is_fresh(5):
+                    raise StaleEvidenceError("native observation exceeded its freshness limit")
                 if (
                     selected_current is not None
                     and gateway.journal.current_change.read().settled_or_missing
