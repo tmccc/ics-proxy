@@ -11,12 +11,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 
+from ics_proxy_core import commands
 from ics_proxy_core.engine.connection_scope import current_scope
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_release_recovery import release_evidence
 from ics_proxy_core.engine.rpc import UnavailableError
 from ics_proxy_core.engine.store import encoded, fingerprint
-from tests.charge_rig import owner_start, positive_flow
+from tests.charge_rig import owner_rig, owner_start, positive_flow
 from tests.current_rig import selected_ready
 from tests.handover_helpers import crash
 from tests.managed_rig import healthy, introduced, managed_session, starts
@@ -160,6 +161,51 @@ async def test_ocpp_first_mapped_closure_recovers_only_after_native_closure(
         assert not any(
             f[2] in ("RemoteStartTransaction", "RemoteStopTransaction") for f in rig.bench.device_calls[command_count:]
         )
+
+
+# Intent: a joined Stop still explains the exact closure gap after its accepted vendor mutation rotates out.
+# Why: a normal session-only Stop must not introduce a new station hold while waiting for native closure.
+async def test_joined_vendor_stop_retains_closure_wait_after_rotation(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, j, bench = b.controller, b.session.journal, b.rig.bench
+        local = await positive_flow(b, "daily")
+        await healthy(c)
+        vendor = j.vendor_id(local)
+        assert vendor is not None
+        response = await bench.cloud_call("accepted-stop", "RemoteStopTransaction", {"transactionId": vendor})
+        assert response[0] == 3 and response[2] == {"status": "Accepted"}
+        intent = c.requests.intent()
+        request = uuid.uuid4().hex
+        target = c.session_stop.target()
+        assert target is not None
+        c.command(request, "stop_session", intent.revision, target=target)
+        binding = j.outcomes.owner(request).result["_session_stop"]
+        predecessor = binding["accepted_attempt"]["identifier"]
+
+        await close_session(b.rig, b.session, b.charger, local)
+        bench.firmware.active = local  # Native still reports the transaction as open at zero.
+        bench.cp, bench.connection = "B", "Plug"
+        assert j.outcomes.latest_closed_session_stop_id() == local
+        with monkeypatch.context() as rotation:
+            rotation.setattr(j, "capacity", 1)
+            await bench.cloud_call(
+                "rotate-accepted-stop",
+                "SetChargingProfile",
+                commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 6, 1001, stack_level=0),
+            )
+        assert j.outcomes.vendor(predecessor) is None
+
+        mark = len(bench.received_limits)
+        assert (await c.tick())["state"] == "reconciling"
+        assert bench.received_limits[mark:] == []
+        assert j.outcomes.latest_closed_session_stop_id() == local
+        assert c.requests.receipt(request)["state"] == "running"
+
+        bench.firmware.active = None
+        assert (await healthy(c))["charging_session_open"] is False
+        assert c.requests.receipt(request)["state"] == "completed"
+        assert c.requests.intent() == intent and bench.received_limits[mark:] == []
+        assert sum(frame[2] == "RemoteStopTransaction" for frame in bench.device_calls) == 1
 
 
 # Intent: replacement during an exact, mapped Stop waits for the report and native closure.

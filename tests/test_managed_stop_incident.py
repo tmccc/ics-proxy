@@ -10,7 +10,7 @@ import pytest
 
 from ics_proxy_core.engine.command_outcomes import ForwardedReply, OwnerWire
 from ics_proxy_core.engine.managed_intent import ManagedRequests, insert_request
-from ics_proxy_core.engine.stop_settlement import STOP_COMPLETION_FIELDS, STOP_SESSION
+from ics_proxy_core.engine.stop_settlement import STOP_COMPLETION_FIELDS, STOP_SESSION, settle_saved_stop_rejections
 from ics_proxy_core.engine.store import Journal
 from ics_proxy_core.engine.trial_session import save_private
 from tools.managed_incident import reference
@@ -52,6 +52,36 @@ def vendor_attempt(journal, local, wire, *, result="dispatched"):
     if result in ("Accepted", "Rejected"):
         journal.mutation_finished(token, True)
     return token
+
+
+# Intent: keep a rejection recovered from its checkpoint after the original vendor row is rotated.
+# Why: history recovery can settle a joined Stop before the checkpoint is promoted to its original wire row.
+def test_saved_vendor_rejection_survives_joined_receipt_settlement(tmp_path):
+    path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"
+    wire = uuid.uuid4().hex
+    with closing(Journal(path, "test-charger")) as journal:
+        ManagedRequests(journal)
+        local = journal.start("start-token", START)["transactionId"]
+        vendor = vendor_attempt(journal, local, wire)
+        request = write_request(journal, local, joined=1, vendor_attempts=[vendor])
+        checkpoint = f"retained_transaction_reply_vendor:{wire}"
+        journal.put(checkpoint, asdict(ForwardedReply(vendor, STOP_ACTION, wire, "Rejected")))
+        assert journal.outcomes.vendor(vendor).status is None
+
+        settle_saved_stop_rejections(journal)
+        receipt = ManagedRequests(journal).receipt(request)
+        assert receipt["state"] == "failed" and receipt["result"]["classification"] == "stop_rejected"
+        journal.outcomes.recover_transaction_replies()
+        assert journal.outcomes.vendor(vendor).status == "Rejected"
+        assert journal.get(checkpoint) is None
+        journal.capacity = 1
+        journal.mutation_intent("vendor", "SetChargingProfile", {"profile": "next"})
+        assert journal.outcomes.vendor(vendor) is None
+
+    report = stop_incident_report(path, events, request_reference=reference(request))
+    assert report["wire"]["joined_attempts"] == [
+        {"origin": "vendor", "request": reference(vendor), "reply": "rejected", "reply_source": "joined_receipt"}
+    ]
 
 
 # Intent: observe an open session with a missing reply, then record closure for the same session.

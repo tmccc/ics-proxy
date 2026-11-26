@@ -14,7 +14,7 @@ from ..frames import Frame
 from .delivery_reply import DeliveryReply
 from .ics import unique_object
 from .plans import PlanBook
-from .stop_settlement import STOP_SESSION, StopAcceptance, stop_rejections
+from .stop_settlement import STOP_SESSION, StopAttempt, joined_stop_acceptance, stop_rejections
 from .store import Delivery, RecoveryRequiredError, encoded
 from .trial_evidence import profile_projection
 
@@ -700,7 +700,7 @@ class CommandOutcomes:
         return self.accepted_stop_attempt(local, ticket=ticket) is not None
 
     # Keep the actual predecessor when a session-only request joins an already accepted Stop.
-    def accepted_stop_attempt(self, local: int | None, *, ticket: str | None = None) -> StopAcceptance | None:
+    def accepted_stop_attempt(self, local: int | None, *, ticket: str | None = None) -> StopAttempt | None:
         if local is None:
             return None
         for wire in (*self._retained_owner_replies(), *self._owner_writes.values()):
@@ -710,7 +710,7 @@ class CommandOutcomes:
                 and wire.reply == "Accepted"
                 and (ticket is None or wire.ticket == ticket)
             ):
-                return StopAcceptance("local", wire.request or wire.ticket, wire.wire)
+                return StopAttempt("local", wire.request or wire.ticket, wire.wire)
         saved = self.journal.db.execute(
             "SELECT COALESCE(request,ticket),wire FROM owner_command_wires WHERE local=:local "
             "AND action='RemoteStopTransaction' AND reply='Accepted' AND (:ticket IS NULL OR ticket=:ticket) "
@@ -718,11 +718,11 @@ class CommandOutcomes:
             {"local": local, "ticket": ticket},
         ).fetchone()
         if saved is not None:
-            return StopAcceptance("local", saved[0], saved[1])
+            return StopAttempt("local", saved[0], saved[1])
         return self._accepted_forwarded_stop(local) if ticket is None else None
 
     # A forwarded Stop has the same session effect while its exact reply is being saved or already durable.
-    def _accepted_forwarded_stop(self, local: int) -> StopAcceptance | None:
+    def _accepted_forwarded_stop(self, local: int) -> StopAttempt | None:
         rows = self.journal.db.execute(
             "SELECT token,wire_request,wire_result FROM vendor_command_scope JOIN mutations ON mutation=token "
             "WHERE local=? AND origin='vendor' AND action='RemoteStopTransaction' "
@@ -731,7 +731,7 @@ class CommandOutcomes:
         )
         for row in rows:
             if row["wire_result"] == "Accepted":
-                return StopAcceptance("vendor", row["token"], row["wire_request"])
+                return StopAttempt("vendor", row["token"], row["wire_request"])
             reply = self._received(row["token"])
             if (
                 isinstance(reply, ForwardedReply)
@@ -739,7 +739,7 @@ class CommandOutcomes:
                 and reply.wire == row["wire_request"]
                 and reply.status == "Accepted"
             ):
-                return StopAcceptance("vendor", reply.mutation, reply.wire)
+                return StopAttempt("vendor", reply.mutation, reply.wire)
         return None
 
     # Bind live reply windows to the exact local or vendor request and allocated session.
@@ -852,20 +852,25 @@ class CommandOutcomes:
         if self.journal.get("managed_mode") is None:
             return False
         rejections = stop_rejections(self.journal)
-        count = self.journal.db.execute(
+        joins = self.journal.db.execute(
             f"{rejections.prefix}"
-            "SELECT MAX(COALESCE(json_array_length(result,'$._session_stop.owner_wire_attempts'),0)) "
+            "SELECT id,json_extract(result,'$._session_stop') AS binding, "
+            "json_array_length(result,'$._session_stop.owner_wire_attempts') AS wires "
             "FROM managed_requests WHERE action='stop_session' AND state IN ('running','uncertain') "
             "AND json_extract(result,'$._session_stop.local')=? AND json_extract(result,'$._session_stop.joined')=1 "
             f"AND NOT {rejections.receipts}",
             (*rejections.bindings, local),
-        ).fetchone()[0]
-        return count is not None and (
-            count > 0
-            or self.accepted_stop(local)
-            or self.unanswered_vendor_stop(local)
-            or self.unanswered_shutdown_stop(local)
-        )
+        ).fetchall()
+        if not joins:
+            return False
+        # The joining receipt's exact acceptance remains after the earlier vendor mutation rotates out.
+        for join in joins:
+            if join["wires"]:
+                return True
+            binding = json.loads(join["binding"])
+            if binding["local"] == local and joined_stop_acceptance(binding, join["id"]) is not None:
+                return True
+        return self.accepted_stop(local) or self.unanswered_vendor_stop(local) or self.unanswered_shutdown_stop(local)
 
     # A closed session can retain a Stop wait only until the next connector lifecycle.
     def latest_closed_session_stop_id(self) -> int | None:

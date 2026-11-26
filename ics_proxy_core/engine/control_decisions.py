@@ -80,7 +80,7 @@ from .security import SecurityError, StaleEvidenceError
 from .start_handoff import NativeStartReport, OwnedStartResult, StartHandoff, StartHandoffContext, StartPublication
 from .start_policy import ACTIVE, owner_tag_separate, start_refusal
 from .start_settlement import RetirementCandidate, StartFailureAction, StartFailureFacts, settle_start
-from .stop_settlement import StopAcceptance
+from .stop_settlement import StopAttempt
 from .store import RecoveryRequiredError, StationZeroStorageError, encoded, fingerprint
 from .trial_evidence import Resource, profile_projection
 
@@ -150,7 +150,7 @@ class StopZeroEvidence(Protocol):
 class StopPredecessors:
     """The earlier Stop attempts that could cover this request at admission."""
 
-    accepted: StopAcceptance | None = None
+    accepted: StopAttempt | None = None
     local_requests: tuple[str, ...] = ()
     owner_wires: tuple[str, ...] = ()
     vendor_mutations: tuple[str, ...] = ()

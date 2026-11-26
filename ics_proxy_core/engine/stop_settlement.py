@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -11,14 +12,14 @@ from typing import TYPE_CHECKING, Any, Literal
 from .store import encoded
 
 if TYPE_CHECKING:
-    from .command_outcomes import CommandOutcomes
+    from .command_outcomes import CommandOutcomes, TransactionReplyStatus
     from .store import Journal
 
 STOP_SESSION = "stop_session"
 STOP_NONTERMINAL_CLASSIFICATIONS = ("stop_not_confirmed", "process_replaced")
 STOP_CLOSURE_VERIFIED = "json_type(result,'$._session_stop.closure_verified') IS 'true'"
 STOP_CLOSURE_FIELDS = "result=json_set(result,'$._session_stop.closure_verified',json('true'))"
-STOP_REJECTION_FIELDS = "state='failed',result=json_set(result,'$.classification','stop_rejected')"
+_REJECTED_STOP_RESULT = "json_set(result,'$.classification','stop_rejected')"
 _COMPLETED_STOP_RESULT = (
     "json_set(json_remove(result,'$.classification'),"
     "'$.session_stopped',json('true'),'$._session_stop.closure_verified',json('true'))"
@@ -59,8 +60,8 @@ _EFFECTIVE_REJECTIONS = (
 
 
 @dataclass(frozen=True)
-class StopAcceptance:
-    """The exact accepted predecessor a joining request used."""
+class StopAttempt:
+    """The exact predecessor a joining request used."""
 
     origin: Literal["local", "vendor"]
     identifier: str
@@ -83,11 +84,8 @@ def joined_stop_session(binding: object) -> int | None:
     return local
 
 
-# Read the exact predecessor that this receipt has already saved as accepted.
-def joined_stop_acceptance(binding: object, request: str) -> StopAcceptance | None:
-    if not isinstance(binding, dict) or joined_stop_session(binding) is None:
-        return None
-    attempt = binding.get("accepted_attempt")
+# Read one exact predecessor saved on a joining receipt.
+def saved_stop_attempt(attempt: object, request: str) -> StopAttempt | None:
     if not isinstance(attempt, dict) or attempt.keys() != {"origin", "identifier", "wire"}:
         return None
     origin, predecessor, wire = attempt["origin"], attempt["identifier"], attempt["wire"]
@@ -100,15 +98,22 @@ def joined_stop_acceptance(binding: object, request: str) -> StopAcceptance | No
         or not 0 < len(wire) <= 36
     ):
         return None
-    return StopAcceptance(origin, predecessor, wire)
+    return StopAttempt(origin, predecessor, wire)
 
 
-# A later Accepted must belong to one of the specific attempts the receipt joined.
-def resolve_joined_stop_acceptance(outcomes: CommandOutcomes, request: str, binding: object) -> StopAcceptance | None:
-    if not isinstance(binding, dict) or (local := joined_stop_session(binding)) is None:
+# Read the exact predecessor that this receipt has already saved as accepted.
+def joined_stop_acceptance(binding: object, request: str) -> StopAttempt | None:
+    if not isinstance(binding, dict) or joined_stop_session(binding) is None:
         return None
-    if (saved := joined_stop_acceptance(binding, request)) is not None:
-        return saved
+    return saved_stop_attempt(binding.get("accepted_attempt"), request)
+
+
+# A later reply must belong to one of the specific attempts the receipt joined.
+def joined_stop_replies(
+    outcomes: CommandOutcomes, request: str, binding: object, status: TransactionReplyStatus
+) -> Iterator[StopAttempt]:
+    if not isinstance(binding, dict) or (local := joined_stop_session(binding)) is None:
+        return
     owner_bindings: tuple[tuple[str, Literal["request", "wire"]], ...] = (
         ("local_attempts", "request"),
         ("owner_wire_attempts", "wire"),
@@ -125,12 +130,13 @@ def resolve_joined_stop_acceptance(outcomes: CommandOutcomes, request: str, bind
                 if (
                     wire.local == local
                     and wire.action == "RemoteStopTransaction"
-                    and wire.reply == "Accepted"
+                    and wire.reply == status
                     and predecessor != request
                 ):
-                    return StopAcceptance("local", predecessor, wire.wire)
+                    yield StopAttempt("local", predecessor, wire.wire)
     attempts = binding.get("vendor_attempts")
-    if isinstance(attempts, list):
+    if isinstance(attempts, list) and attempts:
+        retained_rejections = set(outcomes.buffered_stop_rejections()[1]) if status == "Rejected" else set()
         for attempt in attempts:
             if (
                 isinstance(attempt, str)
@@ -140,10 +146,16 @@ def resolve_joined_stop_acceptance(outcomes: CommandOutcomes, request: str, bind
                 and vendor.wire is not None
                 and vendor.session is not None
                 and vendor.session.local == local
-                and vendor.status == "Accepted"
+                and (vendor.status == status or (vendor.token, vendor.wire) in retained_rejections)
             ):
-                return StopAcceptance("vendor", vendor.token, vendor.wire)
-    return None
+                yield StopAttempt("vendor", vendor.token, vendor.wire)
+
+
+# One genuine acceptance supplies the wire side of a joined Stop; closure is established independently.
+def resolve_joined_stop_acceptance(outcomes: CommandOutcomes, request: str, binding: object) -> StopAttempt | None:
+    return joined_stop_acceptance(binding, request) or next(
+        joined_stop_replies(outcomes, request, binding, "Accepted"), None
+    )
 
 
 # Retain only reply windows that still belong to this receipt or one of its joined Stop attempts.
@@ -209,21 +221,27 @@ class StopRejections:
 SAVED_STOP_REJECTIONS = StopRejections()
 
 
-# Preserve late acceptance in the same update as closure, before the original vendor mutation can rotate out.
+# Preserve the exact replies in the same update as closure, before the original vendor mutations can rotate out.
 def stop_completion_fields(
     journal: Journal, rejections: StopRejections, where: str, bindings: tuple[Any, ...]
 ) -> tuple[str, tuple[str, ...]]:
     rows = journal.db.execute(
         f"{rejections.prefix}SELECT id,json_extract(result,'$._session_stop') FROM managed_requests WHERE {where} "
-        "AND json_extract(result,'$._session_stop.joined')=1 "
-        "AND json_type(result,'$._session_stop.accepted_attempt') IS NULL",
+        "AND json_extract(result,'$._session_stop.joined')=1",
         (*rejections.bindings, *bindings),
     )
     patches = {}
-    for request, binding in rows:
-        acceptance = resolve_joined_stop_acceptance(journal.outcomes, request, json.loads(binding))
-        if acceptance is not None:
-            patches[request] = {"_session_stop": {"accepted_attempt": asdict(acceptance)}}
+    for request, raw_binding in rows:
+        binding = json.loads(raw_binding)
+        patch = joined_stop_rejection_patch(journal.outcomes, request, binding)
+        if (
+            joined_stop_acceptance(binding, request) is None
+            and (acceptance := next(joined_stop_replies(journal.outcomes, request, binding, "Accepted"), None))
+            is not None
+        ):
+            patch["accepted_attempt"] = asdict(acceptance)
+        if patch:
+            patches[request] = {"_session_stop": patch}
     if not patches:
         return STOP_COMPLETION_FIELDS, ()
     return (
@@ -240,6 +258,32 @@ def stop_rejections(journal: Journal) -> StopRejections:
         return SAVED_STOP_REJECTIONS
     return StopRejections(
         _EFFECTIVE_REJECTIONS, (encoded(owner), encoded(vendor)), "owner_rejections", "vendor_rejections"
+    )
+
+
+# Preserve proved refusals even when a distinct attempt accepted the Stop.
+def joined_stop_rejection_patch(outcomes: CommandOutcomes, request: str, binding: object) -> dict[str, Any]:
+    rejected = dict.fromkeys(joined_stop_replies(outcomes, request, binding, "Rejected"))
+    return {"rejected_attempts": [asdict(attempt) for attempt in rejected]} if rejected else {}
+
+
+# Save the exact rejected predecessors in the same update that makes the receipt terminal.
+def stop_rejection_fields(journal: Journal, rejections: StopRejections) -> tuple[str, tuple[str, ...]]:
+    rows = journal.db.execute(
+        f"{rejections.prefix}SELECT id,json_extract(result,'$._session_stop') FROM managed_requests "
+        f"WHERE {rejections.rejected_receipts} AND json_extract(result,'$._session_stop.joined')=1",
+        (*rejections.bindings, STOP_SESSION),
+    )
+    patches = {}
+    for request, binding in rows:
+        if patch := joined_stop_rejection_patch(journal.outcomes, request, json.loads(binding)):
+            patches[request] = {"_session_stop": patch}
+    if not patches:
+        return f"state='failed',result={_REJECTED_STOP_RESULT}", ()
+    return (
+        f"state='failed',result=json_patch({_REJECTED_STOP_RESULT},"
+        "COALESCE((SELECT value FROM json_each(?) WHERE key=managed_requests.id),'{}'))",
+        (encoded(patches),),
     )
 
 
@@ -263,6 +307,8 @@ def settle_saved_stop_rejections(journal: Journal) -> None:
     bindings = (*rejections.bindings, STOP_SESSION)
     if db.execute(f"{rejections.prefix}SELECT 1 FROM managed_requests WHERE {where} LIMIT 1", bindings).fetchone():
         with nullcontext() if db.in_transaction else journal.atomic():
+            fields, rejected = stop_rejection_fields(journal, rejections)
             db.execute(
-                f"{rejections.prefix}UPDATE managed_requests SET {STOP_REJECTION_FIELDS} WHERE {where}", bindings
+                f"{rejections.prefix}UPDATE managed_requests SET {fields} WHERE {where}",
+                (*rejections.bindings, *rejected, STOP_SESSION),
             )

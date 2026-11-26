@@ -448,9 +448,9 @@ async def run_display_core(config_dir, request, *, expiry_seconds=None, cleanup_
 
 
 # Send a tap carrying the displayed control marker and the current Home Assistant state.
-def send_display_tap(hass, starting):
+def send_display_tap(hass, starting, *, canvas_age=1, frame_rendered_at=None):
     hass.states.async_set("sensor.ics_display_screen_source", "Home Assistant")
-    rendered_at = datetime.now(UTC)
+    rendered_at = dt_util.now()
     hass.states.async_set(
         IMAGE,
         rendered_at.isoformat(),
@@ -468,8 +468,8 @@ def send_display_tap(hass, starting):
             "device_id": "replace-with-esphome-device-id",
             "x": "120" if starting else "352",
             "y": "396",
-            "canvas_age_seconds": "1",
-            "canvas_rendered_at_epoch": str(int(rendered_at.timestamp())),
+            "canvas_age_seconds": str(canvas_age),
+            "canvas_rendered_at_epoch": str(int((frame_rendered_at or rendered_at).timestamp())),
             "frame_control": START_MARKER if starting else "stop:" + TARGET,
         },
     )
@@ -480,6 +480,38 @@ async def wait_for_feedback(hass, feedback):
     async with asyncio.timeout(6):
         while hass.states.get(PENDING).state != feedback or hass.states.get(AUTOMATION).attributes["current"]:
             await asyncio.sleep(0.02)
+
+
+# Intent: a backward Home Assistant clock step cannot revive a delayed tap whose displayed age exposes the step.
+# Why: both reported ages can still look fresh when checked independently.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+async def test_display_rejects_expired_tap_after_clock_step(tmp_path, monkeypatch, starting):
+    calls = []
+    called = asyncio.Event()
+
+    # Record the action only if the actual automation admits the tap.
+    async def request(call):
+        calls.append(dict(call.data))
+        called.set()
+        return {"confirmed": True}
+
+    async with run_display_core(tmp_path, request, cleanup_event=CLEANUP_TICK) as hass:
+        frame = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=50)
+        # The display sent at elapsed 43 seconds and rounded its age up to 44 seconds.
+        # Seven seconds later, a 15-second backward clock correction makes the frame look 35 seconds old.
+        corrected = frame + timedelta(seconds=35)
+        monkeypatch.setattr(dt_util, "now", lambda *args: corrected)
+        send_display_tap(hass, starting, canvas_age=44, frame_rendered_at=frame)
+        await hass.async_block_till_done()
+        assert calls == []
+
+        # A fresh tap still works with the same one-second rounding allowance.
+        send_display_tap(hass, starting, canvas_age=12, frame_rendered_at=corrected - timedelta(seconds=11))
+        await asyncio.wait_for(called.wait(), 3)
+        expected = (
+            {"action": "start", "revision": REVISION} if starting else {"action": "stop_session", "target": TARGET}
+        )
+        assert calls == [expected]
 
 
 # Intent: a Home Assistant restart carries an interrupted request into the existing unconfirmed feedback.

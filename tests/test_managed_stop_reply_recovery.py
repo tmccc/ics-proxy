@@ -19,13 +19,54 @@ from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError, fingerprint
 from ics_proxy_core.engine.trial_session import save_private
 from tests import managed_rig as mp
+from tests.charge_rig import owner_rig, positive_flow
 from tests.connected_rig import strategy_file
 from tests.handover_helpers import crash
 from tests.managed_rig import ReplyBench
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
+from tests.test_managed_normal_start import natural_stop
 from tests.tls_support import tls as tls
 from tools import reconcile_managed_debt as operator
+
+
+# Intent: accept the real closure of a session that ends while its Stop is still waiting for the wire.
+# Why: a fresh native close may withdraw the Stop target before the matching OCPP report reaches the proxy.
+async def test_queued_stop_awaits_matching_report_after_native_closure(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        local = await positive_flow(t, "daily")
+        await mp.healthy(c)
+        target, intent = c.session_stop.target(), c.requests.intent()
+        assert target is not None
+        request = uuid.uuid4().hex
+        mark = len(bench.received_limits)
+        gate = t.session.gateway.charger.gate
+        async with gate.enter(10):
+            assert c.command(request, "stop_session", intent.revision, target=target)["state"] == "accepted"
+            await asyncio.wait_for(gate.restrictive_waiting.wait(), 3)
+
+            bench.firmware.active = None
+            bench.firmware.requested_current = 0
+            bench.cp, bench.connection = "B", "Plug"
+            t.rig.peer.permission_enabled = False
+            status = await asyncio.wait_for(c.tick(), 3)
+            assert status["state"] == "reconciling"
+            assert j.active() == local and c.session_stop.target() is None
+            assert c.requests.receipt(request)["state"] == "accepted"
+
+        assert c.session_stop.worker is not None
+        await asyncio.wait_for(c.session_stop.worker, 3)
+        assert c.requests.receipt(request)["state"] == "accepted"
+        assert not bench.remote_stop.is_set()
+
+        await natural_stop(t, local)
+        assert (await mp.healthy(c))["charging_session_open"] is False
+        receipt = c.requests.receipt(request, include_binding=True)
+        assert receipt["state"] == "completed" and receipt["result"]["session_stopped"] is True
+        assert receipt["target"] == target and receipt["revision"] == intent.revision
+        assert c.requests.intent() == intent and bench.received_limits[mark:] == []
+        assert not bench.remote_stop.is_set()
 
 
 # Record a genuine native-timer lifecycle so Stop has its actual local/cloud mapping and immutable body.

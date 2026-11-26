@@ -23,10 +23,10 @@ from .stop_settlement import (
     STOP_BUFFERED_CLOSURE,
     STOP_CLOSURE_FIELDS,
     STOP_CLOSURE_VERIFIED,
-    STOP_REJECTION_FIELDS,
     STOP_SESSION,
     StopRejections,
     stop_completion_fields,
+    stop_rejection_fields,
     stop_rejections,
     stop_reply_window_predicate,
 )
@@ -87,6 +87,11 @@ class ManagedSessionStop:
             or not c.native.session_stop_verified(local)
         ):
             return None
+        return self._bound_target(connection, local)
+
+    # Use the same opaque binding for an open target and its closure wait on this connection.
+    @staticmethod
+    def _bound_target(connection: ControlScope, local: int) -> str:
         scope, generation = connection
         return fingerprint((scope.boot, scope.epoch, scope.metadata_revision, generation, local))
 
@@ -158,6 +163,14 @@ class ManagedSessionStop:
                 session = j.outcomes.session(scope.local)
                 if session is not None and session.closed:
                     raise StopAlreadyHandledError  # The original report still needs independent closure evidence.
+                native = c.native._current_stop_sample(None)
+                if (
+                    j.active() == scope.local
+                    and native is not None
+                    and not native.physical.transaction_open
+                    and c.native.owner_closure_observed(scope.local, time.time())
+                ):
+                    raise StopAlreadyHandledError  # The fresh native closure still needs the genuine Stop report.
                 raise RecoveryRequiredError("Stop lost its current session")
             if time.monotonic() >= scope.confirmation_deadline:
                 raise RecoveryRequiredError("Stop expired before dispatch")
@@ -209,9 +222,10 @@ class ManagedSessionStop:
 
     # Use the same rejection evidence for replies that arrive immediately, late, or before a restart.
     def _publish_rejections(self, rejections: StopRejections) -> None:
+        fields, rejected = stop_rejection_fields(self.controller.session.journal, rejections)
         self._update_receipts(
-            STOP_REJECTION_FIELDS,
-            (),
+            fields,
+            rejected,
             rejections.rejected_receipts,
             (STOP_SESSION,),
             rejections=rejections,
@@ -387,14 +401,26 @@ class ManagedSessionStop:
         ):
             pass  # Neither an unavailable local reading nor a cloud fault proves closure.
 
-    # During a real Stop, either of the two observations can confirm closure before the other.
+    # A native-first closure can arrive before the exact pending Stop gets the wire.
+    def _queued_stop(self, local: int) -> bool:
+        c = self.controller
+        connection = current_control_scope(c.session.gateway)
+        return connection is not None and self._has_receipts(
+            "action=? AND state='accepted' AND revision=? AND json_extract(result,'$.target')=? "
+            "AND json_extract(result,'$._session_stop.local')=? "
+            "AND json_type(result,'$._session_stop.dispatched')='false'",
+            (STOP_SESSION, c.requests.intent().revision, self._bound_target(connection, local), local),
+            SAVED_STOP_REJECTIONS,
+        )
+
+    # During a pending Stop, either of the two observations can confirm closure before the other.
     def closure_pending(self, native: HandoverEvidence) -> bool:
         j, physical = self.controller.session.journal, native.physical
         if physical.power_w != 0 or any(value != 0 for value in native.currents_a + native.powers_w):
             return False
         active = j.active()
         if not physical.transaction_open and physical.native_transaction_id is None and active is not None:
-            return j.outcomes.session_stop_tracks_closure(active)
+            return j.outcomes.session_stop_tracks_closure(active) or (native.is_fresh(5) and self._queued_stop(active))
         local = physical.native_transaction_id
         if not physical.transaction_open or local is None or active is not None:
             return False

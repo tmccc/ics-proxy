@@ -421,6 +421,59 @@ async def test_live_diagnostics_learn_joined_stop_reply(
         assert sum(frame[2] == "RemoteStopTransaction" for frame in bench.device_calls) == 1
 
 
+# Intent: retain the exact rejected vendor Stop with the joined receipt across rotation and reopening.
+# Why: the terminal failure must still have its charger reply after the original mutation has rotated.
+async def test_joined_stop_rejection_preserves_wire_report(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        path, identity = j.path, j.identity
+        c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await zero_power_session(t)
+        await healthy(c)
+        send, held, entered = delay_reply(monkeypatch, t.rig, t.charger, "RemoteStopTransaction")
+        monkeypatch.setattr(t.session.gateway.charger, "timeout", 0.25)
+        vendor = asyncio.create_task(
+            bench.cloud_call("vendor-stop", "RemoteStopTransaction", {"transactionId": j.vendor_id(local)})
+        )
+        await asyncio.wait_for(entered.wait(), 3)
+        assert (await vendor)[0] == 4
+        request = uuid.uuid4().hex
+        receipt = c.command(request, "stop_session", c.requests.intent().revision, target=c.session_stop.target())
+        assert receipt["state"] == "accepted"
+        (token,) = j.outcomes.owner(request).result["_session_stop"]["vendor_attempts"]
+
+        await natural_stop(t, local)
+        await c.session_stop.confirm_while_blocked()
+        assert c.requests.receipt(request)["state"] == "running"
+        await send(build_call_result(decode(held[0])[1], {"status": "Rejected"}))
+        await until(lambda: j.outcomes.vendor(token).status == "Rejected")
+        c.session_stop.expire()
+        first = stop_incident_report(path, tmp_path / "events.jsonl", request_reference=reference(request))
+        assert first["wire"]["joined_attempts"] == [
+            {"origin": "vendor", "request": reference(token), "reply": "rejected", "reply_source": "wire_journal"}
+        ]
+
+        with monkeypatch.context() as rotation:
+            rotation.setattr(j, "capacity", 1)
+            write = await bench.cloud_call(
+                "rotate-confirmed-stop",
+                "SetChargingProfile",
+                commands.set_charging_profile(1, commands.PURPOSE_TX_DEFAULT, 6, 1001, stack_level=0),
+            )
+            assert write[0] == 3 and write[2] == {"status": "Accepted"}
+        assert j.outcomes.vendor(token) is None
+        assert sum(frame[2] == "RemoteStopTransaction" for frame in bench.device_calls) == 1
+
+    with closing(Journal(path, identity)) as reopened:
+        receipt = ManagedRequests(reopened).receipt(request)
+        assert receipt["state"] == "failed" and receipt["result"]["classification"] == "stop_rejected"
+        report = stop_incident_report(path, tmp_path / "events.jsonl", request_reference=reference(request))
+        assert report["wire"]["joined_attempts"] == [
+            {"origin": "vendor", "request": reference(token), "reply": "rejected", "reply_source": "joined_receipt"}
+        ]
+
+
 # Intent: a queued local Stop can join the vendor Stop that reached the charger ahead of it.
 # Why: the join records the earlier acceptance without replacing the wire diagnostics or inflating the send count.
 async def test_session_stop_join_at_dispatch_preserves_rpc_diagnostics(tmp_path, tls, unused_tcp_port, monkeypatch):
@@ -976,6 +1029,16 @@ async def test_session_stop_joins_protective_pause_and_earlier_stop(
         expected = [(reference(first), "rejected")] if first is not None else []
         expected.append((reference(pause), pause_reply.lower()))
         assert [(item["request"], item["reply"]) for item in report["wire"]["joined_attempts"]] == expected
+        if earlier == "vendor_stop":
+            with monkeypatch.context() as rotation, j.atomic():
+                rotation.setattr(j, "capacity", 1)
+                j.mutation_intent("vendor", "SetChargingProfile", {"profile": "next"})
+            assert j.outcomes.vendor(first) is None
+            report = stop_incident_report(
+                j.path, t.session.prepared.config.incident_events, request_reference=reference(request)
+            )
+            assert [(item["request"], item["reply"]) for item in report["wire"]["joined_attempts"]] == expected
+            assert report["wire"]["joined_attempts"][0]["reply_source"] == "joined_receipt"
         assert [frame[3] for frame in t.rig.bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
             {"transactionId": local}
         ] * (1 if first_wire is None else 2)

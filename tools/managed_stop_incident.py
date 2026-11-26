@@ -12,7 +12,12 @@ from ics_proxy_core.engine.gateway import timestamp as charger_timestamp
 from ics_proxy_core.engine.ics import unique_object
 from ics_proxy_core.engine.managed_diagnostics import timestamp as receipt_timestamp
 from ics_proxy_core.engine.policy import DeniedError
-from ics_proxy_core.engine.stop_settlement import STOP_NONTERMINAL_CLASSIFICATIONS, STOP_SESSION, joined_stop_acceptance
+from ics_proxy_core.engine.stop_settlement import (
+    STOP_NONTERMINAL_CLASSIFICATIONS,
+    STOP_SESSION,
+    joined_stop_acceptance,
+    saved_stop_attempt,
+)
 from tools.managed_incident import (
     MAX_REPORT_EVENTS,
     UNKNOWN,
@@ -236,6 +241,18 @@ def joined_attempts(
     saved = None
     if (accepted := joined_stop_acceptance(binding, request)) is not None:
         saved = {"request": reference(accepted.identifier), "reply": "accepted", "reply_source": "joined_receipt"}
+    rejected_attempts = binding.get("rejected_attempts")
+    rejected = (
+        {
+            attempt
+            for item in rejected_attempts[:MAX_REPORT_EVENTS]
+            if (attempt := saved_stop_attempt(item, request)) is not None
+        }
+        if isinstance(rejected_attempts, list)
+        else set()
+    )
+    rejected_requests = {(attempt.origin, attempt.identifier) for attempt in rejected}
+    rejected_wires = {attempt.wire: attempt.identifier for attempt in rejected if attempt.origin == "local"}
     for origin, key in (("local", "local_attempts"), ("vendor", "vendor_attempts")):
         tokens = binding.get(key)
         if not isinstance(tokens, list):
@@ -260,6 +277,8 @@ def joined_attempts(
                 if reply["reply"] != "accepted":
                     reply = saved
                 saved = None
+            elif (origin, token) in rejected_requests and reply["reply"] != "rejected":
+                reply = {"reply": "rejected", "reply_source": "joined_receipt"}
             attempts.append(
                 {
                     "origin": origin,
@@ -279,6 +298,12 @@ def joined_attempts(
                 if evidence is None or evidence["reply"] != "accepted":
                     evidence = saved
                 saved = None
+            elif wire in rejected_wires and (evidence is None or evidence["reply"] != "rejected"):
+                evidence = {
+                    "request": reference(rejected_wires[wire]),
+                    "reply": "rejected",
+                    "reply_source": "joined_receipt",
+                }
             if evidence is not None:
                 attempts.append({"origin": "local", **evidence})
     if accepted is not None and saved is not None:
