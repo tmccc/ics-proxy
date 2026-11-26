@@ -520,3 +520,32 @@ async def test_restore_from_managed32_keeps_history(
         }
         assert all(report == {"restore_stage": report.get("restore_stage")} for report in output[:-1])
         assert {report["restore_stage"] for report in output[:-1]} == stages
+
+
+# Intent: resume a route write that succeeded before a lost reply and a backward host clock correction.
+# Why: the journal and fresh independent observations establish order even when their wall times reverse.
+async def test_restore_reconnect_after_backward_host_clock_correction(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
+    ) as test:
+        rig = test.rig
+        await stop_paused(test)
+        records, _ = journal_facts(rig.prepared.config.journal)
+        wall_time, clock_offset = time.time, 120
+        monkeypatch.setattr(time, "time", lambda: wall_time() + clock_offset)
+        peer, bench = rig.peer, rig.bench
+        route = {key: rig.spec.original_configuration[key] for key in rig.spec.trial_route}
+        args = ("restore", tmp_path / "trial.json", spec_file(tmp_path, rig), rig.prepared.observer.port)
+        peer.lost_patch = route
+        async with asyncio.timeout(10), asyncio.TaskGroup() as tasks:
+            tasks.create_task(cleanup_charger(test))
+            with pytest.raises(NativeTransportUnavailableError):
+                await run(*args)
+        assert peer.route_changed and not bench.online and peer.runtime_user == 60
+        assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}, route]
+
+        bench.online = True
+        clock_offset = 0
+        assert await asyncio.wait_for(run(*args), 5) == 0
+        assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}, route, {"AmpLmt": "32"}]
+        assert peer.runtime_user == 320 and journal_facts(rig.prepared.config.journal) == (records, "complete")
