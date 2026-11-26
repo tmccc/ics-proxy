@@ -14,6 +14,7 @@ from homeassistant.const import EVENT_CALL_SERVICE
 from homeassistant.core import HomeAssistant, SupportsResponse, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import condition, trigger
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.template import Template
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
@@ -116,9 +117,15 @@ def test_display_feedback_follows_live_home_assistant_subscriptions():
     assert "const bool ready = id(canvas_ha_connections) == 1 && id(canvas_ics_feedback_missing) == 0;" in feedback
     assert "!ready || !enabled || !solar_display::charger_request_known(request) || !(active_runs >= 0)" in feedback
     assert re.search(r'if \(unavailable\)\s*\{\s*feedback = "Charger buttons unavailable";', feedback)
-    assert "!solar_display::charger_request_idle(request, active_runs)" in feedback
-    assert "id(canvas_pressed_control).clear();" in feedback
-    assert "if (!pending && !unavailable)" in feedback
+    assert "const bool blocked = unavailable || !solar_display::charger_request_idle(request, active_runs);" in feedback
+    assert re.search(r'if \(!showing \|\| blocked\)\s*\{\s*id\(canvas_pressed_control\).clear\(\);', feedback)
+    assert re.search(r'if \(showing && blocked\)\s*\{\s*feedback = "Charger buttons unavailable";', feedback)
+    assert re.search(
+        r"if \(!showing \|\| !blocked\)\s*\{\s*"
+        r"lv_obj_add_flag\(start_button, LV_OBJ_FLAG_HIDDEN\);\s*"
+        r"lv_obj_add_flag\(stop_button, LV_OBJ_FLAG_HIDDEN\);",
+        feedback,
+    )
     assert 'const bool starting = showing && !unavailable && request == "starting";' in feedback
     assert 'const bool stopping = showing && !unavailable && request == "stopping";' in feedback
     for state, message in (("starting_timeout", "Start not confirmed"), ("stopping_timeout", "Stop not confirmed")):
@@ -312,6 +319,21 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         tap(True, f"start:{REVISION - 1:014x}")
         await asyncio.sleep(0.05)
         assert calls == []
+
+        # HA sends the run count and request state independently, so firmware must also cover their transitions.
+        feedback_events = []
+
+        # Record changes to the two independent Home Assistant signals in their actual delivery order.
+        @callback
+        def record_feedback(event):
+            old, new = event.data["old_state"], event.data["new_state"]
+            if event.data["entity_id"] == AUTOMATION:
+                if old.attributes["current"] != new.attributes["current"]:
+                    feedback_events.append(new.attributes["current"])
+            elif old.state != new.state:
+                feedback_events.append(new.state)
+
+        stop_recording = async_track_state_change_event(hass, [AUTOMATION, PENDING], record_feedback)
         tap(True, age="11", rendered_at=int((datetime.now(UTC) - timedelta(seconds=10)).timestamp()))
         await wait_for(lambda: len(calls) == 1)
         tap(True)
@@ -321,6 +343,8 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         assert hass.states.get(PENDING).state == "starting"
         gate.set()
         await wait_for(lambda: settled("idle"))
+        stop_recording()
+        assert feedback_events == [1, "starting", "idle", 0]
         assert hass.states.get(SESSION).state == "on"
         assert hass.states.get("sensor.ics_proxy_power").state == "0"
         gate.clear()

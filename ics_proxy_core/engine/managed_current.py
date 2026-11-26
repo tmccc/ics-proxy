@@ -259,7 +259,12 @@ class ManagedCurrentLimits:
         published = c.authority()
         if published is None:
             return Pending(Prerequisite.SUPERSEDED, "current recovery lost its confirmed authority")
-        return decisions.complete_current_recovery(self, change, published, local)
+        # Use the same fresh station proof for the first receipt write and any retry.
+        self._settling_overlap = (change["id"], published, local)
+        settled, pending = await decisions.retry_current_recovery(self, change, expected)
+        if settled:
+            return pending
+        return Pending(Prerequisite.ZERO_PROOF, "current recovery awaits a verified station ceiling")
 
     # Hand the real Start report to the current recovery's decision owner.
     async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:

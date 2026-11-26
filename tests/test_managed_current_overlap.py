@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from ics_proxy_core.constants import HUB_PROFILE_ID
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.recovery_contracts import FailureKind, GateDecision, Pending, Prerequisite
 from ics_proxy_core.engine.rpc import UnavailableError
@@ -383,6 +384,62 @@ async def test_restart_during_pending_increase(tmp_path, tls, unused_tcp_port, m
             await introduced(b.rig, b.session, b.sock, "pending-current-replacement")
             assert not b.stops() and b.device.effective_limit() == 0
             await assert_daily_recovery(b, local, original, demand)
+
+
+# Intent: current recovery requires fresh native station inventory before the first or retried settlement.
+# Why: a previous composite reply cannot prove that the physical profile is still present.
+@pytest.mark.parametrize("lose_on_retry", [False, True], ids=["first-publication", "retry"])
+async def test_overlap_recovery_requires_live_station_before_settlement(
+    tmp_path, tls, unused_tcp_port, monkeypatch, lose_on_retry
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        async with interrupted_increase(b, True) as (identifier, release):
+            local = await b.start_plan(9, demand=False)
+            await b.c.native.read()
+            async with asyncio.timeout(3):
+                while b.session.journal.next_delivery() is not None or b.session.gateway.vendor._pending:
+                    await asyncio.sleep(0.01)
+            b.c.current.worker.cancel()
+            await asyncio.gather(b.c.current.worker, return_exceptions=True)
+            release.set()
+        await crash(b.session)
+        b.session = managed_session(b.rig)
+        await b.session.start()
+        b.c = ManagedController(b.session)
+        j = b.session.journal
+        async with b.rig.charger(b.session) as b.sock:
+            await introduced(b.rig, b.session, b.sock, "station-loss-overlap")
+            before = b.c.requests.receipt(identifier)
+            assert before["state"] == "uncertain"
+            removed = []
+            if lose_on_retry:
+                j.db.execute(
+                    "CREATE TEMP TRIGGER refuse_current_result BEFORE UPDATE ON managed_requests "
+                    "WHEN NEW.state='failed' "
+                    "BEGIN SELECT RAISE(ABORT,'test settlement refusal'); END"
+                )
+                assert (await b.c.tick())["state"] == "reconciling"
+                assert b.c.requests.receipt(identifier) == before
+                assert j.current_change.read().recovering and b.device.effective_limit() == 6
+                j.db.execute("DROP TRIGGER refuse_current_result")
+                removed.append(b.device.profiles.pop(HUB_PROFILE_ID))
+            else:
+                actual_answer = b.device.answer
+
+                # Let the composite report be correct before the simulated profile disappears.
+                def station_vanishes_after_composite(action, payload):
+                    result = actual_answer(action, payload)
+                    if action == "GetCompositeSchedule" and b.device.effective_limit() == 6 and not removed:
+                        removed.append(b.device.profiles.pop(HUB_PROFILE_ID))
+                    return result
+
+                monkeypatch.setattr(b.device, "answer", station_vanishes_after_composite)
+
+            await b.c.tick()
+            assert removed and j.active() == local
+            assert b.c.requests.receipt(identifier) == before
+            assert j.current_change.read().recovering and not b.stops() and not starts(b.rig)
+            assert b.session.book.station_ceiling_lost()
 
 
 # Intent: actual automatic recovery owns the transaction that settles metadata and its process-replaced receipt.

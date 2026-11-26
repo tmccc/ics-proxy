@@ -272,7 +272,8 @@ script:
           const bool starting = showing && !unavailable && request == "starting";
           const bool stopping = showing && !unavailable && request == "stopping";
           const bool pending = starting || stopping;
-          if (!showing || unavailable || !solar_display::charger_request_idle(request, active_runs)) {
+          const bool blocked = unavailable || !solar_display::charger_request_idle(request, active_runs);
+          if (!showing || blocked) {
             id(canvas_pressed_control).clear();
           }
           const char *feedback = nullptr;
@@ -284,6 +285,8 @@ script:
             feedback = "Start not confirmed";
           } else if (showing && request == "stopping_timeout") {
             feedback = "Stop not confirmed";
+          } else if (showing && blocked) {
+            feedback = "Charger buttons unavailable";
           }
           auto *hint = id(canvas_ics_request_hint);
           auto *hint_label = id(canvas_ics_request_hint_label);
@@ -299,7 +302,7 @@ script:
           auto *start_button = id(canvas_ics_start_feedback);
           auto *stop_button = id(canvas_ics_stop_feedback);
           if (start_button == nullptr || stop_button == nullptr) return;
-          if (!pending && !unavailable) {
+          if (!showing || !blocked) {
             lv_obj_add_flag(start_button, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(stop_button, LV_OBJ_FLAG_HIDDEN);
             return;

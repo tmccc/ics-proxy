@@ -391,6 +391,54 @@ async def test_observed_cutoff_survives_refused_claim_and_wall_rewind(
             assert stops(bench) == [{"transactionId": local}]
 
 
+# Intent: keep the scheduled cutoff effective while an already issued Start has no transaction number.
+# Why: a delayed report and unavailable full audit cannot leave a due occurrence with a positive offer.
+@pytest.mark.parametrize("first", ["control-poll", "owner-report"])
+async def test_cutoff_restricts_issued_start_before_report(tmp_path, tls, unused_tcp_port, monkeypatch, first):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "late-owner-start") as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            await status(test, lambda view: view.get("local_hold_verified") is True)
+            clock.step_wall(MIDNIGHT + 6 * 3600 - 40)
+            await status(test, lambda _: bool(starts(rig)))
+            await c.charging.settle()
+            assert j.get(LOCAL_SCHEDULE_OCCURRENCE)["local"] is None
+            assert j.starts.receipt()["stage"] == "accepted"
+            assert bench.firmware.effective_limit() == 6
+            authorized = await bench.call(test.charger, uuid.uuid4().hex, "Authorize", {"idTag": OWNER_TAG})
+            assert authorized[0] == 3 and authorized[2]["idTagInfo"]["status"] == "Accepted"
+            report = START | {"idTag": OWNER_TAG, "timestamp": datetime.fromtimestamp(clock.now, UTC).isoformat()}
+
+            # Only the wall clock crosses cutoff. The startup watchdog still has time on its own clock.
+            clock.step_wall(MIDNIGHT + 6 * 3600)
+            if first == "control-poll":
+
+                # Only the full native audit fails while the restrictive owner path remains available.
+                async def unavailable():
+                    raise NativeTransportUnavailableError("transient loss at cutoff")
+
+                with monkeypatch.context() as outage:
+                    outage.setattr(c.native, "observe", unavailable)
+                    await c.tick()
+                assert bench.firmware.effective_limit() == 0 and j.active() is None and not stops(bench)
+
+            response = await bench.call(test.charger, uuid.uuid4().hex, "StartTransaction", report)
+            assert response[0] == 3 and response[2]["idTagInfo"]["status"] == "Accepted"
+            local = response[2]["transactionId"]
+            assert j.get(LOCAL_SCHEDULE_OCCURRENCE)["local"] == j.active() == local
+            assert bench.firmware.effective_limit() == 0 and not stops(bench)
+            new_authorization = await bench.call(test.charger, uuid.uuid4().hex, "Authorize", {"idTag": OWNER_TAG})
+            assert new_authorization[0] == 3 and new_authorization[2]["idTagInfo"]["status"] == "Invalid"
+            rig.peer.plan_session = (local, 987654)
+            rig.peer.paused, rig.peer.permission_enabled = False, True
+            bench.cp, bench.connection = "C", "Charging"
+            bench.firmware.requested_current = 32
+            await status(test, lambda _: bool(stops(bench)))
+            assert stops(bench) == [{"transactionId": local}] and len(starts(rig)) == 1
+            await close(test, clock, local, report["meterStart"])
+            await status(test, lambda view: view.get("local_hold_verified") is True)
+
+
 # Intent: a scheduled profile reply arrives outside the admitted window without a RemoteStart on the charger wire.
 # Why: only the same, now verified hold can permit the next day's plan or Return to iCS.
 @pytest.mark.parametrize("cutoff_first", ["wire-guard-first", "lease-timer-first", "rewind-before-start"])

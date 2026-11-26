@@ -16,15 +16,17 @@ from .connection_scope import control_scope_matches, current_control_scope
 from .local_schedule_cutoff import cutoff
 from .local_schedule_window import ScheduleCutoff, schedule_window
 from .managed_intent import LOCAL_SCHEDULE_OCCURRENCE as OCCURRENCE
+from .managed_intent import ControlIntent
 from .policy import DeniedError
 from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
+from .rpc import UnavailableError
+from .security import SecurityError
 from .store import RecoveryRequiredError, fingerprint
 
 if TYPE_CHECKING:
     from .local_schedule_window import ScheduleWindow
     from .managed import ManagedController
     from .managed_charging import ChargeLease
-    from .managed_intent import ControlIntent
     from .start_handoff import OwnedStartResult
     from .trial_handover_evidence import HandoverEvidence
 
@@ -515,11 +517,54 @@ class LocalSchedule:
             return False
         return isinstance(proof, str) and proof == self._closure_binding(occurrence)
 
+    # An issued Start can lose its positive authority before there is a transaction number to Stop.
+    async def hold_due_unbound_start(self) -> None:
+        c, j = self.controller, self.journal
+
+        # Retire the exact pending wire in the same turn that checks its occurrence and current owner.
+        def expire() -> bool:
+            lease = c.charging.lease
+            if (
+                c.stopping
+                or lease is None
+                or lease.schedule is None
+                or c.requests.intent() != ControlIntent(lease.mode, lease.revision)
+                or c.requests.return_in_progress()
+                or j.active() is not None
+                or j.get(OCCURRENCE, {}).get("local") is not None
+            ):
+                return False
+            receipt = j.starts.receipt()
+            if (
+                receipt.get("request_id") != lease.identifier
+                or receipt.get("owner_authorized") is not True
+                or receipt.get("stage") not in ("issued", "accepted")
+                or receipt.get("local") is not None
+                or j.get("control", {}).get("start_pending") is not True
+                or not self.cutoff_elapsed(lease)
+            ):
+                return False
+            c.charging.stop(lease, SCHEDULE_CUTOFF)
+            return c.charging.scoped_normal_stop()
+
+        try:
+            if c.commands.decide(expire, priority=CommandPriority.RESTRICT):
+                await c.charging.hold_expired()
+        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError, sqlite3.Error:
+            if j.db.in_transaction:
+                raise
+            # A refused claim or zero attempt remains eligible for restrictive supervision.
+
     # Periodic restrictive work can stop its own session even when no complete native poll is available.
     async def stop_if_due(self) -> None:
         c, j = self.controller, self.journal
         occurrence = j.get(OCCURRENCE, {})
+        if not occurrence:
+            return
         local = occurrence.get("local")
+        if local is None:
+            await self.hold_due_unbound_start()
+            return
         active = j.active()
         if c.stopping or type(local) is not int or not self._due(occurrence):
             return

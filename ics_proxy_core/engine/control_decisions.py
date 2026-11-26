@@ -1076,12 +1076,13 @@ class ControlDecisions:
         if worker._settling_overlap is not None and not c.stopping:
             identifier, authority, local = worker._settling_overlap
             if identifier == change["id"] and c.authority() == authority and j.active() == local and g.controls.ready:
-                native = await c.native.read_result()
+                native = await c.native.read_result(owned=True)
                 if c.stopping or c.requests.intent() != expected:
                     return True, Pending(Prerequisite.SUPERSEDED, "current recovery yielded to newer control")
                 if (
                     not isinstance(native, Pending)
                     and c.authority() == authority
+                    and j.active() == local
                     and g.controls.ready
                     and g.controls.desired() == change["previous_a"]
                     and c.native.session_decision(native) is ALLOW
@@ -1092,7 +1093,12 @@ class ControlDecisions:
                     )
                     is ALLOW
                 ):
-                    return True, self.complete_current_recovery(worker, change, authority, local)
+                    try:
+                        c.session.book.require_confirmed_station(native.physical.resources, change["previous_a"])
+                    except DeniedError:
+                        pass  # A later attempt can reclaim the exact restrictive hold and restore the profile.
+                    else:
+                        return True, self.complete_current_recovery(worker, change, authority, local)
             worker._settling_overlap = None
         return False, None
 
@@ -1617,6 +1623,7 @@ class ControlDecisions:
                     reason = SCHEDULE_CUTOFF
             preserve = (
                 lease.normal
+                and (reason != SCHEDULE_CUTOFF or j.active() is not None)
                 and intent.mode == "app"
                 and intent.revision == lease.revision
                 and charging.state().get("independent_seen") is True

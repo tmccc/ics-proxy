@@ -474,6 +474,8 @@ class ManagedCharging:
             if not self.can_record_owner(tag):
                 raise UnavailableError("the already issued Start report awaits verified shutdown zero")
             return
+        if j.starts.pending_owner_tag(tag):
+            await c.local_schedule.hold_due_unbound_start()
         if self.scoped_normal_stop() and c.requests.intent().mode == "app":
             await self.hold_expired()
         intent = c.requests.intent()
