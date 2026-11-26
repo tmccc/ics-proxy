@@ -175,6 +175,10 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: "0"
+  - id: canvas_touch_rendered_at_epoch
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
 
 text_sensor:
   - platform: homeassistant
@@ -517,6 +521,7 @@ lvgl:
                       id(canvas_touch_x) = point.x;
                       id(canvas_touch_y) = point.y;
                       id(canvas_touch_age_seconds) = frame.freshness().render_age_ms(now, clock.timestamp) / 1000;
+                      id(canvas_touch_rendered_at_epoch) = frame.freshness().rendered_at();
                       ++id(canvas_touch_event_count);
                       return true;
                   then:
@@ -527,6 +532,7 @@ lvgl:
                           x: !lambda return to_string(id(canvas_touch_x));
                           y: !lambda return to_string(id(canvas_touch_y));
                           canvas_age_seconds: !lambda return to_string(id(canvas_touch_age_seconds));
+                          canvas_rendered_at_epoch: !lambda return to_string(id(canvas_touch_rendered_at_epoch));
                           frame_control: !lambda return id(canvas_pressed_control);
         - button:
             id: canvas_brightness_button

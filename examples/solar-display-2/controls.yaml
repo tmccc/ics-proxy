@@ -28,6 +28,7 @@ variables:
   touch_x: "{{ touch_data.get('x', '') | int(-1) }}"
   touch_y: "{{ touch_data.get('y', '') | int(-1) }}"
   canvas_age: "{{ touch_data.get('canvas_age_seconds', '') | float(-1) }}"
+  canvas_rendered_at: "{{ touch_data.get('canvas_rendered_at_epoch', '') | int(0) }}"
   frame_control: "{{ touch_data.get('frame_control', '') }}"
   start_revision: >-
     {{ frame_control[6:] | int(-1, 16)
@@ -71,7 +72,9 @@ conditions:
             value_template: >-
               {% set image = 'image.ics_display_preview' %}
               {% set rendered = as_timestamp(states(image), none) %}
-              {{ rendered is not none and 0 <= as_timestamp(now()) - rendered < 45
+              {% set received_at = as_timestamp(now()) %}
+              {{ 0 < canvas_rendered_at < 2**32 and 0 <= received_at - canvas_rendered_at < 45
+                 and rendered is not none and 0 <= received_at - rendered < 45
                  and state_attr(image, 'assigned_views') == ['replace-with-editor-view-id']
                  and state_attr(image, 'current_view_id') == 'replace-with-editor-view-id'
                  and state_attr(image, 'rendered_view_id') == 'replace-with-editor-view-id'

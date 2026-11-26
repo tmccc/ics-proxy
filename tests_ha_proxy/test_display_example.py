@@ -226,7 +226,8 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         }
 
         # Send the same event shape and rendered marker as the touchscreen.
-        def tap(starting, marker=None, *, age="1"):
+        def tap(starting, marker=None, *, age="1", rendered_at=None):
+            rendered_at = int(datetime.now(UTC).timestamp()) if rendered_at is None else rendered_at
             hass.bus.async_fire(
                 "esphome.general_display_touch",
                 {
@@ -235,6 +236,7 @@ async def test_public_display_example_with_actual_ha(tmp_path):
                     "x": "120" if starting else "352",
                     "y": "396",
                     "canvas_age_seconds": age,
+                    "canvas_rendered_at_epoch": str(rendered_at),
                     "frame_control": (START_MARKER if starting else "stop:" + TARGET) if marker is None else marker,
                 },
             )
@@ -256,11 +258,15 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         assert calls == []
         hass.states.async_set(IMAGE, datetime.now(UTC).isoformat(), image_attributes)
         tap(True, age="45")
+        # The displayed frame was fresh at release and expired in transit while the renderer refreshed.
+        tap(True, age="44", rendered_at=int((datetime.now(UTC) - timedelta(seconds=46)).timestamp()))
+        tap(True, rendered_at=0)
+        tap(True, rendered_at=int((datetime.now(UTC) + timedelta(seconds=5)).timestamp()))
         tap(True, "")
         tap(True, f"start:{REVISION - 1:014x}")
         await asyncio.sleep(0.05)
         assert calls == []
-        tap(True)
+        tap(True, age="11", rendered_at=int((datetime.now(UTC) - timedelta(seconds=10)).timestamp()))
         await wait_for(lambda: len(calls) == 1)
         tap(True)
         tap(False)
@@ -276,6 +282,7 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         # Session A is still on the physical frame while the proxy now reports B.
         tap(False, "stop:" + "a" * 64)
         tap(False, "")
+        tap(False, age="44", rendered_at=int((datetime.now(UTC) - timedelta(seconds=46)).timestamp()))
         await asyncio.sleep(0.1)
         assert len(calls) == 1
         rendered = Template((PROJECT / "view.html.jinja").read_text(), hass)
@@ -443,9 +450,10 @@ async def run_display_core(config_dir, request, *, expiry_seconds=None, cleanup_
 # Send a tap carrying the displayed control marker and the current Home Assistant state.
 def send_display_tap(hass, starting):
     hass.states.async_set("sensor.ics_display_screen_source", "Home Assistant")
+    rendered_at = datetime.now(UTC)
     hass.states.async_set(
         IMAGE,
-        datetime.now(UTC).isoformat(),
+        rendered_at.isoformat(),
         {"assigned_views": [VIEW], "current_view_id": VIEW, "rendered_view_id": VIEW, "notification_active": False},
     )
     hass.states.async_set(
@@ -461,6 +469,7 @@ def send_display_tap(hass, starting):
             "x": "120" if starting else "352",
             "y": "396",
             "canvas_age_seconds": "1",
+            "canvas_rendered_at_epoch": str(int(rendered_at.timestamp())),
             "frame_control": START_MARKER if starting else "stop:" + TARGET,
         },
     )

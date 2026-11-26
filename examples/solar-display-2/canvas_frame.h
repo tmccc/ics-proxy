@@ -78,6 +78,8 @@ class CanvasFreshness {
 
   void note_fetch(uint32_t now) { this->last_fetch_ms_ = now; }
 
+  uint32_t rendered_at() const { return this->rendered_at_; }
+
   uint32_t render_age_ms(uint32_t now, int64_t epoch) {
     if (this->render_age_ms_ >= MAX_AGE_MS) return MAX_AGE_MS;
     const uint32_t elapsed = std::min(now - this->age_checked_ms_, MAX_AGE_MS);
