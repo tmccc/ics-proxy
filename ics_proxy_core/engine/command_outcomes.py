@@ -14,7 +14,7 @@ from ..frames import Frame
 from .delivery_reply import DeliveryReply
 from .ics import unique_object
 from .plans import PlanBook
-from .stop_settlement import STOP_SESSION, StopAttempt, joined_stop_acceptance, stop_rejections
+from .stop_settlement import PAUSE_STOP_HISTORY, STOP_SESSION, StopAttempt, joined_stop_acceptance, stop_rejections
 from .store import Delivery, RecoveryRequiredError, encoded
 from .trial_evidence import profile_projection
 
@@ -38,7 +38,7 @@ def transaction_reply_status(frame: Frame) -> TransactionReplyStatus | None:
 
 
 # JSON can contain lone surrogates that cannot be bound to SQLite text parameters.
-def _reply_identifier(value: object) -> bool:
+def reply_identifier(value: object) -> bool:
     return isinstance(value, str) and value.isprintable()
 
 
@@ -238,10 +238,10 @@ def decode_retained_owner_reply(db: sqlite3.Connection, saved: dict[str, Any]) -
     if (
         action not in ("RemoteStartTransaction", "RemoteStopTransaction")
         or saved["reply"] not in ("Accepted", "Rejected")
-        or not _reply_identifier(saved["wire"])
+        or not reply_identifier(saved["wire"])
         or len(saved["wire"]) > 36
-        or not _reply_identifier(saved["ticket"])
-        or any(value is not None and not _reply_identifier(value) for value in (saved["request"], saved["boot"]))
+        or not reply_identifier(saved["ticket"])
+        or any(value is not None and not reply_identifier(value) for value in (saved["request"], saved["boot"]))
         or saved["limit_a"] is not None
         or (action == "RemoteStartTransaction" and local is not None)
         or (action == "RemoteStopTransaction" and (type(local) is not int or not 0 < local < 2**63))
@@ -258,6 +258,22 @@ def decode_retained_owner_reply(db: sqlite3.Connection, saved: dict[str, Any]) -
     if action == "RemoteStopTransaction" and not _owner_stop_claim_matches(db, reply):
         return None
     return reply
+
+
+# A Pause's latest claim may change while a prior wire still awaits durable publication.
+def _bound_pause_stop(result: dict[str, Any], reply: OwnerWire) -> dict[str, Any] | None:
+    if reply.request is None or reply.request == reply.ticket or reply.boot is None:
+        return None
+    history = result.get(PAUSE_STOP_HISTORY)
+    historical = history.get(reply.wire) if isinstance(history, dict) else None
+    for bound in (result.get("_stop"), historical):
+        if (
+            isinstance(bound, dict)
+            and type(bound.get("local")) is int
+            and (bound.get("ticket"), bound["local"], bound.get("boot")) == (reply.ticket, reply.local, reply.boot)
+        ):
+            return bound
+    return None
 
 
 # A named Stop must retain its original session Stop or Pause claim.
@@ -294,23 +310,17 @@ def _owner_stop_claim_matches(db: sqlite3.Connection, reply: OwnerWire) -> bool:
                     return False
                 return True
             elif action == "pause":
-                bound = result.get("_stop")
-                return (
-                    reply.request != reply.ticket
-                    and reply.boot is not None
-                    and isinstance(bound, dict)
-                    and type(bound.get("local")) is int
-                    and (bound.get("ticket"), bound.get("local"), bound.get("boot"))
-                    == (reply.ticket, reply.local, reply.boot)
-                )
+                return _bound_pause_stop(result, reply) is not None
             else:
                 return False
         if (
             reply.request is None
             and db.execute(
                 "SELECT 1 FROM managed_requests WHERE action='pause' AND "
-                "CASE WHEN json_valid(result) THEN json_extract(result,'$._stop.ticket') END=? LIMIT 1",
-                (reply.ticket,),
+                "CASE WHEN json_valid(result) THEN json_extract(result,'$._stop.ticket')=? OR EXISTS ("
+                f"SELECT 1 FROM json_each(result,'$.{PAUSE_STOP_HISTORY}') h "
+                "WHERE h.key=? OR json_extract(CASE WHEN h.type='object' THEN h.value END,'$.ticket')=?) END LIMIT 1",
+                (reply.ticket, reply.wire, reply.ticket),
             ).fetchone()
         ):
             return False
@@ -553,7 +563,7 @@ class CommandOutcomes:
                 not isinstance(payload, dict)
                 or not isinstance(wire, str)
                 or len(wire) > 36
-                or not _reply_identifier(wire)
+                or not reply_identifier(wire)
                 or key.partition(":")[2] != wire
                 or (reply := decode(payload)) is None
                 or key != self._reply_key(source, reply)
@@ -586,6 +596,22 @@ class CommandOutcomes:
                 valid.append(reply)
         return tuple(valid)
 
+    # Once the primary wire owns its exact scope, it no longer needs an older Pause claim.
+    def pending_pause_stop_claims(self, request: str, result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        claims = {}
+        for wire in (*self._retained_owner_replies(), *self._owner_writes.values()):
+            if (
+                wire.request == request
+                and wire.action == "RemoteStopTransaction"
+                and wire.reply in (None, "Accepted", "Rejected")
+                and (bound := _bound_pause_stop(result, wire)) is not None
+                and not self.journal.db.execute(
+                    "SELECT 1 FROM owner_command_wires WHERE wire=?", (wire.wire,)
+                ).fetchone()
+            ):
+                claims[wire.wire] = {"ticket": bound["ticket"], "local": bound["local"], "boot": bound["boot"]}
+        return claims
+
     # A forwarded checkpoint still belongs to the original vendor mutation and exact charger call.
     def _retained_vendor_replies(self) -> tuple[ForwardedReply, ...]:
         return self._retained_replies("vendor", self._decode_vendor_reply)
@@ -602,7 +628,7 @@ class CommandOutcomes:
     def _decode_vendor_reply(self, saved: dict[str, Any]) -> ForwardedReply | None:
         if (
             saved.keys() != {"mutation", "action", "wire", "status"}
-            or not _reply_identifier(saved["mutation"])
+            or not reply_identifier(saved["mutation"])
             or saved["action"] not in ("RemoteStartTransaction", "RemoteStopTransaction")
             or saved["status"] not in ("Accepted", "Rejected")
         ):

@@ -28,6 +28,7 @@ CUTOFF_CLOSED_REPORT = f"{SCHEDULE_CUTOFF}::test_cutoff_holds_zero_when_stop_rep
 SCHEDULE_VENDOR_RETURN = f"{SCHEDULE}::test_cloud_returns_before_local_schedule_sends_start"
 STOP_INCIDENT = "tests/test_managed_stop_incident.py"
 SCHEDULE_CLOSURE = "tests/test_managed_scheduled_closure.py"
+CUTOFF_RETAINED_CLOSURE = f"{SCHEDULE_CLOSURE}::test_cutoff_checks_retained_stop_closure_after_replacement"
 INCIDENT_WAL = "tests/test_managed_incident.py::test_incident_respects_the_published_live_wal_boundary"
 PAUSE_OVERLAP = (
     "tests/test_managed_cloud_zero_controls.py::test_local_pause_and_cloud_stop_share_unanswered_stop_at_zero"
@@ -124,6 +125,8 @@ SUITES = {
             f"{SCHEDULE_CLOSURE}::test_scheduled_closure_survives_interrupted_poll[native-audit]",
             f"{SCHEDULE_CLOSURE}::test_scheduled_closure_survives_interrupted_poll[charge-publication]",
             f"{SCHEDULE_CLOSURE}::test_scheduled_closure_survives_marker_refusal_and_replacement",
+            f"{CUTOFF_RETAINED_CLOSURE}[exact]",
+            f"{CUTOFF_RETAINED_CLOSURE}[other-report]",
             f"{SCHEDULE_VENDOR_RETURN}[vendor-lost-during-rollback-automatic-return]",
             f"{SCHEDULE}::test_overlapping_timezone_change_does_not_repeat_local_occurrence",
             "tests/test_vendor_stop_rotation.py::test_queued_vendor_stop_keeps_reply_through_rotation[Accepted]",

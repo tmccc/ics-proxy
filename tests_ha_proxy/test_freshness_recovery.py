@@ -155,7 +155,7 @@ async def test_app_connection_expires_after_native_reading_during_held_poll(actu
 
     clock = SimpleNamespace(now=1000.0)
     scheduled = []
-    monkeypatch.setattr(coordinator, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(coordinator, "time", SimpleNamespace(monotonic=lambda: clock.now, time=lambda: clock.now))
 
     # Drive the real coordinator expiry callbacks without making the peer wait for wall-clock seconds.
     def later(hass, delay, action):

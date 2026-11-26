@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from ics_proxy_core.engine.command_outcomes import decode_retained_owner_reply
+from ics_proxy_core.engine.command_outcomes import decode_retained_owner_reply, reply_identifier
 from ics_proxy_core.engine.gateway import timestamp as charger_timestamp
 from ics_proxy_core.engine.ics import unique_object
 from ics_proxy_core.engine.managed_diagnostics import timestamp as receipt_timestamp
@@ -59,7 +59,7 @@ def local_id(value: object) -> int | None:
 
 # The transport bounds CALL identifiers before dispatch.
 def wire_id(value: object) -> str | None:
-    return value if isinstance(value, str) and 0 < len(value) <= 36 else None
+    return value if isinstance(value, str) and len(value) <= 36 and reply_identifier(value) else None
 
 
 # Dispatch, an exact reply, and predecessor evidence are independently available.
@@ -121,8 +121,7 @@ def owner_reply(db: sqlite3.Connection, tables: set[str], request: str, local: i
             or (row["request"], row["ticket"], row["action"]) != (request, request, STOP_ACTION)
             or row["limit_a"] is not None
             or wire is None
-            or not isinstance(boot, str)
-            or not boot
+            or not reply_identifier(boot)
             or not isinstance(reply, str)
             or reply not in DEFINITE_REPLIES
             or local_id(row.get("local")) != local

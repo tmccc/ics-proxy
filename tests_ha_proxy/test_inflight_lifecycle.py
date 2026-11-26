@@ -56,7 +56,7 @@ def observe_notice_callbacks(monkeypatch):
         callbacks.append(action)
         return original(hass, delay, action)
 
-    monkeypatch.setattr(coordinator, "time", SimpleNamespace(monotonic=lambda: clock.value))
+    monkeypatch.setattr(coordinator, "time", SimpleNamespace(monotonic=lambda: clock.value, time=lambda: clock.value))
     monkeypatch.setattr(notice_module, "async_call_later", later)
     return clock, callbacks, notice_module
 

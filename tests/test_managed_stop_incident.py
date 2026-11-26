@@ -5,12 +5,16 @@ import sqlite3
 import uuid
 from contextlib import closing
 from dataclasses import asdict, replace
+from types import SimpleNamespace
 
 import pytest
 
-from ics_proxy_core.engine.command_outcomes import ForwardedReply, OwnerWire
+from ics_proxy_core.engine.command_outcomes import ForwardedReply, OwnerWire, decode_retained_owner_reply
+from ics_proxy_core.engine.gateway import Gateway
 from ics_proxy_core.engine.managed_intent import ManagedRequests, insert_request
+from ics_proxy_core.engine.managed_session_stop import ManagedSessionStop
 from ics_proxy_core.engine.stop_settlement import (
+    PAUSE_STOP_HISTORY,
     STOP_COMPLETION_FIELDS,
     STOP_SESSION,
     StopPredecessors,
@@ -266,6 +270,12 @@ def test_stop_report_uses_only_exact_retained_checkpoints(tmp_path, vendor, stat
             assert stop_incident_report(path, events, vendor=vendor)["wire"]["reply"] == "missing"
             journal.db.execute("DELETE FROM meta WHERE key=?", (other_key,))
         if not vendor and status == "Accepted":
+            for unusable in (replace(correct, boot="broken\nboot"), replace(correct, wire="broken\ncall")):
+                damaged_key = f"{prefix}_owner:{unusable.wire}"
+                journal.put(damaged_key, asdict(unusable))
+                assert not journal.outcomes.owner_wires("wire", unusable.wire)
+                assert stop_incident_report(path, events)["wire"]["reply"] == "missing"
+                journal.db.execute("DELETE FROM meta WHERE key=?", (damaged_key,))
             conflict = replace(correct, wire=uuid.uuid4().hex, local=local + 1, reply=None)
             journal.outcomes.record_owner_wire(conflict)
             journal.put(key, asdict(correct))
@@ -391,6 +401,88 @@ def test_joined_owner_checkpoint_must_match_pause_claim(tmp_path, checkpoint):
         "reply_source": "retained_checkpoint",
     }
     assert report["wire"]["joined_attempts"] == ([expected] if exact else [])
+
+
+# Intent: recover the original rejected Stop after its Pause owns a newer ticket or is superseded.
+# Why: a joined receipt must follow the exact prior wire even when both of that wire's primary writes were refused.
+@pytest.mark.parametrize("supersession", ["new-ticket", "new-pause"])
+@pytest.mark.parametrize("late_reply", [False, True])
+def test_replaced_pause_stop_claim_preserves_issued_wire(tmp_path, supersession, late_reply):
+    path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"
+    pause, ticket, wire, next_ticket, new_pause, hold = (uuid.uuid4().hex for _ in range(6))
+    with closing(Journal(path, "test-charger")) as journal:
+        journal.put("managed_control_intent", {"mode": "paused", "revision": 2})
+        requests = ManagedRequests(journal)
+        local = journal.start("start-token", START)["transactionId"]
+        insert_request(journal, pause, "pause", 2, {"_pause": {"revision": 2, "hold": hold, "local": local}})
+        with journal.atomic():
+            requests.bind_pause_stop(requests.intent(), ticket, requests.pause_request(), local, BOOT)
+        journal.db.execute(
+            "CREATE TEMP TRIGGER refuse_wire BEFORE INSERT ON owner_command_wires "
+            "WHEN NEW.action='RemoteStopTransaction' BEGIN SELECT RAISE(ABORT, 'test'); END"
+        )
+        sent = OwnerWire(wire, pause, ticket, BOOT, STOP_ACTION, local, None)
+        journal.outcomes.record_owner_wire(sent)
+        joined = write_request(journal, local, dispatched=False, joined=True, owner_wire_attempts=[wire])
+        frame = [3, wire, {"status": "Rejected"}]
+        if not late_reply:
+            journal.outcomes.record_owner_reply(sent, frame)
+        if supersession == "new-ticket":
+            with journal.atomic():
+                requests.bind_pause_stop(requests.intent(), next_ticket, requests.pause_request(), local, BOOT)
+        else:
+            requests.accept(new_pause, "pause", 2)
+            assert requests.receipt(pause)["result"] == {
+                "classification": "superseded_by_pause",
+                "superseded_by": new_pause,
+            }
+        if late_reply:
+            journal.outcomes.record_owner_reply(sent, frame)
+        reply = replace(sent, reply="Rejected")
+        key = f"retained_transaction_reply_owner:{wire}"
+        assert journal.get(key) == asdict(reply)
+        assert journal.outcomes.owner(pause).result[PAUSE_STOP_HISTORY] == {
+            wire: {"ticket": ticket, "local": local, "boot": BOOT},
+        }
+        assert not journal.db.execute("SELECT 1 FROM owner_command_wires").fetchone()
+        journal.stop("stop-token", {"transactionId": local, "meterStop": 120, "timestamp": START["timestamp"]})
+        journal.db.execute(
+            "UPDATE managed_requests SET result=json_set(result,'$._session_stop.closure_verified',json('true')) "
+            "WHERE id=?",
+            (joined,),
+        )
+        invalid = (
+            replace(reply, boot="wrong-boot"),
+            replace(reply, request=None),
+            replace(reply, ticket=uuid.uuid4().hex),
+            replace(reply, request=None, ticket=uuid.uuid4().hex),
+            replace(reply, wire=uuid.uuid4().hex),
+        )
+        for damaged in invalid:
+            damaged_key = f"retained_transaction_reply_owner:{damaged.wire}"
+            journal.put(damaged_key, asdict(damaged))
+            assert decode_retained_owner_reply(journal.db, asdict(damaged)) is None
+            report = stop_incident_report(path, events, request_reference=reference(joined))
+            assert not report["wire"]["joined_attempts"]
+            journal.db.execute("DELETE FROM meta WHERE key=?", (damaged_key,))
+        journal.put(key, asdict(reply))
+        report = stop_incident_report(path, events, request_reference=reference(joined))
+        assert report["wire"]["joined_attempts"] == [
+            {"origin": "local", "request": reference(pause), "reply": "rejected", "reply_source": "retained_checkpoint"}
+        ]
+
+    with closing(Journal(path, "test-charger")) as journal:
+        requests = ManagedRequests(journal)
+        ManagedSessionStop(SimpleNamespace(session=SimpleNamespace(journal=journal, gateway=Gateway(journal))))
+        assert requests.receipt(joined)["state"] == "failed"
+        assert requests.receipt(joined)["result"]["classification"] == "stop_rejected"
+        journal.outcomes.retry_owner_writes()
+        assert journal.outcomes.owner_wires("wire", wire) == (reply,)
+        assert journal.get(key) is None
+        if supersession == "new-ticket":
+            with journal.atomic():
+                requests.bind_pause_stop(requests.intent(), uuid.uuid4().hex, requests.pause_request(), local, BOOT)
+            assert PAUSE_STOP_HISTORY not in journal.outcomes.owner(pause).result
 
 
 # Intent: reopen a retained unnamed Stop reply alongside an older shutdown claim.

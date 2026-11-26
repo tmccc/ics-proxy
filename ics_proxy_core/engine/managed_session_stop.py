@@ -365,6 +365,21 @@ class ManagedSessionStop:
         self._checkpoint_native_first()
         self._settle_closure(stop_rejections(j), observed=True)
 
+    # The exact closure can already be proved while its receipt publication still awaits storage.
+    def closure_verified(self, local: int) -> bool:
+        j = self.controller.session.journal
+        receipt = j.db.execute(
+            "SELECT 1 FROM managed_requests JOIN transactions "
+            "ON transactions.local=json_extract(result,'$._session_stop.local') "
+            "WHERE action=? AND json_type(result,'$._session_stop.local')='integer' AND transactions.local=? "
+            f"AND transactions.stop IS NOT NULL AND {STOP_CLOSURE_VERIFIED} LIMIT 1",
+            (STOP_SESSION, local),
+        ).fetchone()
+        return receipt is not None or (
+            bool(self._verified_closures)
+            and bool(self._matching_closures(stop_rejections(j), observed=False, local=local))
+        )
+
     # A refused receipt write can leave the same exact closure in memory or in the separate checkpoint.
     def _closure_proof(self) -> tuple[str, tuple[str, ...]]:
         if self._verified_closures:
@@ -401,20 +416,21 @@ class ManagedSessionStop:
             return False
         return True
 
-    # Save verified closure separately so a refused completion cannot roll back the observation.
-    def _checkpoint_closure(self, rejections: StopRejections, *, observed: bool) -> None:
-        if not observed and not self._verified_closures:
-            self._retain_closures()
-            return
+    # The current observation can prove closure. A resumed checkpoint must match the original receipt and report.
+    def _matching_closures(
+        self, rejections: StopRejections, *, observed: bool, local: int | None = None
+    ) -> dict[str, int | VerifiedStopClosure]:
         where = f"{rejections.closed_receipts} AND NOT {STOP_CLOSURE_VERIFIED}"
-        bindings: tuple[str, ...] = (STOP_SESSION,)
+        bindings: tuple[str | int, ...] = (STOP_SESSION,)
         if not observed:
             where += f" AND {STOP_BUFFERED_CLOSURE}"
             bindings += (self._buffered_closure_locals(),)
+        if local is not None:
+            where += " AND transactions.local=?"
+            bindings += (local,)
         j = self.controller.session.journal
-        # The current observation can prove closure. A resumed checkpoint must match the original receipt and report.
         closures: dict[str, int | VerifiedStopClosure] = {}
-        for request, revision, target, local, stop in j.db.execute(
+        for request, revision, target, session, stop in j.db.execute(
             f"{rejections.prefix}SELECT id,revision,json_extract(result,'$.target'),transactions.local,stop "
             "FROM managed_requests JOIN transactions "
             f"ON transactions.local=json_extract(result,'$._session_stop.local') WHERE {where}",
@@ -422,13 +438,20 @@ class ManagedSessionStop:
         ):
             if not isinstance(stop, str) or (target is not None and (not isinstance(target, str) or len(target) != 64)):
                 continue
-            proof: VerifiedStopClosure = revision, target, local, fingerprint(stop)
+            proof: VerifiedStopClosure = revision, target, session, fingerprint(stop)
             saved = self._verified_closures.get(request)
             if observed:
                 closures[request] = proof
-            elif saved is not None and saved in (local, proof):
+            elif saved is not None and saved in (session, proof):
                 closures[request] = saved
-        self._verified_closures = closures
+        return closures
+
+    # Save verified closure separately so a refused completion cannot roll back the observation.
+    def _checkpoint_closure(self, rejections: StopRejections, *, observed: bool) -> None:
+        if not observed and not self._verified_closures:
+            self._retain_closures()
+            return
+        self._verified_closures = self._matching_closures(rejections, observed=observed)
         if self._verified_closures and self._update_receipts(
             STOP_CLOSURE_FIELDS,
             (),

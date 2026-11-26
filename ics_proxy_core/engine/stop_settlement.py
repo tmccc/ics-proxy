@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from .command_outcomes import CommandOutcomes, OwnerWire, TransactionReplyStatus
     from .store import Journal
 
+PAUSE_STOP_HISTORY = "_stop_history"
 STOP_SESSION = "stop_session"
 STOP_NONTERMINAL_CLASSIFICATIONS = ("stop_not_confirmed", "process_replaced")
 STOP_CLOSURE_VERIFIED = "json_type(result,'$._session_stop.closure_verified') IS 'true'"

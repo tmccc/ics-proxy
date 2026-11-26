@@ -18,7 +18,6 @@ from .local_schedule_window import ScheduleCutoff, schedule_window
 from .managed_intent import LOCAL_SCHEDULE_OCCURRENCE as OCCURRENCE
 from .policy import DeniedError
 from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
-from .stop_settlement import STOP_CLOSURE_VERIFIED, STOP_SESSION
 from .store import RecoveryRequiredError, fingerprint
 
 if TYPE_CHECKING:
@@ -482,16 +481,13 @@ class LocalSchedule:
             if j.db.in_transaction:
                 raise
 
-    # A separate verified Stop receipt can preserve the same closure across process replacement.
+    # The session Stop owner can preserve the same physical proof across process replacement.
     def closure_known(self, occurrence: dict[str, Any]) -> bool:
-        if occurrence.get("native_closed") is True or self.closed_request == occurrence["request"]:
-            return True
-        receipt = self.journal.db.execute(
-            "SELECT 1 FROM managed_requests WHERE action=? AND json_type(result,'$._session_stop.local')='integer' "
-            f"AND json_extract(result,'$._session_stop.local')=? AND {STOP_CLOSURE_VERIFIED} LIMIT 1",
-            (STOP_SESSION, occurrence["local"]),
-        ).fetchone()
-        return receipt is not None
+        return (
+            occurrence.get("native_closed") is True
+            or self.closed_request == occurrence["request"]
+            or self.controller.session_stop.closure_verified(occurrence["local"])
+        )
 
     # Periodic restrictive work can stop its own session even when no complete native poll is available.
     async def stop_if_due(self) -> None:
