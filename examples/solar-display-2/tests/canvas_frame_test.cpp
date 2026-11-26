@@ -4,6 +4,7 @@
 #include "canvas_frame.h"
 
 using solar_display::CanvasFreshness;
+using solar_display::CanvasRequestFeedback;
 
 void publish(CanvasFreshness &frame, uint32_t rendered, uint32_t received_ms, int64_t wall) {
   assert(frame.accepts(rendered, received_ms, wall));
@@ -42,4 +43,38 @@ int main() {
   publish(before_wrap, 2001, 250, 2001);
   assert(pressed_before_wrap.rendered_at() == 2000);
   assert(pressed_before_wrap.render_age_ms(500, 2001) == 2000);
+
+  constexpr auto start = "start:00000000000001";
+  constexpr auto stop = "stop:current-session";
+  constexpr auto new_stop = "stop:next-session";
+  CanvasRequestFeedback feedback;
+  feedback.submitted(start);
+  feedback.observe("idle", 3000, start);
+  assert(!feedback.retired(3000, start));
+  feedback.observe("starting", 3000, start);
+  assert(!feedback.retired(3000, start));
+  // A refresh of the same control can arrive during the wait for confirmation.
+  feedback.observe("idle", 3001, start);
+  assert(feedback.retired(3001, start));
+  assert(!feedback.retired(3002, start));
+  assert(!feedback.retired(3001, stop));
+  feedback.reset_pending();
+  feedback.observe("idle", 3001, start);
+  assert(feedback.retired(3001, start));
+
+  feedback.submitted(stop);
+  feedback.observe("stopping", 3002, stop);
+  feedback.observe("stopping_timeout", 3002, stop);
+  feedback.observe("idle", 3002, stop);
+  assert(!feedback.retired(3002, stop));
+
+  feedback.submitted(stop);
+  feedback.observe("stopping", 3002, stop);
+  feedback.observe("idle", 3003, new_stop);
+  assert(!feedback.retired(3003, new_stop));
+
+  feedback.submitted(stop);
+  feedback.observe("stopping", 3004, stop);
+  feedback.observe("idle", 3004, stop);
+  assert(feedback.retired(3004, stop));
 }

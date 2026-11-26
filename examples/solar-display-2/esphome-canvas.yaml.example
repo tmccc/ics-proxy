@@ -23,6 +23,7 @@ api:
           id(canvas_ics_feedback_reads) = 0;
           id(canvas_ics_feedback_missing) = solar_display::ALL_FEEDBACK;
           id(canvas_pressed_control).clear();
+          solar_display::canvas_frame().request_feedback().reset_pending();
           id(canvas_ics_touch_automation).publish_state("");
           id(canvas_ics_request_state).publish_state("");
           id(canvas_ics_pending_runs).publish_state(std::numeric_limits<float>::quiet_NaN());
@@ -35,6 +36,7 @@ api:
             id(canvas_ics_feedback_reads) = 0;
             id(canvas_ics_feedback_missing) = solar_display::ALL_FEEDBACK;
             id(canvas_pressed_control).clear();
+            solar_display::canvas_frame().request_feedback().reset_pending();
             id(check_canvas_freshness).execute();
           } else if (id(canvas_ha_connections) == 1) {
             id(canvas_ics_feedback_missing) = solar_display::ALL_FEEDBACK;
@@ -188,6 +190,8 @@ text_sensor:
     on_value:
       - lambda: |-
           if (id(canvas_ha_connections) == 1 && solar_display::charger_request_known(x)) {
+            auto &frame = solar_display::canvas_frame();
+            frame.request_feedback().observe(x, frame.freshness().rendered_at(), id(canvas_frame_control));
             id(canvas_ics_feedback_missing) &= ~solar_display::REQUEST_STATE;
           }
       - script.execute: show_ics_request_feedback
@@ -272,7 +276,8 @@ script:
           const bool starting = showing && !unavailable && request == "starting";
           const bool stopping = showing && !unavailable && request == "stopping";
           const bool pending = starting || stopping;
-          const bool blocked = unavailable || !solar_display::charger_request_idle(request, active_runs);
+          const bool retired = solar_display::canvas_frame().control_retired(id(canvas_frame_control));
+          const bool blocked = unavailable || !solar_display::charger_request_idle(request, active_runs) || retired;
           if (!showing || blocked) {
             id(canvas_pressed_control).clear();
           }
@@ -485,6 +490,7 @@ lvgl:
                       id(canvas_ha_connections) == 1 && id(canvas_ics_feedback_missing) == 0 &&
                       solar_display::charger_request_idle(id(canvas_ics_request_state).state,
                                                          id(canvas_ics_pending_runs).state) &&
+                      !frame.control_retired(id(canvas_frame_control)) &&
                       id(canvas_showing) && id(canvas_image_ready) && clock.is_valid() &&
                       api::global_api_server->is_connected_with_state_subscription() &&
                       freshness.fresh(now, clock.timestamp) &&
@@ -510,6 +516,7 @@ lvgl:
                           (id(canvas_ics_touch_automation).state != "on" ||
                            id(canvas_ha_connections) != 1 || id(canvas_ics_feedback_missing) != 0 ||
                            !solar_display::charger_request_idle(request, id(canvas_ics_pending_runs).state) ||
+                           frame.control_retired(id(canvas_frame_control)) ||
                            static_cast<int>(button) != id(canvas_pressed_button) ||
                            id(canvas_pressed_control) != id(canvas_frame_control) ||
                            (button == ChargerButton::START && !id(canvas_pressed_control).starts_with("start:")) ||
@@ -533,6 +540,7 @@ lvgl:
                       id(canvas_touch_age_seconds) = touch_age / 1000;
                       id(canvas_touch_rendered_at_epoch) = touch_frame.rendered_at();
                       ++id(canvas_touch_event_count);
+                      if (charger_button) frame.request_feedback().submitted(id(canvas_pressed_control));
                       return true;
                   then:
                     - homeassistant.event:

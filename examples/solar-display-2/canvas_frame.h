@@ -54,6 +54,42 @@ struct CanvasMarker {
   std::string control;
 };
 
+// Keep a confirmed tap from re-enabling the control already painted into the image.
+class CanvasRequestFeedback {
+ public:
+  void submitted(std::string_view control) {
+    this->submitted_ = control;
+    this->pending_ = false;
+  }
+
+  void reset_pending() {
+    this->submitted_.clear();
+    this->pending_ = false;
+  }
+
+  void observe(std::string_view request, uint32_t rendered_at, std::string_view control) {
+    if (request == "starting" || request == "stopping") {
+      this->pending_ = this->submitted_.starts_with(request == "starting" ? "start:" : "stop:");
+      return;
+    }
+    // Idle without a pending transition can also be the initial or a repeated subscription value.
+    if (request == "idle" && !this->pending_) return;
+    if (request == "idle" && rendered_at != 0 && control == this->submitted_) {
+      this->retired_ = {rendered_at, this->submitted_};
+    }
+    this->reset_pending();
+  }
+
+  bool retired(uint32_t rendered_at, std::string_view control) const {
+    return rendered_at != 0 && rendered_at == this->retired_.rendered_at && control == this->retired_.control;
+  }
+
+ private:
+  std::string submitted_;
+  bool pending_{false};
+  CanvasMarker retired_;
+};
+
 // The server's clock supplies the age at download. Elapsed time keeps that
 // frame aging even if a cache response or clock correction arrives later.
 class CanvasFreshness {
@@ -231,6 +267,11 @@ class StableCanvasFrame : public esphome::image::Image {
   const std::array<DirtyRegion, DIRTY_REGION_COUNT> &dirty_regions() const { return this->dirty_regions_; }
   CanvasFreshness &freshness() { return this->freshness_; }
   CanvasFreshness &pressed_freshness() { return this->pressed_freshness_; }
+  CanvasRequestFeedback &request_feedback() { return this->request_feedback_; }
+
+  bool control_retired(std::string_view control) const {
+    return this->request_feedback_.retired(this->freshness_.rendered_at(), control);
+  }
 
  protected:
   static bool valid_picture_(const esphome::image::Image &source) {
@@ -284,6 +325,7 @@ class StableCanvasFrame : public esphome::image::Image {
   std::array<DirtyRegion, DIRTY_REGION_COUNT> dirty_regions_{};
   CanvasFreshness freshness_{};
   CanvasFreshness pressed_freshness_{};
+  CanvasRequestFeedback request_feedback_{};
 };
 
 inline StableCanvasFrame &canvas_frame() {

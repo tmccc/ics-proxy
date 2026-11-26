@@ -117,7 +117,15 @@ def test_display_feedback_follows_live_home_assistant_subscriptions():
     assert "const bool ready = id(canvas_ha_connections) == 1 && id(canvas_ics_feedback_missing) == 0;" in feedback
     assert "!ready || !enabled || !solar_display::charger_request_known(request) || !(active_runs >= 0)" in feedback
     assert re.search(r'if \(unavailable\)\s*\{\s*feedback = "Charger buttons unavailable";', feedback)
-    assert "const bool blocked = unavailable || !solar_display::charger_request_idle(request, active_runs);" in feedback
+    assert "frame.request_feedback().observe(x, frame.freshness().rendered_at(), id(canvas_frame_control));" in (
+        helper["on_value"][0]["lambda"]
+    )
+    assert "control_retired(id(canvas_frame_control))" in feedback
+    assert re.search(
+        r"const bool blocked = unavailable \|\| "
+        r"!solar_display::charger_request_idle\(request, active_runs\) \|\| retired;",
+        feedback,
+    )
     assert re.search(r'if \(!showing \|\| blocked\)\s*\{\s*id\(canvas_pressed_control\).clear\(\);', feedback)
     assert re.search(r'if \(showing && blocked\)\s*\{\s*feedback = "Charger buttons unavailable";', feedback)
     assert re.search(
@@ -143,6 +151,7 @@ def test_display_feedback_follows_live_home_assistant_subscriptions():
         press,
     )
     assert "fresh(now, clock.timestamp)" in press
+    assert "!frame.control_retired(id(canvas_frame_control))" in press
     click = touch["on_click"][0]["if"]["condition"]["lambda"]
     assert 'id(canvas_ics_touch_automation).state != "on"' in click
     assert re.search(
@@ -151,6 +160,8 @@ def test_display_feedback_follows_live_home_assistant_subscriptions():
         click,
     )
     assert "!solar_display::charger_request_idle(request, id(canvas_ics_pending_runs).state)" in click
+    assert "frame.control_retired(id(canvas_frame_control))" in click
+    assert "if (charger_button) frame.request_feedback().submitted(id(canvas_pressed_control));" in click
 
 
 # Intent: a held tap is retired when Home Assistant disconnects or the old frame expires before a new download.
