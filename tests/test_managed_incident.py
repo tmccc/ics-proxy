@@ -2,6 +2,7 @@
 """Independent process cuts and a read-only report used to select the matching replay."""
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import shutil
@@ -328,13 +329,15 @@ def test_incident_reads_stopped_journal_without_writes(tmp_path, read_only, side
         archive.chmod(0o700)
 
 
-# A clean owner exit during copying removes the live sidecars and checkpoints the journal.
+# Intent: retry the snapshot when the owner closes the journal during the copy.
+# Why: a clean exit checkpoints the journal and removes sidecars the reader may have observed.
 def test_incident_reads_journal_as_owner_closes(tmp_path, monkeypatch):
     path = tmp_path / "journal.sqlite"
     request = uuid.uuid4().hex
     journal = Journal(path, "OFFLINE001")
     files_after_close = {}
 
+    # Trigger checkpoint and sidecar removal after the first database copy.
     def close_during_copy(source, target):
         shutil.copyfile(source, target)
         if source == path and not files_after_close:
@@ -352,7 +355,8 @@ def test_incident_reads_journal_as_owner_closes(tmp_path, monkeypatch):
     assert {file.name: file.read_bytes() for file in tmp_path.iterdir()} == files_after_close
 
 
-# Retry a moving snapshot so the report sees a newer committed WAL record without touching the index.
+# Intent: report the latest committed request after the source WAL changes during a copy.
+# Why: a copy that missed a commit must be retried without updating the original SQLite index.
 def test_incident_retries_when_live_wal_changes_during_copy(tmp_path, monkeypatch):
     path = tmp_path / "journal.sqlite"
     wal = path.with_name(path.name + "-wal")
@@ -360,6 +364,7 @@ def test_incident_retries_when_live_wal_changes_during_copy(tmp_path, monkeypatc
     journal = Journal(path, "OFFLINE001")
     files_after_commit = {}
 
+    # Commit another request at the point where the reader has just copied the old WAL.
     def commit_during_wal_copy(source, target):
         shutil.copyfile(source, target)
         if source == wal and not files_after_commit:
@@ -375,6 +380,68 @@ def test_incident_retries_when_live_wal_changes_during_copy(tmp_path, monkeypatc
         saved = incident_report(path, tmp_path / "events.jsonl")["journal"]
         assert saved["available"] is True and saved["request"]["request"] == reference(request)
         assert {file.name: file.read_bytes() for file in tmp_path.iterdir()} == files_after_commit
+    finally:
+        journal.close()
+
+
+# Intent: use the active SQLite writer's published commit boundary when the WAL already contains a later commit frame.
+# Why: rebuilding the index from the untrimmed copy can show a request before the owner's commit finishes.
+@pytest.mark.parametrize("index_state", ["published", "checkpointed", "missing", "torn"])
+def test_incident_respects_the_published_live_wal_boundary(tmp_path, index_state):
+    source = tmp_path / "source.sqlite"
+    archive = tmp_path / "archive"
+    archive.mkdir(mode=0o700)
+    path = archive / "journal.sqlite"
+    wal, index, lock = (Path(str(path) + suffix) for suffix in ("-wal", "-shm", ".lock"))
+    source_index = Path(str(source) + "-shm")
+    first, next_request = (uuid.uuid4().hex for _ in range(2))
+    journal = Journal(source, "OFFLINE001")
+    try:
+        journal.db.execute("PRAGMA wal_autocheckpoint=0")
+        requests = ManagedRequests(journal)
+        requests.accept(first, "start", 0)
+        if index_state == "checkpointed":
+            journal.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        published = source_index.read_bytes()
+        requests.accept(next_request, "start", 0)
+        shutil.copy2(source, path)
+        shutil.copy2(Path(str(source) + "-wal"), wal)
+        if index_state != "missing":
+            shutil.copy2(source_index, index)
+            if index_state == "torn":
+                published = published[:48] + source_index.read_bytes()[48:]
+            index.write_bytes(published)
+        shutil.copy2(Path(str(source) + ".lock"), lock)
+    finally:
+        journal.close()
+
+    files = {file.name: file.read_bytes() for file in archive.iterdir()}
+    events = archive / "events.jsonl"
+    # Simulate the active owner with the two independently generated on-disk commit boundaries.
+    with lock.open("rb") as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        live = incident_report(path, events)["journal"]
+        if index_state in ("missing", "torn"):
+            assert live == {"available": False, "intent": None, "request": None, "start": None}
+        else:
+            assert live["available"] is True and live["request"]["request"] == reference(first)
+    stopped = incident_report(path, events)["journal"]
+    assert stopped["available"] is True and stopped["request"]["request"] == reference(next_request)
+    assert {file.name: file.read_bytes() for file in archive.iterdir()} == files
+
+
+# Intent: refuse journal aliases that lack the live owner's path-specific lock and WAL index.
+# Why: raw recovery of a hard-linked live WAL can report a commit the original writer has yet to publish.
+def test_incident_refuses_an_aliased_live_journal(tmp_path):
+    path, alias = tmp_path / "journal.sqlite", tmp_path / "alias.sqlite"
+    request = uuid.uuid4().hex
+    journal = Journal(path, "OFFLINE001")
+    try:
+        ManagedRequests(journal).accept(request, "start", 0)
+        alias.hardlink_to(path)
+        Path(str(alias) + "-wal").hardlink_to(Path(str(path) + "-wal"))
+        for candidate in (path, alias):
+            assert incident_report(candidate, tmp_path / "events.jsonl")["journal"]["available"] is False
     finally:
         journal.close()
 

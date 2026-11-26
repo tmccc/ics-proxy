@@ -923,7 +923,25 @@ class RecoveryControl:
                 handover.book.owned_present(native.physical)
             if recorded_station_profile(j, handover.spec.digest, handover.spec.boot_digest):
                 j.put(KEY, {**hold, "reason": reason})
-        elif selected_current is not None:
+        else:
+            if selected_current is None:
+                # The reconnect's existing owned audit may see closure after its first zero was confirmed.
+                controls = handover.gateway.controls
+                control = j.control.read()
+                if not (
+                    inventory_audited
+                    and j.phase.read().value == "recovering"
+                    and control.explicit_local_hold
+                    and controls.ready
+                    and controls.desired() == 0
+                ):
+                    return
+                saved_current = control.values.get("resume_limit", 6)
+                if type(saved_current) not in (int, float) or not 6 <= saved_current <= controls.policy.max_current_a:
+                    return
+                selected_current = int(saved_current)
+                if saved_current != selected_current:
+                    return
             start = self._closing_owner_start(handover, native, local)
             if start is not None and recorded_station_profile(j, handover.spec.digest, handover.spec.boot_digest):
                 revision = decode_intent(intent).revision

@@ -892,10 +892,10 @@ async def test_replacement_recognizes_owner_closure_after_native_outage(
             assert not stops(bench)
 
 
-# Intent: keep both closure orders at zero through a charger reconnect and another Boot on its new socket.
+# Intent: keep either closure order at zero through a charger reconnect and another Boot on its new socket.
 # Why: a failed vendor registration must leave the next scheduled occurrence available once closure settles.
-@pytest.mark.parametrize("reported_first", [False, True], ids=["native-first", "report-first"])
-async def test_owner_closure_during_charger_reconnect(tmp_path, tls, unused_tcp_port, monkeypatch, reported_first):
+@pytest.mark.parametrize("closure_order", ["native-first", "report-first", "after-audit"])
+async def test_owner_closure_during_charger_reconnect(tmp_path, tls, unused_tcp_port, monkeypatch, closure_order):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
         bench = rig.bench
         async with connection(rig, "before-owner-closure-reconnect") as test:
@@ -906,10 +906,11 @@ async def test_owner_closure_during_charger_reconnect(tmp_path, tls, unused_tcp_
             receipt = c.requests.receipt(occurrence["request"])
             assert j.get(ORDINARY_HOLD) is None
             clock.now = MIDNIGHT + 30
+            reported_first = closure_order == "report-first"
             if reported_first:
                 await close(test, clock, local, meter_start)
             bench.cp, bench.connection = "B", "Plug"
-            bench.firmware.active = local if reported_first else None
+            bench.firmware.active = None if closure_order == "native-first" else local
             bench.firmware.requested_current = 0
             rig.peer.permission_enabled = False
 
@@ -920,6 +921,9 @@ async def test_owner_closure_during_charger_reconnect(tmp_path, tls, unused_tcp_
                 reconnected = replace(test, charger=charger)
                 assert (await bench.call(charger, "owner-closure-reconnect", "BootNotification", BOOT))[0] == 3
                 await until(lambda: test.session.runtime.status.vendor_failed_charger_epoch == g._charger_epoch)
+                if closure_order == "after-audit":
+                    assert g.controls.ready and j.get(ORDINARY_HOLD) is None
+                    bench.firmware.active = None
                 view = await c.tick()
                 assert view["state"] == "reconciling" and not view["local_hold_verified"]
                 hold = j.get(ORDINARY_HOLD)

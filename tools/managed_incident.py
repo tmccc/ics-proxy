@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import re
 import shutil
 import sqlite3
 import stat
+import struct
 import tempfile
 import threading
 import time
@@ -290,26 +292,112 @@ def same_snapshot_version(before: os.stat_result, current: os.stat_result) -> bo
     return os.path.samestat(before, current) and before.st_ctime_ns == current.st_ctime_ns
 
 
-# Copies of private state must start from ordinary files owned by the reporting account.
+# Journal sidecars and ownership apply to one name, so copies require private files with one link.
 def private_snapshot_file(info: os.stat_result) -> bool:
-    return stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077
+    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.getuid() and not info.st_mode & 0o077
 
 
-# Rebuild the WAL index on the private copy and confirm the original files stayed stable.
+# Probe the existing owner lock without creating it or keeping it across any copy.
+def journal_owner_active(path: Path) -> bool:
+    try:
+        descriptor = os.open(str(path) + ".lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    with os.fdopen(descriptor, "rb") as lock:
+        if not private_snapshot_file(os.fstat(descriptor)):
+            raise ValueError("incident requires a private regular journal lock")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+# Read the two SQLite WAL-index headers as data so SQLite cannot update the source shared memory.
+def read_wal_index(path: Path) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb", buffering=0) as index:
+        if not private_snapshot_file(os.fstat(descriptor)):
+            raise ValueError("incident requires a private regular WAL index")
+        return index.read(96)
+
+
+# The active writer can put a complete commit frame in the WAL before publishing it in the index.
+def restrict_live_wal(index: bytes, copied_wal: Path) -> bool:
+    header = index[:48]
+    if len(index) != 96 or header != index[48:] or header[12] != 1:
+        return False
+    version = struct.unpack_from("=I", header)[0]
+    if version != 3_007_000:
+        return False
+    first = second = 0
+    for word1, word2 in struct.iter_unpack("=II", header[:40]):
+        first = (first + word1 + second) & 0xFFFFFFFF
+        second = (second + word2 + first) & 0xFFFFFFFF
+    if (first, second) != struct.unpack_from("=II", header, 40):
+        return False
+
+    page_size, frames, pages, checksum1, checksum2 = struct.unpack_from("=HIIII", header, 14)
+    if frames == 0:
+        copied_wal.unlink(missing_ok=True)
+        return True
+    page_size = 65536 if page_size == 1 else page_size
+    if page_size not in (512, 1024, 2048, 4096, 8192, 16384, 32768, 65536) or pages == 0:
+        return False
+
+    with copied_wal.open("r+b") as wal:
+        wal_header = wal.read(32)
+        if len(wal_header) != 32:
+            return False
+        magic, wal_version, wal_page_size = struct.unpack_from(">III", wal_header)
+        if (
+            magic not in (0x377F0682, 0x377F0683)
+            or magic & 1 != header[13]
+            or (wal_version, wal_page_size) != (version, page_size)
+            or wal_header[16:24] != header[32:40]
+        ):
+            return False
+        frame_size = 24 + page_size
+        published_size = 32 + frames * frame_size
+        if os.fstat(wal.fileno()).st_size < published_size:
+            return False
+        wal.seek(published_size - frame_size)
+        frame = wal.read(24)
+        if (
+            len(frame) != 24
+            or int.from_bytes(frame[4:8], "big") != pages
+            or frame[8:16] != header[32:40]
+            or struct.unpack_from(">II", frame, 16) != (checksum1, checksum2)
+        ):
+            return False
+        wal.truncate(published_size)
+    return True
+
+
+# The original remains untouched even when SQLite reconstructs the WAL index on the private copy.
 def copy_snapshot(path: Path, copy: Path) -> bool:
     parent = path.parent.stat()
+    active = journal_owner_active(path)
     sidecars = {suffix: Path(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal")}
     present = {suffix for suffix, source in sidecars.items() if os.path.lexists(source)}
-    sources = {"": path, **{suffix: sidecars[suffix] for suffix in ("-wal", "-journal") if suffix in present}}
+    sources = {"": path, **{suffix: source for suffix, source in sidecars.items() if suffix in present}}
     observations = {suffix: source.lstat() for suffix, source in sources.items()}
     if any(not private_snapshot_file(info) for info in observations.values()):
         raise ValueError("incident requires private regular journal files")
+    if active and "-journal" in present:
+        return False
+    index_path = sidecars["-shm"]
+    index = read_wal_index(index_path) if active and present & {"-shm", "-wal"} else None
     for suffix, source in sources.items():
-        shutil.copyfile(source, Path(str(copy) + suffix))
+        if suffix != "-shm":
+            shutil.copyfile(source, Path(str(copy) + suffix))
+    copied_wal = Path(str(copy) + "-wal")
     return (
         all(same_snapshot_version(observations[suffix], source.lstat()) for suffix, source in sources.items())
         and same_snapshot_version(parent, path.parent.stat())
         and all(os.path.lexists(source) == (suffix in present) for suffix, source in sidecars.items())
+        and journal_owner_active(path) == active
+        and (index is None or index == read_wal_index(index_path) and restrict_live_wal(index, copied_wal))
     )
 
 
