@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import time
-
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 
+from . import coordinator as proxy_coordinator
 from .api import ProxyError
 from .coordinator import DOMAIN, ProxyCoordinator
 
@@ -16,35 +15,23 @@ FRAME_MAX_EPOCH = 2**32 - 1
 WALL_STEP_TOLERANCE = 0.5
 
 
-# Pair the wall clock with elapsed time. A small sampling variation must not appear to be a clock step.
-def _frame_clock() -> tuple[float, float]:
-    before = time.monotonic()
-    wall = time.time()
-    return wall, (before + time.monotonic()) / 2
-
-
-# A new coordinator can have the same revision as the previous one. Require its own render sequence.
-def mark_canvas_activation(coordinator: ProxyCoordinator) -> None:
-    coordinator.canvas_activation = _frame_clock()
-
-
 # A response belongs to this exact command. The client reads its receipt and never repeats the write.
 def register_session_service(hass: HomeAssistant) -> None:
-    first_wall, first_elapsed = _frame_clock()
+    first_wall, first_elapsed = proxy_coordinator.frame_clock()
     reject_through = int(first_wall)
     wall_offset = first_wall - first_elapsed
 
     # An observed step makes frame epochs through either wall-clock reading ambiguous.
-    def frame_is_current(epoch: int, coordinator: ProxyCoordinator | None) -> bool:
+    def frame_is_current(epoch: int, coordinator: ProxyCoordinator, owner: str | None) -> bool:
         nonlocal reject_through, wall_offset
-        wall, elapsed = _frame_clock()
+        wall, elapsed = proxy_coordinator.frame_clock()
         offset = wall - elapsed
         if abs(offset - wall_offset) > WALL_STEP_TOLERANCE:
             reject_through = max(reject_through, int(wall), int(elapsed + wall_offset))
             wall_offset = offset
         else:
             wall_offset = max(wall_offset, offset)
-        if coordinator is None or coordinator.canvas_activation is None:
+        if owner is None or owner != coordinator.canvas_owner or coordinator.canvas_activation is None:
             return False
         activated_wall, activated_elapsed = coordinator.canvas_activation
         # A clock adjustment can occur while the replacement entry is loading.
@@ -77,7 +64,10 @@ def register_session_service(hass: HomeAssistant) -> None:
             response["request_reference"] = None
         frame_epoch = call.data.get("canvas_rendered_at_epoch")
         coordinator = active_coordinator()
-        if (frame_epoch is not None and not frame_is_current(frame_epoch, coordinator)) or coordinator is None:
+        if coordinator is None:
+            return response
+        owner = coordinator.canvas_owner if frame_epoch is not None else None
+        if frame_epoch is not None and not frame_is_current(frame_epoch, coordinator, owner):
             return response
         action = call.data["action"]
         target = call.data.get("target")
@@ -119,13 +109,15 @@ def register_session_service(hass: HomeAssistant) -> None:
         # The frame or its current control can expire while Home Assistant opens the management connection.
         def require_current_canvas() -> None:
             if (
-                not frame_is_current(frame_epoch, coordinator)
+                not frame_is_current(frame_epoch, coordinator, owner)
                 or active_coordinator() is not coordinator
                 or not request_is_current()
             ):
                 raise ProxyError("The display request is no longer current")
 
         fields = {"target": target} if action == "stop_session" else {}
+        if owner is not None:
+            fields["canvas_owner"] = owner
         try:
             await coordinator.client.command(
                 action,

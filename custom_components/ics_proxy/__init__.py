@@ -9,7 +9,7 @@ from homeassistant.core import HomeAssistant
 from .coordinator import ProxyCoordinator
 from .diagnostics import CLIENT_BUILD_INFO, client_build_info
 from .notification import NOTICES
-from .session_service import mark_canvas_activation, register_session_service
+from .session_service import register_session_service
 
 PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON, Platform.NUMBER]
 type ProxyEntry = ConfigEntry[ProxyCoordinator]
@@ -29,7 +29,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ProxyEntry) -> bool | No
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    mark_canvas_activation(coordinator)
+    coordinator.mark_canvas_activation()
     if (MAJOR_VERSION, MINOR_VERSION) < (2026, 11):
         return True
     return None

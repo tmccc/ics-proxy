@@ -91,6 +91,11 @@ async def peer():
         command = value["command"]
         control["commands"].append(command)
         control["requests"].append(copy.deepcopy(value))
+        if command in ("start", "stop_session") and "canvas_owner" in value:
+            if value["canvas_owner"] != state.get("canvas_owner"):
+                await socket.send_json({"ok": False, "error": "not_ready"})
+                await socket.close()
+                return socket
         if command == "pause" and control.get("pre_admission_close") is not None:
             await socket.close(code=1013, message=control["pre_admission_close"].encode())
             return socket

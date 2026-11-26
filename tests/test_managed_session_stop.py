@@ -131,7 +131,8 @@ async def test_management_start_then_session_stop_at_zero_watts(tmp_path, tls, u
         def status():
             return {**published, "running": True, "certificate_remaining_seconds": 86400}
 
-        api = ManagementServer(ManagementSettings(port, tmp_path / "unused-secret", TOKEN), c, status)
+        settings = ManagementSettings(port, tmp_path / "unused-secret", TOKEN)
+        api = ManagementServer(settings, c, status)
         await api.start()
         try:
             async with connect(
@@ -139,21 +140,45 @@ async def test_management_start_then_session_stop_at_zero_watts(tmp_path, tls, u
                 additional_headers={"Authorization": "Bearer " + TOKEN},
                 subprotocols=["ics-proxy.v1"],
             ) as socket:
-                started = await call(socket, "start", revision=c.requests.intent().revision)
+                initial = (await call(socket, "status"))["result"]
+                owner, initial_revision = initial["canvas_owner"], initial["control_revision"]
+                assert len(owner) == 64 and all(digit in "0123456789abcdef" for digit in owner)
+                assert owner != TOKEN
+                restarted = ManagementServer(settings, c, status)
+                assert restarted.read_only(uuid.uuid4().hex, "status")["result"]["canvas_owner"] == owner
+                prior_owner = ("1" if owner[0] != "1" else "2") + owner[1:]
+
+                refused = uuid.uuid4().hex
+                assert await call(socket, "start", id=refused, revision=initial_revision, canvas_owner=prior_owner) == {
+                    "ok": False,
+                    "error": "not_ready",
+                }
+                assert (await call(socket, "receipt", request_id=refused))["result"]["state"] == "not_found"
+                assert not any(frame[2] == "RemoteStartTransaction" for frame in bench.device_calls)
+                started = await call(socket, "start", revision=initial_revision, canvas_owner=owner)
                 await c.charging.settle()
                 local = await zero_power_session(t)
                 published = await healthy(c)
                 view = (await call(socket, "status"))["result"]
                 assert view["charging_session_open"] is True and view["power_w"] == 0
+                assert view["canvas_owner"] == owner
                 assert (await call(socket, "receipt", request_id=started["id"]))["result"]["state"] == "completed"
                 target, revision = view["stop_target"], view["control_revision"]
                 assert isinstance(target, str)
                 mark, limit = len(bench.device_calls), bench.firmware.effective_limit()
                 reply = await call(socket, "stop_session", revision=revision, target="b" * 64)
                 assert reply["ok"] is False and not bench.remote_stop.is_set()
+                refused = uuid.uuid4().hex
+                assert await call(
+                    socket, "stop_session", id=refused, revision=revision, target=target, canvas_owner=prior_owner
+                ) == {"ok": False, "error": "not_ready"}
+                assert (await call(socket, "receipt", request_id=refused))["result"]["state"] == "not_found"
+                assert not bench.remote_stop.is_set()
 
                 stop = uuid.uuid4().hex
-                accepted = await call(socket, "stop_session", id=stop, revision=revision, target=target)
+                accepted = await call(
+                    socket, "stop_session", id=stop, revision=revision, target=target, canvas_owner=owner
+                )
                 assert accepted["result"]["state"] == "accepted"
                 await asyncio.wait_for(bench.remote_stop.wait(), 3)
                 await until(lambda: j.outcomes.accepted_stop(local))

@@ -724,6 +724,7 @@ class ManagedController:
         if authority != self.native.authority() or sequence != self.native.last_resolved_read:
             raise AuditSupersededError("native supervision crossed a newer authority or observation")
         connection = current_control_scope(g)
+        self.local_schedule.observe_closed(native)
         verified_pause = False
         if (self.requests.intent().mode == "app") and (self.released_epoch != g._charger_epoch):
             raise RecoveryRequiredError("managed release awaits fresh app-control restoration")
@@ -732,7 +733,6 @@ class ManagedController:
             verified_pause = True
         previous_intent = self.requests.intent()
         self.charging.observed(native)
-        self.local_schedule.observe_closed(native)
         observed_intent = self.requests.intent()
         intent_changed = observed_intent != previous_intent
         self.failures = 0

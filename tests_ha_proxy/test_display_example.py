@@ -32,8 +32,17 @@ CLEANUP_TICK = "test_display_cleanup_tick"
 IMAGE = "image.ics_display_preview"
 VIEW = "replace-with-editor-view-id"
 TARGET = "b" * 64
+CANVAS_OWNER = "c" * 64
+REPLACEMENT_OWNER = "d" * 64
 REVISION = 42
 START_MARKER = f"start:{REVISION:014x}"
+
+
+# Give canvas tests destination evidence while the ordinary client fixture can still model an older proxy.
+@pytest.fixture
+def canvas_peer(peer):
+    peer["state"]["canvas_owner"] = CANVAS_OWNER
+    return peer
 
 
 # These tests of display feedback observe the charger command separately from its image timestamp.
@@ -559,13 +568,15 @@ async def test_display_rejects_expired_tap_after_clock_step(tmp_path, monkeypatc
 # Why: an earlier forward step can hide a later rewind even when a delayed tap has expired in elapsed time.
 @pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
 @pytest.mark.parametrize("clock_change", ["rewind", "forward", "forward_then_rewind"])
-async def test_display_service_rejects_pre_adjustment_frames(actual_hass, peer, monkeypatch, starting, clock_change):
-    from custom_components.ics_proxy import session_service
+async def test_display_service_rejects_pre_adjustment_frames(
+    actual_hass, canvas_peer, monkeypatch, starting, clock_change
+):
+    from custom_components.ics_proxy import coordinator
 
-    hass = actual_hass
+    hass, peer = actual_hass, canvas_peer
     base = int(datetime.now(UTC).timestamp())
     wall, elapsed = base, 100
-    monkeypatch.setattr(session_service, "_frame_clock", lambda: (wall, elapsed))
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, elapsed))
     if not starting:
         peer["state"].update(charging_session_open=True, can_start=False, stop_target=TARGET)
     peer["state"]["control_revision"] = REVISION
@@ -632,23 +643,26 @@ async def test_display_service_rejects_pre_adjustment_frames(actual_hass, peer, 
     (command,) = [request for request in peer["requests"] if request["command"] == action]
     assert command["revision"] == REVISION
     assert command.get("target") == (None if starting else TARGET)
+    assert command["canvas_owner"] == CANVAS_OWNER
     assert "canvas_rendered_at_epoch" not in command
     await hass.services.async_call("script", "turn_off", {"entity_id": EXPIRY}, blocking=True)
 
 
 # Intent: a fresh frame from another management endpoint cannot start the replacement charger.
-# Why: independent proxies can publish the same numeric control revision.
+# Why: a replacement entry can expose the same commissioned owner and revision.
 @pytest.mark.parametrize("operation", ["reload", "remove-add"])
 async def test_display_rejects_start_frame_from_before_entry_replacement(
-    actual_hass, peer, replacement_peer, monkeypatch, operation
+    actual_hass, canvas_peer, replacement_peer, monkeypatch, operation
 ):
-    from custom_components.ics_proxy import session_service
+    from custom_components.ics_proxy import coordinator
 
-    hass = actual_hass
+    hass, peer = actual_hass, canvas_peer
     base = int(datetime.now(UTC).timestamp())
     wall = base
-    monkeypatch.setattr(session_service, "_frame_clock", lambda: (wall, 100 + wall - base))
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, 100 + wall - base))
     peer["state"]["control_revision"] = replacement_peer["state"]["control_revision"] = REVISION
+    # Use the same marker so this test also covers a reload of the same destination.
+    replacement_peer["state"]["canvas_owner"] = CANVAS_OWNER
     assert peer["port"] != replacement_peer["port"]
     await asyncio.gather(condition.async_setup(hass), trigger.async_setup(hass))
     entry = await setup_proxy(hass, peer["port"])
@@ -698,13 +712,93 @@ async def call_session_command(hass, action, **fields):
     )
 
 
-# Intent: only an ordinary Start may use the coordinator's current revision when no revision is supplied.
-# Why: a canvas Start must use the control the user actually saw.
-async def test_canvas_start_requires_the_displayed_revision(actual_hass, peer, monkeypatch):
-    from custom_components.ics_proxy import session_service
+# Intent: an unchanged HA entry rejects a fresh frame or an in-flight write for its previous proxy.
+# Why: independent destinations at the same address can advertise the same revision and capabilities.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+@pytest.mark.parametrize("observed", [True, False], ids=["after-poll", "during-handshake"])
+async def test_canvas_rejects_replacement_at_the_same_endpoint(
+    actual_hass, canvas_peer, monkeypatch, starting, observed
+):
+    from custom_components.ics_proxy import coordinator
+
+    peer = canvas_peer
+    wall = 1000
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, wall))
+    peer["state"].update(control_revision=REVISION, charging_session_open=not starting, can_start=starting)
+    if not starting:
+        peer["state"]["stop_target"] = TARGET
+    entry = await setup_proxy(actual_hass, peer["port"])
+    runtime = entry.runtime_data
+    action = "start" if starting else "stop_session"
+    fields = {"revision": REVISION} if starting else {"target": TARGET}
+    old_frame = wall + 1
+    wall = old_frame + 1
+
+    # Swap the commissioned peer during the management upgrade when the caller still has the previous status.
+    async def replace_owner():
+        peer["state"]["canvas_owner"] = REPLACEMENT_OWNER
+
+    if observed:
+        await replace_owner()
+        await runtime.async_refresh()
+    else:
+        peer["before_handshake"] = replace_owner
+
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=old_frame, **fields)
+    assert result["confirmed"] is False
+    assert (result["request_reference"] is None) is observed
+    assert peer["state"]["charging_session_open"] is (not starting)
+    assert entry.runtime_data is runtime and runtime.client.port == peer["port"]
+    assert runtime.canvas_owner == REPLACEMENT_OWNER
+
+    # A frame stamped in the observation's whole second can still precede it.
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=wall, **fields)
+    assert result == {"confirmed": False, "request_reference": None}
+
+    # A subsequent poll of the same owner must preserve the observation floor.
+    wall += 2
+    new_frame = wall
+    wall += 1
+    await runtime.async_refresh()
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=new_frame, **fields)
+    assert result["confirmed"] is True
+    requests = [request for request in peer["requests"] if request["command"] == action]
+    assert [request["canvas_owner"] for request in requests] == (
+        [REPLACEMENT_OWNER] if observed else [CANVAS_OWNER, REPLACEMENT_OWNER]
+    )
+    assert all(request["revision"] == REVISION for request in requests)
+
+
+# Intent: a proxy without a valid owner marker still supports ordinary HA controls.
+# Why: only canvas requests rely on a commissioned destination to interpret the displayed render time.
+@pytest.mark.parametrize("owner", [None, "malformed"], ids=["legacy", "malformed"])
+async def test_canvas_requires_a_valid_status_owner(actual_hass, peer, monkeypatch, owner):
+    from custom_components.ics_proxy import coordinator
 
     wall = 1000
-    monkeypatch.setattr(session_service, "_frame_clock", lambda: (wall, wall))
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, wall))
+    if owner is not None:
+        peer["state"]["canvas_owner"] = owner
+    await setup_proxy(actual_hass, peer["port"])
+    wall += 2
+
+    result = await call_session_command(actual_hass, "start", revision=0, canvas_rendered_at_epoch=wall - 1)
+    assert result == {"confirmed": False, "request_reference": None}
+    assert set(peer["commands"]) == {"status"}
+
+    assert (await call_session_command(actual_hass, "start"))["confirmed"] is True
+    (command,) = [request for request in peer["requests"] if request["command"] == "start"]
+    assert "canvas_owner" not in command
+
+
+# Intent: only an ordinary Start may use the coordinator's current revision when no revision is supplied.
+# Why: a canvas Start must use the control the user actually saw.
+async def test_canvas_start_requires_the_displayed_revision(actual_hass, canvas_peer, monkeypatch):
+    from custom_components.ics_proxy import coordinator
+
+    peer = canvas_peer
+    wall = 1000
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, wall))
     await setup_proxy(actual_hass, peer["port"])
     wall += 2
     result = await call_session_command(actual_hass, "start", canvas_rendered_at_epoch=wall - 1)
@@ -717,16 +811,18 @@ async def test_canvas_start_requires_the_displayed_revision(actual_hass, peer, m
     assert result["request_reference"] is not None
     (command,) = [request for request in peer["requests"] if request["command"] == "start"]
     assert command["revision"] == 0
+    assert "canvas_owner" not in command
 
 
 # Intent: require fresh native session evidence for the displayed Stop target, even with the vendor offline.
 # Why: target equality alone does not show that the original session is still open.
 @pytest.mark.parametrize("invalid", ["closed", "unknown", "old_native", "old_status"])
-async def test_canvas_stop_rechecks_the_local_session(actual_hass, peer, monkeypatch, invalid):
-    from custom_components.ics_proxy import session_service
+async def test_canvas_stop_rechecks_the_local_session(actual_hass, canvas_peer, monkeypatch, invalid):
+    from custom_components.ics_proxy import coordinator as proxy_coordinator
 
+    peer = canvas_peer
     wall = 1000
-    monkeypatch.setattr(session_service, "_frame_clock", lambda: (wall, wall))
+    monkeypatch.setattr(proxy_coordinator, "frame_clock", lambda: (wall, wall))
     peer["state"].update(charging_session_open=True, can_start=False, stop_target=TARGET)
     entry = await setup_proxy(actual_hass, peer["port"])
     wall += 2
@@ -754,11 +850,12 @@ async def test_canvas_stop_rechecks_the_local_session(actual_hass, peer, monkeyp
 # Intent: stop an expired display action before its first management write and omit the attempt reference.
 # Why: a slow handshake can outlive a frame that was fresh when the action began.
 @pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
-async def test_canvas_frame_can_expire_during_the_management_handshake(actual_hass, peer, monkeypatch, starting):
-    from custom_components.ics_proxy import session_service
+async def test_canvas_frame_can_expire_during_the_management_handshake(actual_hass, canvas_peer, monkeypatch, starting):
+    from custom_components.ics_proxy import coordinator
 
+    peer = canvas_peer
     wall = 1000
-    monkeypatch.setattr(session_service, "_frame_clock", lambda: (wall, wall))
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, wall))
     if not starting:
         peer["state"].update(charging_session_open=True, can_start=False, stop_target=TARGET)
     await setup_proxy(actual_hass, peer["port"])

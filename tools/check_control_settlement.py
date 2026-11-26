@@ -27,6 +27,7 @@ CUTOFF_REWIND = f"{SCHEDULE_CUTOFF}::test_observed_cutoff_survives_refused_claim
 CUTOFF_CLOSED_REPORT = f"{SCHEDULE_CUTOFF}::test_cutoff_holds_zero_when_stop_report_arrives_first"
 SCHEDULE_VENDOR_RETURN = f"{SCHEDULE}::test_cloud_returns_before_local_schedule_sends_start"
 STOP_INCIDENT = "tests/test_managed_stop_incident.py"
+SCHEDULE_CLOSURE = "tests/test_managed_scheduled_closure.py"
 INCIDENT_WAL = "tests/test_managed_incident.py::test_incident_respects_the_published_live_wal_boundary"
 PAUSE_OVERLAP = (
     "tests/test_managed_cloud_zero_controls.py::test_local_pause_and_cloud_stop_share_unanswered_stop_at_zero"
@@ -48,6 +49,7 @@ HA_DISPLAY_STOP = f"{HA_DISPLAY}::test_canvas_stop_rechecks_the_local_session"
 HA_DISPLAY_HANDSHAKE = f"{HA_DISPLAY}::test_canvas_frame_can_expire_during_the_management_handshake"
 HA_DISPLAY_CLOCK_STEP = f"{HA_DISPLAY}::test_display_service_rejects_pre_adjustment_frames"
 HA_DISPLAY_REPLACEMENT = f"{HA_DISPLAY}::test_display_rejects_start_frame_from_before_entry_replacement"
+HA_DISPLAY_DESTINATION = f"{HA_DISPLAY}::test_canvas_rejects_replacement_at_the_same_endpoint"
 
 SUITES = {
     "engine": (
@@ -118,11 +120,17 @@ SUITES = {
             f"{CUTOFF_CLOSED_REPORT}[native-unavailable]",
             f"{SCHEDULE_CUTOFF}::test_cutoff_leaves_settled_early_stop_in_app_mode",
             f"{STOP_TEST}::test_blocked_poll_records_scheduled_session_stop_closure",
+            f"{STOP_TEST}::test_management_start_then_session_stop_at_zero_watts",
+            f"{SCHEDULE_CLOSURE}::test_scheduled_closure_survives_interrupted_poll[native-audit]",
+            f"{SCHEDULE_CLOSURE}::test_scheduled_closure_survives_interrupted_poll[charge-publication]",
+            f"{SCHEDULE_CLOSURE}::test_scheduled_closure_survives_marker_refusal_and_replacement",
             f"{SCHEDULE_VENDOR_RETURN}[vendor-lost-during-rollback-automatic-return]",
             f"{SCHEDULE}::test_overlapping_timezone_change_does_not_repeat_local_occurrence",
             "tests/test_vendor_stop_rotation.py::test_queued_vendor_stop_keeps_reply_through_rotation[Accepted]",
             f"{STOP_INCIDENT}::test_legacy_joined_stop_report_retains_its_primary_reply",
             f"{STOP_INCIDENT}::test_saved_vendor_rejection_survives_joined_receipt_settlement",
+            f"{STOP_INCIDENT}::test_joined_owner_checkpoint_must_match_pause_claim[wrong-ticket]",
+            f"{STOP_INCIDENT}::test_legacy_shutdown_checkpoint_must_match_original_target[wrong-boot]",
             f"{INCIDENT_WAL}[published]",
         ),
     ),
@@ -140,6 +148,8 @@ SUITES = {
             f"{HA_DISPLAY_CLOCK_STEP}[forward_then_rewind-stop]",
             f"{HA_DISPLAY_REPLACEMENT}[reload]",
             f"{HA_DISPLAY_REPLACEMENT}[remove-add]",
+            f"{HA_DISPLAY_DESTINATION}[after-poll-start]",
+            f"{HA_DISPLAY_DESTINATION}[during-handshake-start]",
         ),
     ),
 }

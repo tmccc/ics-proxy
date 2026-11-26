@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import timedelta
 from sys import float_info
@@ -23,6 +24,13 @@ LOGGER = logging.getLogger(__name__)
 AGE_FIELDS = ("status_age_seconds", "native_age_seconds")
 
 
+# Pair wall time with elapsed time so sampling variation does not look like a clock step.
+def frame_clock() -> tuple[float, float]:
+    before = time.monotonic()
+    wall = time.time()
+    return wall, (before + time.monotonic()) / 2
+
+
 # Bound before any float arithmetic: JSON integers can exceed the representable range without exceeding message size.
 def usable_age(value: Any) -> bool:
     return type(value) in (int, float) and 0 <= value <= float_info.max
@@ -40,9 +48,14 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.notice_generation = self.notice.claim(lambda: time.monotonic())
         self.notification_id = self.notice.notification_id
         self.received_at = time.monotonic()
+        self.canvas_owner: str | None = None
         self.canvas_activation: tuple[float, float] | None = None
         self.cancel_timer = None
         entry.async_on_unload(self.cancel_expiry)
+
+    # Require a new frame after entry activation or the first observation of a different owner.
+    def mark_canvas_activation(self) -> None:
+        self.canvas_activation = frame_clock() if self.canvas_owner is not None else None
 
     # Keep the existing coordinator inspection surface while its debounce belongs to the entry.
     @property
@@ -149,6 +162,12 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed("The local charger proxy is unavailable") from None
         if not self.notice.active or self.notice.generation != self.notice_generation:
             raise UpdateFailed("The charger proxy status belongs to an inactive entry")
+        owner = value.get("canvas_owner")
+        if not isinstance(owner, str) or not re.fullmatch(r"[a-f0-9]{64}", owner):
+            owner = None
+        if owner != self.canvas_owner:
+            self.canvas_owner = owner
+            self.mark_canvas_activation()
         self.received_at = time.monotonic()
         transit = max(0, self.received_at - started)
         for key in AGE_FIELDS:

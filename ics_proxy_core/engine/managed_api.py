@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import re
 import sqlite3
@@ -25,7 +26,7 @@ from .managed_view import refresh_for_read, session_history
 from .policy import DeniedError
 from .rpc import UnavailableError
 from .security import TRANSPORT_LOG, SecurityError, authorization_matches
-from .store import RecoveryRequiredError
+from .store import RecoveryRequiredError, encoded
 from .trial_config import private_json
 
 
@@ -65,6 +66,13 @@ class ManagementServer:
         self, settings: ManagementSettings, controller: ManagedController, status: Callable[[], dict[str, Any]]
     ) -> None:
         self.settings, self.controller, self.status = settings, controller, status
+        # Bind canvas writes to the commissioned destination without publishing charger identifiers.
+        identity = (
+            "ics-proxy canvas owner v1",
+            controller.session.journal.identity,
+            controller.native.spec.hardware_identity,
+        )
+        self._canvas_owner = hmac.digest(settings.token.encode(), encoded(identity).encode(), "sha256").hex()
         self.server: Server | None = None
         self.clients: set[ServerConnection] = set()
         self.pause_client: ServerConnection | None = None
@@ -131,6 +139,13 @@ class ManagementServer:
                 raise SecurityError("management Stop target is invalid")
         elif command not in ("pause", "app_control", "start", "start_test", "arm_cloud_test"):
             raise SecurityError("management command is not supported")
+        if command in ("start", "stop_session") and "canvas_owner" in value:
+            fields.add("canvas_owner")
+            owner = value["canvas_owner"]
+            if not isinstance(owner, str) or not re.fullmatch(r"[a-f0-9]{64}", owner):
+                raise SecurityError("management canvas owner is invalid")
+            if not hmac.compare_digest(owner, self._canvas_owner):
+                raise UnavailableError("management canvas owner has changed")
         if set(value) != fields:
             raise SecurityError("management command is not supported")
         try:
@@ -182,6 +197,7 @@ class ManagementServer:
                 result = {"sessions": session_history(self.controller.session.journal)}
             elif command == "status":
                 result = refresh_for_read(self.controller, self.status())
+                result["canvas_owner"] = self._canvas_owner
             else:
                 raise SecurityError("management read is not supported")
         except sqlite3.Error:

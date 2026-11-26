@@ -466,7 +466,10 @@ class ManagedSessionStop:
         if c.stopping:
             return
         rejections = stop_rejections(j)
-        if not self._has_receipts(rejections.closed_receipts, (STOP_SESSION,), rejections):
+        if not (
+            self._has_receipts(rejections.closed_receipts, (STOP_SESSION,), rejections)
+            or c.local_schedule.closure_probe_needed()
+        ):
             return
         try:
             native = await c.native.read(stop_only=True)
@@ -474,8 +477,7 @@ class ManagedSessionStop:
             # A restricted poll can prove the scheduled session closed before normal supervision resumes.
             def accept_closure() -> None:
                 c.native.require_known_session(native)
-                if native is c.native._current_stop_sample(None) and native.is_fresh(5):
-                    c.local_schedule.observe_closed(native)
+                c.local_schedule.observe_closed(native)
                 self.observed(native)
 
             c.commands.decide(accept_closure, priority=CommandPriority.RESTRICT)

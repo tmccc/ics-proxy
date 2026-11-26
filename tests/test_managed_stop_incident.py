@@ -342,8 +342,10 @@ def test_stop_report_keeps_joined_replies_with_their_original_attempt(tmp_path):
 
 
 # Intent: validate a joined Pause reply against the same original claim in the engine and the report.
-# Why: a reply saved for a different Boot or request must never describe this Stop.
-@pytest.mark.parametrize("checkpoint", ["exact", "wrong-boot", "wrong-key"])
+# Why: after both primary writes fail, only the original Pause ticket can recover the reply.
+@pytest.mark.parametrize(
+    "checkpoint", ["exact", "wrong-boot", "wrong-ticket", "unknown-request", "no-request", "wrong-key"]
+)
 def test_joined_owner_checkpoint_must_match_pause_claim(tmp_path, checkpoint):
     path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"
     with closing(Journal(path, "test-charger")) as journal:
@@ -353,21 +355,67 @@ def test_joined_owner_checkpoint_must_match_pause_claim(tmp_path, checkpoint):
         insert_request(
             journal, pause, "pause", 2, {"_stop": {"ticket": ticket, "local": local, "boot": BOOT}}, state="running"
         )
-        boot = "different-boot" if checkpoint == "wrong-boot" else BOOT
-        prefix = "retained_transaction_reply" if checkpoint == "wrong-key" else "retained_stop"
-        reply = OwnerWire(wire, pause, ticket, boot, STOP_ACTION, local, None, "Accepted")
-        journal.put(f"{prefix}_owner:{wire}", asdict(reply))
+        journal.db.execute(
+            "CREATE TEMP TRIGGER refuse_primary BEFORE INSERT ON owner_command_wires "
+            "BEGIN SELECT RAISE(ABORT, 'test'); END"
+        )
+        sent = OwnerWire(wire, pause, ticket, BOOT, STOP_ACTION, local, None)
+        journal.outcomes.record_owner_wire(sent)
+        reply = journal.outcomes.record_owner_reply(sent, [3, wire, {"status": "Accepted"}])
+        key = f"retained_stop_owner:{wire}"
+        assert journal.get(key) == asdict(reply)
+        assert journal.db.execute("SELECT 1 FROM owner_command_wires").fetchone() is None
+        changes = {
+            "wrong-boot": {"boot": "different-boot"},
+            "wrong-ticket": {"ticket": uuid.uuid4().hex},
+            "unknown-request": {"request": uuid.uuid4().hex},
+            "no-request": {"request": None},
+        }
+        if checkpoint in changes:
+            journal.put(key, asdict(reply) | changes[checkpoint])
+        elif checkpoint == "wrong-key":
+            journal.db.execute("DELETE FROM meta WHERE key=?", (key,))
+            journal.put(f"retained_transaction_reply_owner:{wire}", asdict(reply))
         joined = write_request(journal, local, dispatched=False, joined=1, owner_wire_attempts=[wire])
         report = stop_incident_report(path, events, request_reference=reference(joined))
-        exact = checkpoint == "exact"
+    exact = checkpoint == "exact"
+    with closing(Journal(path, "test-charger")) as journal:
         assert journal.outcomes.owner_wires("wire", wire) == ((reply,) if exact else ())
-        expected = {
-            "origin": "local",
-            "request": reference(pause),
-            "reply": "accepted",
-            "reply_source": "retained_checkpoint",
+        journal.outcomes.retry_owner_writes()
+        assert journal.outcomes.accepted_stop(local) is exact
+        assert (journal.db.execute("SELECT 1 FROM owner_command_wires").fetchone() is not None) is exact
+    expected = {
+        "origin": "local",
+        "request": reference(pause),
+        "reply": "accepted",
+        "reply_source": "retained_checkpoint",
+    }
+    assert report["wire"]["joined_attempts"] == ([expected] if exact else [])
+
+
+# Intent: reopen a retained unnamed Stop reply alongside an older shutdown claim.
+# Why: the older claim still binds Boot and session, while a different ticket can belong to internal protection.
+@pytest.mark.parametrize("binding", ["exact", "wrong-boot", "wrong-local", "unrelated-ticket"])
+def test_legacy_shutdown_checkpoint_must_match_original_target(tmp_path, binding):
+    path = tmp_path / "journal.db"
+    ticket, wire = uuid.uuid4().hex, uuid.uuid4().hex
+    with closing(Journal(path, "test-charger")) as journal:
+        ManagedRequests(journal)
+        local = journal.start("start-token", START)["transactionId"]
+        shutdown = {"ticket": ticket, "local": local, "boot": BOOT}
+        changes = {
+            "wrong-boot": {"boot": "different-boot"},
+            "wrong-local": {"local": local + 1},
+            "unrelated-ticket": {"ticket": uuid.uuid4().hex},
         }
-        assert report["wire"]["joined_attempts"] == ([expected] if exact else [])
+        journal.put("trial_shutdown_attempt", shutdown | changes.get(binding, {}))
+        reply = OwnerWire(wire, None, ticket, BOOT, STOP_ACTION, local, None, "Accepted")
+        journal.put(f"retained_stop_owner:{wire}", asdict(reply))
+    with closing(Journal(path, "test-charger")) as journal:
+        journal.outcomes.retry_owner_writes()
+        expected = binding in ("exact", "unrelated-ticket")
+        assert journal.outcomes.accepted_stop(local, ticket=ticket) is expected
+        assert (journal.db.execute("SELECT 1 FROM owner_command_wires").fetchone() is not None) is expected
 
 
 # Intent: read the remaining facts in journals with no supplementary outcome tables and refuse an unsafe file.

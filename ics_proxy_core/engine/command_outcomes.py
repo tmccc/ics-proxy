@@ -260,7 +260,7 @@ def decode_retained_owner_reply(db: sqlite3.Connection, saved: dict[str, Any]) -
     return reply
 
 
-# A pending session Stop and the latest shutdown retain independent dispatch claims.
+# A named Stop must retain its original session Stop or Pause claim.
 def _owner_stop_claim_matches(db: sqlite3.Connection, reply: OwnerWire) -> bool:
     if db.execute("SELECT 1 FROM sqlite_schema WHERE name='managed_requests'").fetchone():
         claims = db.execute(
@@ -295,28 +295,39 @@ def _owner_stop_claim_matches(db: sqlite3.Connection, reply: OwnerWire) -> bool:
                 return True
             elif action == "pause":
                 bound = result.get("_stop")
-                if (
-                    isinstance(bound, dict)
-                    and bound.get("ticket") == reply.ticket
-                    and (bound.get("local"), bound.get("boot")) != (reply.local, reply.boot)
-                ):
-                    return False
+                return (
+                    reply.request != reply.ticket
+                    and reply.boot is not None
+                    and isinstance(bound, dict)
+                    and type(bound.get("local")) is int
+                    and (bound.get("ticket"), bound.get("local"), bound.get("boot"))
+                    == (reply.ticket, reply.local, reply.boot)
+                )
             else:
                 return False
-    if reply.request is None:
-        row = db.execute("SELECT CAST(value AS BLOB) FROM meta WHERE key='trial_shutdown_attempt'").fetchone()
-        try:
-            shutdown = json.loads(row[0].decode("utf-8"), object_pairs_hook=unique_object) if row is not None else {}
-        except ValueError, RecursionError:
+        if (
+            reply.request is None
+            and db.execute(
+                "SELECT 1 FROM managed_requests WHERE action='pause' AND "
+                "CASE WHEN json_valid(result) THEN json_extract(result,'$._stop.ticket') END=? LIMIT 1",
+                (reply.ticket,),
+            ).fetchone()
+        ):
             return False
-        if isinstance(shutdown, dict) and shutdown.get("ticket") == reply.ticket and "stop_wire" in shutdown:
-            return (shutdown["stop_wire"], shutdown.get("boot"), shutdown.get("local")) == (
-                reply.wire,
-                reply.boot,
-                reply.local,
-            )
-    # Session-only Stops use the request ID as their ticket and require the claim above.
-    return reply.request != reply.ticket
+    if reply.request is not None:
+        return False
+    row = db.execute("SELECT CAST(value AS BLOB) FROM meta WHERE key='trial_shutdown_attempt'").fetchone()
+    try:
+        shutdown = json.loads(row[0].decode("utf-8"), object_pairs_hook=unique_object) if row is not None else {}
+    except ValueError, RecursionError:
+        return False
+    if isinstance(shutdown, dict) and shutdown.get("ticket") == reply.ticket:
+        return (
+            type(shutdown.get("local")) is int
+            and (shutdown["local"], shutdown.get("boot")) == (reply.local, reply.boot)
+            and ("stop_wire" not in shutdown or shutdown["stop_wire"] == reply.wire)
+        )
+    return True  # Internal protective Stops can have no named request or shutdown claim.
 
 
 class CommandOutcomes:

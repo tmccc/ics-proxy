@@ -12,12 +12,13 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from .command_processor import CommandPriority
-from .connection_scope import control_scope_matches
+from .connection_scope import control_scope_matches, current_control_scope
 from .local_schedule_cutoff import cutoff
 from .local_schedule_window import ScheduleCutoff, schedule_window
 from .managed_intent import LOCAL_SCHEDULE_OCCURRENCE as OCCURRENCE
 from .policy import DeniedError
 from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
+from .stop_settlement import STOP_CLOSURE_VERIFIED, STOP_SESSION
 from .store import RecoveryRequiredError, fingerprint
 
 if TYPE_CHECKING:
@@ -436,25 +437,44 @@ class LocalSchedule:
             return occurrence
         return None
 
+    # Only the latest owner Stop can meet the exact occurrence without an intervening session.
+    def _closed_occurrence(self) -> dict[str, Any] | None:
+        j = self.journal
+        if self.timezone is None or j.active() is not None:
+            return None
+        occurrence: dict[str, Any] = j.get(OCCURRENCE, {})
+        local = occurrence.get("local")
+        if type(local) is int and "stop_revision" not in occurrence and j.latest_owner_stop_id() == local:
+            return occurrence
+        return None
+
+    # An early closure still needs a native reading when normal supervision cannot finish.
+    def closure_probe_needed(self) -> bool:
+        occurrence = self._closed_occurrence()
+        return (
+            occurrence is not None
+            and current_control_scope(self.controller.session.gateway) is not None
+            and not self.closure_known(occurrence)
+        )
+
     # Remember settled early closure so its spent window has no physical work left at cutoff.
     def observe_closed(self, native: HandoverEvidence) -> None:
-        j, physical = self.journal, native.physical
+        physical = native.physical
         if (
-            self.timezone is None
-            or physical.transaction_open
+            physical.transaction_open
             or physical.native_transaction_id is not None
             or any((physical.power_w, *native.currents_a, *native.powers_w))
+            or not native.is_fresh(5)
         ):
             return
-        occurrence = j.get(OCCURRENCE, {})
-        local = occurrence.get("local")
+        occurrence = self._closed_occurrence()
         if (
-            type(local) is not int
-            or "stop_revision" in occurrence
+            occurrence is None
             or occurrence.get("native_closed") is True
-            or j.latest_owner_stop_id() != local
+            or native is not self.controller.native._current_stop_sample(None)
         ):
             return
+        j = self.journal
         self.closed_request = occurrence["request"]
         try:
             j.put(OCCURRENCE, {**occurrence, "native_closed": True})
@@ -462,9 +482,16 @@ class LocalSchedule:
             if j.db.in_transaction:
                 raise
 
-    # A refused journal write can still leave proof for this exact occurrence in the running owner.
+    # A separate verified Stop receipt can preserve the same closure across process replacement.
     def closure_known(self, occurrence: dict[str, Any]) -> bool:
-        return occurrence.get("native_closed") is True or self.closed_request == occurrence["request"]
+        if occurrence.get("native_closed") is True or self.closed_request == occurrence["request"]:
+            return True
+        receipt = self.journal.db.execute(
+            "SELECT 1 FROM managed_requests WHERE action=? AND json_type(result,'$._session_stop.local')='integer' "
+            f"AND json_extract(result,'$._session_stop.local')=? AND {STOP_CLOSURE_VERIFIED} LIMIT 1",
+            (STOP_SESSION, occurrence["local"]),
+        ).fetchone()
+        return receipt is not None
 
     # Periodic restrictive work can stop its own session even when no complete native poll is available.
     async def stop_if_due(self) -> None:
