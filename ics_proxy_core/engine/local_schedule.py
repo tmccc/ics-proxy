@@ -21,6 +21,7 @@ from .policy import DeniedError
 from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
 from .rpc import UnavailableError
 from .security import SecurityError
+from .session_closure import observe_closure
 from .store import RecoveryRequiredError, fingerprint
 
 if TYPE_CHECKING:
@@ -461,13 +462,7 @@ class LocalSchedule:
 
     # Remember settled early closure so its spent window has no physical work left at cutoff.
     def observe_closed(self, native: HandoverEvidence) -> None:
-        physical = native.physical
-        if (
-            physical.transaction_open
-            or physical.native_transaction_id is not None
-            or any((physical.power_w, *native.currents_a, *native.powers_w))
-            or not native.is_fresh(5)
-        ):
+        if not observe_closure(None, native).confirms_idle:
             return
         occurrence = self._closed_occurrence()
         if (
@@ -497,11 +492,10 @@ class LocalSchedule:
 
     # A replacement can reuse only the proof for the exact scheduled request and its genuine closing report.
     def _closure_binding(self, occurrence: dict[str, Any]) -> str | None:
-        local = occurrence["local"]
-        row = self.journal.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()
-        if row is None or not isinstance(row["stop"], str):
+        report = self.journal.outcomes.closing_report(occurrence["local"])
+        if report is None:
             return None
-        return fingerprint((occurrence["request"], local, row["stop"]))
+        return fingerprint((occurrence["request"], report.local, report.body))
 
     # Either journal path can preserve the same physical proof across process replacement.
     def closure_known(self, occurrence: dict[str, Any], *, require_durable: bool = False) -> bool:

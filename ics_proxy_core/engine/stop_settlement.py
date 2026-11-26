@@ -24,6 +24,12 @@ STOP_REPORT_CLOSED = (
     "EXISTS (SELECT 1 FROM transactions WHERE local=json_extract(managed_requests.result,'$._session_stop.local') "
     "AND stop IS NOT NULL)"
 )
+STOP_OBSERVABLE_CLOSURE = (
+    "action=? AND json_type(result,'$._session_stop.local')='integer' "
+    "AND (state IN ('accepted','running','uncertain') "
+    "OR (state='failed' AND json_extract(result,'$.classification')='stop_rejected')) "
+    f"AND {STOP_REPORT_CLOSED} AND NOT {STOP_CLOSURE_VERIFIED}"
+)
 _REJECTED_STOP_RESULT = "json_set(result,'$.classification','stop_rejected')"
 _COMPLETED_STOP_RESULT = (
     "json_set(json_remove(result,'$.classification'),"

@@ -43,6 +43,7 @@ from .policy import DeniedError
 from .recovery_contracts import ALLOW, GateDecision, Guard, Pending, Prerequisite, require_allowed
 from .rpc import IntroductionDeferredError, UnavailableError
 from .security import SecurityError, StaleEvidenceError
+from .session_closure import observe_closure
 from .station import StationChoice
 from .store import RecoveryRequiredError, StationZeroStorageError, encoded, fingerprint
 from .trial_allocation import initialize_allocation, verify_initial_history
@@ -699,7 +700,8 @@ class NativeBoundedHandover:
     def stop_zero_refusal(self, native: HandoverEvidence, *, local: int | None = None) -> str | None:
         g, j = self.gateway, self.gateway.journal
         self.require(native, closed=True)
-        self.require_known_session(native)
+        if not observe_closure(j.active(), native).confirms_idle:
+            raise NativeSessionPendingError("native and local transaction closure disagree")
         if not j.outcomes.stop_report_closed(local):
             raise NativeSessionPendingError("the exact Stop still awaits its charger report")
         present = self.book.owned_present(native.physical, record_unchanged=False)

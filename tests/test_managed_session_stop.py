@@ -1241,6 +1241,67 @@ async def test_verified_closure_survives_stop_reply_window(tmp_path, tls, unused
             t.rig.peer.unavailable = False
 
 
+# Intent: retain genuine physical closure independently of the exact Stop refusal in either order.
+# Why: a Stop reply describes its command. The charger can close that transaction for a different reason.
+@pytest.mark.parametrize("rejection_first", [False, True], ids=["closure-first", "rejection-first"])
+@pytest.mark.parametrize("restricted_poll", [False, True], ids=["full-poll", "restricted-poll"])
+async def test_rejected_stop_retains_verified_closure(
+    tmp_path, tls, unused_tcp_port, monkeypatch, rejection_first, restricted_poll
+):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t:
+        c, j, bench = t.controller, t.session.journal, t.rig.bench
+        c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
+        await c.charging.settle()
+        local = await zero_power_session(t)
+        await healthy(c)
+        request, target = uuid.uuid4().hex, c.session_stop.target()
+        assert target is not None
+        send, held, entered = delay_reply(monkeypatch, t.rig, t.charger, "RemoteStopTransaction")
+        c.command(request, "stop_session", c.requests.intent().revision, target=target)
+        await asyncio.wait_for(entered.wait(), 3)
+        wire = decode(held[0])[1]
+
+        # Deliver the original matched rejection without changing the independent native observation.
+        async def reject() -> None:
+            await send(build_call_result(wire, {"status": "Rejected"}))
+            await c.session_stop.worker
+            c.session_stop.expire()
+
+        if rejection_first:
+            await reject()
+            assert c.requests.receipt(request)["state"] == "failed"
+            assert not c.session_stop.closure_verified(local)
+        await natural_stop(t, local)
+        assert not c.session_stop.closure_verified(local)
+        if restricted_poll:
+            read = c.native.read
+
+            # Only the full audit fails. The fallback retains its independent restricted sample.
+            async def read_restricted(*args, **kwargs):
+                if kwargs.get("stop_only") is not True:
+                    raise NativeTransportUnavailableError("full audit is temporarily unavailable")
+                return await read(*args, **kwargs)
+
+            with monkeypatch.context() as outage:
+                outage.setattr(c.native, "read", read_restricted)
+                assert (await c.tick())["state"] == "degraded"
+        else:
+            assert (await healthy(c))["charging_session_open"] is False
+        assert c.session_stop.closure_verified(local, require_durable=True)
+        if not rejection_first:
+            assert c.requests.receipt(request)["state"] == "running"
+            await reject()
+        receipt = c.requests.receipt(request, include_binding=True)
+        assert (receipt["state"], receipt["target"]) == ("failed", target)
+        assert receipt["result"]["classification"] == "stop_rejected"
+        assert "session_stopped" not in receipt["result"]
+        assert j.outcomes.owner(request).result["_session_stop"]["closure_verified"] is True
+        assert not t.session.gateway.charger.reply_windows()
+        assert [frame[3] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
+
+
 # Intent: keep independent closure evidence when SQLite temporarily refuses to publish the successful receipt.
 # Why: after an Accepted reply retires the wire, readings can become unavailable before publication retries.
 @pytest.mark.parametrize("recovery", ["next-poll", "marker-refused", "replacement"])

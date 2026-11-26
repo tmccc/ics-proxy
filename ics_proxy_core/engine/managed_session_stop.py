@@ -18,11 +18,13 @@ from .native_http import NativeTransportUnavailableError
 from .policy import DeniedError
 from .rpc import UnavailableError
 from .security import SecurityError, StaleEvidenceError
+from .session_closure import ClosingReport, ClosurePosition, observe_closure
 from .stop_settlement import (
     SAVED_STOP_REJECTIONS,
     STOP_BUFFERED_CLOSURE,
     STOP_CLOSURE_FIELDS,
     STOP_CLOSURE_VERIFIED,
+    STOP_OBSERVABLE_CLOSURE,
     STOP_REPORT_CLOSED,
     STOP_SESSION,
     StopRejections,
@@ -352,14 +354,7 @@ class ManagedSessionStop:
     # A fresh native observation and the genuine Stop report must agree before a receipt completes.
     def observed(self, native: HandoverEvidence) -> None:
         j = self.controller.session.journal
-        active = j.active()
-        if (
-            native.physical.transaction_open != (active is not None)
-            or native.physical.native_transaction_id != active
-            or not native.is_fresh(5)
-            or active is None
-            and (native.physical.power_w != 0 or any(value != 0 for value in native.currents_a + native.powers_w))
-        ):
+        if not observe_closure(j.active(), native).matches_journal:
             return
         self._checkpoint_native_first()
         self._settle_closure(stop_rejections(j), observed=True)
@@ -430,17 +425,16 @@ class ManagedSessionStop:
     def _matching_closures(
         self, rejections: StopRejections, *, observed: bool, local: int | None = None
     ) -> dict[str, int | VerifiedStopClosure]:
-        where = rejections.closed_receipts
         bindings: tuple[str | int, ...] = (STOP_SESSION,)
-        if observed and local is not None:
+        if observed:
+            where = STOP_OBSERVABLE_CLOSURE
+            rejections = SAVED_STOP_REJECTIONS
+        else:
             where = (
-                "action=? AND (state IN ('accepted','running','uncertain') "
-                "OR (state='failed' AND json_extract(result,'$.classification')='stop_rejected'))"
+                f"({rejections.closed_receipts} AND {STOP_BUFFERED_CLOSURE} OR (action=? AND {STOP_BUFFERED_CLOSURE})) "
+                f"AND NOT {STOP_CLOSURE_VERIFIED} AND json_type(result,'$._session_stop.local')='integer'"
             )
-        elif not observed:
-            where = f"({where} AND {STOP_BUFFERED_CLOSURE} OR (action=? AND {STOP_BUFFERED_CLOSURE}))"
             bindings += (self._buffered_closure_locals(), STOP_SESSION, self._buffered_closure_locals(exact_only=True))
-        where += f" AND json_type(result,'$._session_stop.local')='integer' AND NOT {STOP_CLOSURE_VERIFIED}"
         if local is not None:
             where += " AND transactions.local=?"
             bindings += (local,)
@@ -452,9 +446,10 @@ class ManagedSessionStop:
             f"ON transactions.local=json_extract(result,'$._session_stop.local') WHERE {where}",
             (*rejections.bindings, *bindings),
         ):
-            if not isinstance(stop, str) or (target is not None and (not isinstance(target, str) or len(target) != 64)):
+            report = ClosingReport.from_record(session, stop)
+            if report is None or (target is not None and (not isinstance(target, str) or len(target) != 64)):
                 continue
-            proof: VerifiedStopClosure = revision, target, session, fingerprint(stop)
+            proof: VerifiedStopClosure = revision, target, report.local, fingerprint(report.body)
             saved = self._verified_closures.get(request)
             if observed:
                 closures[request] = proof
@@ -502,12 +497,11 @@ class ManagedSessionStop:
 
     # Cloud reconciliation must not erase an independently confirmed local closure.
     async def confirm_while_blocked(self) -> None:
-        c, j = self.controller, self.controller.session.journal
+        c = self.controller
         if c.stopping:
             return
-        rejections = stop_rejections(j)
         if not (
-            self._has_receipts(rejections.closed_receipts, (STOP_SESSION,), rejections)
+            self._has_receipts(STOP_OBSERVABLE_CLOSURE, (STOP_SESSION,), SAVED_STOP_REJECTIONS)
             or c.local_schedule.closure_probe_needed()
         ):
             return
@@ -580,8 +574,7 @@ class ManagedSessionStop:
             )
         if (
             native is c.native._current_stop_sample(None)
-            and not native.physical.transaction_open
-            and native.physical.power_w == 0
+            and observe_closure(local, native).position is ClosurePosition.NATIVE_FIRST
             and c.native.owner_closure_observed(local, time.time())
         ):
             self._native_first.update({request: (revision, target, local) for request, saved in rows if not saved})
@@ -590,20 +583,19 @@ class ManagedSessionStop:
 
     # During a pending Stop, either of the two observations can confirm closure before the other.
     def closure_pending(self, native: HandoverEvidence) -> bool:
-        c, physical = self.controller, native.physical
+        c = self.controller
         j = c.session.journal
-        if physical.power_w != 0 or any(value != 0 for value in native.currents_a + native.powers_w):
-            return False
         active = j.active()
-        if not physical.transaction_open and physical.native_transaction_id is None and active is not None:
+        observation = observe_closure(active, native)
+        if observation.position is ClosurePosition.NATIVE_FIRST and active is not None:
             return j.outcomes.session_stop_tracks_closure(active) or (
-                native.is_fresh(5)
+                observation.fresh
                 and c.commands.decide(partial(self._queued_stop, active, native), priority=CommandPriority.RESTRICT)
             )
-        local = physical.native_transaction_id
-        if not physical.transaction_open or local is None or active is not None:
-            return False
-        return j.outcomes.latest_closed_session_stop_id() == local
+        return (
+            observation.position is ClosurePosition.REPORT_FIRST
+            and j.outcomes.latest_closed_session_stop_id() == native.physical.native_transaction_id
+        )
 
     # Retire the wire worker before the journal closes. Its dispatch marker survives cancellation.
     async def close(self) -> None:

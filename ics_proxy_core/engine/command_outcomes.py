@@ -14,6 +14,7 @@ from ..frames import Frame
 from .delivery_reply import DeliveryReply
 from .ics import unique_object
 from .plans import PlanBook
+from .session_closure import ClosingReport
 from .stop_settlement import PAUSE_STOP_HISTORY, STOP_SESSION, StopAttempt, joined_stop_acceptance, stop_rejections
 from .store import Delivery, RecoveryRequiredError, encoded
 from .trial_evidence import profile_projection
@@ -733,12 +734,14 @@ class CommandOutcomes:
         row = self.journal.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()
         return SessionEffect(local, row["stop"] is not None) if row is not None else None
 
+    # A closure checkpoint must bind the exact saved body as well as the allocated ID.
+    def closing_report(self, local: int) -> ClosingReport | None:
+        row = self.journal.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()
+        return ClosingReport.from_record(local, row["stop"]) if row is not None else None
+
     # Idle requires ledger closure, including the original target if the operation already had one.
     def stop_report_closed(self, local: int | None = None) -> bool:
-        if self.journal.active() is not None:
-            return False
-        session = self.session(local)
-        return local is None or (session is not None and session.closed)
+        return self.journal.active() is None and (local is None or self.closing_report(local) is not None)
 
     # A matched reply stays with its exact allocated session across Boot and process replacement.
     def accepted_stop(self, local: int | None, *, ticket: str | None = None) -> bool:

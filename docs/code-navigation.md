@@ -36,6 +36,9 @@ flowchart LR
 - Use the same exact reply evidence during normal operation and recovery. The request, possible dispatch,
   definite charger reply, and verified physical outcome are separate facts. A refused reply write can leave an
   independent checkpoint for that attempt. Retrying publication uses that evidence without sending the command again.
+- [Session closure](../ics_proxy_core/engine/session_closure.py) matches native evidence to the journal lifecycle.
+  A caller binds verified closure to the original closing report before saving proof. Pause and shutdown also
+  need a verified zero station profile. An ended session can still leave a positive offer for a future session.
 - Check recovery before allowing positive current again. The owner combines the saved intent, current charger Boot,
   native evidence, and the journal. Reconciliation can preserve reports for normal delivery without performing a
   new charging action.
