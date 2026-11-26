@@ -482,13 +482,14 @@ class RecoveryControl:
             return False
         active = j.active()
         if active is not None:
-            if active != local or not self.held_owner_stop_pending(c):
+            if active != local or not self._held_active_owner(c):
                 return False
         elif j.latest_owner_stop_id() != local:
             return False
-        if (active is not None or self.held_owner_closure(c) == local) and c.session.book.station_ceiling_lost():
-            c.fault(STATION_CEILING_LOST)
+        if self._latch_owner_station_fault(c):
             return True
+        if active is not None and not self.held_owner_stop_pending(c):
+            return False
         if not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest):
             return False
         if active is None and (not self.ordinary_active(c) or j.get(KEY, {}).get("owner_closure") != local):
@@ -516,27 +517,33 @@ class RecoveryControl:
         # A prior unplugged observation can own the same session before its genuine Stop is recorded.
         return local if hold.get("owner_closure") == local or self._owner_hold_matches(hold, local) else None
 
+    # An active hold must belong to the current revision and the exact owner Start.
+    def _held_active_owner(self, c: ManagedController) -> bool:
+        j = self.journal
+        local = j.active()
+        return self.ordinary_active(c) and j.is_owner_session(local) and self._owner_hold_matches(j.get(KEY, {}), local)
+
     # An unplugged owner session still needs its genuine Stop even while iCS is unavailable.
     def held_owner_stop_pending(self, c: ManagedController) -> bool:
-        j = self.journal
-        hold = j.get(KEY, {})
-        local = j.active()
-        return (
-            self.ordinary_active(c)
-            and hold.get("reason") in ("unplugged_session_pending", "native_closure_pending")
-            and j.is_owner_session(local)
-            and self._owner_hold_matches(hold, local)
+        return self._held_active_owner(c) and self.journal.get(KEY, {}).get("reason") in (
+            "unplugged_session_pending",
+            "native_closure_pending",
         )
 
-    # A known profile failure remains visible while the exact owner waits for closure on either channel.
-    def record_owner_closure_station_fault(self, c: ManagedController) -> None:
-        j = self.journal
-        if j.fault.latched() or not (self.held_owner_stop_pending(c) or self.held_owner_closure(c) is not None):
-            return
+    # Independently recorded station faults also apply to a hold first taken during a native outage.
+    def record_owner_hold_station_fault(self, c: ManagedController) -> None:
+        if not self.journal.fault.latched() and (self._held_active_owner(c) or self.held_owner_closure(c) is not None):
+            self._latch_owner_station_fault(c)
+
+    # Preserve the independently proved station failure under the exact owner's existing control intent.
+    def _latch_owner_station_fault(self, c: ManagedController) -> bool:
         if c.session.book.station_ceiling_lost():
             c.fault(STATION_CEILING_LOST)
-        elif j.get("trial_inventory_fault", {}).get("resource") == f"profile:{HUB_PROFILE_ID}":
+        elif self.journal.get("trial_inventory_fault", {}).get("resource") == f"profile:{HUB_PROFILE_ID}":
             c.fault("native_authority_or_preservation_failed")
+        else:
+            return False
+        return True
 
     # Independent closed zero and settled reports can hand the exact hold over to the usual automatic Pause.
     def complete_owner_closure(
@@ -827,11 +834,13 @@ class RecoveryControl:
             self.journal.phase.activate()
             self.journal.phase.begin_introduction()
         else:
-            self._recognize_startup_owner_closure(session.native_bounded, native)
+            self.recognize_owner_closure(session.native_bounded, native, inventory_audited=True)
             self.journal.phase.recover()
 
-    # A native outage may own the exact active session before startup can observe that it unplugged.
-    def _recognize_startup_owner_closure(self, handover: NativeBoundedHandover, native: HandoverEvidence) -> None:
+    # A fresh audit can recognize unplugging after a native outage has already claimed this owner session.
+    def recognize_owner_closure(
+        self, handover: NativeBoundedHandover, native: HandoverEvidence, *, inventory_audited: bool
+    ) -> None:
         j = self.journal
         hold, local = j.get(KEY, {}), j.active()
         intent, revision = j.get("managed_control_intent"), hold.get("revision")
@@ -843,9 +852,11 @@ class RecoveryControl:
             and decode_intent(intent) == ControlIntent("app", revision)
             and self._owner_hold_matches(hold, local)
             and self.owner_closure_gap(handover, native, local)
-            and recorded_station_profile(j, handover.spec.digest, handover.spec.boot_digest)
         ):
-            j.put(KEY, {**hold, "reason": "unplugged_session_pending"})
+            if not inventory_audited:
+                handover.book.owned_present(native.physical)
+            if recorded_station_profile(j, handover.spec.digest, handover.spec.boot_digest):
+                j.put(KEY, {**hold, "reason": "unplugged_session_pending"})
 
     # Bind the new observation to the admitted installation before any native wait.
     def begin_introduction(self, handover: NativeBoundedHandover) -> IntroductionClaim:

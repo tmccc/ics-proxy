@@ -144,6 +144,7 @@ def journal_facts(path):
     return rows, json.loads(phase[0])
 
 
+# Read the real CLI failure report and check that it leaves no private paths in the output.
 async def failed_restore_cli(action, config, spec, native_port=80):
     child = await asyncio.create_subprocess_exec(
         sys.executable, "-B", restore_vendor.__file__, action,
@@ -163,6 +164,8 @@ async def failed_restore_cli(action, config, spec, native_port=80):
     return report
 
 
+# Intent: report invalid restore inputs with the stage and a corrective action.
+# Why: the operator needs enough information to fix the configuration without exposing private paths.
 async def test_invalid_restore_inputs_report_the_stage_without_private_paths(tmp_path):
     report = await failed_restore_cli("check", tmp_path / "private-config.json", tmp_path / "private-spec.json")
     assert report["restore_stage"] == "validate_inputs"

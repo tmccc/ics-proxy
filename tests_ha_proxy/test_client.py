@@ -746,7 +746,8 @@ async def test_pending_operation_label_does_not_invent_pause(actual_hass, peer, 
     assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "Waiting for verification"
 
 
-# A current service snapshot can report pending work even without native evidence. Its label expires with it.
+# Intent: show pending control work only as long as the proxy status remains fresh.
+# Why: embedded and legacy status can carry a pending result after native evidence becomes unavailable.
 @pytest.mark.parametrize("legacy", [False, True], ids=["published-mode", "legacy-facts"])
 @pytest.mark.parametrize(
     "mode,label,legacy_fields",

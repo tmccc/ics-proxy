@@ -178,12 +178,24 @@ def snapshot(c: ManagedController, status: dict[str, Any], now: float | None = N
         fault, blockers, recovery = fault_summary(c)
         commands, count = pending_commands(c, current)
         gateway, journal = c.session.gateway, c.session.journal
+        owner_recovery = gateway.controls.decisions.recovery
+        verified_at = c.native.last_verified_at
+        owner_closure_pending = (
+            fault is None
+            and status.get("state") == "reconciling"
+            and status.get("fault") is None
+            and status.get("charger_connected") is True
+            and status.get("boot_verified") is True
+            and 0 < verified_at <= current <= verified_at + 5
+            and (owner_recovery.held_owner_stop_pending(c) or owner_recovery.held_owner_closure(c) is not None)
+        )
         for present, reason in (
             (status.get("fault") == "native_observation_unavailable", "native_observation_unavailable"),
             (status.get("fault") == "current_update_pending", "current_update_pending"),
             (status.get("fault") == "start_operation_pending", "start_operation_pending"),
             (gateway.authorisation.pending(), "cloud_start_pending"),
             (status.get("charger_connected") is False, "charger_disconnected"),
+            (owner_closure_pending, "owner_session_closure_pending"),
             (status.get("cloud_connected") is False, "cloud_disconnected"),
             (status.get("boot_verified") is False, "boot_unverified"),
             (

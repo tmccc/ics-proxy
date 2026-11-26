@@ -625,7 +625,12 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         owner_control_enabled=proof.shared,
         local_hold_verified=proof.hold_verified,
     )
-    if intent.mode == "paused" and (j.get(OFFLINE_PAUSE) is True or c.requests.offline_pause_current(intent)):
+    # Legacy markers retain their historical cause. Automatic handback can also follow local session closure.
+    if intent.mode == "paused" and (
+        j.get(OFFLINE_PAUSE) is True
+        or not c.session.runtime.vendor_registered
+        and c.requests.offline_pause_current(intent)
+    ):
         result["pause_reason"] = "cloud_connection_failed"
     else:
         result.pop("pause_reason", None)

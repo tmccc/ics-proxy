@@ -67,6 +67,7 @@ def stops(bench):
 def report_offer(peer, read_limit):
     native = peer.native
 
+    # Override only the reported connector offer when the test supplies a value.
     def observe(key):
         value = native(key)
         if key == "CONNECTOR" and (limit := read_limit()) is not None:
@@ -74,6 +75,19 @@ def report_offer(peer, read_limit):
         return value
 
     return observe
+
+
+# Intent: drive the normal poll through enough native transport failures to claim zero.
+# Why: the regressions need the actual durable outage hold and charger profile write.
+async def hold_during_native_outage(c, monkeypatch):
+    # Keep the simulated native transport unavailable through each triggering poll.
+    async def unavailable():
+        raise NativeTransportUnavailableError("brief loss of native telemetry")
+
+    with monkeypatch.context() as outage:
+        outage.setattr(c.native, "observe", unavailable)
+        for _ in range(3):
+            await c.tick()
 
 
 # Intent: at 06:00 the proxy restricts the exact local session and waits for its separate closure.
@@ -175,7 +189,8 @@ async def test_cutoff_waits_for_native_closure_across_replacement(
             assert len(starts(rig)) == 1
 
 
-# A spontaneous Stop must wait at zero when the exact owner's native ID lags its real Stop report.
+# Intent: keep a spontaneously stopped owner session at zero while native closure lags its Stop report.
+# Why: operator Pause, cloud handback and the next offline Start all need the independent closure proof.
 @pytest.mark.parametrize("positive_offer", [False, True], ids=["zero-offer", "positive-offer"])
 @pytest.mark.parametrize("after_closure", ["offline-start", "online-handback", "explicit-pause"])
 async def test_natural_owner_stop_waits_for_native_closure(
@@ -219,6 +234,7 @@ async def test_natural_owner_stop_waits_for_native_closure(
             if positive_offer and pause is None:
                 native = rig.peer.native
 
+                # Keep the offer positive after the native transaction marker has cleared.
                 def lingering_offer(key):
                     value = native(key)
                     if key == "CONNECTOR":
@@ -253,7 +269,8 @@ async def test_natural_owner_stop_waits_for_native_closure(
                 assert c.requests.receipt(pause)["state"] == "completed"
 
 
-# The native connector can unplug first or clear its session before the separate Stop report arrives.
+# Intent: handle an unplug, a native close and a genuine Stop in either order.
+# Why: the first sign of closure only authorizes the restrictive wait for the other channel.
 @pytest.mark.parametrize(
     ("report_order", "offered", "cloud_returned"),
     [
@@ -353,7 +370,8 @@ async def test_natural_owner_stop_with_unplugged_connector(
             assert not stops(bench)
 
 
-# Audits must still reject a different native ID or real draw while awaiting the genuine Stop.
+# Intent: reject a different native ID or measured draw while the owner's genuine Stop is outstanding.
+# Why: a replug or a returning cloud connection cannot make contradictory native evidence valid.
 @pytest.mark.parametrize("activity", ["drawing", "foreign-id"])
 @pytest.mark.parametrize("cloud_returned", [False, True], ids=["offline", "cloud-returned"])
 @pytest.mark.parametrize("replugged", [False, True], ids=["unplugged", "replugged"])
@@ -382,6 +400,7 @@ async def test_unplugged_owner_wait_rejects_other_native_activity(
             else:
                 native = rig.peer.native
 
+                # Report independent draw during the saved zero hold.
                 def drawing(key):
                     if key == "METER":
                         return [{"meterData": {"cur": [10, 0, 0], "power": [240, 0, 0, 240]}}]
@@ -396,7 +415,8 @@ async def test_unplugged_owner_wait_rejects_other_native_activity(
             assert not stops(bench) and len(starts(rig)) == 1 and bench.firmware.effective_limit() == 0
 
 
-# Losing the installed zero is a fault on either side of the genuine Stop report.
+# Intent: report a missing or changed station profile on either side of the genuine Stop.
+# Why: a zero hold needs the commissioned profile, and a protective Stop needs an exact open session.
 @pytest.mark.parametrize("station", ["missing", "changed"])
 @pytest.mark.parametrize("closure", ["native-open", "native-closed", "ocpp-closed"])
 async def test_unplugged_owner_wait_reports_station_fault(
@@ -449,7 +469,93 @@ async def test_unplugged_owner_wait_reports_station_fault(
             )
 
 
-# Startup can observe a proved station loss before the saved owner closure is restored.
+# Intent: report missing and changed station profiles after a generic native outage has claimed the owner session.
+# Why: an independently proved station fault must be visible while the charger still owes its real Stop.
+@pytest.mark.parametrize("cloud_returned", [False, True], ids=["offline", "cloud-returned"])
+@pytest.mark.parametrize("station", ["missing", "changed"])
+async def test_native_outage_owner_hold_reports_station_fault(
+    tmp_path, tls, unused_tcp_port, monkeypatch, cloud_returned, station
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "native-outage-station-fault") as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            local, meter_start = await begin(test, clock)
+            intent = c.requests.intent()
+            clock.now = MIDNIGHT + 30
+            if cloud_returned:
+                bench.vendor_available = True
+                await until(lambda: test.session.runtime.vendor_registered, timeout=20)
+            await hold_during_native_outage(c, monkeypatch)
+            hold = j.get(ORDINARY_HOLD)
+            assert hold["reason"] == "native_observation_unavailable" and hold["local"] == local
+            assert bench.firmware.effective_limit() == 0
+
+            bench.cp, bench.connection = "A", "Unplug"
+            bench.firmware.active = None
+            bench.firmware.requested_current = 0
+            rig.peer.permission_enabled = False
+            if station == "missing":
+                bench.firmware.profiles.pop(HUB_PROFILE_ID)
+                expected = "station_ceiling_lost"
+            else:
+                profile = bench.firmware.profiles[HUB_PROFILE_ID]
+                profile["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] = 6
+                expected = "native_authority_or_preservation_failed"
+
+            mark = len(bench.device_calls)
+            view = await c.tick()
+            assert view["state"] == "attention" and view["fault"] == j.fault.classification() == expected
+            assert not view["local_hold_verified"] and c.requests.intent() == intent
+            assert j.get(ORDINARY_HOLD) == hold
+            assert j.active() == local and not j.outcomes.stop_report_closed(local)
+            assert not stops(bench) and len(starts(rig)) == 1
+            assert not any(
+                frame[2] in ("SetChargingProfile", "ClearChargingProfile") for frame in bench.device_calls[mark:]
+            )
+            await close(test, clock, local, meter_start)
+            assert j.outcomes.stop_report_closed(local) and (await c.tick())["fault"] == expected
+
+
+# Intent: retain a verified unplug that follows a native outage and detect a different session after replugging.
+# Why: an earlier generic zero hold still needs the exact owner's genuine Stop and independent closure.
+@pytest.mark.parametrize("cloud_returned", [False, True], ids=["offline", "cloud-returned"])
+async def test_live_native_outage_recognizes_owner_unplug(tmp_path, tls, unused_tcp_port, monkeypatch, cloud_returned):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "outage-before-owner-unplug") as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            local, _ = await begin(test, clock)
+            intent = c.requests.intent()
+            request = j.get(LOCAL_SCHEDULE_OCCURRENCE)["request"]
+            receipt = c.requests.receipt(request)
+            clock.now = MIDNIGHT + 30
+            if cloud_returned:
+                bench.vendor_available = True
+                await until(lambda: test.session.runtime.vendor_registered, timeout=20)
+            await hold_during_native_outage(c, monkeypatch)
+            hold = j.get(ORDINARY_HOLD)
+            assert hold["reason"] == "native_observation_unavailable" and hold["local"] == j.active() == local
+
+            bench.cp, bench.connection = "A", "Unplug"
+            bench.firmware.requested_current = 0
+            rig.peer.permission_enabled = False
+            view = await c.tick()
+            assert view["state"] == "reconciling" and not view["local_hold_verified"]
+            assert j.get(ORDINARY_HOLD) == {**hold, "reason": "unplugged_session_pending"}
+            assert j.phase.read().value == "recovering" and bench.firmware.effective_limit() == 0
+
+            bench.cp, bench.connection = "B", "Plug"
+            assert (await c.tick())["state"] == "reconciling" and not j.fault.latched()
+            bench.firmware.active = local + 1
+            for _ in range(4):
+                view = await c.tick()
+            assert view["state"] == "attention" and view["fault"] == "native_authority_or_preservation_failed"
+            assert j.active() == local and not j.outcomes.stop_report_closed(local)
+            assert c.requests.intent() == intent and c.requests.receipt(request) == receipt
+            assert not stops(bench) and len(starts(rig)) == 1 and bench.firmware.effective_limit() == 0
+
+
+# Intent: report proved station loss when startup restores a saved owner closure hold.
+# Why: restarting during either half of closure must preserve the fault and the real Stop evidence.
 @pytest.mark.parametrize("ocpp_closed", [False, True], ids=["native-closed", "ocpp-closed"])
 async def test_replacement_reports_missing_station_during_owner_wait(
     tmp_path, tls, unused_tcp_port, monkeypatch, ocpp_closed
@@ -492,7 +598,55 @@ async def test_replacement_reports_missing_station_during_owner_wait(
             assert not any(frame[2] == "SetChargingProfile" for frame in bench.device_calls[mark:])
 
 
-# A real Stop can supersede the native read before the earlier closure evidence resolves.
+# Intent: report station loss on replacement with a generic outage hold or with a genuine Stop alone.
+# Why: the fault must retain the owner's app revision and the exact, independent lifecycle evidence.
+@pytest.mark.parametrize("ocpp_closed", [False, True], ids=["native-first", "ocpp-first"])
+async def test_replacement_first_observes_owner_closure_with_missing_station(
+    tmp_path, tls, unused_tcp_port, monkeypatch, ocpp_closed
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        bench = rig.bench
+        async with connection(rig, "before-outage-station-loss") as test:
+            c, j = test.controller, test.session.journal
+            local, meter_start = await begin(test, clock)
+            intent = c.requests.intent()
+            clock.now = MIDNIGHT + 30
+            if ocpp_closed:
+                await close(test, clock, local, meter_start)
+                assert j.outcomes.stop_report_closed(local) and not j.get(ORDINARY_HOLD)
+                bench.cp, bench.connection = "B", "Plug"
+                bench.firmware.active = local
+            else:
+                await hold_during_native_outage(c, monkeypatch)
+                hold = j.get(ORDINARY_HOLD)
+                assert j.active() == hold["local"] == local and hold["reason"] == "native_observation_unavailable"
+                bench.cp, bench.connection = "A", "Unplug"
+                bench.firmware.active = None
+            bench.firmware.requested_current = 0
+            rig.peer.permission_enabled = False
+
+        mark = len(bench.device_calls)
+        bench.firmware.profiles.pop(HUB_PROFILE_ID)
+        async with connection(rig, "after-outage-station-loss") as test:
+            c, j = test.controller, test.session.journal
+            view = await c.tick()
+            assert view["state"] == "attention" and view["fault"] == "station_ceiling_lost"
+            assert not view["local_hold_verified"] and c.requests.intent() == intent
+            assert j.outcomes.stop_report_closed(local) is ocpp_closed
+            if not ocpp_closed:
+                assert j.active() == local
+                await close(test, clock, local, meter_start)
+            bench.firmware.active = None
+            assert j.outcomes.stop_report_closed(local) and j.active() is None
+            assert (await c.tick())["fault"] == "station_ceiling_lost"
+            assert HUB_PROFILE_ID not in bench.firmware.profiles and not stops(bench) and len(starts(rig)) == 1
+            assert not any(
+                frame[2] in ("SetChargingProfile", "ClearChargingProfile") for frame in bench.device_calls[mark:]
+            )
+
+
+# Intent: deliver the genuine Stop while a native unplug audit is unresolved.
+# Why: the newer ledger event changes which closure proof the existing zero hold needs.
 async def test_genuine_owner_stop_can_arrive_during_unplug_audit(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
         async with connection(rig, "owner-stop-during-unplug-audit") as test:
@@ -508,6 +662,7 @@ async def test_genuine_owner_stop_can_arrive_during_unplug_audit(tmp_path, tls, 
             observed, resume = asyncio.Event(), asyncio.Event()
             observe = c.native.observe
 
+            # Let the genuine Stop reach the proxy before the suspended audit resumes.
             async def delay_native():
                 observed.set()
                 await resume.wait()
@@ -537,7 +692,8 @@ async def test_genuine_owner_stop_can_arrive_during_unplug_audit(tmp_path, tls, 
             assert len(starts(rig)) == 1 and not stops(bench)
 
 
-# The owner's explicit Pause can retry a rejected Stop while the unplugged native ID still identifies its session.
+# Intent: retry an explicitly requested Pause Stop after the charger rejects it while unplugged.
+# Why: the same native ID permits a scoped retry, and the receipt still requires genuine closure.
 async def test_explicit_pause_retries_an_unplugged_owner_stop(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
         async with connection(rig, "pause-retry-exact-owner") as test:
@@ -550,6 +706,7 @@ async def test_explicit_pause_retries_an_unplugged_owner_stop(tmp_path, tls, unu
             answer = bench.firmware.answer
             expected = {"transactionId": local}
 
+            # Refuse just the first wire Stop for the session under test.
             def reject_once(action, payload):
                 if action == "RemoteStopTransaction" and stops(bench) == [expected]:
                     return {"status": "Rejected"}
@@ -571,7 +728,8 @@ async def test_explicit_pause_retries_an_unplugged_owner_stop(tmp_path, tls, unu
             assert c.requests.receipt(request)["state"] == "completed"
 
 
-# The saved unplugged hold must survive a replacement before the charger sends its genuine Stop.
+# Intent: restore the exact unplugged hold before the charger sends its genuine Stop.
+# Why: replacing the listener must leave the reported session and any later explicit Pause independent.
 @pytest.mark.parametrize("native_open", [False, True], ids=["native-closed", "native-id-retained"])
 @pytest.mark.parametrize("operator_pause", [False, True], ids=["next-schedule", "newer-pause"])
 async def test_replacement_after_unplug_before_owner_stop(
@@ -633,7 +791,8 @@ async def test_replacement_after_unplug_before_owner_stop(
             assert not stops(bench)
 
 
-# Startup can first see an unplugged owner session after an earlier native outage claimed its exact zero.
+# Intent: recognize unplugged owner closure at startup after an ordinary native telemetry outage.
+# Why: the saved outage hold identifies the session, and the new native sample establishes whether it unplugged.
 @pytest.mark.parametrize("connector", ["plugged", "unplugged-native-closed", "unplugged-id-retained"])
 async def test_replacement_after_owner_unplugs_during_native_outage(
     tmp_path, tls, unused_tcp_port, monkeypatch, connector
@@ -648,13 +807,7 @@ async def test_replacement_after_owner_unplugs_during_native_outage(
             receipt = c.requests.receipt(occurrence["request"])
             clock.now = MIDNIGHT + 30
 
-            async def unavailable():
-                raise NativeTransportUnavailableError("brief loss of native telemetry")
-
-            with monkeypatch.context() as outage:
-                outage.setattr(c.native, "observe", unavailable)
-                for _ in range(3):
-                    await c.tick()
+            await hold_during_native_outage(c, monkeypatch)
             saved = j.get(ORDINARY_HOLD)
             assert saved["reason"] == "native_observation_unavailable"
             assert saved["local"] == local and saved["start"]
@@ -697,7 +850,8 @@ async def test_replacement_after_owner_unplugs_during_native_outage(
             assert not stops(bench)
 
 
-# A process can stop while independently reported closure is pending on the already claimed zero hold.
+# Intent: retain an exact zero hold across replacement while native closure is pending.
+# Why: the genuine Stop remains valid after replacement and must still wait for independent closure.
 async def test_natural_owner_stop_retains_its_exact_hold_across_replacement(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):
@@ -731,7 +885,8 @@ async def test_natural_owner_stop_retains_its_exact_hold_across_replacement(
             await status(replacement, lambda view: len(starts(rig)) == 2)
 
 
-# The charger can finish while the proxy has only saved the real Stop report, before its next native poll.
+# Intent: replace the proxy after the genuine Stop and before the next native poll.
+# Why: closure may already be complete or the transaction marker or offer may still lag.
 @pytest.mark.parametrize(
     "native_lag", ["none", "session-id", "offer"], ids=["already-closed", "native-lags", "offer-lags"]
 )
@@ -794,7 +949,8 @@ async def test_natural_owner_stop_recovers_after_replacement_before_first_poll(
             assert not j.fault.latched() and not stops(bench)
 
 
-# An open session and a newer operator Pause still follow their existing restrictive startup paths.
+# Intent: keep the restrictive startup outcome for an open session or a newer explicit Pause.
+# Why: the earlier Start or Stop cannot replace a current operator Pause or prove that an open session closed.
 @pytest.mark.parametrize("operator_pause", [False, True], ids=["open-session", "operator-pause"])
 async def test_owner_closure_replacement_keeps_restrictive_winner(
     tmp_path, tls, unused_tcp_port, monkeypatch, operator_pause
@@ -828,7 +984,8 @@ async def test_owner_closure_replacement_keeps_restrictive_winner(
             assert len(starts(rig)) == 1
 
 
-# An identical Boot on the same connection must reverify the retained zero for this exact, unplugged session.
+# Intent: reverify the retained zero for the exact unplugged session after an identical Boot.
+# Why: a new Boot observation expires the previous proof even when the payload and connection match.
 @pytest.mark.parametrize("native_lag", ["session-id", "offer"])
 async def test_natural_owner_stop_reverifies_zero_after_identical_boot(
     tmp_path, tls, unused_tcp_port, monkeypatch, native_lag
@@ -865,7 +1022,8 @@ async def test_natural_owner_stop_reverifies_zero_after_identical_boot(
             assert c.requests.offline_pause_current(c.requests.intent()) and not stops(bench)
 
 
-# A changed ID or real draw cannot extend the exact closed owner's wait, even once zero is confirmed.
+# Intent: reject contradictory native activity during the exact owner closure hold.
+# Why: a different ID, measured draw or excessive offer invalidates the prerequisites for the wait.
 @pytest.mark.parametrize("activity", ["drawing", "drawing-after-native-close", "foreign-id", "offer-above-selected"])
 async def test_natural_owner_stop_rejects_other_native_activity(tmp_path, tls, unused_tcp_port, monkeypatch, activity):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
@@ -900,6 +1058,7 @@ async def test_natural_owner_stop_rejects_other_native_activity(tmp_path, tls, u
                     monkeypatch.setattr(rig.peer, "native", report_offer(rig.peer, lambda: 6))
                 native = rig.peer.native
 
+                # Report independent draw while the owner waits for native closure or zero.
                 def drawing(key):
                     if key == "METER":
                         return [{"meterData": {"cur": [10, 0, 0], "power": [240, 0, 0, 240]}}]

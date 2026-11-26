@@ -415,6 +415,7 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         await hass.async_stop(force=True)
 
 
+# Run the checked-in automation and helper in an isolated Home Assistant instance.
 @asynccontextmanager
 async def run_display_core(config_dir, request, *, expiry_seconds=None, cleanup_event=None):
     hass = HomeAssistant(str(config_dir))
@@ -439,6 +440,7 @@ async def run_display_core(config_dir, request, *, expiry_seconds=None, cleanup_
         await hass.async_stop(force=True)
 
 
+# Send a tap carrying the displayed control marker and the current Home Assistant state.
 def send_display_tap(hass, starting):
     hass.states.async_set("sensor.ics_display_screen_source", "Home Assistant")
     hass.states.async_set(
@@ -464,6 +466,7 @@ def send_display_tap(hass, starting):
     )
 
 
+# Wait for feedback and for its automation run to finish.
 async def wait_for_feedback(hass, feedback):
     async with asyncio.timeout(6):
         while hass.states.get(PENDING).state != feedback or hass.states.get(AUTOMATION).attributes["current"]:
@@ -510,6 +513,7 @@ async def test_display_restores_interrupted_feedback_after_ha_restart(tmp_path, 
 # Why: an abrupt exit can leave an old saved timeout for a different request.
 @pytest.mark.parametrize("feedback", ["starting_timeout", "stopping_timeout"])
 async def test_display_discards_restored_unconfirmed_message(tmp_path, feedback):
+    # Startup cleanup must never send the saved request again.
     async def request(call):
         pytest.fail("Cleanup submitted a charger request")
 
@@ -531,6 +535,7 @@ async def test_display_discards_restored_unconfirmed_message(tmp_path, feedback)
 async def test_display_discards_restored_feedback_after_reenabling(tmp_path):
     calls = []
 
+    # Save a real unconfirmed result before disabling the automation.
     async def request(call):
         calls.append(dict(call.data))
         return {"confirmed": False}
@@ -553,6 +558,7 @@ async def test_display_discards_restored_feedback_after_reenabling(tmp_path):
 # Intent: a live timeout expires with elapsed time after a backward clock step.
 # Why: the written timestamp can stay in the past while still appearing younger than 20 seconds.
 async def test_display_feedback_uses_elapsed_time_after_clock_step(tmp_path, monkeypatch):
+    # Publish unconfirmed feedback so the elapsed timer can run.
     async def request(call):
         return {"confirmed": False}
 
@@ -579,6 +585,7 @@ async def test_display_expiry_follows_only_its_timeout(tmp_path):
     release_expiry_start = asyncio.Event()
     first_expiry = asyncio.Event()
 
+    # Keep the replacement Stop pending until the first expiry has fired.
     async def request(call):
         calls.append(dict(call.data))
         if call.data["action"] == "stop_session":
@@ -588,12 +595,14 @@ async def test_display_expiry_follows_only_its_timeout(tmp_path):
     async with run_display_core(tmp_path, request, expiry_seconds=2, cleanup_event=CLEANUP_TICK) as hass:
         original = hass.services.async_services()["script"]["turn_on"]
 
+        # Exercise cleanup while the starting timeout is visible and its expiry script has yet to run.
         async def hold_first_expiry_start(call):
             if not expiry_starting.is_set():
                 expiry_starting.set()
                 await release_expiry_start.wait()
             await original.job.target(call)
 
+        # Observe the first expiry without changing its normal delivery.
         async def note_expiry(event):
             first_expiry.set()
 

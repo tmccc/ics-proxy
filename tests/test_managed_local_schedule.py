@@ -229,7 +229,8 @@ async def test_offline_schedule_retries_an_unsent_native_preflight(tmp_path, tls
             )
 
 
-# A restored cloud connection can give back the verified hold without sending the scheduled Start.
+# Intent: return the verified hold to iCS if it reconnects before the scheduled Start is sent.
+# Why: an unsent Start should permit normal app authority unless a newer explicit Pause supersedes it.
 @pytest.mark.parametrize("explicit_pause", [False, True], ids=["automatic-return", "new-explicit-pause"])
 @pytest.mark.parametrize("reply_limit", [None, 0, 6], ids=["initial-zero-confirmed", "zero-reply", "positive-reply"])
 async def test_cloud_returns_before_local_schedule_sends_start(
@@ -255,6 +256,7 @@ async def test_cloud_returns_before_local_schedule_sends_start(
             stop = controls.stop
             reached_boundary, release = asyncio.Event(), asyncio.Event()
 
+            # Pause the scheduled worker after the initial zero is verified and before it can send Start.
             async def wait_after_initial_zero(**kwargs):
                 result = await stop(**kwargs)
                 lease = c.charging.lease

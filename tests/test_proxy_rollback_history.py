@@ -17,7 +17,8 @@ from tools import check_proxy_rollback as rollback
 from tools.check_proxy_rollback import RollbackRefusedError, check_snapshot, stopped_journal
 
 
-# Every SQLite state file must belong exclusively to the same stopped journal path and lock.
+# Intent: reject a rollback journal if its database, lock, or sidecars have hard links.
+# Why: one stopped journal path must identify the SQLite files protected by the lock.
 @pytest.mark.parametrize(
     "suffix", ["", ".lock", "-wal", "-shm", "-journal"], ids=["journal", "lock", "wal", "shm", "rollback"]
 )

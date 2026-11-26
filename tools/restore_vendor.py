@@ -38,6 +38,7 @@ from ics_proxy_core.engine.trial_session import (  # noqa: E402
 from tools.trial_proxy import emit, native_spec  # noqa: E402
 
 
+# Publish the current step without including private configuration or journal data.
 def emit_stage(stage: str) -> None:
     emit({"restore_stage": stage})
 
@@ -68,6 +69,7 @@ RESTORE_GUIDANCE = {
 }
 
 
+# Map known refusals to an operator action and keep unexpected exception details private.
 def restore_guidance(stage: str, error: Exception) -> tuple[str, str]:
     detail = error.args[0] if len(error.args) == 1 and isinstance(error.args[0], str) else ""
     known = RESTORE_GUIDANCE.get((type(error), detail))
@@ -285,6 +287,7 @@ async def run(
     return 0
 
 
+# Run the requested operation and report failures with their current restore step.
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("check", "restore"), nargs="?", default="check")
@@ -295,6 +298,7 @@ def main() -> int:
     os.umask(0o077)
     stage = "validate_inputs"
 
+    # Retain the most recent step for a structured failure report.
     def report_stage(current: str) -> None:
         nonlocal stage
         stage = current

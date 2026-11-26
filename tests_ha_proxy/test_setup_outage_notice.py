@@ -148,7 +148,8 @@ async def test_reenable_requires_new_outage_evidence(actual_hass, peer, monkeypa
     assert entry.state is ConfigEntryState.LOADED and writes == []
 
 
-# Explicit disable ends the old notice even if the same failure is observed on the next setup.
+# Intent: let a re-enabled integration issue a fresh notice for a continuing outage.
+# Why: explicit disable ends the previous notice even if the operator dismissed it first.
 @pytest.mark.parametrize("dismiss_first", [False, True], ids=["visible", "dismissed"])
 async def test_reenable_can_notify_for_the_same_failure(actual_hass, peer, monkeypatch, dismiss_first):
     entry = await setup(actual_hass, peer)

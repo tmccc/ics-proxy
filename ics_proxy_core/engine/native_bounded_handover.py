@@ -322,6 +322,8 @@ class NativeBoundedHandover:
                     owner_closure_wait = recovery.owner_closure_gap(self, native, closing_local)
                 if closing_local is None or not owner_closure_wait:
                     _require_ready(native, False, self.allow_unplugged, closing_local)
+                if not stop_only and (owned or as_result) and gateway.current_boot_seen(gateway._charger_epoch):
+                    recovery.recognize_owner_closure(self, native, inventory_audited=owned or attempt is not None)
             except NativeContentError as error:
                 invalidate()
                 # An adapter refusal may arrive after a newer Boot; validate its authority before freezing it as strict.

@@ -18,6 +18,9 @@ REASONS = {
         "A manufacturer cloud Start is awaiting its matching session; further controls remain blocked."
     ),
     "charger_disconnected": "The charger connection is unavailable.",
+    "owner_session_closure_pending": (
+        "The proxy is waiting for the charger reports to confirm the local session is closed."
+    ),
     "cloud_disconnected": "The manufacturer cloud connection is unavailable.",
     "boot_unverified": "The current charger connection has not completed registration verification.",
     "pause_verification_pending": "Pause is requested; physical zero output has not yet been verified.",
