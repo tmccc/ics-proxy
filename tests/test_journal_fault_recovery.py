@@ -7,7 +7,7 @@ from contextlib import closing
 import pytest
 
 from ics_proxy_core.engine.managed_intent import ManagedRequests, insert_request
-from ics_proxy_core.engine.store import Journal
+from ics_proxy_core.engine.store import Journal, fingerprint
 from tests.prototype_rig import START
 
 
@@ -129,6 +129,54 @@ def test_owner_start_rejection_survives_refused_reply_writes(tmp_path, replace_p
 
     with closing(Journal(path, "synthetic")) as recovered:
         check(recovered)
+
+
+# An independent report must not consume a rejected Start whose receipt write still fails after replacement.
+@pytest.mark.parametrize("wire_write_refused", [False, True], ids=["wire", "checkpoint"])
+def test_retained_start_rejection_does_not_bind_independent_lifecycle(tmp_path, wire_write_refused):
+    path = tmp_path / "owner-start-binding.db"
+    request, ticket, tag = "start-request", "start-ticket", "LOCAL_TEST"
+    with closing(Journal(path, "synthetic")) as j:
+        j.put("control", {"ticket": ticket, "inhibit": True})
+        j.starts.prepare(ticket, fingerprint(tag.casefold()), request)
+        j.starts.armed(ticket)
+        j.starts.record(ticket, "issued")
+        scope = j.outcomes.owner_scope(request, ticket, "start-boot")
+        wire = scope.sent("start-wire", "RemoteStartTransaction", {"idTag": tag})
+        assert wire is not None
+        if wire_write_refused:
+            j.db.execute("""
+                CREATE TRIGGER refuse_start_wire_reply BEFORE INSERT ON owner_command_wires
+                WHEN NEW.reply='Rejected'
+                BEGIN SELECT RAISE(ABORT, 'owner Start reply storage unavailable'); END
+            """)
+        j.db.execute("""
+            CREATE TRIGGER refuse_start_rejection BEFORE INSERT ON meta
+            WHEN NEW.key='local_start_receipt' AND json_extract(NEW.value,'$.stage')='rejected'
+            BEGIN SELECT RAISE(ABORT, 'owner Start projection storage unavailable'); END
+        """)
+        scope.received(wire, [3, wire.wire, {"status": "Rejected"}])
+        stored_reply = j.db.execute("SELECT reply FROM owner_command_wires WHERE wire=?", (wire.wire,)).fetchone()[0]
+        assert stored_reply == (None if wire_write_refused else "Rejected")
+
+    with closing(Journal(path, "synthetic")) as j:
+        assert j.starts.receipt()["stage"] == "issued"
+        # Exercise the saved wire evidence on its own, independent of any process-local retry marker.
+        j.starts.pending_reply = None
+        assert not j.starts.pending_local_tag(tag)
+        payload = START | {"idTag": tag}
+        local = j.start("independent-start", payload, lambda local: j.starts.bind(tag, local))["transactionId"]
+        j.outcomes.retain_bound_owner_start()
+        assert j.active() == local and j.known_start(payload)
+        (wire,) = j.outcomes.owner_wires("request", request)
+        assert wire.reply == "Rejected" and wire.local is None
+        assert j.starts.receipt()["local"] is None
+
+        j.db.execute("DROP TRIGGER refuse_start_rejection")
+        j.outcomes.retry_owner_writes()
+        assert j.starts.receipt()["stage"] == "rejected"
+        assert j.get("control")["start_pending"] is False
+        assert j.active() == local
 
 
 # Intent: a definite forwarded Stop rejection survives replacement when normal result storage failed.

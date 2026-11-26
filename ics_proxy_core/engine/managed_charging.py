@@ -418,15 +418,7 @@ class ManagedCharging:
     # Match an already issued owner command without replaying its Start or guessing a lifecycle number.
     def matches_pending_start(self, tag: str) -> bool:
         j = self.journal
-        digest = fingerprint(tag.casefold())
-        prior = local_start_receipt(j)
-        return bool(
-            j.get("control", {}).get("start_pending")
-            and prior.get("local") is None
-            and prior.get("stage") in ("issued", "accepted")
-            and prior.get("digest") == digest
-            or confirmed_vendor_start(j, digest, None)
-        )
+        return j.starts.pending_local_tag(tag) or confirmed_vendor_start(j, fingerprint(tag.casefold()), None)
 
     # A held owner report must use this authenticated current introduction.
     def report_hold_authorized(self) -> bool:

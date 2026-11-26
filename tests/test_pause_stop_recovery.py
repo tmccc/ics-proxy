@@ -381,17 +381,16 @@ async def test_clean_pause_settles_failed_stop_after_genuine_closure(
 
 # Intent: shutdown can wait for an unanswered Stop with verified zero and can protect renewed draw.
 # Why: the physical session can report genuine closure after shutdown has started.
-@pytest.mark.parametrize("resumed_draw", [False, True], ids=["verified-zero", "resumed-draw"])
-async def test_shutdown_reuses_unanswered_pause_stop_at_verified_zero(
-    tmp_path, tls, unused_tcp_port, monkeypatch, resumed_draw
-):
+@pytest.mark.parametrize("draw", ["verified-zero", "resumed-draw", "resumed-draw-on-refresh"])
+async def test_shutdown_reuses_unanswered_stop_at_verified_zero(tmp_path, tls, unused_tcp_port, monkeypatch, draw):
     async with release_bench(tmp_path, tls, unused_tcp_port, 6) as b:
         c, j, rig, gateway = b.c, b.session.journal, b.rig, b.session.gateway
         local = await positive_flow(b, "daily", call_id=uuid.uuid4().hex)
         await mp.healthy(c)
         send, lost_replies = b.charger.send, []
+        decisions = gateway.controls.decisions
 
-        # Keep the first Pause Stop unanswered while allowing any later physical attempt to receive its reply.
+        # Keep the first Stop unanswered while allowing any later physical attempt to receive its reply.
         async def lose_first_stop_reply(raw):
             frame = decode(raw)
             call = next((row for row in rig.bench.device_calls if row[1] == frame[1]), None)
@@ -402,14 +401,18 @@ async def test_shutdown_reuses_unanswered_pause_stop_at_verified_zero(
 
         monkeypatch.setattr(b.charger, "send", lose_first_stop_reply)
         request = uuid.uuid4().hex
-        c.command(request, "pause", c.requests.intent().revision)
-        await asyncio.wait_for(c.pause_task, 8)
+        if draw == "resumed-draw-on-refresh":
+            await asyncio.wait_for(decisions.stop_for_shutdown(gateway, c.native, request, local), 8)
+            assert j.outcomes.unanswered_shutdown_stop(local)
+        else:
+            c.command(request, "pause", c.requests.intent().revision)
+            await asyncio.wait_for(c.pause_task, 8)
         boot = gateway.boot_observation
         assert boot is not None
         assert j.outcomes.unanswered_owner_stop_wires(local, boot) == tuple(lost_replies)
         assert len(lost_replies) == 1 and rig.bench.firmware.effective_limit() == 0
 
-        drawing, native = resumed_draw, rig.peer.native
+        drawing, native = draw == "resumed-draw", rig.peer.native
 
         # Resume measured draw independently of the simulated charger's accepted station-zero profile.
         def native_sample(key):
@@ -419,8 +422,15 @@ async def test_shutdown_reuses_unanswered_pause_stop_at_verified_zero(
             return value
 
         waiting = asyncio.Event()
-        decisions = gateway.controls.decisions
         report_progress = decisions.shutdown_report_progress
+        refresh = c.native.refresh_stop_zero
+
+        # Contradict the trusted first audit only when the same session is read again before reuse.
+        async def resume_during_refresh(target):
+            nonlocal drawing
+            assert target == local and c.native.stop_zero_verified(local)
+            drawing = True
+            await refresh(target)
 
         # Hold the genuine closing report until shutdown has completed its wire decision.
         def observe_report_wait(gateway, stopping_local, **kwargs):
@@ -430,6 +440,8 @@ async def test_shutdown_reuses_unanswered_pause_stop_at_verified_zero(
 
         monkeypatch.setattr(rig.peer, "native", native_sample)
         monkeypatch.setattr(decisions, "shutdown_report_progress", observe_report_wait)
+        if draw == "resumed-draw-on-refresh":
+            monkeypatch.setattr(c.native, "refresh_stop_zero", resume_during_refresh)
         shutdown = asyncio.create_task(b.session.close())
         try:
             await asyncio.wait_for(waiting.wait(), 4)
@@ -438,14 +450,18 @@ async def test_shutdown_reuses_unanswered_pause_stop_at_verified_zero(
             assert j.active() == local and attempt["local"] == local and attempt["boot"] == boot
             assert not shutdown.done() and rig.bench.firmware.effective_limit() == 0
             zero_verified = c.native.stop_zero_verified(local)
+            protective_stop = decisions.stop_acknowledged(local, protective=True)
         finally:
             drawing = False
             await genuine_stop(b, local)
             await asyncio.wait_for(shutdown, 8)
 
+        resumed_draw = draw != "verified-zero"
         assert [frame[3] for frame in stops] == [{"transactionId": local}] * (2 if resumed_draw else 1)
         assert attempt["stop_wire"] == (stops[-1][1] if resumed_draw else None)
         assert zero_verified is not resumed_draw
+        if draw == "resumed-draw-on-refresh":
+            assert protective_stop
         assert b.session.final_status["shutdown_attempt_uncertain"] is False
         assert not mp.starts(rig)
 

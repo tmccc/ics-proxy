@@ -3023,7 +3023,7 @@ class ControlDecisions:
                 return native.still_drawing(sample, sequence) and native.commissioned_binding_matches(sample)
 
             if not ceiling_failed and not station_flowing():
-                return StopProof(require_scope)
+                return StopProof(require_scope, station_flowing)
             native.require_known_session(sample)
 
             # Recheck the independent session proof before sending Stop without a confirmed zero.
