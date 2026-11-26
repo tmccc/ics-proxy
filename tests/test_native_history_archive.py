@@ -118,6 +118,32 @@ def test_latest_native_completion_resolves_retained_timestamp_ties(
     assert latest_completion_available(history_journal, visible_history.completed) is available
 
 
+# Intent: keep the latest energy consistent while an earlier unreadable record enters or leaves the native history.
+# Why: valid Stop and Start times still order a completed session when its meter reading is missing.
+@pytest.mark.parametrize("present", [True, False], ids=["visible", "rotated-out"])
+@pytest.mark.parametrize(
+    ("unreadable_start", "available"),
+    [(1000, True), (1100, False), (1200, False)],
+    ids=["earlier-start", "same-start", "later-start"],
+)
+def test_unreadable_energy_uses_the_same_completion_order_as_the_archive(
+    history_journal: Journal, present: bool, unreadable_start: int, available: bool
+) -> None:
+    unreadable = row(1001) | {"startTime": unreadable_start, "stopTime": 1250, "meterStop": None}
+    latest = row(1002) | {"startTime": 1100, "stopTime": 1250, "meterStop": 12000}
+    rows = [unreadable, latest] if present else [latest]
+    archive = NativeHistoryArchive(history_journal)
+    archive.observe([], [unreadable, latest], allow_missing=True)
+    archive.observe([], rows, allow_missing=True)
+
+    summary = summarize_charger_history(tuple(rows))
+    assert summary.complete is not present
+    known = summary.latest_completion_known and latest_completion_available(history_journal, summary.completed)
+    assert known is available
+    if known:
+        assert summary.last_energy == 7.0
+
+
 # Intent: any number of absent original records is archived and reported without rewriting original admission data.
 # Why: firmware history retention must not force a charging fault or silently erase the complete original archive.
 def test_missing_originals_are_retained_with_unchanged_admission_history(history_journal: Journal) -> None:

@@ -296,18 +296,24 @@ async def run(
         allow_unplugged_native=True,
         require_existing_journal=True,
     )
+    restore_failed = False
     try:
         if session.journal.get(MANAGED_RESTORE_INTENT) != spec.digest:
             raise RecoveryRequiredError("cleanup does not belong to this managed restoration")
         if session.journal.phase.read().value == "rollback":
             await cleanup_profiles(session)
         result = await finish_restore(session.native_bounded, patch, session.runtime.close, report_stage=report_stage)
+    except BaseException:
+        restore_failed = True
+        raise
     finally:
         try:
             await session.close()
         except Exception:
-            report_stage("close_maintenance_session")
-            raise
+            # Keep the stage and error that first interrupted restoration.
+            if not restore_failed:
+                report_stage("close_maintenance_session")
+                raise
     emit(result)
     return 0
 

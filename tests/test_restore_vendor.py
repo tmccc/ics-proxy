@@ -226,6 +226,38 @@ def test_restore_guidance_matches_observed_stage_without_private_details(stage, 
 
 
 # Intent: report invalid restore inputs with the stage and a corrective action.
+@pytest.mark.parametrize("transfer_failed", [False, True])
+async def test_maintenance_close_preserves_restore_stage(tmp_path, tls, unused_tcp_port, monkeypatch, transfer_failed):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, cli_route=True, native_peer=RestorePeer) as test:
+        await stop_paused(test)
+        rig = test.rig
+        config, spec = tmp_path / "trial.json", spec_file(tmp_path, rig)
+        stages = []
+        close = restore_vendor.TrialSession.close
+
+        async def cleanup_profiles(session):
+            pass
+
+        async def finish_restore(handover, patch, close_listener, *, report_stage):
+            report_stage("restore_original_route")
+            if transfer_failed:
+                raise NativeTransportUnavailableError("test route observation interrupted")
+            return {"complete": True}
+
+        async def close_with_error(session):
+            await close(session)
+            raise OSError("test maintenance cleanup failure")
+
+        with monkeypatch.context() as restore:
+            restore.setattr(restore_vendor, "cleanup_profiles", cleanup_profiles)
+            restore.setattr(restore_vendor, "finish_restore", finish_restore)
+            restore.setattr(restore_vendor.TrialSession, "close", close_with_error)
+            error = NativeTransportUnavailableError if transfer_failed else OSError
+            with pytest.raises(error):
+                await run("restore", config, spec, rig.prepared.observer.port, report_stage=stages.append)
+            assert stages[-1] == ("restore_original_route" if transfer_failed else "close_maintenance_session")
+
+
 # Why: the operator needs enough information to fix the configuration without exposing private paths.
 async def test_invalid_restore_inputs_report_the_stage_without_private_paths(tmp_path):
     report = await failed_restore_cli("check", tmp_path / "private-config.json", tmp_path / "private-spec.json")

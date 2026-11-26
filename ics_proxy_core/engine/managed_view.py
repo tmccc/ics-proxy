@@ -193,7 +193,7 @@ def summarize_charger_history(
     energy: dict[int, float] = {}
     latest_times = (0, 0)
     latest_energy: float | None = None
-    newest_unreadable = 0.0
+    newest_unreadable = (0.0, 0.0)
     unreadable_recent = False
     latest_time = time.time() + 30
     for record in records:
@@ -216,10 +216,14 @@ def summarize_charger_history(
             or stop != 0
             and (stop < start or last < first)
         ):
-            # A row with a reversed clock can still threaten the latest completion through its newer Start time.
-            newest_unreadable = max(
-                newest_unreadable, start if start_valid else math.inf, stop if stop_valid else math.inf
+            # Known completion times still order a row whose energy is unreadable.
+            # Use an upper bound when the chronology itself is uncertain.
+            unreadable_times = (
+                (stop, start)
+                if start_valid and stop_valid and stop >= start
+                else (max(start if start_valid else math.inf, stop if stop_valid else math.inf), math.inf)
             )
+            newest_unreadable = max(newest_unreadable, unreadable_times)
             if latest_closed is not None and (type(identifier) is not int or identifier >= latest_closed):
                 unreadable_recent = True
             continue
@@ -238,10 +242,10 @@ def summarize_charger_history(
                 "energy_kwh": energy[identifier] if stop else None,
             }
         )
-    complete = newest_unreadable == 0
+    complete = newest_unreadable == (0.0, 0.0)
     if latest_closed is None:
         # Coincident timestamps can establish energy only when the matching records agree.
-        latest_known = complete if not completed else latest_energy is not None and latest_times[0] > newest_unreadable
+        latest_known = complete if not completed else latest_energy is not None and latest_times > newest_unreadable
     else:
         # The journal can receive the Stop before native history includes that same assigned ID.
         latest_energy = energy.get(latest_closed)
