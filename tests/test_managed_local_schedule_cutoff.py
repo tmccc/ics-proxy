@@ -10,6 +10,7 @@ import pytest
 
 from ics_proxy_core.engine.local_schedule_cutoff import scheduled_cutoff_target
 from ics_proxy_core.engine.managed_intent import LOCAL_SCHEDULE_OCCURRENCE
+from ics_proxy_core.engine.managed_sources import ORDINARY_HOLD
 from ics_proxy_core.engine.managed_view import refresh_for_read
 from tests.managed_rig import starts
 from tests.prototype_rig import BOOT, START
@@ -267,6 +268,95 @@ async def test_natural_owner_stop_retains_its_exact_hold_across_replacement(
             assert not j.fault.latched() and not stops(bench)
             clock.now = MIDNIGHT + 24 * 3600
             await status(replacement, lambda view: len(starts(rig)) == 2)
+
+
+# The charger can finish while the proxy has only saved the real Stop report, before its next native poll.
+@pytest.mark.parametrize("native_lag", [False, True], ids=["already-closed", "native-lags"])
+@pytest.mark.parametrize("cloud_returned", [False, True], ids=["next-offline-schedule", "cloud-handback"])
+async def test_natural_owner_stop_recovers_after_replacement_before_first_poll(
+    tmp_path, tls, unused_tcp_port, monkeypatch, native_lag, cloud_returned
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        bench = rig.bench
+        async with connection(rig, "before-owner-stop") as test:
+            c, j = test.controller, test.session.journal
+            local, meter_start = await begin(test, clock)
+            original = c.requests.intent()
+            request = j.get(LOCAL_SCHEDULE_OCCURRENCE)["request"]
+            receipt = c.requests.receipt(request)
+            assert receipt["state"] == "completed" and receipt["result"]["local_session_verified"]
+            clock.now = MIDNIGHT + 30
+            await close(test, clock, local, meter_start)
+            assert j.latest_owner_stop_id() == local and j.get(ORDINARY_HOLD) is None
+            bench.firmware.active = local if native_lag else None
+            bench.firmware.requested_current = 0
+            bench.cp, bench.connection = "B", "Plug"
+            rig.peer.permission_enabled = native_lag
+
+        first_reconnect_call = len(bench.device_calls)
+        async with connection(rig, "after-owner-stop") as replacement:
+            c, j = replacement.controller, replacement.session.journal
+            assert c.requests.intent() == original and c.requests.receipt(request) == receipt
+            assert j.get(ORDINARY_HOLD)["owner_closure"] == local
+            if cloud_returned:
+                bench.vendor_available = True
+                await until(lambda: replacement.session.runtime.vendor_registered, timeout=20)
+            if native_lag:
+                for _ in range(3):
+                    waiting = await c.tick()
+                    assert waiting["state"] == "reconciling" and not waiting["local_hold_verified"]
+                    assert bench.firmware.effective_limit() == 0 and not j.fault.latched()
+                assert all(
+                    frame[3]["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"] == 0
+                    for frame in bench.device_calls[first_reconnect_call:]
+                    if frame[2] == "SetChargingProfile"
+                )
+                bench.firmware.active = None
+                rig.peer.permission_enabled = False
+
+            if cloud_returned:
+                shared = await status(replacement, lambda view: view.get("station_ceiling_a") == 6)
+                assert shared["desired_control"] == "app" and len(starts(rig)) == 1
+            else:
+                await status(replacement, lambda view: view.get("local_hold_verified") is True)
+                assert c.requests.offline_pause_current(c.requests.intent())
+                clock.now = MIDNIGHT + 24 * 3600
+                await status(replacement, lambda view: len(starts(rig)) == 2)
+            assert not j.fault.latched() and not stops(bench)
+
+
+# An open session and a newer operator Pause still follow their existing restrictive startup paths.
+@pytest.mark.parametrize("operator_pause", [False, True], ids=["open-session", "operator-pause"])
+async def test_owner_closure_replacement_keeps_restrictive_winner(
+    tmp_path, tls, unused_tcp_port, monkeypatch, operator_pause
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "before-restrictive-replacement") as test:
+            c, j = test.controller, test.session.journal
+            local, meter_start = await begin(test, clock)
+            original = c.requests.intent()
+            if operator_pause:
+                clock.now = MIDNIGHT + 30
+                await close(test, clock, local, meter_start)
+                assert j.latest_owner_stop_id() == local
+                pause = uuid.uuid4().hex
+                c.command(pause, "pause", original.revision)
+                await status(test, lambda view: view.get("local_hold_verified") is True)
+            else:
+                assert j.active() == local
+            assert j.get(ORDINARY_HOLD) is None
+
+        async with connection(rig, "after-restrictive-replacement") as replacement:
+            c, j = replacement.controller, replacement.session.journal
+            intent = c.requests.intent()
+            assert intent.mode == "paused" and intent.revision == original.revision + 1
+            assert not c.requests.offline_pause_current(intent) and j.get(ORDINARY_HOLD) is None
+            if operator_pause:
+                assert c.requests.receipt(pause)["state"] == "completed"
+                assert (await c.tick())["local_hold_verified"]
+            else:
+                assert c.charging.state()["state"] == "interrupted"
+            assert len(starts(rig)) == 1
 
 
 # An identical Boot on the same connection must reverify the retained zero for this exact, unplugged session.

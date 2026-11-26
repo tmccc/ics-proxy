@@ -214,23 +214,23 @@ class RecoveryControl:
         )
 
     # Timer/current/test state machines retain exclusive ownership of their own restoration obligations.
-    def ordinary(self, ordinary: OrdinaryRecovery) -> bool:
-        c, j = ordinary.c, self.journal
+    def ordinary(self, charging: ManagedCharging) -> bool:
+        c, j = charging.controller, self.journal
         return (
             not c.stopping
             and (not j.fault.read())
             and (j.phase.read().operating)
             and (c.requests.intent().mode == "app")
             and (not c.current.pending())
-            and (c.charging.lease is None)
-            and (c.charging.state().get("state") in (None, "completed") or ordinary.verified_normal())
+            and (charging.lease is None)
+            and (charging.state().get("state") in (None, "completed") or self.verified_normal(charging))
             and (j.current_change.read().state not in ("interrupted", "uncertain"))
         )
 
     # A newer explicit Pause or control revision immediately invalidates the saved positive recovery authority.
-    def ordinary_active(self, ordinary: OrdinaryRecovery) -> bool:
+    def ordinary_active(self, c: ManagedController) -> bool:
         saved = self.journal.get(KEY, {})
-        intent = ordinary.c.requests.intent()
+        intent = c.requests.intent()
         return saved.get("state") == "holding" and intent.mode == "app" and saved.get("revision") == intent.revision
 
     # Publish or revoke source after every successful full native audit; an older proof cannot survive contradiction.
@@ -380,26 +380,19 @@ class RecoveryControl:
             return Pending(Prerequisite.SOURCE, "ordinary continuation source changed during verification")
         return ALLOW
 
-    # Claim the exact zero before its independent charger write.
-    def claim_ordinary_hold(
-        self, ordinary: OrdinaryRecovery, reason: str, *, owner_closure: int | None = None
-    ) -> Callable[[], None]:
-        c, j, g = ordinary.c, self.journal, ordinary.c.session.gateway
-        if not ordinary.ordinary() or not g.current_boot_seen(g._charger_epoch):
-            raise RecoveryRequiredError("ordinary recovery awaits admitted current owner authority")
-        c.native.spec.require_boot(j.get("boot"))
-        if not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest):
-            raise RecoveryRequiredError("ordinary zero hold requires the existing admitted station receipt")
-        previous = current = j.get(KEY, {})
-        local = j.active()
-        if owner_closure is not None and (local is not None or j.latest_owner_stop_id() != owner_closure):
-            raise RecoveryRequiredError("owner closure hold lost its latest closed session")
-        if not ordinary.active():
+    # Journal the same restrictive hold whether startup or a live observation first finds the closure.
+    def _save_ordinary_hold(
+        self, c: ManagedController, reason: str, local: int | None, start: str | None, owner_closure: int | None
+    ) -> dict[str, Any]:
+        j, g = self.journal, c.session.gateway
+        previous: dict[str, Any] = j.get(KEY, {})
+        current = previous
+        if not self.ordinary_active(c):
             current = {
                 "state": "holding",
                 "revision": c.requests.intent().revision,
                 "local": local,
-                "start": ordinary.start_digest(local),
+                "start": start,
                 "selected_a": c.current.selected(),
                 "reason": reason,
                 "at_epoch": time.time(),
@@ -410,8 +403,6 @@ class RecoveryControl:
                 current = {**current, "local": None, "start": None}
         if owner_closure is not None and current.get("owner_closure") != owner_closure:
             current = {**current, "owner_closure": owner_closure}
-        epoch, boot = g._charger_epoch, g.boot_observation
-        connection = current_control_scope(g)
         with j.atomic(retry_busy=True):
             if current != previous:
                 j.put(KEY, current)
@@ -419,6 +410,24 @@ class RecoveryControl:
                 g.controls._claim(True, stopping=True)
             j.phase.recover()
         c.released_epoch = None
+        return current
+
+    # Claim the exact zero before its independent charger write.
+    def claim_ordinary_hold(
+        self, ordinary: OrdinaryRecovery, reason: str, *, owner_closure: int | None = None
+    ) -> Callable[[], None]:
+        c, j, g = ordinary.c, self.journal, ordinary.c.session.gateway
+        if not ordinary.ordinary() or not g.current_boot_seen(g._charger_epoch):
+            raise RecoveryRequiredError("ordinary recovery awaits admitted current owner authority")
+        c.native.spec.require_boot(j.get("boot"))
+        if not recorded_station_profile(j, c.native.spec.digest, c.native.spec.boot_digest):
+            raise RecoveryRequiredError("ordinary zero hold requires the existing admitted station receipt")
+        local = j.active()
+        if owner_closure is not None and (local is not None or j.latest_owner_stop_id() != owner_closure):
+            raise RecoveryRequiredError("owner closure hold lost its latest closed session")
+        epoch, boot = g._charger_epoch, g.boot_observation
+        connection = current_control_scope(g)
+        current = self._save_ordinary_hold(c, reason, local, ordinary.start_digest(local), owner_closure)
 
         # A new owner intent, source epoch or overlapping state machine cannot inherit this station write.
         def guard() -> None:
@@ -442,6 +451,28 @@ class RecoveryControl:
                 raise RecoveryRequiredError("ordinary zero hold was superseded")
 
         return guard
+
+    # Preserve a completed normal Start when the process stopped after the report committed but before the zero hold.
+    def restore_owner_closure(self, charging: ManagedCharging, saved: dict[str, Any]) -> bool:
+        c, j = charging.controller, self.journal
+        local, revision = saved.get("local_transaction"), saved.get("revision")
+        if (
+            type(local) is not int
+            or type(revision) is not int
+            or c.requests.intent() != ControlIntent("app", revision)
+            or j.active() is not None
+            or j.latest_owner_stop_id() != local
+            or not self.verified_normal(charging)
+        ):
+            return False
+        if self.held_owner_closure(c) == local:
+            return True
+        if not self.ordinary(charging) or not recorded_station_profile(
+            j, c.native.spec.digest, c.native.spec.boot_digest
+        ):
+            return False
+        self._save_ordinary_hold(c, "native_closure_pending", None, None, local)
+        return True
 
     # Only the saved closure of the latest owner session can use this zero hold without cloud registration.
     def held_owner_closure(self, c: ManagedController) -> int | None:

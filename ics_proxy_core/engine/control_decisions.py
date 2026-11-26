@@ -1536,13 +1536,8 @@ class ControlDecisions:
     def restore_charging_request(self, charging: ManagedCharging) -> None:
         controller = charging.controller
         saved = charging.state()
-        owner_closure = self.recovery.held_owner_closure(controller)
-        if (
-            owner_closure is not None
-            and saved.get("local_transaction") == owner_closure
-            and self.recovery.verified_normal(charging)
-        ):
-            return  # This completed Start has a genuine Stop and awaits only fresh independent closure.
+        if self.recovery.restore_owner_closure(charging, saved):
+            return
         if saved.get("state") in ACTIVE:
             with self.journal.atomic():
                 ownership = controller.requests.pause_ownership()

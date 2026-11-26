@@ -45,11 +45,11 @@ class OrdinaryRecovery:
 
     # Check that ordinary recovery owns the current app intent.
     def ordinary(self) -> bool:
-        return self.control.ordinary(self)
+        return self.control.ordinary(self.c.charging)
 
     # Check whether the saved hold still belongs to this app intent.
     def active(self) -> bool:
-        return self.control.ordinary_active(self)
+        return self.control.ordinary_active(self.c)
 
     # The immutable accepted Start binds identity; a connector number or native session number alone cannot do so.
     def start_digest(self, local: int | None) -> str | None:
