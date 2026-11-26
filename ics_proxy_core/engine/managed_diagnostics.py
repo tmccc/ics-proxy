@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from .managed_intent import unfinished_owner_requests
 from .managed_native_repair import AUDITS, REVOCATIONS, repair_pending, repair_revoked, repair_sources
 from .security import SecurityError
+from .stop_settlement import STOP_SESSION, joined_stop_acceptance
 from .store import RecoveryRequiredError, fingerprint
 
 if TYPE_CHECKING:
@@ -154,9 +155,11 @@ def pending_commands(c: ManagedController, now: float) -> tuple[list[dict[str, A
             raise ValueError("diagnostic receipt metadata is unavailable")
         accepted = timestamp(command.result.get("accepted_at"))
         age = now - accepted if accepted is not None and accepted <= now else None
-        confirmation = (
-            "reply_received" if command.reply_known else "unknown" if command.state == "uncertain" else "pending"
+        reply_known = command.reply_known or (
+            command.action == STOP_SESSION
+            and joined_stop_acceptance(command.result.get("_session_stop"), command.identifier) is not None
         )
+        confirmation = "reply_received" if reply_known else "unknown" if command.state == "uncertain" else "pending"
         commands.append(
             {
                 "action": command.action if command.action in ACTIONS else "other",

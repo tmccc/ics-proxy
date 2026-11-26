@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -61,6 +62,35 @@ class StopAcceptance:
     origin: Literal["local", "vendor"]
     identifier: str
     wire: str | None
+
+
+# Read only the accepted predecessor saved when this exact receipt joined its session's Stop.
+def joined_stop_acceptance(binding: object, request: str) -> StopAcceptance | None:
+    if not isinstance(binding, dict):
+        return None
+    local, joined, dispatched = binding.get("local"), binding.get("joined"), binding.get("dispatched")
+    attempt = binding.get("accepted_attempt")
+    if (
+        type(local) is not int
+        or not 0 < local < 2**63
+        or type(joined) not in (int, bool)
+        or joined != 1
+        or (dispatched is not None and dispatched is not False)
+        or not isinstance(attempt, dict)
+        or attempt.keys() != {"origin", "identifier", "wire"}
+    ):
+        return None
+    origin, predecessor, wire = attempt["origin"], attempt["identifier"], attempt["wire"]
+    if (
+        origin not in ("local", "vendor")
+        or not isinstance(predecessor, str)
+        or predecessor == request
+        or re.fullmatch(r"[a-f0-9]{32}", predecessor) is None
+        or not isinstance(wire, str)
+        or not 0 < len(wire) <= 36
+    ):
+        return None
+    return StopAcceptance(origin, predecessor, wire)
 
 
 # Retain only reply windows that still belong to this receipt or one of its joined Stop attempts.

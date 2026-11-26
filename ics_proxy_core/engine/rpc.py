@@ -640,7 +640,8 @@ class Peer:
                 if on_sent is not None:
                     sent = on_sent
                     self.decide(lambda: sent(action), priority=priority)
-                self.diagnostics.phase = "awaiting_reply"
+                if not future.done():
+                    self.diagnostics.phase = "awaiting_reply"
                 answer = await future
                 processing_reply = True
                 result = self.decide(lambda: self._accept_reply(action, actual, answer, on_reply), priority=priority)

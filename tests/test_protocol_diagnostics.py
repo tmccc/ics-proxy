@@ -18,6 +18,7 @@ from ics_proxy_core.engine.diagnostics import FaultDiagnostics
 from ics_proxy_core.engine.gateway import decode
 from ics_proxy_core.engine.rpc import Peer, UnavailableError
 from ics_proxy_core.engine.security import TRANSPORT_LOG, Admission
+from ics_proxy_core.engine.store import RecoveryRequiredError
 from ics_proxy_core.frames import build_call, build_call_result
 from tests.prototype_rig import BOOT
 from tests.runtime_rig import NOW, Bench, until
@@ -210,6 +211,36 @@ async def test_rpc_diagnostics_only_retain_classifications() -> None:
     fault = FaultDiagnostics()
     fault.record(ValueError(SECRET), "untrusted-" + SECRET, SECRET)
     assert fault.stage == "session" and fault.action == "Other" and SECRET not in json.dumps(fault.snapshot())
+
+
+# Intent: preserve the phase of a matched reply when the sender is still draining.
+# Why: publication can fail after a definite reply and should show that the reply already arrived.
+@pytest.mark.parametrize("reply_during_send", [False, True], ids=["after-send", "while-sending"])
+async def test_rpc_publication_failure_preserves_received_phase(reply_during_send: bool) -> None:
+    peer = Peer("vendor", 1)
+
+    # Both orders return the same correlated reply before the caller can try to publish it.
+    async def sender(raw: str) -> None:
+        reply = [3, decode(raw)[1], {"status": "Accepted"}]
+        if reply_during_send:
+            peer.receive(reply)
+            await asyncio.sleep(0)
+        else:
+            asyncio.get_running_loop().call_soon(peer.receive, reply)
+
+    # An earlier authorization reply can arrive after the request owner has changed.
+    def publish(_action: str, _answer: Any) -> bool:
+        raise RecoveryRequiredError("The original authorization no longer owns publication")
+
+    peer.sender = sender
+    with pytest.raises(RecoveryRequiredError):
+        await peer.call("Authorize", {"idTag": "TEST"}, on_reply=publish)
+
+    diagnostic = peer.diagnostics.snapshot()
+    assert diagnostic["action"] == "Authorize" and diagnostic["phase"] == "unconfirmed"
+    assert diagnostic["failed_phase"] == "reply_received"
+    assert diagnostic["send_attempts"] == diagnostic["matched_replies"] == 1
+    assert diagnostic["reply_matched"] is True
 
 
 # Intent: settling a late reply updates the receipt without changing a newer completed exchange.

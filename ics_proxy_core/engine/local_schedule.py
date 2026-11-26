@@ -47,10 +47,8 @@ class LocalSchedule:
         self.journal = controller.session.journal
         self.deadline: tuple[str, float] | None = None
 
-    # An independently identified native run consumes the window without giving the fallback ownership of its Stop.
+    # Record the exact source of a same-tag session while its independent plan marker is available.
     def observe_native_occurrence(self, native: HandoverEvidence) -> None:
-        from .gateway import timestamp
-
         if self.timezone is None or native.session_plan_id is None or not native.physical.transaction_open:
             return
         c, j = self.controller, self.journal
@@ -63,16 +61,55 @@ class LocalSchedule:
         ):
             return
         window = schedule_window(native, c.native.spec.saved_schedule_digest, self.timezone, time.time())
-        if window is None or native.session_plan_id != window.plan_id:
+        if window is None:
             return
-        saved = j.get(NATIVE_OCCURRENCE)
-        if saved is not None and saved["window"]["starts_at"] >= window.starts_at:
+        saved, bounds = j.get(NATIVE_OCCURRENCE, {}), asdict(window)
+        if saved and saved["window"]["starts_at"] > window.starts_at:
             return
+        if saved.get("window") != bounds:
+            saved = {"window": bounds}
+        if "local" in saved:
+            return  # A positive native occurrence already consumes this exact window.
         start = json.loads(j.db.execute("SELECT start FROM transactions WHERE local=?", (local,)).fetchone()[0])
+        if not self._matches_window(window, start):
+            return
+        digest = fingerprint(start)
+        if native.session_plan_id == window.plan_id:
+            j.put(NATIVE_OCCURRENCE, {"window": bounds, "local": local, "start": digest})
+        else:
+            unrelated = saved.get("unrelated", {})
+            if unrelated.get(str(local)) != digest:
+                j.put(NATIVE_OCCURRENCE, {**saved, "unrelated": {**unrelated, str(local): digest}})
+
+    # Use the same accepted report timestamp and tag for both witnessed and unwitnessed sessions.
+    @staticmethod
+    def _matches_window(window: ScheduleWindow, start: dict[str, Any]) -> bool:
+        from .gateway import timestamp
+
+        if fingerprint(start["idTag"].casefold()) != window.tag_digest:
+            return False
         occurred = timestamp(start["timestamp"]).timestamp()
-        tag = fingerprint(start["idTag"].casefold())
-        if window.starts_at <= occurred < window.ends_at and tag == window.tag_digest:
-            j.put(NATIVE_OCCURRENCE, {"window": asdict(window), "local": local, "start": fingerprint(start)})
+        return window.starts_at <= occurred < window.ends_at
+
+    # A same-tag Start can use the window even if it closes before an audit sees its native plan marker.
+    def _native_window_used(self, window: ScheduleWindow) -> bool:
+        j = self.journal
+        saved = j.get(NATIVE_OCCURRENCE, {})
+        if saved.get("window") != asdict(window):
+            saved = {}
+        if "local" in saved:
+            return True
+        unrelated = saved.get("unrelated", {})
+        transactions = j.db.execute("SELECT local,start FROM transactions WHERE connector=1 ORDER BY local DESC")
+        for local, payload in transactions:
+            start = json.loads(payload)
+            if (
+                self._matches_window(window, start)
+                and not j.is_owner_session(local)
+                and unrelated.get(str(local)) != fingerprint(start)
+            ):
+                return True
+        return False
 
     # Admission is only from shared control or the exact clean automatic Pause caused by an outage.
     def consider(self, native: HandoverEvidence) -> None:
@@ -88,9 +125,6 @@ class LocalSchedule:
         window = schedule_window(native, c.native.spec.saved_schedule_digest, self.timezone, now)
         if window is None or c.current.selected() > window.limit_a or not c.charging.available(native, normal=True):
             return
-        native_occurrence = self.journal.get(NATIVE_OCCURRENCE)
-        if native_occurrence is not None and native_occurrence["window"] == asdict(window):
-            return
         identifier = fingerprint(["local-schedule", c.native.spec.digest, asdict(window)])[:32]
         previous = self.journal.get(OCCURRENCE, {})
         if previous and previous["window"]["starts_at"] >= window.starts_at:
@@ -103,13 +137,16 @@ class LocalSchedule:
                 return
             identifier = fingerprint(["local-schedule-unsent-retry", identifier])[:32]
         try:
+            # This owner turn checks earlier reports and installs the lease that fences later reports.
+            if self._native_window_used(window):
+                return
             c.charging.accept(identifier, "start", intent.revision, schedule=window)
         except DeniedError, RecoveryRequiredError:
             return  # The expected authority or time can expire before admission.
         except sqlite3.Error:
             if self.journal.db.in_transaction:
                 raise
-            return  # A committed admission already owns its worker and cutoff.
+            return  # Retry a failed read on the next poll. A committed admission retains its worker and cutoff.
 
     # A single replacement admission is safe only when the original Start had no physical effects or wire.
     def _proved_unsent(self, identifier: str, revision: int) -> bool:

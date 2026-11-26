@@ -19,6 +19,7 @@ from ics_proxy_core.engine.command_outcomes import ForwardedReply, OwnerWire
 from ics_proxy_core.engine.gateway import Gateway, decode
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
+from ics_proxy_core.engine.managed_diagnostics import snapshot
 from ics_proxy_core.engine.managed_intent import ManagedRequests, insert_request
 from ics_proxy_core.engine.managed_session_stop import ManagedSessionStop
 from ics_proxy_core.engine.managed_view import refresh_for_read
@@ -283,8 +284,8 @@ async def test_session_stop_shares_the_vendor_wire_in_either_order(
         c.command(uuid.uuid4().hex, "start", c.requests.intent().revision)
         await c.charging.settle()
         local = await positive_flow(t)
-        status = await healthy(c)
-        view = refresh_for_read(c, {**status, "running": True, "certificate_remaining_seconds": 86400})
+        status = dict(await healthy(c), running=True, certificate_remaining_seconds=86400, diagnostics={})
+        view = refresh_for_read(c, status)
         target = view["stop_target"]
         assert isinstance(target, str)
         stop, revision, vendor = uuid.uuid4().hex, view["control_revision"], j.vendor_id(local)
@@ -304,6 +305,11 @@ async def test_session_stop_shares_the_vendor_wire_in_either_order(
             await asyncio.wait_for(c.session_stop.worker, 3)
         else:
             assert c.session_stop.worker is None
+        # A direct or joined acceptance is already known while the physical session still awaits closure.
+        live = refresh_for_read(c, view)
+        assert live["charging_session_open"] is True
+        (pending,) = [row for row in live["diagnostics"]["pending_commands"] if row["action"] == "stop_session"]
+        assert (pending["state"], pending["confirmation"]) == ("running", "reply_received")
         mark = len(bench.received_limits)
         if closure_first == "native":
             bench.firmware.active = None
@@ -688,7 +694,7 @@ async def test_session_stop_joins_unanswered_pause(tmp_path, tls, unused_tcp_por
         await select(t, 32)
         assert (await healthy(c))["station_ceiling_a"] == 32
         local = await positive_flow(t, "daily")
-        await healthy(c)
+        observed = await healthy(c)
         peer = t.session.gateway.charger
         monkeypatch.setattr(peer, "timeout", 0.25)
         send, held, entered = delay_reply(monkeypatch, t.rig, t.charger, "RemoteStopTransaction")
@@ -709,6 +715,8 @@ async def test_session_stop_joins_unanswered_pause(tmp_path, tls, unused_tcp_por
         assert c.requests.receipt(request)["state"] == "running"
         binding = j.outcomes.owner(request).result["_session_stop"]
         assert binding["owner_wire_attempts"] == [wire]
+        (pending,) = [row for row in snapshot(c, observed)["pending_commands"] if row["action"] == "stop_session"]
+        assert (pending["state"], pending["confirmation"]) == ("running", "pending")
         assert j.outcomes.awaits_stop_report(local)
         if outcome == "rejected_first":
             await send(build_call_result(wire, {"status": "Rejected"}))

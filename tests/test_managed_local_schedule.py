@@ -172,21 +172,29 @@ async def test_offline_schedule_uses_exact_owner_session_once(tmp_path, tls, unu
             assert len(starts(rig)) == 1 and replacement.session.journal.active() is None
 
 
-# Intent: a completed native run uses the same window as the outage fallback, including after a vendor-app Stop.
-# Why: a later outage must not restart that day's run, and a different source must not block today's scheduled Start.
+# Intent: a completed same-tag run can use the fallback window even when no audit saw its native plan marker.
+# Why: an outage must not restart the day's run; only an independently identified different source can leave it unused.
 @pytest.mark.parametrize("restart", [False, True], ids=["same-process", "replacement"])
-@pytest.mark.parametrize("scheduled", [False, True], ids=["different-plan-marker", "native-schedule"])
+@pytest.mark.parametrize(
+    ("source", "app_stop"),
+    [("different", True), ("native", True), ("unobserved", True), ("unobserved", False)],
+    ids=["different-plan-marker", "native-schedule", "unobserved-app-stop", "unobserved-natural-stop"],
+)
 async def test_native_daily_start_uses_the_outage_window(
-    tmp_path, tls, unused_tcp_port, monkeypatch, restart, scheduled
+    tmp_path, tls, unused_tcp_port, monkeypatch, restart, source, app_stop
 ):
+    used_window = source != "different"
     clock = SchedulerClock(MIDNIGHT - 60)
     monotonic = time.monotonic()
     monkeypatch.setattr(
         local_schedule, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: monotonic + clock.elapsed)
     )
-    async with managed_bench(
-        tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
-    ) as rig, AsyncExitStack() as connections:
+    async with (
+        managed_bench(
+            tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
+        ) as rig,
+        AsyncExitStack() as connections,
+    ):
         rig.prepared.config = replace(rig.prepared.config, owner_start_tag=OWNER_TAG, owner_schedule_timezone=ZONE.key)
         bench, peer = rig.bench, rig.peer
         test = await connections.enter_async_context(connection(rig, "online-for-native", online=True))
@@ -197,20 +205,28 @@ async def test_native_daily_start_uses_the_outage_window(
         reported = await bench.call(test.charger, uuid.uuid4().hex, "StartTransaction", start)
         assert reported[0] == 3 and reported[2]["idTagInfo"]["status"] == "Accepted"
         local = reported[2]["transactionId"]
-        peer.plan_session = (local, ORIGINAL_PLAN["planId"] if scheduled else 987654)
+        peer.plan_session = (local, ORIGINAL_PLAN["planId"] if used_window else 987654)
         peer.paused, peer.permission_enabled = False, True
         bench.cp, bench.connection = "C", "Charging"
         bench.firmware.requested_current = 32
         await until(lambda: j.vendor_id(local) is not None)
-        assert (await healthy(c))["power_w"] == 1440
-        assert (j.get(local_schedule.NATIVE_OCCURRENCE) is not None) is scheduled
+        if source == "unobserved":
+            assert j.get(local_schedule.NATIVE_OCCURRENCE) is None
+        else:
+            assert (await healthy(c))["power_w"] == 1440
+            witness = j.get(local_schedule.NATIVE_OCCURRENCE)
+            if used_window:
+                assert witness["local"] == local
+            else:
+                assert set(witness["unrelated"]) == {str(local)}
         assert j.get(LOCAL_SCHEDULE_OCCURRENCE) is None
 
         clock.now = MIDNIGHT + 60
-        stopped = await bench.cloud_call(
-            "vendor-app-stop", "RemoteStopTransaction", {"transactionId": j.vendor_id(local)}
-        )
-        assert stopped[0] == 3 and stopped[2]["status"] == "Accepted"
+        if app_stop:
+            stopped = await bench.cloud_call(
+                "vendor-app-stop", "RemoteStopTransaction", {"transactionId": j.vendor_id(local)}
+            )
+            assert stopped[0] == 3 and stopped[2]["status"] == "Accepted"
         peer.permission_enabled = False
         bench.cp, bench.connection = "B", "Plug"
         stop = {
@@ -223,15 +239,17 @@ async def test_native_daily_start_uses_the_outage_window(
         await until(lambda: j.next_delivery() is None)
         await healthy(c)
         assert j.active() is None and not starts(rig)
+        if source == "unobserved":
+            assert j.get(local_schedule.NATIVE_OCCURRENCE) is None
         await bench.vendor_outage()
         if restart:
             await connections.aclose()
             test = await connections.enter_async_context(connection(rig, "offline-after-native"))
             c, j = test.controller, test.session.journal
 
-        if scheduled:
+        if used_window:
             ready = await status(
-                test, lambda value: value["cloud_connected"] is False and value.get("normal_start_ready") or starts(rig)
+                test, lambda value: starts(rig) or (not value["cloud_connected"] and value.get("normal_start_ready"))
             )
             assert ready["normal_start_ready"] and not starts(rig)
             for _ in range(3):
@@ -242,11 +260,10 @@ async def test_native_daily_start_uses_the_outage_window(
 
         await status(test, lambda _: bool(starts(rig)))
         occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
-        assert occurrence["window"]["starts_at"] == MIDNIGHT + (24 * 3600 if scheduled else 0)
+        assert occurrence["window"]["starts_at"] == MIDNIGHT + (24 * 3600 if used_window else 0)
         assert [frame[3] for frame in starts(rig)] == [{"connectorId": 1, "idTag": OWNER_TAG}]
-        assert [frame[3] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
-            {"transactionId": local}
-        ]
+        expected_stops = [{"transactionId": local}] if app_stop else []
+        assert [frame[3] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == expected_stops
 
 
 # Intent: the freshly rechecked connector briefly refuses a midnight Start before any command is attempted.

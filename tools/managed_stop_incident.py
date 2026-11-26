@@ -12,7 +12,7 @@ from ics_proxy_core.engine.gateway import timestamp as charger_timestamp
 from ics_proxy_core.engine.ics import unique_object
 from ics_proxy_core.engine.managed_diagnostics import timestamp as receipt_timestamp
 from ics_proxy_core.engine.policy import DeniedError
-from ics_proxy_core.engine.stop_settlement import STOP_NONTERMINAL_CLASSIFICATIONS, STOP_SESSION
+from ics_proxy_core.engine.stop_settlement import STOP_NONTERMINAL_CLASSIFICATIONS, STOP_SESSION, joined_stop_acceptance
 from tools.managed_incident import (
     MAX_REPORT_EVENTS,
     UNKNOWN,
@@ -233,19 +233,11 @@ def joined_attempts(
     db: sqlite3.Connection, tables: set[str], request: str, local: int, binding: dict[str, Any]
 ) -> list[dict[str, Any]]:
     attempts = []
-    accepted = binding.get("accepted_attempt")
-    if (
-        isinstance(accepted, dict)
-        and accepted.keys() == {"origin", "identifier", "wire"}
-        and accepted["origin"] in ("local", "vendor")
-        and (predecessor := identifier(accepted["identifier"])) is not None
-        and predecessor != request
-        and wire_id(accepted["wire"]) is not None
-    ):
+    if (accepted := joined_stop_acceptance(binding, request)) is not None:
         attempts.append(
             {
-                "origin": accepted["origin"],
-                "request": reference(predecessor),
+                "origin": accepted.origin,
+                "request": reference(accepted.identifier),
                 "reply": "accepted",
                 "reply_source": "joined_receipt",
             }
