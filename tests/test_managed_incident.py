@@ -8,6 +8,7 @@ import json
 import shutil
 import socket
 import uuid
+from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -684,6 +685,47 @@ def test_incident_preserves_historical_start_receipt(tmp_path, stage):
         assert report["journal"]["start"]["lifecycle"] == "unbound"
     finally:
         journal.close()
+
+
+# Intent: keep the bound ledger and any queued delivery rows readable without a reply table.
+# Why: the Start and Stop reports remain useful when historical snapshots lack optional delivery records.
+@pytest.mark.parametrize("outbox", [False, True], ids=["no-outbox", "outbox-without-replies"])
+def test_incident_keeps_bound_lifecycle_without_delivery_tables(tmp_path, outbox):
+    path, events = tmp_path / "journal.db", tmp_path / "missing-events.jsonl"
+    start, ticket, stop = (uuid.uuid4().hex for _ in range(3))
+    with closing(Journal(path, "OFFLINE001")) as journal:
+        requests = ManagedRequests(journal)
+        requests.accept(start, "start", 0)
+        requests.finish(start, "completed", {})
+        requests.accept(stop, "stop_session", 1)
+        requests.finish(stop, "completed", {"session_stopped": True, "_session_stop": {"local": 42}})
+        journal.put("local_start_receipt", {"request_id": start, "ticket": ticket, "stage": "accepted", "local": 42})
+        journal.db.execute(
+            "INSERT INTO transactions(local,connector,start,stop,vendor) VALUES(42,1,'{}',?,99)",
+            (json.dumps({"transactionId": 42, "timestamp": "2026-11-01T01:00:00Z"}),),
+        )
+        if outbox:
+            journal.db.execute(
+                "INSERT INTO outbox(token,action,payload,local,state) "
+                "VALUES('delivery','StopTransaction','{}',42,'queued')"
+            )
+        else:
+            journal.db.execute("DROP TABLE outbox")
+        journal.db.execute("DROP TABLE delivery_replies")
+
+    start_report = incident_report(path, events)
+    stop_report = stop_incident_report(path, events)
+    delivery = [{"event": "StopTransaction", "state": "queued", "reply_saved": False}] if outbox else []
+    for report, request in ((start_report, start), (stop_report, stop)):
+        assert report["journal"]["available"]
+        assert report["journal"]["request"]["request"] == reference(request)
+        assert report["observations"] == [] and report["sampled_status"] is None
+    lifecycle = start_report["journal"]["start"]
+    assert lifecycle["saved_reply"] == "accepted"
+    for facts in (lifecycle, stop_report["journal"]):
+        assert facts["lifecycle"] == "closed" and facts["cloud_mapping"] == "recorded"
+        assert facts["pending_delivery"] == delivery
+    assert start_report["waiting_for_evidence"] == (["cloud_delivery"] if outbox else [])
 
 
 # Intent: project only exact retained reply and lifecycle records, with a bounded and redacted event excerpt.

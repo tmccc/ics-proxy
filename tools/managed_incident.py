@@ -200,21 +200,38 @@ def lifecycle_fields(db: sqlite3.Connection, local: object) -> tuple[str, str, l
     row = db.execute("SELECT stop IS NOT NULL,vendor IS NOT NULL FROM transactions WHERE local=?", (local,)).fetchone()
     if row is None:
         return UNKNOWN, UNKNOWN, []
-    delivery = [
+    return "closed" if row[0] else "open", "recorded" if row[1] else "unmapped", pending_delivery_fields(db, local)
+
+
+# Preserve queued delivery evidence when a historical journal lacks the optional reply table.
+def pending_delivery_fields(db: sqlite3.Connection, local: int) -> list[dict[str, Any]]:
+    tables = {
+        name
+        for (name,) in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('outbox','delivery_replies')"
+        )
+    }
+    if "outbox" not in tables:
+        return []
+    reply_projection = (
+        "EXISTS(SELECT 1 FROM delivery_replies r WHERE r.token=o.token "
+        "AND r.action=o.action AND r.payload=o.payload AND r.local=o.local)"
+        if "delivery_replies" in tables
+        else "0"
+    )
+    return [
         {
             "event": action,
             "state": state if state in ("queued", "inflight", "ambiguous", "rejected") else UNKNOWN,
             "reply_saved": bool(reply_saved),
         }
         for action, state, reply_saved in db.execute(
-            "SELECT o.action,o.state,EXISTS(SELECT 1 FROM delivery_replies r WHERE r.token=o.token "
-            "AND r.action=o.action AND r.payload=o.payload AND r.local=o.local) "
+            f"SELECT o.action,o.state,{reply_projection} "
             "FROM outbox o WHERE o.local=? AND o.action IN ('StartTransaction','StopTransaction') "
             "ORDER BY o.seq LIMIT 4",
             (local,),
         )
     ]
-    return "closed" if row[0] else "open", "recorded" if row[1] else "unmapped", delivery
 
 
 # A checkpoint contains only the definite reply to an actual charger call.

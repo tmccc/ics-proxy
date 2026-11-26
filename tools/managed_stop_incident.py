@@ -23,8 +23,8 @@ from tools.managed_incident import (
     MAX_REPORT_EVENTS,
     UNKNOWN,
     identifier,
-    lifecycle_fields,
     observations,
+    pending_delivery_fields,
     read_journal,
     reference,
     sampled_status,
@@ -395,8 +395,7 @@ def journal_fields(
                     stop_at = charger_timestamp(row[2]).isoformat()
                 except DeniedError:
                     pass
-            if {"outbox", "delivery_replies"} <= tables:
-                _, _, delivery = lifecycle_fields(db, local)
+            delivery = pending_delivery_fields(db, local)
     return {
         "available": True,
         "request": request,
