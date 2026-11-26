@@ -22,9 +22,9 @@ the dashboard stays visible while its charger buttons are unavailable. After one
 buttons wait for the request helper, automation state and active-run count from the remaining connection.
 The offline dashboard hides request feedback.
 
-If disabling the automation interrupts its wait for a Start or Stop, the first cleanup tick after re-enabling
-it marks the request unconfirmed. The charger buttons wait for that feedback to update before accepting another
-tap. The proxy can still settle the original request.
+If disabling the automation or restarting Home Assistant interrupts a Start or Stop wait, the first cleanup tick
+after the automation resumes marks the saved request unconfirmed. The charger buttons wait for that feedback to
+update before accepting another tap. The proxy can still settle the original request.
 
 Use this with a compatible 480 × 480 ESPHome/LVGL touchscreen whose Home Assistant renderer provides the assigned
 view and display image. The canvas example is a package for an existing board configuration. The board supplies its
@@ -39,7 +39,8 @@ display, touch and brightness components, its fallback dashboard, and the render
    The package synchronizes its Home Assistant clock every 10 seconds to check render times. Set the renderer to
    update every 25 seconds or less with the example's 10-second download interval and 5-second HTTP timeout.
    This leaves time for clock rounding and processing before the picture expires. Update the firmware, preview
-   template and touch automation together. You can keep the existing request helper with the same options.
+   template and touch automation together. Keep the request helper and its options and remove `initial: idle`
+   if an earlier example set it.
 4. Confirm that the automation entity ID used by the view and the firmware's `canvas_ics_automation_entity`
    substitution matches the installed automation.
    In the view, write the quoted entity ID directly in both `is_state()` and `state_attr()` so GeekMagic

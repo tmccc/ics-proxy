@@ -7,4 +7,3 @@ input_select:
       - stopping
       - starting_timeout
       - stopping_timeout
-    initial: idle

@@ -2,9 +2,11 @@
 
 import asyncio
 import re
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 import yaml
 from homeassistant import bootstrap, loader
 from homeassistant.config_entries import ConfigEntries
@@ -406,3 +408,75 @@ async def test_public_display_example_with_actual_ha(tmp_path):
         gate.set()
         await hass.services.async_call("automation", "turn_off", {"entity_id": AUTOMATION}, blocking=True)
         await hass.async_stop(force=True)
+
+
+# Intent: a Home Assistant restart carries an interrupted request into the existing unconfirmed feedback.
+# Why: the independent proxy can still settle that request after the original Home Assistant run ends.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+async def test_display_restores_interrupted_feedback_after_ha_restart(tmp_path, starting):
+    calls = []
+    request_started = asyncio.Event()
+    pending = "starting" if starting else "stopping"
+    original_request = (
+        {"action": "start", "revision": REVISION} if starting else {"action": "stop_session", "target": TARGET}
+    )
+
+    # Hold the service response until Core shuts down this automation run.
+    async def request(call):
+        calls.append(dict(call.data))
+        request_started.set()
+        return await asyncio.Future()
+
+    @asynccontextmanager
+    async def run_core():
+        hass = HomeAssistant(str(tmp_path))
+        loader.async_setup(hass)
+        hass.config_entries = ConfigEntries(hass, {})
+        assert await bootstrap.async_load_base_functionality(hass)
+        config = yaml.safe_load((PROJECT / "controls.yaml").read_text())
+        helper = yaml.safe_load((PROJECT / "request-helper.yaml").read_text())
+        hass.services.async_register("ics_proxy", "session_command", request, supports_response=SupportsResponse.ONLY)
+        assert await async_setup_component(hass, "input_select", helper)
+        assert await async_setup_component(hass, "automation", {"automation": [config]})
+        await hass.async_start()
+        await hass.async_block_till_done()
+        try:
+            yield hass
+        finally:
+            await hass.async_stop(force=True)
+
+    async with run_core() as hass:
+        assert hass.states.get(PENDING).state == "idle"
+        hass.states.async_set("sensor.ics_display_screen_source", "Home Assistant")
+        hass.states.async_set(
+            IMAGE,
+            datetime.now(UTC).isoformat(),
+            {"assigned_views": [VIEW], "current_view_id": VIEW, "rendered_view_id": VIEW, "notification_active": False},
+        )
+        hass.states.async_set(
+            SESSION,
+            "off" if starting else "on",
+            {"can_start": True, "control_revision": REVISION} if starting else {"stop_target": TARGET},
+        )
+        hass.bus.async_fire(
+            "esphome.general_display_touch",
+            {
+                "display": "general_display_2",
+                "device_id": "replace-with-esphome-device-id",
+                "x": "120" if starting else "352",
+                "y": "396",
+                "canvas_age_seconds": "1",
+                "frame_control": START_MARKER if starting else "stop:" + TARGET,
+            },
+        )
+        await asyncio.wait_for(request_started.wait(), 3)
+        assert hass.states.get(PENDING).state == pending
+        assert hass.states.get(AUTOMATION).attributes["current"] == 1
+
+    unconfirmed = pending + "_timeout"
+    async with run_core() as hass:
+        assert hass.states.get(PENDING).state in (pending, unconfirmed)
+        async with asyncio.timeout(6):
+            while hass.states.get(PENDING).state != unconfirmed or hass.states.get(AUTOMATION).attributes["current"]:
+                await asyncio.sleep(0.02)
+        assert calls == [original_request]
