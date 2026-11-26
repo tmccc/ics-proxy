@@ -17,7 +17,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -295,41 +295,44 @@ def private_snapshot_file(info: os.stat_result) -> bool:
     return stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077
 
 
-# Read one private WAL snapshot with no service lock, normalization, socket or recovery call.
+# Rebuild the WAL index on the private copy and confirm the original files stayed stable.
+def copy_snapshot(path: Path, copy: Path) -> bool:
+    parent = path.parent.stat()
+    sidecars = {suffix: Path(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal")}
+    present = {suffix for suffix, source in sidecars.items() if os.path.lexists(source)}
+    sources = {"": path, **{suffix: sidecars[suffix] for suffix in ("-wal", "-journal") if suffix in present}}
+    observations = {suffix: source.lstat() for suffix, source in sources.items()}
+    if any(not private_snapshot_file(info) for info in observations.values()):
+        raise ValueError("incident requires private regular journal files")
+    for suffix, source in sources.items():
+        shutil.copyfile(source, Path(str(copy) + suffix))
+    return (
+        all(same_snapshot_version(observations[suffix], source.lstat()) for suffix, source in sources.items())
+        and same_snapshot_version(parent, path.parent.stat())
+        and all(os.path.lexists(source) == (suffix in present) for suffix, source in sidecars.items())
+    )
+
+
+# Read a stable snapshot. SQLite may create a WAL or update its index even when opened with mode=ro.
 @contextmanager
 def read_journal(path: Path) -> Iterator[sqlite3.Connection]:
-    info = path.lstat()
-    if not private_snapshot_file(info):
+    if not private_snapshot_file(path.lstat()):
         raise ValueError("incident requires a private regular journal file")
-    with ExitStack() as resources:
-        parent = path.parent.stat()
-        sidecars = {suffix: Path(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal")}
-        present = {suffix for suffix, source in sidecars.items() if os.path.lexists(source)}
-        if not {"-wal", "-shm"} <= present:
-            # Build any needed WAL index on a private copy, even beside a writable stopped journal.
-            directory = resources.enter_context(tempfile.TemporaryDirectory(prefix="ics-incident-"))
+    for _ in range(3):
+        with tempfile.TemporaryDirectory(prefix="ics-incident-") as directory:
             copy = Path(directory) / "journal.sqlite"
-            copied = [("", path, info)]
-            for suffix in ("-wal", "-journal"):
-                if suffix in present:
-                    source = sidecars[suffix]
-                    source_info = source.lstat()
-                    if not private_snapshot_file(source_info):
-                        raise ValueError("incident requires private regular journal sidecars")
-                    copied.append((suffix, source, source_info))
-            for suffix, source, _ in copied:
-                shutil.copyfile(source, Path(str(copy) + suffix))
-            if (
-                any(not same_snapshot_version(saved, source.lstat()) for _, source, saved in copied)
-                or not same_snapshot_version(parent, path.parent.stat())
-                or any(os.path.lexists(source) != (suffix in present) for suffix, source in sidecars.items())
-            ):
-                raise ValueError("incident backup changed while being copied")
-            path = copy
-        db = resources.enter_context(closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.1)))
-        db.execute("PRAGMA query_only=ON")
-        db.execute("BEGIN")
-        yield db
+            try:
+                stable = copy_snapshot(path, copy)
+            except FileNotFoundError:
+                continue  # A checkpoint can remove sidecars during the copy.
+            if not stable:
+                continue
+            with closing(sqlite3.connect(copy.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as db:
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                yield db
+                return
+    raise ValueError("incident journal changed while being copied")
 
 
 # Assemble Start facts from the same SQLite read transaction.

@@ -624,7 +624,9 @@ class NativeBoundedHandover:
 
             try:
                 recovering = gateway.decide(
-                    lambda: decisions.prepare_introduction(self, claim, native, read_sequence),
+                    lambda: decisions.prepare_introduction(
+                        self, claim, native, read_sequence, selected_current=selected_current
+                    ),
                     priority=CommandPriority.RESTRICT,
                 )
                 if recovering and claim.first_zero:

@@ -24,7 +24,7 @@ from tests.process_helpers import process_rig
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 from tests.trial_helpers import config_files
-from tools import managed_proxy
+from tools import managed_incident, managed_proxy
 from tools.managed_incident import MAX_REPORT_EVENTS, incident_report, reference
 from tools.managed_stop_incident import stop_incident_report
 
@@ -288,25 +288,30 @@ def test_incident_cli_uses_local_read_only_sources(tmp_path, tls, capsys, monkey
 # Intent: read stopped journal snapshots with and without uncheckpointed records.
 # Why: reporting must retain committed WAL records without creating sidecars or changing source files.
 @pytest.mark.parametrize("read_only", [False, True], ids=["writable", "read-only"])
-@pytest.mark.parametrize("sidecar", ["", "-wal", "-shm"], ids=["checkpointed", "uncheckpointed", "index-only"])
-def test_incident_reads_stopped_journal_without_writes(tmp_path, read_only, sidecar):
+@pytest.mark.parametrize(
+    "sidecars",
+    [(), ("-wal",), ("-shm",), ("-wal", "-shm"), ("-wal", "-shm", ".lock")],
+    ids=["checkpointed", "uncheckpointed", "index-only", "paired-backup", "stopped-owner"],
+)
+def test_incident_reads_stopped_journal_without_writes(tmp_path, read_only, sidecars):
     archive = tmp_path / "backup"
     archive.mkdir(mode=0o700)
     path = archive / "journal.sqlite"
     request = uuid.uuid4().hex
-    source = tmp_path / "fixture.sqlite" if sidecar else path
+    source = tmp_path / "fixture.sqlite" if sidecars else path
     journal = Journal(source, "OFFLINE001")
     try:
         requests = ManagedRequests(journal)
         journal.db.execute("PRAGMA wal_autocheckpoint=0")
-        if sidecar == "-wal":
+        if "-wal" in sidecars:
             journal.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         requests.accept(request, "start", 0)
-        if sidecar == "-shm":
+        if sidecars == ("-shm",):
             journal.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        if sidecar:
+        if sidecars:
             shutil.copy2(source, path)
-            shutil.copy2(Path(str(source) + sidecar), Path(str(path) + sidecar))
+            for suffix in sidecars:
+                shutil.copy2(Path(str(source) + suffix), Path(str(path) + suffix))
     finally:
         journal.close()
     files_before = {file.name: file.read_bytes() for file in archive.iterdir()}
@@ -321,6 +326,57 @@ def test_incident_reads_stopped_journal_without_writes(tmp_path, read_only, side
         assert {file.name: file.read_bytes() for file in archive.iterdir()} == files_before
     finally:
         archive.chmod(0o700)
+
+
+# A clean owner exit during copying removes the live sidecars and checkpoints the journal.
+def test_incident_reads_journal_as_owner_closes(tmp_path, monkeypatch):
+    path = tmp_path / "journal.sqlite"
+    request = uuid.uuid4().hex
+    journal = Journal(path, "OFFLINE001")
+    files_after_close = {}
+
+    def close_during_copy(source, target):
+        shutil.copyfile(source, target)
+        if source == path and not files_after_close:
+            journal.close()
+            files_after_close.update({file.name: file.read_bytes() for file in tmp_path.iterdir()})
+
+    try:
+        ManagedRequests(journal).accept(request, "start", 0)
+        monkeypatch.setattr(managed_incident, "shutil", SimpleNamespace(copyfile=close_during_copy))
+        saved = incident_report(path, tmp_path / "events.jsonl")["journal"]
+    finally:
+        journal.close()
+    assert saved["available"] is True and saved["request"]["request"] == reference(request)
+    assert set(files_after_close) == {"journal.sqlite", "journal.sqlite.lock"}
+    assert {file.name: file.read_bytes() for file in tmp_path.iterdir()} == files_after_close
+
+
+# Retry a moving snapshot so the report sees a newer committed WAL record without touching the index.
+def test_incident_retries_when_live_wal_changes_during_copy(tmp_path, monkeypatch):
+    path = tmp_path / "journal.sqlite"
+    wal = path.with_name(path.name + "-wal")
+    request = uuid.uuid4().hex
+    journal = Journal(path, "OFFLINE001")
+    files_after_commit = {}
+
+    def commit_during_wal_copy(source, target):
+        shutil.copyfile(source, target)
+        if source == wal and not files_after_commit:
+            requests.accept(request, "start", 0)
+            files_after_commit.update({file.name: file.read_bytes() for file in tmp_path.iterdir()})
+
+    try:
+        requests = ManagedRequests(journal)
+        journal.db.execute("PRAGMA wal_autocheckpoint=0")
+        journal.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        requests.accept(uuid.uuid4().hex, "start", 0)
+        monkeypatch.setattr(managed_incident, "shutil", SimpleNamespace(copyfile=commit_during_wal_copy))
+        saved = incident_report(path, tmp_path / "events.jsonl")["journal"]
+        assert saved["available"] is True and saved["request"]["request"] == reference(request)
+        assert {file.name: file.read_bytes() for file in tmp_path.iterdir()} == files_after_commit
+    finally:
+        journal.close()
 
 
 # Intent: the incident command selects a retained local Stop by its redacted request reference.

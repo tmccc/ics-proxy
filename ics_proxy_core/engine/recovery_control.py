@@ -189,7 +189,7 @@ class RecoveryControl:
     def verified_normal(self, charging: ManagedCharging) -> bool:
         return charging.lease is None and self._verified_normal_start(charging.state()) is not None
 
-    # Cold startup can verify the same durable Start before the managed controller is constructed.
+    # Startup and charger reintroduction can verify the same durable Start directly from the journal.
     def _verified_normal_start(self, state: dict[str, Any]) -> str | None:
         j = self.journal
         receipt = j.starts.receipt()
@@ -883,18 +883,18 @@ class RecoveryControl:
                     session.native_bounded,
                     native,
                     inventory_audited=True,
-                    startup_current=session._commissioned_selection(),
+                    selected_current=session._commissioned_selection(),
                 )
                 self.journal.phase.recover()
 
-    # A fresh audit can recognize closure during startup or after a native outage has already claimed this session.
+    # A fresh audit can recognize closure during introduction or under an existing hold for this session.
     def recognize_owner_closure(
         self,
         handover: NativeBoundedHandover,
         native: HandoverEvidence,
         *,
         inventory_audited: bool,
-        startup_current: int | None = None,
+        selected_current: int | None = None,
     ) -> None:
         j = self.journal
         hold, local = j.get(KEY, {}), j.active()
@@ -907,21 +907,27 @@ class RecoveryControl:
             and intent is not None
             and decode_intent(intent) == ControlIntent("app", revision)
         )
-        if (
-            holding
-            and hold.get("reason") == "native_observation_unavailable"
-            and self._owner_hold_matches(hold, local)
-            and self.owner_closure_gap(handover, native, local, allow_plugged_close=plugged)
-        ):
+        if holding:
+            held_reason = hold.get("reason")
+            if held_reason not in ("native_observation_unavailable", "restricted_introduction"):
+                return
+            if not self._owner_hold_matches(hold, local):
+                return
+            if held_reason == "native_observation_unavailable":
+                closure = self.owner_closure_gap(handover, native, local, allow_plugged_close=plugged)
+            else:
+                closure = self._closing_owner_start(handover, native, local) is not None
+            if not closure:
+                return
             if not inventory_audited:
                 handover.book.owned_present(native.physical)
             if recorded_station_profile(j, handover.spec.digest, handover.spec.boot_digest):
                 j.put(KEY, {**hold, "reason": reason})
-        elif not holding and startup_current is not None:
+        elif selected_current is not None:
             start = self._closing_owner_start(handover, native, local)
             if start is not None and recorded_station_profile(j, handover.spec.digest, handover.spec.boot_digest):
                 revision = decode_intent(intent).revision
-                j.put(KEY, self._new_ordinary_hold(reason, revision, local, start, startup_current))
+                j.put(KEY, self._new_ordinary_hold(reason, revision, local, start, selected_current))
 
     # Bind the new observation to the admitted installation before any native wait.
     def begin_introduction(self, handover: NativeBoundedHandover) -> IntroductionClaim:
@@ -942,7 +948,13 @@ class RecoveryControl:
 
     # Preserve the original binding and enter the restrictive hold before verifying zero.
     def prepare_introduction(
-        self, handover: NativeBoundedHandover, claim: IntroductionClaim, native: HandoverEvidence, sequence: int
+        self,
+        handover: NativeBoundedHandover,
+        claim: IntroductionClaim,
+        native: HandoverEvidence,
+        sequence: int,
+        *,
+        selected_current: int | None,
     ) -> bool:
         from .native_bounded_handover import NativeSessionPendingError
 
@@ -984,8 +996,12 @@ class RecoveryControl:
                 },
             )
         if binding is not None or journal.get("control", {}).get("uncertain"):
-            control = journal.get("control", {})
-            journal.control.hold(control)
+            with journal.atomic():
+                if binding is not None:
+                    self.recognize_owner_closure(
+                        handover, native, inventory_audited=True, selected_current=selected_current
+                    )
+                journal.control.hold(journal.get("control", {}))
             return True
         return False
 

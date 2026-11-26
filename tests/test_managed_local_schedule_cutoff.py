@@ -16,7 +16,7 @@ from ics_proxy_core.engine.managed_intent import AUTOMATIC_PAUSE_CAUSE, LOCAL_SC
 from ics_proxy_core.engine.managed_sources import ORDINARY_HOLD
 from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
-from tests.managed_rig import starts
+from tests.managed_rig import introduced, starts
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.test_managed_local_schedule import MIDNIGHT, connection, overnight, status
@@ -890,6 +890,110 @@ async def test_replacement_recognizes_owner_closure_after_native_outage(
             await status(test, lambda view: len(starts(rig)) == 2)
             await c.charging.settle()
             assert not stops(bench)
+
+
+# Intent: keep both closure orders at zero through a charger reconnect and another Boot on its new socket.
+# Why: a failed vendor registration must leave the next scheduled occurrence available once closure settles.
+@pytest.mark.parametrize("reported_first", [False, True], ids=["native-first", "report-first"])
+async def test_owner_closure_during_charger_reconnect(tmp_path, tls, unused_tcp_port, monkeypatch, reported_first):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        bench = rig.bench
+        async with connection(rig, "before-owner-closure-reconnect") as test:
+            c, j, g = test.controller, test.session.journal, test.session.gateway
+            local, meter_start = await begin(test, clock)
+            original = c.requests.intent()
+            occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
+            receipt = c.requests.receipt(occurrence["request"])
+            assert j.get(ORDINARY_HOLD) is None
+            clock.now = MIDNIGHT + 30
+            if reported_first:
+                await close(test, clock, local, meter_start)
+            bench.cp, bench.connection = "B", "Plug"
+            bench.firmware.active = local if reported_first else None
+            bench.firmware.requested_current = 0
+            rig.peer.permission_enabled = False
+
+            await test.charger.close()
+            await until(lambda: not test.session.runtime.status.charger_connected)
+            limits = len(bench.received_limits)
+            async with rig.charger(test.session) as charger:
+                reconnected = replace(test, charger=charger)
+                assert (await bench.call(charger, "owner-closure-reconnect", "BootNotification", BOOT))[0] == 3
+                await until(lambda: test.session.runtime.status.vendor_failed_charger_epoch == g._charger_epoch)
+                view = await c.tick()
+                assert view["state"] == "reconciling" and not view["local_hold_verified"]
+                hold = j.get(ORDINARY_HOLD)
+                if not reported_first:
+                    assert c.requests.intent() == original and j.active() == local
+                    assert hold["local"] == local and hold["reason"] == "native_closure_pending"
+                    assert not j.outcomes.stop_report_closed(local)
+
+                boot = g.boot_observation
+                assert (await bench.call(charger, "owner-closure-repeat-boot", "BootNotification", BOOT))[0] == 3
+                assert g.boot_observation != boot
+                assert (await c.tick())["state"] == "reconciling"
+                if not reported_first:
+                    assert j.get(ORDINARY_HOLD) == hold and c.requests.intent() == original
+                    await close(reconnected, clock, local, meter_start)
+                bench.firmware.active = None
+                await status(reconnected, lambda value: value["local_hold_verified"])
+                assert j.outcomes.stop_report_closed(local) and not j.fault.latched()
+                assert c.requests.receipt(occurrence["request"]) == receipt
+                assert c.requests.offline_pause_current(c.requests.intent())
+                assert bench.received_limits[limits:] and set(bench.received_limits[limits:]) == {0}
+                assert len(starts(rig)) == 1 and not stops(bench)
+
+                clock.now = MIDNIGHT + 24 * 3600
+                await status(reconnected, lambda value: len(starts(rig)) == 2)
+                await c.charging.settle()
+
+
+# Intent: recognize native closure when a previous reconnect had already saved a hold for the exact owner Start.
+# Why: that hold must preserve the completed Start and the following schedule even across process replacement.
+async def test_owner_closure_replacement_upgrades_existing_reconnect_hold(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        bench = rig.bench
+        async with connection(rig, "before-first-owner-reconnect") as test:
+            c, j = test.controller, test.session.journal
+            local, meter_start = await begin(test, clock)
+            original = c.requests.intent()
+            occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
+            receipt = c.requests.receipt(occurrence["request"])
+            bench.vendor_available = True
+            await test.charger.close()
+            await until(lambda: not test.session.runtime.status.charger_connected)
+            async with rig.charger(test.session) as charger:
+                await introduced(rig, test.session, charger, "reconnect-while-owner-session-open")
+                assert j.active() == bench.firmware.active == local
+                assert (await c.tick())["state"] == "reconciling"
+                hold = j.get(ORDINARY_HOLD)
+                assert hold["local"] == local and hold["reason"] == "restricted_introduction"
+                assert bench.firmware.effective_limit() == 0
+
+                clock.now = MIDNIGHT + 30
+                bench.cp, bench.connection = "B", "Plug"
+                bench.firmware.active = None
+                bench.firmware.requested_current = 0
+                rig.peer.permission_enabled = False
+                await bench.vendor_outage()
+
+        async with connection(rig, "replacement-after-native-close") as replacement:
+            c, j = replacement.controller, replacement.session.journal
+            assert c.requests.intent() == original and c.charging.state()["state"] == "running"
+            assert j.get(ORDINARY_HOLD) == {**hold, "reason": "native_closure_pending"}
+            assert (await c.tick())["state"] == "reconciling"
+            assert j.active() == local and not j.outcomes.stop_report_closed(local)
+            assert bench.firmware.effective_limit() == 0 and not stops(bench)
+
+            await close(replacement, clock, local, meter_start)
+            await status(replacement, lambda value: value["local_hold_verified"])
+            assert j.outcomes.stop_report_closed(local) and not j.fault.latched()
+            assert c.requests.receipt(occurrence["request"]) == receipt
+            assert c.requests.offline_pause_current(c.requests.intent())
+            assert len(starts(rig)) == 1 and not stops(bench)
+            clock.now = MIDNIGHT + 24 * 3600
+            await status(replacement, lambda value: len(starts(rig)) == 2)
+            await c.charging.settle()
 
 
 # Intent: retain an exact zero hold across replacement while native closure is pending.
