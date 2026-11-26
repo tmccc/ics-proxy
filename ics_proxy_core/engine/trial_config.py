@@ -157,6 +157,7 @@ class TrialConfig:
             Path(str(self.journal) + ".lock"),
             Path(str(self.journal) + "-wal"),
             Path(str(self.journal) + "-shm"),
+            Path(str(self.journal) + "-journal"),
             self.journal.with_suffix(".status.json"),
             self.journal.with_suffix(".events.jsonl"),
             self.journal.with_suffix(".events.jsonl.1"),

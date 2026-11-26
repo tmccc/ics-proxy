@@ -69,8 +69,7 @@ class LocalSchedule:
         except sqlite3.Error:
             if self.journal.db.in_transaction:
                 raise
-            return  # No positive work was launched before the admission commit.
-        self.deadline = identifier, time.monotonic() + window.ends_at - now
+            return  # A committed admission already owns its worker and cutoff.
 
     # A single replacement admission is safe only when the original Start had no physical effects or wire.
     def _proved_unsent(self, identifier: str, revision: int) -> bool:
@@ -95,9 +94,11 @@ class LocalSchedule:
             and not j.outcomes.owner_wires("request", identifier)
         )
 
-    # A late admission cannot keep the existing Start worker alive beyond the scheduled cutoff.
-    def remaining(self, window: ScheduleWindow) -> float:
-        return window.ends_at - time.time()
+    # Sample both clocks before admission so a later wall-clock correction cannot extend this occurrence.
+    def sample_cutoff(self, window: ScheduleWindow) -> tuple[float, float]:
+        elapsed = time.monotonic()
+        remaining = window.ends_at - time.time()
+        return remaining, elapsed + remaining
 
     # This restriction runs at each existing lease boundary, including nested charger authorization.
     def require_lease(self, lease: ChargeLease, *, finishing_initial_zero: bool = False) -> None:

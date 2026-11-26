@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -141,6 +142,54 @@ async def test_cutoff_owns_exact_stop_until_real_closure(tmp_path, tls, unused_t
             clock.now = MIDNIGHT + 24 * 3600
             await status(test, lambda value: len(starts(rig)) == 2)
             assert j.get(LOCAL_SCHEDULE_OCCURRENCE)["request"] != occurrence["request"]
+
+
+# Intent: enforce the same elapsed cutoff when SQLite refuses the scheduled Start's first receipt read.
+# Why: a committed Start can charge after that read fails, and a backward clock adjustment cannot extend its window.
+@pytest.mark.parametrize("refuse_receipt", [False, True], ids=["read-works", "refused-post-commit-read"])
+async def test_cutoff_uses_elapsed_time_after_scheduled_receipt_read(
+    tmp_path, tls, unused_tcp_port, monkeypatch, refuse_receipt
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "same-process-cutoff") as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            insert_seen = False
+            denied = []
+
+            # Refuse the first receipt table read while allowing the already committed Start to proceed.
+            def authorize(action, table, column, database, trigger):
+                if not denied and action == sqlite3.SQLITE_READ and table == "managed_requests":
+                    denied.append(table)
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            # Arm the read refusal only during the actual transaction that admits the scheduled Start.
+            def trace(sql):
+                nonlocal insert_seen
+                if sql.startswith("INSERT INTO managed_requests VALUES") and "'start'" in sql:
+                    insert_seen = True
+                if insert_seen and sql == "COMMIT" and not denied:
+                    j.db.set_authorizer(authorize)
+
+            if refuse_receipt:
+                j.db.set_trace_callback(trace)
+            try:
+                local, _ = await begin(test, clock)
+            finally:
+                j.db.set_trace_callback(None)
+                j.db.set_authorizer(None)
+            assert denied == (["managed_requests"] if refuse_receipt else [])
+            occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE)
+            assert j.active() == bench.firmware.active == occurrence["local"] == local
+            assert c.requests.receipt(occurrence["request"])["result"]["local_session_verified"]
+            assert bench.firmware.effective_limit() == 6 and not stops(bench)
+
+            # Correct the civil clock backward before the first cutoff poll while elapsed time continues.
+            clock.now = MIDNIGHT + 6 * 3600
+            clock.step_wall(MIDNIGHT + 6 * 3600 - 60)
+            await c.tick()
+            assert bench.firmware.effective_limit() == 0
+            assert stops(bench) == [{"transactionId": local}]
 
 
 # Intent: the native session ID can lag behind the genuine cutoff Stop report, even across process replacement.

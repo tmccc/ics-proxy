@@ -217,7 +217,7 @@ def test_health_cli_stale_report_returns_failure(
 # Intent: the native-mode specification cannot be overwritten by a status, event, rotation or journal output.
 # Why: corruption after the first valid parse could otherwise break the next automatic service restart.
 @pytest.mark.parametrize(
-    "output", ["journal", "status", "events", "rotation", "baseline", "original", "evidence", "wal"]
+    "output", ["journal", "status", "events", "rotation", "baseline", "original", "evidence", "wal", "rollback"]
 )
 def test_managed_spec_rejects_output_aliases(
     tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], output: str
@@ -232,6 +232,7 @@ def test_managed_spec_rejects_output_aliases(
         "original": config.baseline.with_suffix(".original-config.json"),
         "evidence": config.evidence,
         "wal": Path(str(config.journal) + "-wal"),
+        "rollback": Path(str(config.journal) + "-journal"),
     }
     with pytest.raises(SecurityError):
         managed_proxy.check_spec_path(config, paths[output])
@@ -396,18 +397,26 @@ async def test_operator_inspection_reads_a_stopped_wal_without_writing_it(tmp_pa
             assert writer.execute("SELECT value FROM meta WHERE key='test_stopped_wal'").fetchone()[0] == "true"
 
 
-# Intent: commissioning refuses a valid native strategy stored at its own status output path.
-# Why: starting from that alias would replace the owner's spec with a status report.
-async def test_commissioning_refuses_to_overwrite_its_native_spec(tmp_path, tls, unused_tcp_port):
+# Intent: commissioning and managed startup refuse a valid native strategy stored at a service output path.
+# Why: even a fresh journal's rollback sidecar can be removed by SQLite before the listener starts.
+@pytest.mark.parametrize("rollback_sidecar", [False, True], ids=["status", "rollback-sidecar"])
+async def test_commissioning_refuses_to_overwrite_its_native_spec(tmp_path, tls, unused_tcp_port, rollback_sidecar):
     async with connected_bench(tmp_path, tls, unused_tcp_port) as rig:
         strategy = strategy_file(rig, tmp_path)
-        status = rig.prepared.config.journal.with_suffix(".status.json")
-        save_private(status, json.loads(strategy.read_text()))
-        before = status.read_bytes()
+        journal = rig.prepared.config.journal
+        config = tmp_path / "trial.json"
+        output = Path(str(journal) + "-journal") if rollback_sidecar else journal.with_suffix(".status.json")
+        save_private(output, json.loads(strategy.read_text()))
+        before = output.read_bytes()
+        check = ["check", "--config", str(config), "--native-bounded-spec"]
+        assert managed_proxy.main([*check, str(strategy)]) == 0
+        assert managed_proxy.main([*check, str(output)]) == 2
         with pytest.raises(SecurityError, match="must not alias"):
-            await trial_proxy.run(tmp_path / "trial.json", 1, False, status)
-        assert status.read_bytes() == before
-        assert not rig.prepared.config.journal.exists() and not rig.bench.device_calls
+            await trial_proxy.run(config, 1, False, output)
+        with pytest.raises(SecurityError, match="must not alias"):
+            await managed_proxy.serve(config, output)
+        assert output.read_bytes() == before
+        assert not journal.exists() and not rig.bench.device_calls
 
 
 # Intent: a saved managed journal can never reopen with assistant-local Start enabled by an ordinary constructor.

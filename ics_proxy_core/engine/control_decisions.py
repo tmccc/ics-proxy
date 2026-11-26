@@ -1320,14 +1320,18 @@ class ControlDecisions:
                 if action == "start"
                 else "test requires current shared six-ampere authority and no pending work"
             )
+        schedule_cutoff = None
         if schedule is not None:
-            startup = min(startup, c.local_schedule.remaining(schedule))
+            remaining, schedule_cutoff = c.local_schedule.sample_cutoff(schedule)
+            startup = min(startup, remaining)
             if startup <= 0:
                 raise DeniedError("the scheduled Start window closed before admission")
         lease = charging._start_lease(identifier, action, revision, schedule=schedule, startup=startup)
         if schedule is not None and (not lease.normal or lease.owner_start_tag is None):
             raise DeniedError("a local schedule requires its bounded owner Start authorization")
         j.starts.admit(lease, action, startup, duration)
+        if schedule_cutoff is not None:
+            c.local_schedule.deadline = identifier, schedule_cutoff
         charging._launch_start(lease)
         return c.requests.receipt(identifier)
 
