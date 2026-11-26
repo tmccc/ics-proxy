@@ -7,7 +7,7 @@ import asyncio
 import json
 import time
 import uuid
-from contextlib import closing
+from contextlib import AsyncExitStack, closing
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 
@@ -312,6 +312,76 @@ async def test_session_stop_awaits_closure_when_session_closes_in_gate(tmp_path,
         assert binding["dispatched"] is False and "joined" not in binding and binding["closure_verified"] is True
         assert receipt["target"] == target and receipt["revision"] == intent.revision
         assert status["charging_session_open"] is False and c.requests.intent() == intent
+        assert not bench.remote_stop.is_set()
+
+
+# Intent: a new Boot retires an old wire target while the accepted request can still learn its exact closure.
+# Why: a genuine report can reach the journal before reconnect and before an independent charger reading.
+@pytest.mark.parametrize("transition", ["boot", "reconnect", "expiry", "open", "new-session"])
+async def test_queued_stop_keeps_original_closure_across_boot(tmp_path, tls, unused_tcp_port, monkeypatch, transition):
+    async with owner_rig(tmp_path, tls, unused_tcp_port, monkeypatch) as t, AsyncExitStack() as connections:
+        c, j, gateway, bench = t.controller, t.session.journal, t.session.gateway, t.rig.bench
+        local = await positive_flow(t, "daily")
+        await healthy(c)
+        request, intent = uuid.uuid4().hex, c.requests.intent()
+        target = c.session_stop.target()
+        assert target is not None
+
+        replacement = None
+        replacement_at = "2026-01-01T00:01:00Z"
+        gate = gateway.charger.gate
+        async with gate.enter(10):
+            assert c.command(request, "stop_session", intent.revision, target=target)["state"] == "accepted"
+            await asyncio.wait_for(gate.restrictive_waiting.wait(), 3)
+            if transition != "open":
+                await natural_stop(t, local)
+                assert j.outcomes.session(local).closed
+            if transition == "new-session":
+                replacement = await positive_flow(
+                    t, "daily", call_id="replacement-after-queued-stop", timestamp=replacement_at
+                )
+                assert replacement != local
+
+            boot, charger = gateway.boot_observation, t.charger
+            if transition == "reconnect":
+                await charger.close()
+                await until(lambda: gateway.charger.sender is None)
+                charger = await connections.enter_async_context(t.rig.charger(t.session))
+            assert (await bench.call(charger, "boot-with-queued-stop", "BootNotification", BOOT))[0] == 3
+            await until(lambda: gateway.boot_observation is not None and gateway.boot_observation != boot)
+
+            if transition == "expiry":
+                expired = time.monotonic() + managed_session_stop.CONFIRMATION_SECONDS + 1
+                with monkeypatch.context() as clock:
+                    clock.setattr(
+                        managed_session_stop, "time", SimpleNamespace(time=time.time, monotonic=lambda: expired)
+                    )
+                    c.session_stop.expire()
+                assert c.requests.receipt(request)["state"] == "uncertain"
+
+        assert c.session_stop.worker is not None
+        await asyncio.wait_for(c.session_stop.worker, 3)
+        receipt = c.requests.receipt(request, include_binding=True)
+        assert receipt["target"] == target and receipt["revision"] == intent.revision
+        if transition == "open":
+            assert receipt["state"] == "failed" and receipt["result"]["classification"] == "stop_not_sent"
+            assert j.active() == local
+            await natural_stop(t, local)
+            await healthy(c)
+            assert c.requests.receipt(request)["state"] == "failed"
+        else:
+            assert receipt["state"] == ("uncertain" if transition == "expiry" else "accepted")
+            await healthy(c)
+            assert c.requests.receipt(request)["state"] == "completed"
+            assert c.requests.receipt(request)["result"]["session_stopped"] is True
+            assert j.active() == replacement
+            if replacement is not None:
+                assert c.session_stop.target() not in (None, target)
+                stop = {"transactionId": replacement, "timestamp": replacement_at, "meterStop": 1100}
+                assert (await bench.call(charger, "close-replacement-session", "StopTransaction", stop))[0] == 3
+                t.rig.peer.permission_enabled = False
+                await healthy(c)
+        assert c.requests.intent() == intent
         assert not bench.remote_stop.is_set()
 
 
@@ -1422,17 +1492,32 @@ def test_exact_stop_rejection_fences_receipt_after_replacement(tmp_path, source)
 
 # Intent: a replacement can finish a previously verified closure without reopening its retired wire window.
 # Why: legacy receipts with only an OCPP closing report still need independent evidence.
-@pytest.mark.parametrize("verified", [False, True], ids=["old-receipt", "verified-closure"])
-def test_replacement_settles_only_saved_verified_stop_closure(tmp_path, verified):
+@pytest.mark.parametrize(
+    ("verified", "dispatched"),
+    [
+        pytest.param(False, True, id="old-receipt"),
+        pytest.param(True, True, id="verified-closure"),
+        pytest.param(False, False, id="unsent-report-only"),
+        pytest.param(True, False, id="unsent-verified-closure"),
+    ],
+)
+def test_replacement_settles_only_saved_verified_stop_closure(tmp_path, verified, dispatched):
     path = tmp_path / "verified-closure.sqlite"
     with closing(Journal(path, "synthetic-charger")) as journal:
         ManagedRequests(journal)
         local = journal.start("start-report", START)["transactionId"]
-        journal.stop("stop-report", {"transactionId": local, "meterStop": 1200, "timestamp": "2026-01-01T00:01:00Z"})
-        binding = {"local": local, "dispatched": True}
+        binding = {"local": local, "dispatched": dispatched}
         if verified:
             binding["closure_verified"] = True
-        insert_request(journal, "stop-request", "stop_session", 0, {"_session_stop": binding}, state="running")
+        insert_request(
+            journal,
+            "stop-request",
+            "stop_session",
+            0,
+            {"_session_stop": binding},
+            state="running" if dispatched else "accepted",
+        )
+        journal.stop("stop-report", {"transactionId": local, "meterStop": 1200, "timestamp": "2026-01-01T00:01:00Z"})
 
     with closing(Journal(path, "synthetic-charger")) as journal:
         requests = ManagedRequests(journal)

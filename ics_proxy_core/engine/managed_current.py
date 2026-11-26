@@ -264,6 +264,19 @@ class ManagedCurrentLimits:
         settled, pending = await decisions.retry_current_recovery(self, change, expected)
         if settled:
             return pending
+        if pending is not None and pending.reason is Prerequisite.SOURCE:
+            # A conflicting fresh source revokes the previous release while that exact authority still owns it.
+            reclaim = c.commands.decide(
+                lambda: (
+                    c.authority() == published
+                    and self.journal.active() == local
+                    and decisions.reclaim_current_recovery(self, change, expected)
+                ),
+                priority=CommandPriority.RESTRICT,
+            )
+            if reclaim:
+                await self.protect_overlap()
+            return pending
         return Pending(Prerequisite.ZERO_PROOF, "current recovery awaits a verified station ceiling")
 
     # Hand the real Start report to the current recovery's decision owner.

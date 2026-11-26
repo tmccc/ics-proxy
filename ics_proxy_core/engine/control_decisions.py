@@ -1086,13 +1086,15 @@ class ControlDecisions:
                     and g.controls.ready
                     and g.controls.desired() == change["previous_a"]
                     and c.native.session_decision(native) is ALLOW
-                    and (
+                ):
+                    source = (
                         current_source_decision(g, None)
                         if local is None
                         else current_session_decision(g, native, local)
                     )
-                    is ALLOW
-                ):
+                    if isinstance(source, Pending):
+                        worker._settling_overlap = None
+                        return False, source
                     try:
                         c.session.book.require_confirmed_station(native.physical.resources, change["previous_a"])
                     except DeniedError:

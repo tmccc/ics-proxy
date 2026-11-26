@@ -75,7 +75,11 @@ def finite_number(value: object) -> float | None:
 
 # A fresh file or API response must still prove the applicable app or intentional zero-hold authority.
 def health_snapshot(
-    value: dict[str, Any], now: float | None = None, *, delivery_blocked: bool = False
+    value: dict[str, Any],
+    now: float | None = None,
+    *,
+    delivery_blocked: bool = False,
+    cloud_status_current: bool = True,
 ) -> dict[str, Any]:
     current = time.time() if now is None else now
     checked, native = finite_number(value.get("checked_at")), finite_number(value.get("native_observed_at"))
@@ -117,6 +121,7 @@ def health_snapshot(
         and value.get("native_limit_a") == native_ceiling
         and certificate_valid
     )
+    cloud_registered = value.get("cloud_connected") is True
     blockers = [
         reason
         for passed, reason in (
@@ -131,14 +136,15 @@ def health_snapshot(
             (bool(authority), "control_verification_pending"),
             (certificate_valid, "certificate_validity_insufficient"),
             (value.get("cloud_connected") is not False, "cloud_disconnected"),
+            (not cloud_registered or cloud_status_current, "cloud_status_pending"),
         )
         if not passed
     ]
-    if not local_okay and not any(reason != "cloud_disconnected" for reason in blockers):
+    if not local_okay and not any(reason not in ("cloud_disconnected", "cloud_status_pending") for reason in blockers):
         blockers.append("local_health_unverified")
     return {
         **value,
-        "healthy": local_okay and value.get("cloud_connected") is True,
+        "healthy": local_okay and cloud_registered and cloud_status_current,
         "local_healthy": local_okay,
         "status_age_seconds": age if math.isfinite(age) else None,
         "native_age_seconds": native_age if math.isfinite(native_age) else None,
@@ -535,8 +541,9 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         result["charger_connected"] = False
     if not g.current_boot_seen(g._charger_epoch):
         result["boot_verified"] = False
-    if not c.session.runtime.vendor_registered or c.status_vendor_epoch != g._vendor_epoch:
-        result["cloud_connected"] = False
+    # Show today's registration immediately. Full health still requires a poll on this vendor connection.
+    cloud_status_current = result.get("cloud_connected") is True and c.status_vendor_epoch == g._vendor_epoch
+    result["cloud_connected"] = c.session.runtime.vendor_registered
     current, observed = c.authority(), c.status_authority
     current_worker, start_worker = c.current.worker, c.charging.worker
     pending_fault = None
@@ -639,7 +646,9 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         result["pause_reason"] = "cloud_connection_failed"
     else:
         result.pop("pause_reason", None)
-    result = health_snapshot(result, delivery_blocked=runtime.delivery_blocked)
+    result = health_snapshot(
+        result, delivery_blocked=runtime.delivery_blocked, cloud_status_current=cloud_status_current
+    )
     fresh = all(
         age is not None and 0 <= age <= 15 for age in (result["status_age_seconds"], result["native_age_seconds"])
     )

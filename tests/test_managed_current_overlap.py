@@ -23,6 +23,7 @@ from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.test_managed_boot_supersession import delay_reply
 from tests.test_managed_schedule_unnumbered import unnumbered
+from tests.test_native_read_supersession import OrderedNativePeer
 from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
@@ -440,6 +441,67 @@ async def test_overlap_recovery_requires_live_station_before_settlement(
             assert b.c.requests.receipt(identifier) == before
             assert j.current_change.read().recovering and not b.stops() and not starts(b.rig)
             assert b.session.book.station_ceiling_lost()
+
+
+# Intent: revoke a restored positive offer in the same turn when fresh native evidence disagrees.
+# Why: an independently changed charging source cannot inherit the previous recovery’s approval.
+@pytest.mark.parametrize("after_composite", ("original", "source_changed", "transport_unavailable"))
+async def test_first_overlap_settlement_distinguishes_conflict_from_unavailable(
+    tmp_path, tls, unused_tcp_port, monkeypatch, after_composite
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, peer_type=OrderedNativePeer) as b:
+        async with interrupted_increase(b, True) as (identifier, release):
+            local = await b.start_plan(9, demand=True)
+            await b.c.native.read()
+            async with asyncio.timeout(3):
+                while b.session.journal.next_delivery() is not None or b.session.gateway.vendor._pending:
+                    await asyncio.sleep(0.01)
+            b.c.current.worker.cancel()
+            await asyncio.gather(b.c.current.worker, return_exceptions=True)
+            release.set()
+        await crash(b.session)
+        b.session = managed_session(b.rig)
+        await b.session.start()
+        b.c = ManagedController(b.session)
+        j = b.session.journal
+        async with b.rig.charger(b.session) as b.sock:
+            await introduced(b.rig, b.session, b.sock, "first-settlement-scope")
+            assert b.device.effective_limit() == 0
+            before = b.c.requests.receipt(identifier)
+            assert before["state"] == "uncertain"
+            result = b.device.answer
+            positive_composites = []
+
+            # Arrange the independent native change after the simulated charger confirms the previous limit.
+            def observe_after_positive_composite(action, payload):
+                answer = result(action, payload)
+                if action == "GetCompositeSchedule" and b.device.effective_limit() == 6:
+                    positive_composites.append(answer)
+                    if after_composite == "source_changed":
+                        b.rig.peer.plan_session = (local, 98765)
+                    elif after_composite == "transport_unavailable":
+                        b.rig.peer.unavailable = True
+                return answer
+
+            monkeypatch.setattr(b.device, "answer", observe_after_positive_composite)
+            try:
+                await b.c.tick()
+                receipt = b.c.requests.receipt(identifier)
+                change = j.current_change.read().value
+                assert positive_composites and j.active() == local and not b.stops()
+                if after_composite == "original":
+                    assert receipt["state"] == "failed" and b.device.effective_limit() == 6
+                else:
+                    assert receipt == before and j.current_change.read().recovering
+                    if after_composite == "source_changed":
+                        assert change["continuing_local"] is None
+                        assert b.device.effective_limit() == 0 and b.device.current == 0
+                    else:
+                        assert b.rig.peer.unavailable_requests and b.c.native.last_verified_at == 0
+                        assert b.device.effective_limit() == 6
+            finally:
+                b.rig.peer.unavailable = False
+                b.rig.peer.plan_session = (local, 9)
 
 
 # Intent: actual automatic recovery owns the transaction that settles metadata and its process-replaced receipt.

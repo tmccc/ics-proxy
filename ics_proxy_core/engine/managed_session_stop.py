@@ -23,6 +23,7 @@ from .stop_settlement import (
     STOP_BUFFERED_CLOSURE,
     STOP_CLOSURE_FIELDS,
     STOP_CLOSURE_VERIFIED,
+    STOP_REPORT_CLOSED,
     STOP_SESSION,
     StopRejections,
     stop_completion_fields,
@@ -204,19 +205,16 @@ class ManagedSessionStop:
         c, j, g = self.controller, self.controller.session.journal, self.controller.session.gateway
         boot = scope.connection[0].boot
 
-        # Reject a new target or an expired/replaced request both before and at the actual write boundary.
+        # The original report can settle without wire authority once fresh native evidence agrees.
         def guard() -> None:
-            if (
-                c.stopping
-                or c.requests.intent() != scope.intent
-                or not control_scope_matches(g, scope.connection)
-                or not request_pending(j, scope.identifier, STOP_SESSION, scope.intent.revision)
-            ):
+            if not request_pending(j, scope.identifier, STOP_SESSION, scope.intent.revision):
+                raise RecoveryRequiredError("Stop lost its current request")
+            session = j.outcomes.session(scope.local)
+            if session is not None and session.closed:
+                raise StopAlreadyHandledError
+            if c.stopping or c.requests.intent() != scope.intent or not control_scope_matches(g, scope.connection):
                 raise RecoveryRequiredError("Stop lost its current request")
             if self.target() != scope.target:
-                session = j.outcomes.session(scope.local)
-                if session is not None and session.closed:
-                    raise StopAlreadyHandledError  # The original report still needs independent closure evidence.
                 native = c.native._current_stop_sample(None)
                 if (
                     j.active() == scope.local
@@ -265,14 +263,15 @@ class ManagedSessionStop:
         except sqlite3.Error:
             pass  # Preserve the receipt for expiry if the original store operation failed.
 
-    # A pre-dispatch refusal is final while the original receipt has no possible send, join or native closure.
+    # A pre-dispatch refusal is final while the receipt has no possible send, join or closure evidence.
     def _fail_unsent(self, scope: SessionStop) -> None:
         self._checkpoint_native_first()
         native_first, proofs = self._native_first_proof()
         self._update_receipts(
             "state='failed',result=json_set(result,'$.classification','stop_not_sent')",
             (),
-            f"id=? AND action=? AND revision=? AND state='accepted' AND {_UNSENT} AND NOT {native_first}",
+            f"id=? AND action=? AND revision=? AND state='accepted' AND {_UNSENT} "
+            f"AND NOT {native_first} AND NOT {STOP_REPORT_CLOSED}",
             (scope.identifier, STOP_SESSION, scope.intent.revision, *proofs),
             retry_after_rollback=True,
         )
@@ -301,7 +300,7 @@ class ManagedSessionStop:
         self._update_receipts(
             "state=CASE WHEN json_extract(result,'$._session_stop.dispatched') "
             "OR json_extract(result,'$._session_stop.joined') "
-            f"OR {native_first} OR {verified} "
+            f"OR {native_first} OR {verified} OR {STOP_REPORT_CLOSED} "
             "THEN 'uncertain' ELSE 'failed' END,result=json_set(result,'$.classification',?)",
             (*native_proofs, *proofs, "process_replaced" if replaced else "stop_not_confirmed"),
             f"action=? AND state IN ('accepted','running') AND NOT {rejections.receipts} "
@@ -513,7 +512,8 @@ class ManagedSessionStop:
         ):
             return
         try:
-            native = await c.native.read(stop_only=True)
+            recovery = c.session.gateway.controls.decisions.recovery
+            native = await c.native.read(closing_local=recovery.held_owner_closure(c), stop_only=True)
 
             # A restricted poll can prove the scheduled session closed before normal supervision resumes.
             def accept_closure() -> None:

@@ -20,6 +20,10 @@ STOP_SESSION = "stop_session"
 STOP_NONTERMINAL_CLASSIFICATIONS = ("stop_not_confirmed", "process_replaced")
 STOP_CLOSURE_VERIFIED = "json_type(result,'$._session_stop.closure_verified') IS 'true'"
 STOP_CLOSURE_FIELDS = "result=json_set(result,'$._session_stop.closure_verified',json('true'))"
+STOP_REPORT_CLOSED = (
+    "EXISTS (SELECT 1 FROM transactions WHERE local=json_extract(managed_requests.result,'$._session_stop.local') "
+    "AND stop IS NOT NULL)"
+)
 _REJECTED_STOP_RESULT = "json_set(result,'$.classification','stop_rejected')"
 _COMPLETED_STOP_RESULT = (
     "json_set(json_remove(result,'$.classification'),"
@@ -309,11 +313,8 @@ class StopRejections:
     # A genuine closure settles the waiting request when its exact Stop attempts still permit it.
     @property
     def closed_receipts(self) -> str:
-        return (
-            f"action=? AND state IN ('accepted','running','uncertain') AND NOT {self.receipts} AND EXISTS ("
-            "SELECT 1 FROM transactions WHERE local=json_extract(managed_requests.result,'$._session_stop.local') "
-            "AND stop IS NOT NULL)"
-        )
+        rejected = self.receipts
+        return f"action=? AND state IN ('accepted','running','uncertain') AND NOT {rejected} AND {STOP_REPORT_CLOSED}"
 
 
 SAVED_STOP_REJECTIONS = StopRejections()

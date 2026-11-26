@@ -2,6 +2,7 @@
 """Actual HA keeps snapshot transit, reload recovery and incomplete history honest."""
 
 import asyncio
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -109,6 +110,64 @@ async def test_natural_schedule_closure_keeps_the_ordinary_outage_notice(
                 assert "requested Pause after it could not connect" not in notice
             finally:
                 await server.close()
+
+
+# Intent: report verified vendor registration immediately through the App connection entity.
+# Why: Return still needs fresh control supervision on the new connection.
+async def test_app_connection_reports_new_registration_before_return_is_available(
+    actual_hass, tmp_path, tls, unused_tcp_port_factory, monkeypatch
+):
+    from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
+    from ics_proxy_core.engine.managed_diagnostics import snapshot
+    from tests.managed_rig import healthy
+    from tests.native_schedule_support import timer_bench
+    from tests.runtime_rig import until
+    from tests_ha_proxy.test_client import TOKEN
+
+    async with timer_bench(tmp_path, tls, unused_tcp_port_factory()) as bench:
+        controller, runtime = bench.c, bench.session.runtime
+        gateway = bench.session.gateway
+        controller.command(uuid.uuid4().hex, "pause", controller.requests.intent().revision)
+        assert (await healthy(controller))["local_hold_verified"]
+        old_epoch = gateway._vendor_epoch
+        published = {"running": True, "certificate_remaining_seconds": 86400}
+        server = ManagementServer(
+            ManagementSettings(unused_tcp_port_factory(), tmp_path / "unused", TOKEN), controller, lambda: published
+        )
+        await server.start()
+        try:
+            app = "binary_sensor.ics_proxy_cloud_connected"
+            mode = "sensor.ics_proxy_control_mode"
+            return_button = "button.ics_proxy_app_control"
+            with monkeypatch.context() as offline:
+                offline.setattr(runtime, "vendor_enabled", lambda: False)
+                await bench.rig.bench.cloud.close(code=1011)
+                await until(lambda: not runtime.vendor_registered)
+                polled = await controller.tick()
+                published.update(polled, diagnostics=snapshot(controller, polled))
+                entry = await setup(actual_hass, {"port": server.settings.port})
+                coordinator = entry.runtime_data
+                assert actual_hass.states.get(app).state == "off"
+                assert actual_hass.states.get(return_button).state == "unavailable"
+
+            await until(lambda: runtime.vendor_registered and gateway._vendor_epoch != old_epoch, timeout=6)
+            await coordinator.async_refresh()
+            assert coordinator.data["checked_at"] == polled["checked_at"]
+            assert coordinator.data["local_hold_verified"] and not coordinator.data["healthy"]
+            assert coordinator.data["cloud_connected"] and not coordinator.data["can_return"]
+            assert not coordinator.data["can_start_test"]
+            assert actual_hass.states.get(app).state == "on"
+            assert actual_hass.states.get(return_button).state == "unavailable"
+            diagnostic = actual_hass.states.get(mode).attributes["diagnostic_summary"]
+            assert diagnostic == "The manufacturer cloud is connected. The proxy is waiting for its next status check."
+
+            polled = await healthy(controller)
+            published.update(polled, diagnostics=snapshot(controller, polled))
+            await coordinator.async_refresh()
+            assert coordinator.data["healthy"] and coordinator.data["can_return"]
+            assert actual_hass.states.get(return_button).state != "unavailable"
+        finally:
+            await server.close()
 
 
 # Intent: health flags and fresh ages need a running service to restore controls or resolve an outage.

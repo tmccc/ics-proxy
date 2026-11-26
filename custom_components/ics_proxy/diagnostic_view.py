@@ -22,6 +22,7 @@ REASONS = {
         "The proxy is waiting for the charger reports to confirm the local session is closed."
     ),
     "cloud_disconnected": "The manufacturer cloud connection is unavailable.",
+    "cloud_status_pending": "The manufacturer cloud is connected. The proxy is waiting for its next status check.",
     "boot_unverified": "The current charger connection has not completed registration verification.",
     "pause_verification_pending": "Pause is requested; physical zero output has not yet been verified.",
     "lifecycle_acknowledgement_pending": "A genuine session event is awaiting the manufacturer's acknowledgement.",
