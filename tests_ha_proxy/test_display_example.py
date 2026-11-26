@@ -746,6 +746,65 @@ async def test_ordinary_start_does_not_reach_a_replacement_destination(actual_ha
     ]
 
 
+# Intent: each other HA command keeps the commissioned destination in its initiating status.
+# Why: Stop, Pause, Return, and timed Start can all affect a replacement with the same revision and readiness.
+@pytest.mark.parametrize(
+    "action,initial,effect,value",
+    [
+        ("stop_session", {"charging_session_open": True, "stop_target": TARGET}, "charging_session_open", False),
+        ("pause", {}, "desired_control", "paused"),
+        ("app_control", {"desired_control": "paused", "can_return": True}, "desired_control", "app"),
+        (
+            "start_test",
+            {},
+            "test_charge",
+            {"source": "local", "state": "armed", "duration_seconds": 120, "seconds_remaining": 120},
+        ),
+    ],
+)
+@pytest.mark.parametrize("refresh", [False, True], ids=["unobserved", "observed"])
+async def test_other_ordinary_commands_keep_the_initiating_destination(
+    actual_hass, canvas_peer, refresh, action, initial, effect, value
+):
+    hass, peer = actual_hass, canvas_peer
+    state = peer["state"]
+    state.update(control_revision=REVISION, management_owner_binding=True, **initial)
+    entry = await setup_proxy(hass, peer["port"])
+    original = state[effect]
+    assert original != value
+
+    # The replacement advertises the same revision and capabilities before the pending write reaches it.
+    async def replace_owner():
+        state["canvas_owner"] = REPLACEMENT_OWNER
+        if refresh:
+            await entry.runtime_data.async_refresh()
+
+    # Exercise each ordinary HA service instead of calling the underlying client directly.
+    async def issue():
+        if action == "stop_session":
+            return await call_session_command(hass, action, target=TARGET)
+        await hass.services.async_call("button", "press", {"entity_id": f"button.ics_proxy_{action}"}, blocking=True)
+        return None
+
+    peer["before_handshake"] = replace_owner
+    if action == "stop_session":
+        result = await issue()
+        assert result["confirmed"] is False and result["request_reference"] is not None
+    else:
+        with pytest.raises(HomeAssistantError, match="could not confirm this request"):
+            await issue()
+    assert state[effect] == original
+    assert entry.runtime_data.canvas_owner == REPLACEMENT_OWNER
+
+    result = await issue()
+    if action == "stop_session":
+        assert result["confirmed"] is True and result["request_reference"] is not None
+    assert state[effect] == value
+    requests = [request for request in peer["requests"] if request["command"] == action]
+    assert [request["canvas_owner"] for request in requests] == [CANVAS_OWNER, REPLACEMENT_OWNER]
+    assert all(request["revision"] == REVISION for request in requests)
+
+
 # Intent: a bound Pause still uses the restrictive path when the proxy revision has advanced.
 # Why: a stale dashboard can still pause the same charger, including with earlier proxy versions.
 @pytest.mark.parametrize("binding", [True, None], ids=["all-commands", "canvas-only"])
@@ -934,6 +993,146 @@ async def test_canvas_frame_can_expire_during_the_management_handshake(actual_ha
     assert result["request_reference"] is not None
     assert peer["commands"].count(action) == 1
     assert "receipt" not in peer["commands"]
+
+
+# Intent: recheck paired wall and elapsed time at the real WebSocket write boundary.
+# Why: a sizable clock change can arrive during handshake while both reported ages still appear fresh.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+@pytest.mark.parametrize(
+    "step,allowed",
+    [(-4, False), (-0.5, True), (0.5, True), (4, False)],
+    ids=["rewind", "backward-tolerance", "forward-tolerance", "forward"],
+)
+async def test_canvas_clock_step_during_handshake(actual_hass, canvas_peer, monkeypatch, starting, step, allowed):
+    from custom_components.ics_proxy import coordinator
+
+    peer = canvas_peer
+    wall, elapsed = 1000, 100
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, elapsed))
+    if not starting:
+        peer["state"].update(charging_session_open=True, can_start=False, stop_target=TARGET)
+    await setup_proxy(actual_hass, peer["port"])
+    wall, elapsed = 1002, 102
+
+    # The epoch remains in the past and within the normal age limit across every simulated change.
+    async def adjust_clock():
+        nonlocal wall, elapsed
+        wall += 6 + step
+        elapsed += 6
+
+    peer["before_handshake"] = adjust_clock
+    action = "start" if starting else "stop_session"
+    fields = {"revision": 0} if starting else {"target": TARGET}
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=1001, **fields)
+    assert elapsed == 108
+    assert result["confirmed"] is allowed
+    assert (result["request_reference"] is not None) is allowed
+    assert peer["commands"].count(action) == int(allowed)
+    if not allowed:
+        # Later frames must clear both the old clock and the adjusted clock's observed range.
+        advance = max(108 + 900, wall) - wall + 2
+        wall += advance
+        elapsed += advance
+        result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=wall - 1, **fields)
+        assert result["confirmed"] is True and result["request_reference"] is not None
+        assert peer["commands"].count(action) == 1
+
+
+# Intent: Start and Stop require the same fresh authority immediately before the first write.
+# Why: a frame can remain fresh while a newer status revokes the particular control it displayed.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+@pytest.mark.parametrize("interruption", ["control", "revision", "status-failure", "old-native", "old-status", "owner"])
+async def test_canvas_rechecks_observed_control_at_the_management_write(
+    actual_hass, canvas_peer, monkeypatch, starting, interruption
+):
+    from custom_components.ics_proxy import coordinator
+
+    peer = canvas_peer
+    wall = 1000
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, wall))
+    state = peer["state"]
+    state.update(control_revision=REVISION, charging_session_open=not starting, can_start=starting)
+    if not starting:
+        state["stop_target"] = TARGET
+    entry = await setup_proxy(actual_hass, peer["port"])
+    runtime = entry.runtime_data
+    wall += 2
+    previous = state.copy()
+    updates = {
+        "control": {"can_start": False} if starting else {"stop_target": "e" * 64},
+        "revision": {"control_revision": REVISION + 1},
+        "status-failure": {},
+        "old-native": {"native_age_seconds": 16},
+        "old-status": {"status_age_seconds": 16},
+        "owner": {"canvas_owner": REPLACEMENT_OWNER},
+    }
+    action = "start" if starting else "stop_session"
+    fields = {"revision": REVISION} if starting else {"target": TARGET}
+    observed = False
+
+    # Publish the superseding state before the socket upgrade lets the original command write.
+    async def supersede_control():
+        nonlocal observed
+        state.update(updates[interruption])
+        peer["status_failure"] = interruption == "status-failure"
+        await runtime.async_refresh()
+        observed = True
+        assert runtime.last_update_success is (interruption != "status-failure")
+
+    peer["before_handshake"] = supersede_control
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=wall - 1, **fields)
+    assert observed
+    assert result == {"confirmed": False, "request_reference": None}
+    assert set(peer["commands"]) == {"status"}
+    assert state["charging_session_open"] is (not starting)
+
+    # Confirm that normal refreshed control remains usable after the refused write.
+    state.update(previous)
+    peer["status_failure"] = False
+    await runtime.async_refresh()
+    wall += 2
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=wall - 1, **fields)
+    assert result["confirmed"] is True and result["request_reference"] is not None
+    (command,) = [request for request in peer["requests"] if request["command"] == action]
+    assert command["revision"] == REVISION and command["canvas_owner"] == CANVAS_OWNER
+    assert command.get("target") == (None if starting else TARGET)
+
+
+# Intent: a waiting canvas operation cannot write after HA replaces its integration instance.
+# Why: the new runtime can publish the same owner, revision, and target while the old request is still in flight.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+async def test_canvas_write_rejects_inflight_entry_reload(actual_hass, canvas_peer, monkeypatch, starting):
+    from custom_components.ics_proxy import coordinator
+
+    hass, peer = actual_hass, canvas_peer
+    wall = 1000
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, wall))
+    peer["state"].update(control_revision=REVISION, charging_session_open=not starting, can_start=starting)
+    if not starting:
+        peer["state"]["stop_target"] = TARGET
+    entry = await setup_proxy(hass, peer["port"])
+    original = entry.runtime_data
+    wall += 2
+
+    # Use a real reload on the same endpoint before the original websocket handshake can finish.
+    async def reload_entry():
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        assert entry.runtime_data is not original
+        assert entry.runtime_data.canvas_owner == CANVAS_OWNER
+        assert entry.runtime_data.data["control_revision"] == REVISION
+
+    peer["before_handshake"] = reload_entry
+    action = "start" if starting else "stop_session"
+    fields = {"revision": REVISION} if starting else {"target": TARGET}
+    result = await call_session_command(hass, action, canvas_rendered_at_epoch=wall - 1, **fields)
+    assert entry.runtime_data is not original
+    assert result == {"confirmed": False, "request_reference": None}
+    assert set(peer["commands"]) == {"status"}
+
+    wall += 2
+    result = await call_session_command(hass, action, canvas_rendered_at_epoch=wall - 1, **fields)
+    assert result["confirmed"] is True and result["request_reference"] is not None
+    assert peer["commands"].count(action) == 1
 
 
 # Intent: a Home Assistant restart carries an interrupted request into the existing unconfirmed feedback.

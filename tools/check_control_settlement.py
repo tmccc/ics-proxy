@@ -29,6 +29,7 @@ SCHEDULE_VENDOR_RETURN = f"{SCHEDULE}::test_cloud_returns_before_local_schedule_
 STOP_INCIDENT = "tests/test_managed_stop_incident.py"
 SCHEDULE_CLOSURE = "tests/test_managed_scheduled_closure.py"
 CUTOFF_RETAINED_CLOSURE = f"{SCHEDULE_CLOSURE}::test_cutoff_checks_retained_stop_closure_after_replacement"
+SCHEDULE_CLOSURE_CHECKPOINT = f"{SCHEDULE_CLOSURE}::test_schedule_closure_checkpoint_survives_replacement"
 INCIDENT_WAL = "tests/test_managed_incident.py::test_incident_respects_the_published_live_wal_boundary"
 PAUSE_OVERLAP = (
     "tests/test_managed_cloud_zero_controls.py::test_local_pause_and_cloud_stop_share_unanswered_stop_at_zero"
@@ -130,6 +131,9 @@ SUITES = {
             f"{CUTOFF_RETAINED_CLOSURE}[reject-before-exact]",
             f"{CUTOFF_RETAINED_CLOSURE}[reject-after-exact]",
             f"{CUTOFF_RETAINED_CLOSURE}[reject-after-other-report]",
+            f"{SCHEDULE_CLOSURE_CHECKPOINT}[exact]",
+            f"{SCHEDULE_CLOSURE_CHECKPOINT}[not-observed]",
+            f"{SCHEDULE_CLOSURE_CHECKPOINT}[stop-storage-refused]",
             "tests/test_managed_api.py::test_management_connections_leave_pause_available[busy]",
             f"{SCHEDULE_VENDOR_RETURN}[vendor-lost-during-rollback-automatic-return]",
             f"{SCHEDULE}::test_overlapping_timezone_change_does_not_repeat_local_occurrence",

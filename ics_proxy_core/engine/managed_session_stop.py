@@ -365,10 +365,11 @@ class ManagedSessionStop:
         self._checkpoint_native_first()
         self._settle_closure(stop_rejections(j), observed=True)
 
-    # The schedule independently verified this exact closure, but could not save its occurrence marker.
-    def retain_scheduled_closure(self, local: int) -> None:
+    # Tell the schedule if a Stop receipt can durably carry its independently verified closure.
+    def retain_scheduled_closure(self, local: int) -> bool:
         rejections = stop_rejections(self.controller.session.journal)
         self._checkpoint_closure(rejections, observed=True, scheduled_local=local)
+        return self._verified_closures == self._retained_closures and self.closure_verified(local)
 
     # The exact closure can already be proved while its receipt publication still awaits storage.
     def closure_verified(self, local: int) -> bool:

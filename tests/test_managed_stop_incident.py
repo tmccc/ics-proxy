@@ -104,6 +104,77 @@ def test_bound_stop_predecessor_reply(tmp_path, managed_reply, vendor_reply, exa
             assert predecessor_stop_reply(journal.outcomes, successor, predecessors) is None
 
 
+# Intent: resolve every combination of definite and missing replies from the three joinable Stop sources.
+# Why: every exact refusal is required to fail a joined receipt, while successful settlement needs physical closure.
+@pytest.mark.parametrize(
+    "local_reply", [None, "Accepted", "Rejected"], ids=["local-missing", "local-accepted", "local-rejected"]
+)
+@pytest.mark.parametrize(
+    "owner_reply", [None, "Accepted", "Rejected"], ids=["pause-missing", "pause-accepted", "pause-rejected"]
+)
+@pytest.mark.parametrize(
+    "vendor_reply", [None, "Accepted", "Rejected"], ids=["vendor-missing", "vendor-accepted", "vendor-rejected"]
+)
+@pytest.mark.parametrize("unidentified", [False, True], ids=["known-attempts", "unnamed-shutdown"])
+@pytest.mark.parametrize("closure", ["open", "report-only", "verified-closure"])
+def test_joined_stop_outcomes_and_incident_report_agree(
+    tmp_path, local_reply, owner_reply, vendor_reply, unidentified, closure
+):
+    path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"
+    reported = closure != "open"
+    verified = closure == "verified-closure"
+    with closing(Journal(path, "test-charger")) as journal:
+        ManagedRequests(journal)
+        local = journal.start("original-start", START)["transactionId"]
+        request = write_request(journal, local, dispatched=True)
+        pause, ticket, pause_wire, vendor_wire = (uuid.uuid4().hex for _ in range(4))
+        insert_request(journal, pause, "pause", 2, {"_stop": {"ticket": ticket, "local": local, "boot": BOOT}})
+        journal.outcomes.record_owner_wire(
+            OwnerWire(uuid.uuid4().hex, request, request, BOOT, STOP_ACTION, local, None, local_reply)
+        )
+        journal.outcomes.record_owner_wire(
+            OwnerWire(pause_wire, pause, ticket, BOOT, STOP_ACTION, local, None, owner_reply)
+        )
+        mutation = vendor_attempt(journal, local, vendor_wire)
+        if vendor_reply is not None:
+            prefix = "retained_stop" if vendor_reply == "Accepted" else "retained_transaction_reply"
+            evidence = ForwardedReply(mutation, STOP_ACTION, vendor_wire, vendor_reply)
+            journal.put(f"{prefix}_vendor:{vendor_wire}", asdict(evidence))
+        joined = write_request(
+            journal,
+            local,
+            dispatched=False,
+            joined=True,
+            local_attempts=[request],
+            owner_wire_attempts=[pause_wire],
+            vendor_attempts=[mutation],
+            unidentified_shutdown_stop=unidentified,
+            closure_verified=verified,
+        )
+        if reported:
+            journal.stop("original-stop", {"transactionId": local, "meterStop": 102, "timestamp": START["timestamp"]})
+
+    all_refused = not unidentified and local_reply == owner_reply == vendor_reply == "Rejected"
+    with closing(Journal(path, "test-charger")) as journal:
+        requests = ManagedRequests(journal)
+        ManagedSessionStop(SimpleNamespace(session=SimpleNamespace(journal=journal, gateway=Gateway(journal))))
+        receipt = requests.receipt(joined)
+    report = stop_incident_report(path, events, request_reference=reference(joined))
+    expected_state = "failed" if all_refused else "completed" if verified else "uncertain"
+    assert receipt["state"] == report["journal"]["request"]["state"] == expected_state
+    assert (receipt["result"].get("classification") == "stop_rejected") is all_refused
+    assert report["journal"]["lifecycle"] == ("closed" if reported else "open")
+    assert (report["journal"]["request"]["session_stopped"] is True) is (verified and not all_refused)
+    assert report["wire"]["dispatch"] == "joined"
+    observed = {attempt["request"]: attempt["reply"] for attempt in report["wire"]["joined_attempts"]}
+    expected = {
+        reference(token): reply.lower()
+        for token, reply in ((request, local_reply), (pause, owner_reply), (mutation, vendor_reply))
+        if reply is not None
+    }
+    assert {token: reply for token, reply in observed.items() if reply in ("accepted", "rejected")} == expected
+
+
 # Intent: read the legacy scalar accepted predecessor after its original journal row rotates out.
 # Why: an older receipt can have an exact retained reply without the newer arrays of bound attempts.
 def test_legacy_joined_stop_report_retains_its_primary_reply(tmp_path):
@@ -403,13 +474,14 @@ def test_joined_owner_checkpoint_must_match_pause_claim(tmp_path, checkpoint):
     assert report["wire"]["joined_attempts"] == ([expected] if exact else [])
 
 
-# Intent: recover the original rejected Stop after its Pause owns a newer ticket or is superseded.
+# Intent: recover either original Stop reply after its Pause owns a newer ticket or is superseded.
 # Why: a joined receipt must follow the exact prior wire even when both of that wire's primary writes were refused.
-@pytest.mark.parametrize("supersession", ["new-ticket", "new-pause"])
-@pytest.mark.parametrize("late_reply", [False, True])
-def test_replaced_pause_stop_claim_preserves_issued_wire(tmp_path, supersession, late_reply):
+@pytest.mark.parametrize("supersession", ["new-ticket", "new-pause", "published-start"])
+@pytest.mark.parametrize("late_reply", [False, True], ids=["reply-before", "reply-after"])
+@pytest.mark.parametrize("status", ["Accepted", "Rejected"])
+def test_replaced_pause_stop_claim_preserves_issued_wire(tmp_path, supersession, late_reply, status):
     path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"
-    pause, ticket, wire, next_ticket, new_pause, hold = (uuid.uuid4().hex for _ in range(6))
+    pause, ticket, wire, next_ticket, replacement, hold = (uuid.uuid4().hex for _ in range(6))
     with closing(Journal(path, "test-charger")) as journal:
         journal.put("managed_control_intent", {"mode": "paused", "revision": 2})
         requests = ManagedRequests(journal)
@@ -424,22 +496,28 @@ def test_replaced_pause_stop_claim_preserves_issued_wire(tmp_path, supersession,
         sent = OwnerWire(wire, pause, ticket, BOOT, STOP_ACTION, local, None)
         journal.outcomes.record_owner_wire(sent)
         joined = write_request(journal, local, dispatched=False, joined=True, owner_wire_attempts=[wire])
-        frame = [3, wire, {"status": "Rejected"}]
+        frame = [3, wire, {"status": status}]
         if not late_reply:
             journal.outcomes.record_owner_reply(sent, frame)
         if supersession == "new-ticket":
             with journal.atomic():
                 requests.bind_pause_stop(requests.intent(), next_ticket, requests.pause_request(), local, BOOT)
+        elif supersession == "new-pause":
+            requests.accept(replacement, "pause", 2)
         else:
-            requests.accept(new_pause, "pause", 2)
+            with journal.atomic():
+                requests.start_published(replacement, requests.intent(), 3)
+        if supersession != "new-ticket":
+            superseding_action = "pause" if supersession == "new-pause" else "start"
             assert requests.receipt(pause)["result"] == {
-                "classification": "superseded_by_pause",
-                "superseded_by": new_pause,
+                "classification": f"superseded_by_{superseding_action}",
+                "superseded_by": replacement,
             }
         if late_reply:
             journal.outcomes.record_owner_reply(sent, frame)
-        reply = replace(sent, reply="Rejected")
-        key = f"retained_transaction_reply_owner:{wire}"
+        reply = replace(sent, reply=status)
+        prefix = "retained_stop" if status == "Accepted" else "retained_transaction_reply"
+        key = f"{prefix}_owner:{wire}"
         assert journal.get(key) == asdict(reply)
         assert journal.outcomes.owner(pause).result[PAUSE_STOP_HISTORY] == {
             wire: {"ticket": ticket, "local": local, "boot": BOOT},
@@ -459,7 +537,7 @@ def test_replaced_pause_stop_claim_preserves_issued_wire(tmp_path, supersession,
             replace(reply, wire=uuid.uuid4().hex),
         )
         for damaged in invalid:
-            damaged_key = f"retained_transaction_reply_owner:{damaged.wire}"
+            damaged_key = f"{prefix}_owner:{damaged.wire}"
             journal.put(damaged_key, asdict(damaged))
             assert decode_retained_owner_reply(journal.db, asdict(damaged)) is None
             report = stop_incident_report(path, events, request_reference=reference(joined))
@@ -468,14 +546,22 @@ def test_replaced_pause_stop_claim_preserves_issued_wire(tmp_path, supersession,
         journal.put(key, asdict(reply))
         report = stop_incident_report(path, events, request_reference=reference(joined))
         assert report["wire"]["joined_attempts"] == [
-            {"origin": "local", "request": reference(pause), "reply": "rejected", "reply_source": "retained_checkpoint"}
+            {
+                "origin": "local",
+                "request": reference(pause),
+                "reply": status.lower(),
+                "reply_source": "retained_checkpoint",
+            }
         ]
 
     with closing(Journal(path, "test-charger")) as journal:
         requests = ManagedRequests(journal)
         ManagedSessionStop(SimpleNamespace(session=SimpleNamespace(journal=journal, gateway=Gateway(journal))))
-        assert requests.receipt(joined)["state"] == "failed"
-        assert requests.receipt(joined)["result"]["classification"] == "stop_rejected"
+        receipt = requests.receipt(joined)
+        if status == "Accepted":
+            assert receipt["state"] == "completed" and receipt["result"]["session_stopped"] is True
+        else:
+            assert receipt["state"] == "failed" and receipt["result"]["classification"] == "stop_rejected"
         journal.outcomes.retry_owner_writes()
         assert journal.outcomes.owner_wires("wire", wire) == (reply,)
         assert journal.get(key) is None

@@ -11,6 +11,7 @@ import sys
 import time
 import uuid
 from contextlib import closing
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -22,7 +23,7 @@ from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
 from ics_proxy_core.engine.store import RecoveryRequiredError
 from ics_proxy_core.engine.trial_session import save_private
 from ics_proxy_core.frames import basic_auth_header
-from tests.charge_rig import actual_stop, positive_flow
+from tests.charge_rig import actual_stop, positive_flow, ready
 from tests.current_rig import commissioned
 from tests.handover_helpers import NativeVehiclePeer
 from tests.managed_rig import starts
@@ -40,6 +41,7 @@ class RestorePeer(NativeVehiclePeer):
     def __init__(self, bench):
         super().__init__(bench)
         self.writes = []
+        self.user_limits_at_write = []
         self.lost_patch = None
         self.route_changed = False
         self.read_original_offline = asyncio.Event()
@@ -65,6 +67,7 @@ class RestorePeer(NativeVehiclePeer):
             self.requests.append(action)
             if action == "setConfig":
                 self.writes.append((data, self.bench.firmware.effective_limit(), self.bench.online))
+                self.user_limits_at_write.append(self.runtime_user)
                 self.configuration.update(data)
                 if "AmpLmt" in data:
                     self.runtime_user = int(data["AmpLmt"]) * 10
@@ -147,9 +150,18 @@ def journal_facts(path):
 # Read the real CLI failure report and check that it leaves no private paths in the output.
 async def failed_restore_cli(action, config, spec, native_port=80):
     child = await asyncio.create_subprocess_exec(
-        sys.executable, "-B", restore_vendor.__file__, action,
-        "--config", str(config), "--native-bounded-spec", str(spec), "--native-port", str(native_port),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        sys.executable,
+        "-B",
+        restore_vendor.__file__,
+        action,
+        "--config",
+        str(config),
+        "--native-bounded-spec",
+        str(spec),
+        "--native-port",
+        str(native_port),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
     try:
         stdout, stderr = await asyncio.wait_for(child.communicate(), 8)
@@ -162,6 +174,55 @@ async def failed_restore_cli(action, config, spec, native_port=80):
     report = json.loads(stdout.splitlines()[-1])
     assert report["complete"] is False
     return report
+
+
+# Intent: give useful restore guidance for known refusals while keeping unclassified error details private.
+# Why: journal or native failures can embed private data, including during an interrupted restoration.
+@pytest.mark.parametrize(
+    ("stage", "error", "reason", "hint"),
+    [
+        (
+            "verify_unplugged_managed_pause",
+            RecoveryRequiredError("restoration needs a settled managed Pause at a selected 6 A"),
+            "settled_pause_required",
+            "settled Pause with 6 A selected",
+        ),
+        (
+            "verify_unplugged_managed_pause",
+            RecoveryRequiredError("cleanup does not belong to this managed restoration"),
+            "restore_record_mismatch",
+            "matching set for this installation",
+        ),
+        (
+            "verify_vendor_connection",
+            TimeoutError("private fixture detail"),
+            "vendor_connection_unverified",
+            "Check that the charger can reach iCS",
+        ),
+        (
+            "restore_original_route",
+            TimeoutError("private fixture detail"),
+            "restore_stage_failed",
+            "Review the restore instructions for this stage",
+        ),
+        (
+            "verify_unplugged_managed_pause",
+            StaleEvidenceError("private fixture detail"),
+            "native_evidence_unavailable",
+            "reachable locally",
+        ),
+        (
+            "restore_original_current",
+            NativeTransportUnavailableError("private fixture detail"),
+            "native_evidence_unavailable",
+            "reachable locally",
+        ),
+    ],
+)
+def test_restore_guidance_matches_observed_stage_without_private_details(stage, error, reason, hint):
+    actual_reason, next_step = restore_vendor.restore_guidance(stage, error)
+    assert actual_reason == reason and hint in next_step
+    assert "private fixture detail" not in next_step
 
 
 # Intent: report invalid restore inputs with the stage and a corrective action.
@@ -442,20 +503,29 @@ def expire_evidence_on_connect(monkeypatch, target):
     monkeypatch.setattr(restore_vendor, "read_native", request)
 
 
-# Intent: verify managed32 handback and retry when any of the three writes is prevented or loses a reply.
-# Why: expired evidence must prevent transmission, and a lost reply must never duplicate an applied setting.
+# Intent: rehearse handback from each managed native bound and interrupt every applicable write.
+# Why: an applied write must survive a lost reply, and the 6 A bound needs no preliminary current write.
 @pytest.mark.parametrize(
-    ("interruption", "stage"),
-    [(None, None), *((kind, stage) for kind in ("reply", "connect") for stage in ("lower", "route", "raise"))],
+    ("native_bound", "interruption", "stage"),
+    [
+        pytest.param(bound, kind, stage, id=f"{bound}a-{kind or 'uninterrupted'}-{stage or 'all'}")
+        for bound in (6, 32)
+        for kind, stage in [
+            (None, None),
+            *((kind, stage) for kind in ("reply", "connect") for stage in ("lower", "route", "raise")),
+        ]
+        if bound == 32 or stage != "lower"
+    ],
 )
-async def test_restore_from_managed32_keeps_history(
-    tmp_path, tls, unused_tcp_port, monkeypatch, capsys, interruption, stage
+async def test_restore_keeps_history_for_each_managed_bound(
+    tmp_path, tls, unused_tcp_port, monkeypatch, capsys, native_bound, interruption, stage
 ):
-    async with commissioned(
-        tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
-    ) as test:
+    prepare = partial(commissioned, current=6) if native_bound == 32 else ready
+    async with prepare(tmp_path, tls, unused_tcp_port, monkeypatch, cli_route=True, native_peer=RestorePeer) as test:
         rig = test.rig
         peer, bench = rig.peer, rig.bench
+        assert peer.runtime_user == native_bound * 10
+        assert (test.session.journal.get("managed_current_capability") is not None) is (native_bound == 32)
         await stop_paused(test)
         db_path = rig.prepared.config.journal
         records, _ = journal_facts(db_path)
@@ -467,6 +537,7 @@ async def test_restore_from_managed32_keeps_history(
         first_call = len(bench.device_calls)
         first_limit = len(bench.received_limits)
         route = {key: rig.spec.original_configuration[key] for key in rig.spec.trial_route}
+        lower_writes = [{"AmpLmt": "6"}] if native_bound == 32 else []
         target = {"lower": {"AmpLmt": "6"}, "route": route, "raise": {"AmpLmt": "32"}}.get(stage)
         failure = NativeTransportUnavailableError
         if interruption == "reply":
@@ -493,7 +564,7 @@ async def test_restore_from_managed32_keeps_history(
                     await asyncio.wait_for(restore_task, 10)
                 if interruption == "connect":
                     await asyncio.wait_for(peer.empty_connection.wait(), 1)
-                    assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}]
+                    assert [patch for patch, _, _ in peer.writes] == lower_writes
                 assert peer.route_changed == (interruption == "reply") and peer.runtime_user == 60
                 rig.prepared.config.certificate.unlink()
                 rig.prepared.config.private_key.unlink()
@@ -508,7 +579,7 @@ async def test_restore_from_managed32_keeps_history(
                     await asyncio.wait_for(restore_task, 5)
                 if interruption == "connect":
                     await asyncio.wait_for(peer.empty_connection.wait(), 1)
-                    assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}, route]
+                    assert [patch for patch, _, _ in peer.writes] == [*lower_writes, route]
                     assert peer.configuration == rig.spec.configuration("original")
                 else:
                     assert peer.configuration == rig.spec.original_configuration
@@ -522,8 +593,11 @@ async def test_restore_from_managed32_keeps_history(
                 task.cancel()
             await asyncio.gather(restore_task, charger_task, return_exceptions=True)
 
-        assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}, route, {"AmpLmt": "32"}]
-        assert peer.writes[0][1] == 0 and peer.writes[1][2] is False and peer.writes[-1][2] is True
+        assert [patch for patch, _, _ in peer.writes] == [*lower_writes, route, {"AmpLmt": "32"}]
+        if lower_writes:
+            assert peer.writes[0][1] == 0
+        assert peer.user_limits_at_write == ([320, 60, 60] if lower_writes else [60, 60])
+        assert peer.writes[-2][2] is False and peer.writes[-1][2] is True
         assert peer.configuration == rig.spec.original_configuration and peer.runtime_user == 320
         assert not bench.firmware.profiles and bench.firmware.plans == plans and bench.history == history
         assert all(limit == 0 for limit in bench.received_limits[first_limit:])

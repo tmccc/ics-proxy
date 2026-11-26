@@ -58,6 +58,8 @@ async def current_peer():
         if request.headers.get("Authorization") != "Bearer " + TOKEN:
             raise web.HTTPUnauthorized()
         socket = web.WebSocketResponse(protocols=["ics-proxy.v1"])
+        if (before_handshake := control.pop("before_handshake", None)) is not None:
+            await before_handshake()
         await socket.prepare(request)
         value = await socket.receive_json()
         command = value["command"]
@@ -71,7 +73,10 @@ async def current_peer():
             fields = {"id", "command", "revision"} | ({"current_a"} if command == "set_current" else set())
             if "canvas_owner" in value:
                 fields.add("canvas_owner")
-                assert value["canvas_owner"] == state["canvas_owner"]
+                if value["canvas_owner"] != state.get("canvas_owner"):
+                    await socket.send_json({"id": value["id"], "ok": False, "error": "not_ready"})
+                    await socket.close()
+                    return socket
             assert set(value) == fields
             permitted = state["can_set_current"] if command == "set_current" else state["can_start"]
             if command == "set_current":
@@ -131,6 +136,36 @@ async def test_selector_lifecycle_is_passive_and_has_integer_current_metadata(ac
     assert await hass.config_entries.async_unload(entry.entry_id)
     assert set(current_peer["commands"]) == {"status"}
     assert current_peer["state"]["requested_current_a"] == 6
+
+
+# Intent: an in-flight selection retains the commissioned destination of its original status.
+# Why: a replacement with the same idle readiness and revision must not inherit another charger's current change.
+@pytest.mark.parametrize("refresh", [False, True], ids=["unobserved", "observed"])
+async def test_current_selection_keeps_the_initiating_destination(actual_hass, current_peer, refresh):
+    hass, peer = actual_hass, current_peer
+    original, replacement = "b" * 64, "c" * 64
+    state = peer["state"]
+    state.update(canvas_owner=original, management_owner_binding=True)
+    entry = await setup(hass, peer)
+    selection = {"entity_id": "number.ics_proxy_charge_current_a", "value": 16}
+
+    # Change only the commissioned marker before upgrading the command websocket.
+    async def replace_owner():
+        state["canvas_owner"] = replacement
+        if refresh:
+            await entry.runtime_data.async_refresh()
+
+    peer["before_handshake"] = replace_owner
+    with pytest.raises(HomeAssistantError, match="could not confirm this request"):
+        await hass.services.async_call("number", "set_value", selection, blocking=True)
+    assert state["requested_current_a"] == state["native_limit_a"] == state["station_ceiling_a"] == 6
+    assert entry.runtime_data.canvas_owner == replacement
+
+    await hass.services.async_call("number", "set_value", selection, blocking=True)
+    assert state["requested_current_a"] == state["native_limit_a"] == state["station_ceiling_a"] == 16
+    requests = [request for request in peer["requests"] if request["command"] == "set_current"]
+    assert [request["canvas_owner"] for request in requests] == [original, replacement]
+    assert all(request["revision"] == 0 and request["current_a"] == 16 for request in requests)
 
 
 # Intent: explicit selection sends exactly one integer request and keeps a paused station at actual zero.

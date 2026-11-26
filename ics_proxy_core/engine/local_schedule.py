@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 NATIVE_OCCURRENCE = "managed_native_schedule_occurrence"
 SCHEDULE_CUTOFF = "schedule_cutoff"
+_SCHEDULE_CLOSURE = "managed_local_schedule_native_closure"
 
 
 class ScheduleCloudReturnedError(DeniedError):
@@ -480,15 +481,39 @@ class LocalSchedule:
         except sqlite3.Error:
             if j.db.in_transaction:
                 raise
-            self.controller.session_stop.retain_scheduled_closure(occurrence["local"])
+            if not self.controller.session_stop.retain_scheduled_closure(occurrence["local"]):
+                self._retain_closed_occurrence(occurrence)
 
-    # The session Stop owner can preserve the same physical proof across process replacement.
+    # A spontaneous Stop has no receipt. The latest occurrence needs one independent journal slot.
+    def _retain_closed_occurrence(self, occurrence: dict[str, Any]) -> None:
+        try:
+            if (proof := self._closure_binding(occurrence)) is not None:
+                self.journal.put(_SCHEDULE_CLOSURE, proof)
+        except sqlite3.Error:
+            if self.journal.db.in_transaction:
+                raise
+
+    # A replacement can reuse only the proof for the exact scheduled request and its genuine closing report.
+    def _closure_binding(self, occurrence: dict[str, Any]) -> str | None:
+        local = occurrence["local"]
+        row = self.journal.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()
+        if row is None or not isinstance(row["stop"], str):
+            return None
+        return fingerprint((occurrence["request"], local, row["stop"]))
+
+    # Either journal path can preserve the same physical proof across process replacement.
     def closure_known(self, occurrence: dict[str, Any]) -> bool:
-        return (
+        if (
             occurrence.get("native_closed") is True
             or self.closed_request == occurrence["request"]
             or self.controller.session_stop.closure_verified(occurrence["local"])
-        )
+        ):
+            return True
+        try:
+            proof = self.journal.get(_SCHEDULE_CLOSURE)
+        except ValueError, TypeError, RecursionError:
+            return False
+        return isinstance(proof, str) and proof == self._closure_binding(occurrence)
 
     # Periodic restrictive work can stop its own session even when no complete native poll is available.
     async def stop_if_due(self) -> None:

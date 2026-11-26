@@ -8,10 +8,12 @@ import uuid
 import pytest
 
 from ics_proxy_core.engine.gateway import decode
+from ics_proxy_core.engine.local_schedule import _SCHEDULE_CLOSURE
 from ics_proxy_core.engine.local_schedule_cutoff import scheduled_cutoff_target
 from ics_proxy_core.engine.managed_intent import LOCAL_SCHEDULE_OCCURRENCE
 from ics_proxy_core.engine.managed_session_stop import _RETAINED_STOP_CLOSURES
 from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
+from ics_proxy_core.engine.store import fingerprint
 from tests.test_managed_boot_supersession import delay_reply
 from tests.test_managed_local_schedule import MIDNIGHT, connection, overnight
 from tests.test_managed_local_schedule_cutoff import begin, close, stops
@@ -68,6 +70,88 @@ async def test_scheduled_closure_survives_interrupted_poll(tmp_path, tls, unused
             await c.tick()
             assert c.requests.intent() == intent and scheduled_cutoff_target(j) is None
             assert bench.firmware.effective_limit() == 6 and not stops(bench)
+
+
+# Intent: remember early closure when neither the occurrence nor a Stop receipt can carry its proof.
+# Why: only exact, independently verified closure can suppress cutoff after a process replacement.
+@pytest.mark.parametrize(
+    "checkpoint",
+    ["exact", "other-occurrence", "other-session", "other-report", "not-observed", "refused", "stop-storage-refused"],
+)
+async def test_schedule_closure_checkpoint_survives_replacement(
+    tmp_path, tls, unused_tcp_port, monkeypatch, checkpoint
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        bench = rig.bench
+        async with connection(rig, "spontaneous-marker-refusal") as test:
+            local, meter_start = await begin(test, clock)
+            c, j = test.controller, test.session.journal
+            intent, occurrence = c.requests.intent(), j.get(LOCAL_SCHEDULE_OCCURRENCE)
+            expected_stops = []
+            if checkpoint == "stop-storage-refused":
+                request = uuid.uuid4().hex
+                c.command(request, "stop_session", intent.revision, target=c.session_stop.target())
+                await c.session_stop.worker
+                expected_stops = [{"transactionId": local}]
+                j.db.execute(
+                    "CREATE TRIGGER refuse_stop_closure BEFORE UPDATE ON managed_requests "
+                    f"WHEN NEW.id='{request}' AND json_extract(NEW.result,'$._session_stop.closure_verified') "
+                    "BEGIN SELECT RAISE(ABORT,'refuse Stop receipt closure'); END"
+                )
+                j.db.execute(
+                    "CREATE TRIGGER refuse_retained_stop_closure BEFORE INSERT ON meta "
+                    f"WHEN NEW.key='{_RETAINED_STOP_CLOSURES}' "
+                    "BEGIN SELECT RAISE(ABORT,'refuse retained Stop closure'); END"
+                )
+            else:
+                assert not j.db.execute("SELECT 1 FROM managed_requests WHERE action='stop_session'").fetchone()
+            clock.now = MIDNIGHT + 300
+            await close(test, clock, local, meter_start)
+            bench.cp, bench.connection = "B", "Plug"
+            assert j.active() is None and j.latest_owner_stop_id() == local
+            j.db.execute(
+                "CREATE TRIGGER refuse_schedule_closure BEFORE INSERT ON meta "
+                f"WHEN NEW.key='{LOCAL_SCHEDULE_OCCURRENCE}' AND json_extract(NEW.value,'$.native_closed') "
+                "BEGIN SELECT RAISE(ABORT,'refuse scheduled closure marker'); END"
+            )
+            if checkpoint == "refused":
+                j.db.execute(
+                    "CREATE TRIGGER refuse_schedule_checkpoint BEFORE INSERT ON meta "
+                    f"WHEN NEW.key='{_SCHEDULE_CLOSURE}' "
+                    "BEGIN SELECT RAISE(ABORT,'refuse scheduled closure checkpoint'); END"
+                )
+            if checkpoint != "not-observed":
+                await poll_through_native_timeout(c, monkeypatch)
+                assert c.local_schedule.closed_request == occurrence["request"]
+            assert j.get(LOCAL_SCHEDULE_OCCURRENCE).get("native_closed") is None
+            assert j.get(_RETAINED_STOP_CLOSURES) is None
+            assert c.requests.intent() == intent and bench.firmware.effective_limit() == 6
+
+            if checkpoint in ("not-observed", "refused"):
+                assert j.get(_SCHEDULE_CLOSURE) is None
+            else:
+                request = occurrence["request"]
+                report = j.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()["stop"]
+                assert j.get(_SCHEDULE_CLOSURE) == fingerprint((request, local, report))
+                if checkpoint == "other-occurrence":
+                    j.put(_SCHEDULE_CLOSURE, fingerprint((uuid.uuid4().hex, local, report)))
+                elif checkpoint == "other-session":
+                    j.put(_SCHEDULE_CLOSURE, fingerprint((request, local + 1, report)))
+                elif checkpoint == "other-report":
+                    j.put(_SCHEDULE_CLOSURE, fingerprint((request, local, report + " ")))
+
+        clock.now = MIDNIGHT + 6 * 3600
+        async with connection(rig, "spontaneous-marker-replacement") as test:
+            c, j = test.controller, test.session.journal
+            assert c.local_schedule.closed_request is None and c.requests.intent() == intent
+            # Isolate the cutoff from the replacement connection's separate zero hold.
+            await c.local_schedule.stop_if_due()
+            if checkpoint in ("exact", "stop-storage-refused"):
+                assert c.requests.intent() == intent and scheduled_cutoff_target(j) is None
+            else:
+                assert c.requests.intent().mode == "paused" and scheduled_cutoff_target(j) == local
+                assert bench.firmware.effective_limit() == 0
+            assert stops(bench) == expected_stops
 
 
 # Intent: reuse the Stop receipt's separately committed physical proof after process replacement.
