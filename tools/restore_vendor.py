@@ -108,7 +108,12 @@ def restore_guidance(stage: str, error: Exception) -> tuple[str, str]:
 
 # Freeze managed operation before lowering the independently enforced USER limit or removing any profile.
 async def prepare_cleanup(
-    book: ResourceBook, spec: NativeBoundedSpec, observe: ObserveHandover, patch: NativePatch
+    book: ResourceBook,
+    spec: NativeBoundedSpec,
+    observe: ObserveHandover,
+    patch: NativePatch,
+    *,
+    report_stage: Callable[[str], None] = emit_stage,
 ) -> None:
     journal = book.journal
     phase = journal.phase.read()
@@ -118,6 +123,9 @@ async def prepare_cleanup(
     if phase.value in ("backend_restore_pending", "complete"):
         return
 
+    cleanup_stage = "verify_6_a_and_remove_proxy_profiles"
+    if phase.cleanup:
+        report_stage(cleanup_stage)
     ceiling = managed_current_ceiling(journal, spec)
     native = await observe()
     if not phase.cleanup:
@@ -136,6 +144,7 @@ async def prepare_cleanup(
         with journal.atomic():
             journal.put(MANAGED_RESTORE_INTENT, spec.digest)
             journal.phase.begin_cleanup()
+        report_stage(cleanup_stage)
 
     if ceiling == 32:
         if native.saved_user_a == 32:
@@ -192,8 +201,7 @@ async def finish_restore(
 
 
 # While the maintenance listener owns the journal, the existing cleanup is the only available charger action.
-async def cleanup_profiles(session: TrialSession, report_stage: Callable[[str], None]) -> None:
-    report_stage("verify_6_a_and_remove_proxy_profiles")
+async def cleanup_profiles(session: TrialSession) -> None:
     handover, gateway = session.native_bounded, session.gateway
     async with asyncio.timeout(90):
         await session.start()
@@ -278,7 +286,7 @@ async def run(
         except SecurityError:
             report_stage("validate_maintenance_credentials")
             raise
-        await prepare_cleanup(book, spec, observe, patch)
+        await prepare_cleanup(book, spec, observe, patch, report_stage=report_stage)
     # The durable cleanup phase also fences a service restart between the two exclusive journal opens.
     session = TrialSession(
         PreparedTrial(config, prepared.baseline, observer, tls),
@@ -292,7 +300,7 @@ async def run(
         if session.journal.get(MANAGED_RESTORE_INTENT) != spec.digest:
             raise RecoveryRequiredError("cleanup does not belong to this managed restoration")
         if session.journal.phase.read().value == "rollback":
-            await cleanup_profiles(session, report_stage)
+            await cleanup_profiles(session)
         result = await finish_restore(session.native_bounded, patch, session.runtime.close, report_stage=report_stage)
     finally:
         try:

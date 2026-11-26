@@ -264,8 +264,8 @@ class ManagedCurrentLimits:
         settled, pending = await decisions.retry_current_recovery(self, change, expected)
         if settled:
             return pending
-        if pending is not None and pending.reason is Prerequisite.SOURCE:
-            # A conflicting fresh source revokes the previous release while that exact authority still owns it.
+        if pending is not None and pending.reason in (Prerequisite.SOURCE, Prerequisite.LIFECYCLE):
+            # Fresh contradictory evidence revokes the previous release while that exact authority still owns it.
             reclaim = c.commands.decide(
                 lambda: (
                     c.authority() == published

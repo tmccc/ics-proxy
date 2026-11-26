@@ -314,7 +314,9 @@ async def test_restore_keeps_proxy_stopped_after_interrupted_write(tmp_path, tls
         peer = rig.peer
         args = ("restore", tmp_path / "trial.json", spec_file(tmp_path, rig), rig.prepared.observer.port)
         peer.lost_patch = {"AmpLmt": "6"}
-        assert (await failed_restore_cli(*args))["restore_reason"] == "native_evidence_unavailable"
+        report = await failed_restore_cli(*args)
+        assert report["restore_stage"] == "verify_6_a_and_remove_proxy_profiles"
+        assert report["restore_reason"] == "native_evidence_unavailable"
         records, phase = journal_facts(rig.prepared.config.journal)
         assert phase == "rollback"
 
@@ -322,6 +324,7 @@ async def test_restore_keeps_proxy_stopped_after_interrupted_write(tmp_path, tls
         peer.runtime_user = 320
         report = await failed_restore_cli(*args)
 
+        assert report["restore_stage"] == "verify_6_a_and_remove_proxy_profiles"
         assert report["restore_reason"] == "restore_stage_failed"
         assert "Keep the proxy stopped" in report["next_step"]
         assert journal_facts(rig.prepared.config.journal) == (records, phase)
