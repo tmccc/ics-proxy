@@ -9,6 +9,7 @@ import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 from .native_faults import NativeContentError
@@ -187,20 +188,101 @@ class NativeHistoryArchive:
         return summary
 
 
-# The latest completed charge is unknown if an absent archive entry could be as recent as the displayed one.
-def latest_completion_available(journal: Journal, completed: dict[int, int], closed: int | None = None) -> bool:
-    latest = max(completed.values(), default=0)
+type CompletionOrder = tuple[float, float]
+
+
+def completion_order(
+    identifier: int | None, start: int | None, stop: int | None, closed: int | None
+) -> CompletionOrder:
+    """Return the latest possible position of a closed row, even if it has incomplete evidence."""
+    if closed is not None:
+        # Assigned IDs order managed closures despite corrections to the charger clock.
+        return (identifier if identifier is not None else math.inf, 0)
+    if start is None or stop is None:
+        return (math.inf, math.inf)
+    return (stop, start) if stop >= start else (start, math.inf)
+
+
+def completion_agrees(
+    order: CompletionOrder, energy: float | None, other_order: CompletionOrder, other_energy: float | None
+) -> bool:
+    """An earlier completion cannot change the result. A tie must prove the same energy."""
+    return order > other_order or (order == other_order and energy is not None and energy == other_energy)
+
+
+@dataclass(frozen=True, slots=True)
+class NativeHistoryReading:
+    identifier: int | None
+    start: int | None
+    stop: int | None
+    meter_start: int | None
+    meter_stop: int | None
+
+    # Accept each native history field only within its expected type and bounds.
+    @classmethod
+    def read(cls, record: dict[str, Any], as_of: float) -> NativeHistoryReading:
+        identifier, start, stop = record.get("transactionId"), record.get("startTime"), record.get("stopTime")
+        first = record.get("meterStart")
+        last = record.get("meterStop", 0 if type(stop) is int and stop == 0 else None)
+        latest_time = as_of + 30
+        return cls(
+            identifier if type(identifier) is int and 0 < identifier <= 2**31 - 1 else None,
+            start if type(start) is int and 0 < start <= latest_time else None,
+            stop if type(stop) is int and 0 <= stop <= latest_time else None,
+            first if type(first) is int and 0 <= first <= 10**12 else None,
+            last if type(last) is int and 0 <= last <= 10**12 else None,
+        )
+
+    # Require a complete row and ordered times and meter readings for a closed session.
+    @property
+    def valid(self) -> bool:
+        return (
+            self.identifier is not None
+            and self.start is not None
+            and self.stop is not None
+            and self.meter_start is not None
+            and self.meter_stop is not None
+            and (self.stop == 0 or (self.stop >= self.start and self.meter_stop >= self.meter_start))
+        )
+
+    # Convert the meter delta to kWh only for a valid, completed session.
+    @property
+    def energy(self) -> float | None:
+        if self.stop and self.valid and self.meter_start is not None and self.meter_stop is not None:
+            return (self.meter_stop - self.meter_start) / 1000
+        return None
+
+
+# An absent row cannot provide the visible energy, but can make that energy uncertain.
+def latest_completion_available(
+    journal: Journal,
+    completed: dict[int, tuple[int, int]],
+    closed: int | None = None,
+    *,
+    latest_energy: float | None = None,
+    as_of: float | None = None,
+) -> bool:
+    latest_order = max(
+        (completion_order(identifier, start, stop, closed) for identifier, (stop, start) in completed.items()),
+        default=(0, 0),
+    )
+    checked_at = time.time() if as_of is None else as_of
     try:
         for identifier, body in journal.db.execute("SELECT transaction_id,body FROM native_history_records"):
             if identifier in completed or (closed is not None and identifier < closed):
                 continue
             record = json.loads(body)
-            if not isinstance(record, dict) or type(stop := record.get("stopTime")) is not int:
+            if (
+                not isinstance(record, dict)
+                or type(stored_id := record.get("transactionId")) is not int
+                or stored_id != identifier
+            ):
                 return False
-            start = record.get("startTime")
-            if stop > 0 and (closed is not None or type(start) is not int or not 0 < start < latest or stop >= latest):
+            reading = NativeHistoryReading.read(record, checked_at)
+            other_order = completion_order(reading.identifier, reading.start, reading.stop, closed)
+            if reading.stop != 0 and not completion_agrees(latest_order, latest_energy, other_order, reading.energy):
                 return False
-    except sqlite3.Error, ValueError:
+    except sqlite3.Error, ValueError, TypeError, RecursionError:
         # A failed display check must not interrupt charger supervision or present a plausible older value.
         return False
     return True

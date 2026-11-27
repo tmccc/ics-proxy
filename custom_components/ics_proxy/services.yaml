@@ -17,12 +17,25 @@ session_command:
         text:
     revision:
       name: Start control revision
-      description: Optional control_revision from the Session open sensor when the Start button was shown.
+      description: The control_revision from the Session open sensor when Start was shown. Required for a rendered Start that supplies an epoch without a generation.
       selector:
         number:
           min: 0
           max: 9007199254740991
           mode: box
+    rendered_at_epoch:
+      name: Render epoch
+      description: The whole-second Unix timestamp of the displayed control when the button was pressed. Required with a command generation.
+      selector:
+        number:
+          min: 1
+          max: 4294967295
+          mode: box
+    command_generation:
+      name: Command generation
+      description: The generation supplied for this action by the Display command sensor. Supply the render epoch and leave the target and revision empty.
+      selector:
+        text:
     include_request_reference:
       name: Include request reference
       description: Return a redacted reference for the attempted request. Use it to look up a local Stop incident.

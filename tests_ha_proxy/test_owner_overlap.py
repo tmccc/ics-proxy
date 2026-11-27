@@ -164,7 +164,7 @@ async def test_owner_current_and_delayed_return_yield_to_pause(
 
                 # The procedure loses the proxy after acceptance and while physical confirmation is pending.
                 async def interrupted_selection():
-                    message = "request was recorded; physical confirmation is still pending"
+                    message = r"The request was recorded\. Its saved result could not be read\."
                     with pytest.raises(HomeAssistantError, match=message):
                         await select_current(hass, 32)
 
@@ -271,7 +271,7 @@ async def test_owner_return_commit_survives_lost_confirmation(
                 assert proxy.rig.bench.firmware.effective_limit() == 16
                 assert proxy.rig.bench.firmware.current == 0 and not starts(proxy.rig)
                 await proxy.kill()
-                assert "request was recorded; physical confirmation is still pending" in (await returning)["error"]
+                assert (await returning)["error"] == "The request was recorded. Its saved result could not be read."
                 assert requests == [identifier]
 
         assert (await view(hass, entry))["mode"] == "unavailable"

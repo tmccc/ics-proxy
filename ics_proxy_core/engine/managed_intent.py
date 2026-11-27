@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 from .security import SecurityError
-from .stop_settlement import STOP_NONTERMINAL_CLASSIFICATIONS
+from .stop_settlement import PAUSE_STOP_HISTORY, STOP_NONTERMINAL_CLASSIFICATIONS
 from .store import Journal, RecoveryRequiredError
 
 if TYPE_CHECKING:
@@ -20,8 +20,15 @@ if TYPE_CHECKING:
 OWNER_PAUSE = "managed_owner_pause"
 OWNER_STOP = "managed_owner_stop"
 OFFLINE_PAUSE = "managed_offline_pause"
+AUTOMATIC_PAUSE_CAUSE = "managed_automatic_pause_cause"
+LOCAL_SCHEDULE_OCCURRENCE = "managed_owner_schedule_occurrence"
 RELEASE_PAUSE_ACK = "managed_release_pause_acknowledgement"
 PAUSE_RELEASE_PROOF = "_release_ack"
+PAUSE_OUTCOME = (
+    "CASE WHEN json_valid(result) THEN CASE WHEN json_type(result,'$.accepted_at') IN ('integer','real') "
+    "THEN json_set(:outcome,'$.accepted_at',result -> '$.accepted_at') ELSE :outcome END "
+    "ELSE :outcome END"
+)
 RETURN_OUTCOME = (
     "CASE WHEN action='app_control' AND json_valid(result) THEN CASE "
     "WHEN json_type(result,'$._return')='object' "
@@ -30,6 +37,7 @@ RETURN_OUTCOME = (
 )
 
 type ReturnFailure = Literal["return_not_sent", "return_not_confirmed"]
+type AutomaticPauseCause = Literal["cloud_connection_failed", "local_charge"]
 
 
 # Use the same durable receipt format for each command; the domain owner supplies its acceptance evidence.
@@ -141,8 +149,27 @@ def write_intent(journal: Journal, current: ControlIntent, mode: str, *, coalesc
     intent = current.next(mode, coalesce=coalesce)
     journal.put("managed_control_intent", {"mode": intent.mode, "revision": intent.revision})
     if current.mode == "paused" and mode == "app":
-        journal.db.execute("DELETE FROM meta WHERE key=?", (OFFLINE_PAUSE,))
+        journal.db.execute("DELETE FROM meta WHERE key IN (?,?)", (OFFLINE_PAUSE, AUTOMATIC_PAUSE_CAUSE))
     return intent
+
+
+# Keep the existing automatic Return marker and bind any known cause to that same revision.
+def record_automatic_pause(journal: Journal, intent: ControlIntent, cause: AutomaticPauseCause | None) -> None:
+    journal.put(OFFLINE_PAUSE, intent.revision)
+    if cause is not None:
+        journal.put(AUTOMATIC_PAUSE_CAUSE, {"revision": intent.revision, "cause": cause})
+
+
+# Legacy records can lack cause evidence. Ignore any evidence belonging to a different revision.
+def automatic_pause_cause(journal: Journal, intent: ControlIntent) -> AutomaticPauseCause | None:
+    value = journal.get(AUTOMATIC_PAUSE_CAUSE)
+    if isinstance(value, dict) and type(value.get("revision")) is int and value["revision"] == intent.revision:
+        cause = value.get("cause")
+        if cause == "cloud_connection_failed":
+            return "cloud_connection_failed"
+        if cause == "local_charge":
+            return "local_charge"
+    return None
 
 
 # Finish only the original live request and keep an already settled receipt intact.
@@ -344,7 +371,7 @@ class ReturnSettlement:
         operation, pending = progress.operation, progress.pending
         if progress.state is RestoreState.REQUEST_NOT_SENT:
             return cls.failed(identifier, intent, possibly_sent=False), progress
-        await_cloud = False
+        await_cloud = pending is not None and pending.reason is Prerequisite.CLOUD_DELIVERY
         if (operation is None or not operation.claimed) and pending is not None:
             if preflight_disposition("explicit", pending) is PreflightDisposition.NOT_SENT:
                 return cls.failed(identifier, intent, possibly_sent=False), RestoreProgress(
@@ -432,13 +459,9 @@ class ManagedRequests:
         with self.journal.atomic():
             if action == "pause":
                 # One newest restrictive receipt survives even a legacy full ordinary pool; all prior UUID rows remain.
-                self.journal.db.execute(
-                    "UPDATE managed_requests SET state='failed',result=? "
-                    "WHERE action='pause' AND state IN ('accepted','running','uncertain')",
-                    (json.dumps({"classification": "superseded_by_pause", "superseded_by": identifier}),),
-                )
+                self._supersede_pauses(identifier, "superseded_by_pause", include_running=True)
                 write_intent(self.journal, current, "paused")
-                self.journal.db.execute("DELETE FROM meta WHERE key=?", (OFFLINE_PAUSE,))
+                self.journal.db.execute("DELETE FROM meta WHERE key IN (?,?)", (OFFLINE_PAUSE, AUTOMATIC_PAUSE_CAUSE))
                 if on_pause is not None:
                     on_pause()
                     hold = read_pause_claim(self.journal)
@@ -472,6 +495,7 @@ class ManagedRequests:
         if command.action == "pause":
             result.pop("_pause", None)
             result.pop("_stop", None)
+            result.pop(PAUSE_STOP_HISTORY, None)
             result.pop(PAUSE_RELEASE_PROOF, None)
         if command.action == "app_control":
             result.pop("_return", None)
@@ -515,6 +539,12 @@ class ManagedRequests:
             "SELECT result FROM managed_requests WHERE id=?", (request.identifier,)
         ).fetchone()
         result = json.loads(row["result"])
+        if "_stop" in result:
+            history = self.journal.outcomes.pending_pause_stop_claims(request.identifier, result)
+            if history:
+                result[PAUSE_STOP_HISTORY] = history
+            else:
+                result.pop(PAUSE_STOP_HISTORY, None)
         result["_stop"] = {"ticket": ticket, "local": local, "boot": boot}
         self.journal.db.execute(
             "UPDATE managed_requests SET result=? WHERE id=?", (json.dumps(result), request.identifier)
@@ -565,10 +595,26 @@ class ManagedRequests:
     def start_published(self, identifier: str, expected: ControlIntent, epoch: int) -> None:
         self._publish_app(expected)
         self.journal.put("managed_owner_epoch", epoch)
-        self.journal.db.execute(
-            "UPDATE managed_requests SET state='failed',result=? "
-            "WHERE action='pause' AND state IN ('accepted','uncertain')",
-            (json.dumps({"classification": "superseded_by_start", "superseded_by": identifier}),),
+        self._supersede_pauses(identifier, "superseded_by_start")
+
+    # A newer owner's decision ends the prior receipt while its issued Stop can still settle.
+    def _supersede_pauses(self, identifier: str, classification: str, *, include_running: bool = False) -> None:
+        db = self.journal.db
+        pending = "action='pause' AND (state IN ('accepted','uncertain') OR (:include_running AND state='running'))"
+        outcome = {"classification": classification, "superseded_by": identifier}
+        for request, raw in db.execute(
+            f"SELECT id,result FROM managed_requests WHERE {pending} AND CASE WHEN json_valid(result) THEN "
+            f"json_type(result,'$._stop')='object' OR json_type(result,'$.{PAUSE_STOP_HISTORY}')='object' END",
+            {"include_running": include_running},
+        ).fetchall():
+            if history := self.journal.outcomes.pending_pause_stop_claims(request, json.loads(raw)):
+                db.execute(
+                    f"UPDATE managed_requests SET state='failed',result={PAUSE_OUTCOME} WHERE id=:id",
+                    {"outcome": json.dumps(outcome | {PAUSE_STOP_HISTORY: history}), "id": request},
+                )
+        db.execute(
+            f"UPDATE managed_requests SET state='failed',result={PAUSE_OUTCOME} WHERE {pending}",
+            {"outcome": json.dumps(outcome), "include_running": include_running},
         )
 
     # Test-stop revocation follows its caller's induced Pause and claim, without consuming replacement uncertainty.
@@ -776,7 +822,8 @@ class ManagedRequests:
                 "SELECT result FROM managed_requests WHERE id=?", (request.identifier,)
             ).fetchone()
             prior = json.loads(row["result"])
-            result.update({key: prior[key] for key in ("_pause", "_stop", PAUSE_RELEASE_PROOF) if key in prior})
+            keys = ("accepted_at", "_pause", "_stop", PAUSE_STOP_HISTORY, PAUSE_RELEASE_PROOF)
+            result.update({key: prior[key] for key in keys if key in prior})
             self.journal.db.execute(
                 "UPDATE managed_requests SET state='completed',result=? "
                 "WHERE id=? AND state IN ('accepted','uncertain')",
@@ -784,7 +831,7 @@ class ManagedRequests:
             )
             return
         self.journal.db.execute(
-            "UPDATE managed_requests SET state='completed',result=? "
+            f"UPDATE managed_requests SET state='completed',result={PAUSE_OUTCOME} "
             "WHERE action='pause' AND state IN ('accepted','uncertain') AND json_extract(result,'$._pause') IS NULL",
-            (json.dumps(result),),
+            {"outcome": json.dumps(result)},
         )

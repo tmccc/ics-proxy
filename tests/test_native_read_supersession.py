@@ -16,10 +16,61 @@ from ics_proxy_core.engine.native_faults import NativeContentError
 from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
 from ics_proxy_core.engine.ordinary_recovery import SOURCE
 from tests import native_schedule_support as schedule_bench
+from tests.charge_rig import ready
 from tests.managed_rig import healthy, starts
 from tests.native_schedule_support import ZONE, SchedulePeer, timer_bench
 from tests.prototype_rig import START
 from tests.tls_support import tls as tls
+
+
+# Intent: cancel a newer native read before an older, independently retrieved sample can settle.
+# Why: cancellation must withdraw the cached proof and prevent the older sample from authorizing new work.
+async def test_newer_cancelled_audit_fences_an_older_complete_sample(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, native = b.controller, b.controller.native
+        assert c.current_native_sample() is not None
+        observe = native.observe
+        entered = (asyncio.Event(), asyncio.Event())
+        release_old = asyncio.Event()
+        release_new = asyncio.Event()
+        gates = iter(zip(entered, (release_old, release_new), strict=True))
+
+        # Fetch each real sample independently, then let the test control when it reaches the decision owner.
+        async def hold_complete_observation():
+            waiting, release = next(gates)
+            sample = await observe()
+            waiting.set()
+            await release.wait()
+            return sample
+
+        with monkeypatch.context() as patch:
+            patch.setattr(native, "observe", hold_complete_observation)
+            older = asyncio.create_task(native.read())
+            newer = None
+            try:
+                await asyncio.wait_for(entered[0].wait(), 3)
+                newer = asyncio.create_task(native.read())
+                await asyncio.wait_for(entered[1].wait(), 3)
+                sequence = native.read_sequence
+                newer.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await newer
+                assert native.last_resolved_read == sequence and native.last_verified_at == 0
+                assert c.current_native_sample() is None
+                release_old.set()
+                with pytest.raises(AuditSupersededError):
+                    await older
+                assert native.last_resolved_read == sequence and native.last_verified_at == 0
+                assert c.current_native_sample() is None
+            finally:
+                release_old.set()
+                if newer is not None:
+                    newer.cancel()
+                    await asyncio.gather(newer, return_exceptions=True)
+                await asyncio.gather(older, return_exceptions=True)
+
+        assert (await healthy(c))["owner_control_enabled"]
+        assert c.current_native_sample() is not None
 
 
 # Intent: send a genuine daily Start while a newer audit completes or a new owner Pause commits.

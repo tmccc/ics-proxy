@@ -2,18 +2,73 @@
 """The rollback reader recognises a settled migrated journal and its archived evidence."""
 
 import json
+import shutil
 import sqlite3
 import time
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 
-from ics_proxy_core.engine.store import fingerprint
+from ics_proxy_core.engine.store import Journal, fingerprint
 from tests.process_helpers import process_rig
 from tests.tls_support import tls as tls
 from tests_installation.migrated_layout import seed_old_layout
 from tools import check_proxy_rollback as rollback
 from tools.check_proxy_rollback import RollbackRefusedError, check_snapshot, stopped_journal
+
+
+# Intent: reject a rollback journal if its database, lock, or sidecars have hard links.
+# Why: one stopped journal path must identify the SQLite files protected by the lock.
+@pytest.mark.parametrize(
+    "suffix", ["", ".lock", "-wal", "-shm", "-journal"], ids=["journal", "lock", "wal", "shm", "rollback"]
+)
+def test_stopped_journal_refuses_hardlinked_state(tmp_path, suffix):
+    live = tmp_path / "live.sqlite"
+    with closing(Journal(live, "SYNTHETIC")):
+        pass
+    shared = Path(str(live) + suffix)
+    shared.touch(mode=0o600, exist_ok=True)
+    alias = tmp_path / "backup.sqlite"
+    if not suffix:
+        alias.hardlink_to(live)
+        Path(str(alias) + ".lock").touch(mode=0o600)
+        check = alias
+    else:
+        alias.hardlink_to(shared)
+        check = live
+
+    before = set(tmp_path.iterdir())
+    with pytest.raises(RollbackRefusedError, match="^journal_unavailable$"), stopped_journal(check):
+        pytest.fail("rollback inspected a hard-linked journal")
+    assert set(tmp_path.iterdir()) == before
+
+
+# Intent: inspect a stopped journal and its uncheckpointed commits without modifying its files or directory.
+# Why: SQLite can create sidecars beside a WAL database even when opened in read-only mode.
+@pytest.mark.parametrize("committed_wal", [False, True], ids=["checkpointed", "uncheckpointed"])
+def test_stopped_journal_does_not_write_sidecars(tmp_path, committed_wal):
+    path = tmp_path / "stopped.sqlite"
+    if committed_wal:
+        source = tmp_path / "fixture.sqlite"
+        with closing(Journal(source, "SYNTHETIC")) as journal:
+            journal.db.execute("PRAGMA wal_autocheckpoint=0")
+            journal.put("example", "checkpointed")
+            journal.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            journal.put("example", "committed to WAL")
+            shutil.copy2(source, path)
+            shutil.copy2(Path(str(source) + "-wal"), Path(str(path) + "-wal"))
+        Path(str(path) + ".lock").touch(mode=0o600)
+        expected = "committed to WAL"
+    else:
+        with closing(Journal(path, "SYNTHETIC")) as journal:
+            journal.put("example", "checkpointed")
+        expected = "checkpointed"
+
+    before = {file.name: file.read_bytes() for file in tmp_path.iterdir()}
+    with stopped_journal(path) as db:
+        assert db.execute("SELECT value FROM meta WHERE key='example'").fetchone() == (json.dumps(expected),)
+    assert {file.name: file.read_bytes() for file in tmp_path.iterdir()} == before
 
 
 # Save the same immutable timed-Start outcome and later verified Pause found in the installed journal.

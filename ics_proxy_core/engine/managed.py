@@ -14,6 +14,8 @@ from .command_processor import CommandPriority
 from .composite import STATION_COMPOSITE_FAULT, ExcessiveCompositeError
 from .connection_scope import ControlScope, control_scope_matches, current_control_scope, current_scope
 from .local_control import ControlSupersededError
+from .local_schedule import LocalSchedule
+from .local_schedule_cutoff import scheduled_cutoff_target
 from .managed_charging import ManagedCharging
 from .managed_current import ManagedCurrentLimits
 from .managed_current_recovery import capture_interrupted_collision
@@ -95,10 +97,12 @@ class ManagedController:
         self.latest_native_lifecycle: tuple[int, int | None] | None = None
         self.latest_native_scope: ControlScope | None = None
         self.status_authority: AuthorityStamp | None = None
+        self.status_native_sequence: int | None = None
         self.status_latest_closed: int | None = None
         self.status_vendor_epoch: int | None = None
 
         self.current = ManagedCurrentLimits(self)
+        self.local_schedule = LocalSchedule(self, session.prepared.config.owner_schedule_timezone)
         self.charging = ManagedCharging(self)
         self.session_stop = ManagedSessionStop(self)
         session.managed_session_stop = self.session_stop
@@ -121,10 +125,11 @@ class ManagedController:
             session.journal, lambda fault: release_evidence(self, fault) is not None
         )
 
-    # A periodic sample belongs to one Boot, control generation, and position in the charger lifecycle.
+    # A periodic sample belongs to one Boot and lifecycle, and a newer failed audit can withdraw it.
     def current_native_sample(self) -> HandoverEvidence | None:
         if (
             self.latest_native is not None
+            and self.native.last_verified_at != 0
             and control_scope_matches(self.session.gateway, self.latest_native_scope)
             and self.latest_native_lifecycle == self.session.journal.lifecycle_position()
         ):
@@ -149,7 +154,12 @@ class ManagedController:
     ) -> dict[str, Any]:
         if self.stopping:
             raise UnavailableError("managed service is stopping")
-        if action != "pause" and self.session._introduction_refusal is not None:
+        # Allow saved requests to reach their original argument checks while fresh work awaits the diagnostic.
+        if (
+            action != "pause"
+            and self.session._introduction_refusal is not None
+            and self.requests.existing(identifier, action, revision) is None
+        ):
             raise RecoveryRequiredError("strict introduction refusal awaits durable diagnostic")
         if action == "set_current":
             if current_a is None:
@@ -248,11 +258,15 @@ class ManagedController:
     # Keep the physical Stop independent from the requesting websocket's lifetime and retain uncertainty honestly.
     async def _stop_requested(self) -> None:
         try:
+            if scheduled_cutoff_target(self.session.journal) is not None:
+                return  # The scheduled cutoff owns only its exact session.
             if self.charging.scoped_normal_stop():
                 await self.charging.reconcile_expired()
                 return
             await self.ensure_pause_zero()
             g, j = self.session.gateway, self.session.journal
+            if scheduled_cutoff_target(j) is not None:
+                return
             controls = g.controls
             scope = controls.decisions.prepare_pause_stop(g, self.requests)
             local = scope.local
@@ -397,6 +411,9 @@ class ManagedController:
 
     # Let the shared owner recheck outage and Start debt at the native send gate.
     def positive_decision(self, native: HandoverEvidence) -> GateDecision:
+        decision = self.local_schedule.positive_decision(native)
+        if isinstance(decision, Pending):
+            return decision
         return self.session.gateway.controls.decisions.recovery.positive_decision(self, native)
 
     # Verified zero and cloud/lifecycle prerequisites are independent from source and physical release effects.
@@ -413,6 +430,19 @@ class ManagedController:
     async def return_requested(self, identifier: str, revision: int) -> None:
         await self.session.gateway.controls.decisions.run_requested_return(self, identifier, revision)
 
+    # A confirmed station zero can precede the connector limit updating while the meter shows no draw.
+    def _pause_output_pending(self, native: HandoverEvidence) -> bool:
+        g, j = self.session.gateway, self.session.journal
+        return (
+            native.output_limit_a > 0
+            and not any(native.currents_a + native.powers_w)
+            and g.current_boot_seen(g._charger_epoch)
+            and self.requests.intent().mode == "paused"
+            and j.control.read().local_hold
+            and native.physical.native_transaction_id == j.active()
+            and self.native.station_zero_refusal(list(native.physical.resources)) is None
+        )
+
     # Resource settling, a complete native audit and closure agreement each have their own bounded wait.
     async def settled_native(self) -> HandoverEvidence:
         async with asyncio.timeout(15):
@@ -420,8 +450,10 @@ class ManagedController:
                 await asyncio.sleep(0.02)
         if self.current.applying():
             raise RecoveryRequiredError("current application owns the pending native verification")
+        j = self.session.journal
+        recovery = self.session.gateway.controls.decisions.recovery
         try:
-            native = await self.native.read()
+            native = await self.native.read(closing_local=j.latest_owner_stop_id())
             measured = self.native._selected_measurements(native, self.native._inspect(native))
             authority, sequence = self.native.authority(), self.native.last_resolved_read
         except _NativeMeasurementError as candidate:
@@ -432,7 +464,7 @@ class ManagedController:
             if error.unplugged_at_zero and self.session_stop.closure_pending(error.native):
                 self.latest_native = None
                 raise RecoveryRequiredError("session Stop awaits both local closure observations") from error
-            if not self.session.gateway.controls.decisions.recovery.unplugged_closure(self, error):
+            if not recovery.unplugged_closure(self, error):
                 raise
             self.latest_native = None
             self.failures = 0
@@ -475,13 +507,16 @@ class ManagedController:
                         raise StationCeilingLostError("the known charging session lost its owned station ceiling")
                     raise SecurityError("managed local station ceiling is absent or unconfirmed")
                 native.physical.require_fresh(self.session.journal.identity, 5)
+                if self._pause_output_pending(native):
+                    raise NativeReadinessError("requested Pause awaits the native connector limit at zero", native)
                 self.native.require_selected_output(native)
                 if measured.exceeded:
                     raise MeasuredOutputLimitError(native, measured, self.native.spec.digest, self.current.selected())
                 return True
 
             if not self.commands.decide(accept):
-                await self.ordinary.hold("native_closure_pending")
+                owner_closure = j.latest_owner_stop_id() if recovery.owner_closure_gap(self.native, native) else None
+                await self.ordinary.hold("native_closure_pending", owner_closure=owner_closure)
                 raise RecoveryRequiredError("ordinary zero hold awaits exact lifecycle closure")
             return native
 
@@ -514,6 +549,7 @@ class ManagedController:
         self.commands.decide(self.session.gateway.retry_reply_writes)
         self.commands.decide(self.session.runtime.settle_saved_delivery)
         self.commands.decide(self.session_stop.expire)
+        await self.local_schedule.stop_if_due()
         pending = await self._pending_work()
         if pending is not None:
             self.latest_native = None
@@ -539,6 +575,8 @@ class ManagedController:
             return PollStatus("degraded", "native_observation_unavailable")
         if verdict.healthy and self.requests.intent().mode == "app":
             self.requests.complete_legacy_return()
+        if verdict.local_healthy:
+            self.local_schedule.consider(observed.native)
         return observed.native, verdict
 
     # Pending owned completions retain their existing settlement priority before any new native audit.
@@ -567,6 +605,10 @@ class ManagedController:
         if j.fault.latched():
             await self.hold_fault()
         await self._stop_for_missing_station()
+        self.commands.decide(
+            lambda: g.controls.decisions.recovery.record_owner_hold_station_fault(self),
+            priority=CommandPriority.RESTRICT,
+        )
         if j.fault.latched():
             if (
                 self.requests.pending_pause()
@@ -673,6 +715,9 @@ class ManagedController:
     def _record_refused_observation(self, error: Exception) -> PollStatus:
         if self.stopping:
             return PollStatus("stopping")
+        if isinstance(error, NativeReadinessError) and self._pause_output_pending(error.native):
+            self.latest_native = None
+            return PollStatus("reconciling")
         # Only a fully settled typed measurement can make this entire hard-failure run recoverable.
         measured_only = isinstance(error, MeasuredOutputLimitError)
         self.strict_failure_seen = self.strict_failure_seen or not measured_only
@@ -704,6 +749,7 @@ class ManagedController:
         if authority != self.native.authority() or sequence != self.native.last_resolved_read:
             raise AuditSupersededError("native supervision crossed a newer authority or observation")
         connection = current_control_scope(g)
+        self.local_schedule.observe_closed(native)
         verified_pause = False
         if (self.requests.intent().mode == "app") and (self.released_epoch != g._charger_epoch):
             raise RecoveryRequiredError("managed release awaits fresh app-control restoration")

@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -20,6 +21,10 @@ from typing import Any, BinaryIO
 
 class RecoveryRequiredError(RuntimeError):
     """An uncertain remote outcome needs reconciliation instead of automatic replay."""
+
+
+class JournalOwnerBusyError(RecoveryRequiredError):
+    """Another process still holds the journal's exclusive owner lock."""
 
 
 class ReleaseDeferredError(RecoveryRequiredError):
@@ -83,6 +88,7 @@ class Journal:
         self.path = path
         self.identity = identity
         self.capacity = capacity
+        self._vendor_stop_followers: Counter[str] = Counter()
         if require_existing and not path.is_file():
             raise RecoveryRequiredError("the existing charger journal is required")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -94,7 +100,7 @@ class Journal:
             try:
                 fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                raise RecoveryRequiredError("journal already has an active owner") from None
+                raise JournalOwnerBusyError("journal already has an active owner") from None
             for state in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm"), Path(str(path) + "-journal")):
                 try:
                     info = state.lstat()
@@ -462,6 +468,18 @@ class Journal:
             self.put("connection_epoch", epoch)
         return epoch
 
+    # Keep the exact earlier mutation while a queued vendor Stop can still need its reply after closure.
+    @contextmanager
+    def retain_vendor_stop_predecessors(self, mutations: tuple[str, ...]) -> Iterator[None]:
+        self._vendor_stop_followers.update(mutations)
+        try:
+            yield
+        finally:
+            for mutation in mutations:
+                self._vendor_stop_followers[mutation] -= 1
+                if self._vendor_stop_followers[mutation] == 0:
+                    del self._vendor_stop_followers[mutation]
+
     # Retain only a digest of a mutating RPC, never its possibly secret proprietary body.
     def mutation_intent(self, origin: str, action: str, payload: dict[str, Any]) -> str:
         digest = fingerprint(payload)
@@ -479,6 +497,7 @@ class Journal:
                 if entry.get("completed") is None
                 and entry["proof"]["kind"] in ("vendor-write", "vendor-start", "vendor-start-mapping")
             }
+            protected.update(self._vendor_stop_followers)
             grant = self.get("vendor_start_grant", {})
             if grant.get("mutation"):
                 protected.add(grant["mutation"])
@@ -734,6 +753,17 @@ class Journal:
         ).fetchone()
         return int(row[0]) if row is not None else None
 
+    # A closed owner session can explain a lagging native ID only until the next connector lifecycle.
+    def latest_owner_stop_id(self) -> int | None:
+        if not self._has_owner_schema():
+            return None
+        row = self.db.execute(
+            "SELECT latest.local FROM ("
+            "SELECT local, stop, vendor FROM transactions WHERE connector=1 ORDER BY local DESC LIMIT 1"
+            ") AS latest JOIN owner_sessions USING(local) WHERE latest.stop IS NOT NULL AND latest.vendor IS NULL"
+        ).fetchone()
+        return int(row[0]) if row is not None else None
+
     # A complete Start and Stop advances the allocation even when the connector is idle again.
     def lifecycle_position(self) -> tuple[int, int | None]:
         return self.get("next_transaction", 1000), self.active()
@@ -864,8 +894,10 @@ class Journal:
                 raise ConflictError("cloud transaction still belongs to another undelivered local lifecycle")
             try:
                 self.db.execute("UPDATE transactions SET vendor=? WHERE local=?", (vendor, item.transaction))
-            except sqlite3.IntegrityError:
-                raise ConflictError("cloud transaction already belongs to another local session") from None
+            except sqlite3.IntegrityError as error:
+                if getattr(error, "sqlite_errorcode", None) != sqlite3.SQLITE_CONSTRAINT_UNIQUE:
+                    raise
+                raise ConflictError("cloud transaction already belongs to another local session") from error
             from .managed_start_delivery import retire_start_retry
 
             retire_start_retry(self, item.token, item.transaction, fingerprint(item.payload))

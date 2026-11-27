@@ -24,12 +24,13 @@ from .policy import DeniedError
 from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
 from .rpc import UnavailableError
 from .security import SecurityError
-from .start_handoff import StartHandoff, StartHandoffContext, StartPublication
+from .start_handoff import OwnedStartResult, StartHandoff, StartHandoffContext, StartPublication
 from .start_policy import offline_owner_tag
 from .store import Journal, RecoveryRequiredError, StationZeroStorageError, fingerprint
 from .trial_handover_evidence import HandoverEvidence
 
 if TYPE_CHECKING:
+    from .local_schedule_window import ScheduleWindow
     from .managed import ManagedController
 
 DURATION = 120
@@ -69,6 +70,7 @@ class ChargeLease:
     first_flow: TestFlow | None = None
     accepted_boot: str | None = None
     owner_start_tag: str | None = field(default=None, repr=False)
+    schedule: ScheduleWindow | None = None
 
 
 class ManagedCharging:
@@ -177,13 +179,23 @@ class ManagedCharging:
         )
 
     # The decision owner accepts the request and launches work only after its journal commit.
-    def accept(self, identifier: str, action: str, revision: int) -> dict[str, Any]:
+    def accept(
+        self, identifier: str, action: str, revision: int, *, schedule: ScheduleWindow | None = None
+    ) -> dict[str, Any]:
         return self.controller.session.gateway.controls.decisions.accept_start(
-            self, identifier, action, revision, STARTUP_BUDGET, DURATION
+            self, identifier, action, revision, STARTUP_BUDGET, DURATION, schedule=schedule
         )
 
     # Capture the existing data and time budget for the accepted Start.
-    def _start_lease(self, identifier: str, action: str, revision: int) -> ChargeLease:
+    def _start_lease(
+        self,
+        identifier: str,
+        action: str,
+        revision: int,
+        *,
+        schedule: ScheduleWindow | None = None,
+        startup: float = STARTUP_BUDGET,
+    ) -> ChargeLease:
         c, j = self.controller, self.journal
         g = c.session.gateway
         source = "local" if action in ("start", "start_test") else "cloud"
@@ -196,14 +208,15 @@ class ManagedCharging:
             fingerprint(j.identity),
             c.native.spec.digest,
             j.get("control", {}).get("stop_epoch", 0),
-            time.monotonic() + STARTUP_BUDGET,
-            time.monotonic() + STARTUP_BUDGET + (0 if action == "start" else DURATION),
+            time.monotonic() + startup,
+            time.monotonic() + startup + (0 if action == "start" else DURATION),
             j.db.execute("SELECT COALESCE(MAX(rowid),0) FROM mutations").fetchone()[0],
             mode=c.requests.intent().mode,
             normal=action == "start",
             current_a=c.current.selected(),
             accepted_boot=g.boot_observation,
             owner_start_tag=offline_owner_tag(self) if action == "start" else None,
+            schedule=schedule,
         )
 
     # The worker and deadline keep their existing lifetimes after the request is recorded.
@@ -223,6 +236,7 @@ class ManagedCharging:
     async def _start(self, lease: ChargeLease) -> None:
         c, j = self.controller, self.journal
         effects = False
+        result: OwnedStartResult | None = None
         try:
             previous_current = current_candidate(c) if lease.normal else None
             self.guard(lease)
@@ -295,24 +309,23 @@ class ManagedCharging:
             TimeoutError,
             sqlite3.Error,
         ) as error:
-            await self._failed_start(lease, error, effects)
+            await self._failed_start(lease, error, effects, result)
 
     # Settle the exact failed operation before optional diagnostics; a newer restrictive winner remains intact.
-    async def _failed_start(self, lease: ChargeLease, error: Exception, effects: bool) -> None:
+    async def _failed_start(
+        self, lease: ChargeLease, error: Exception, effects: bool, result: OwnedStartResult | None
+    ) -> None:
         c = self.controller
+        decisions = c.session.gateway.controls.decisions
         while not self._closing and not c.stopping:
             try:
-                c.commands.decide(lambda: self._settle_failed_start(lease, error, effects))
+                c.commands.decide(lambda: decisions.settle_failed_start(self, lease, error, effects, result))
                 return
             except sqlite3.Error:
                 # Genuine critical storage failure retains the separate deadline's existing zero/Stop authority.
                 lease.deadline = min(lease.deadline, time.monotonic())
                 self.changed.set()
                 await asyncio.sleep(0.1)
-
-    # Retry lifecycle settlement through the same owner as admission and publication.
-    def _settle_failed_start(self, lease: ChargeLease, error: Exception, effects: bool) -> None:
-        self.controller.session.gateway.controls.decisions.settle_failed_start(self, lease, error, effects)
 
     # Compatibility diagnostics cannot keep a settled worker alive or undo its request-bound durable cause.
     def record_failure_diagnostic(self, cause: dict[str, Any]) -> None:
@@ -453,6 +466,8 @@ class ManagedCharging:
             if not self.can_record_owner(tag):
                 raise UnavailableError("the already issued Start report awaits verified shutdown zero")
             return
+        if j.starts.pending_owner_tag(tag):
+            await c.local_schedule.hold_due_unbound_start()
         if self.scoped_normal_stop() and c.requests.intent().mode == "app":
             await self.hold_expired()
         intent = c.requests.intent()
@@ -700,9 +715,18 @@ class ManagedCharging:
         return self.scoped_normal_stop() or self.timed_pause_leaves_session(self.journal.active())
 
     # Schedule restrictive execution after the shared owner commits the exact expiry.
-    def stop(self, lease: ChargeLease, reason: str, *, failure: dict[str, Any] | None = None) -> None:
+    def stop(
+        self,
+        lease: ChargeLease,
+        reason: str,
+        *,
+        failure: dict[str, Any] | None = None,
+        allow_schedule_return: bool = False,
+    ) -> None:
         c = self.controller
-        if c.session.gateway.controls.decisions.expire_start(self, lease, reason, failure):
+        if c.session.gateway.controls.decisions.expire_start(
+            self, lease, reason, failure, allow_schedule_return=allow_schedule_return
+        ):
             c.schedule_pause()
             self.changed.set()
 

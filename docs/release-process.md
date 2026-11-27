@@ -93,3 +93,16 @@ Builds from before stable recovery reasons can reject a newer failure record for
 Reconcile that change with the build that recorded it before considering a downgrade. The installation
 rehearsal covers a settled journal and does not establish downgrade compatibility for every failure state.
 Resolve interrupted vendor authorization checks on the build that recorded them before considering a downgrade.
+
+## Qualify the overnight outage schedule
+
+Production builds block new automatic outage Starts until an authorized test on the commissioned firmware
+verifies that the charger can enforce the cutoff independently. The proxy's elapsed deadline covers a clock
+correction and some service replacements. An unreachable host leaves cutoff to the charger.
+
+Qualify a candidate at the agreed site current with independent charger session and power readings. Check an
+unsynchronized start after host power loss, loss of synchronization before Start, an in-window vendor outage,
+and a session that still has demand at cutoff with the proxy unavailable across 06:00. A passing cutoff needs
+charger-side evidence that the active session ended and output reached zero before the proxy returned. Verify
+that bringing the proxy back does not start another session in the same window. Retain the redacted evidence
+with the approved source commit and firmware version.

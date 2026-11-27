@@ -5,22 +5,38 @@ import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 import yaml
-from homeassistant import bootstrap, loader
-from homeassistant.config_entries import ConfigEntries
-from homeassistant.core import HomeAssistant, SupportsResponse
+from homeassistant.config_entries import ConfigEntryDisabler, ConfigEntryState
+from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import condition, trigger
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.template import Template
 from homeassistant.setup import async_setup_component
+from homeassistant.util import dt as dt_util
+
+from tests_ha_proxy.conftest import setup_proxy
+from tests_ha_proxy.test_client import peer as peer
+
+replacement_peer = peer
 
 PROJECT = Path(__file__).resolve().parents[1] / "examples" / "solar-display-2"
-SESSION = "binary_sensor.ics_proxy_session_open"
-PENDING = "input_select.general_display_2_ics_request"
 AUTOMATION = "automation.general_display_2_ics_charger_buttons"
+DISPLAY_VIEW = "sensor.general_display_2_ics_control"
 IMAGE = "image.ics_display_preview"
 VIEW = "replace-with-editor-view-id"
 TARGET = "b" * 64
+CANVAS_OWNER = "c" * 64
+REPLACEMENT_OWNER = "d" * 64
 REVISION = 42
-START_MARKER = f"start:{REVISION:014x}"
+
+
+# Give canvas tests destination evidence while the ordinary client fixture can still model an older proxy.
+@pytest.fixture
+def canvas_peer(peer):
+    peer["state"]["canvas_owner"] = CANVAS_OWNER
+    return peer
 
 
 # Decode the produced cells at the firmware's sample locations after RGB565 conversion.
@@ -38,17 +54,47 @@ def render_marker(html):
     return raw
 
 
-# Intent: make the touch automation visible to the renderer's entity scan.
-# Why: without that state, the display greys out charger buttons even when the automation is enabled.
-def test_display_view_declares_touch_automation_to_renderer():
-    # GeekMagic prefetches only entity IDs it can read directly from these template calls.
+# Intent: a same-control refresh preserves the render epoch and age of the original press.
+# Why: replacing either value with the new frame's can make an expired or rewound tap look current.
+def test_display_sends_the_freshness_of_the_pressed_frame():
+    package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
+    page = next(page for page in package["lvgl"]["pages"] if page["id"] == "canvas_dashboard")
+    touch = next(
+        widget["button"] for widget in page["widgets"] if widget.get("button", {}).get("id") == "canvas_touch_button"
+    )
+    press = touch["on_press"][0]["lambda"]
+    assert press.index("freshness.fresh(now, clock.timestamp)") < press.index("frame.pressed_freshness() = freshness")
+    click = touch["on_click"][0]["if"]
+    guard = click["condition"]["lambda"]
+    assert "charger_button ? frame.pressed_freshness() : frame.freshness()" in guard
+    assert "const uint32_t touch_age = touch_frame.render_age_ms(now, clock.timestamp);" in guard
+    assert guard.index("touch_age >= solar_display::CanvasFreshness::MAX_AGE_MS") < guard.index("return true")
+    assert "id(canvas_touch_age_seconds) = touch_age / 1000;" in guard
+    assert "id(canvas_touch_rendered_at_epoch) = touch_frame.rendered_at();" in guard
+    event = click["then"][0]["homeassistant.event"]["data"]
+    assert event["canvas_age_seconds"] == "return to_string(id(canvas_touch_age_seconds));"
+    assert event["canvas_rendered_at_epoch"] == "return to_string(id(canvas_touch_rendered_at_epoch));"
+
+
+# The renderer prefetches only entity IDs it reads directly from its template.
+# Intent: confirm the renderer and the ESPHome configuration consume the same command entity.
+# Why: the pictured control and its submitted generation must come from one view.
+def test_renderer_and_firmware_use_the_same_command_entity():
     view = (PROJECT / "view.html.jinja").read_text()
     references = re.findall(r"""\b(?:states|state_attr|is_state)\(\s*['"]([^'"]+)['"]""", view)
-    assert AUTOMATION in references
+    assert DISPLAY_VIEW in references
+    assert AUTOMATION not in references
+    assert IMAGE not in references
+    assert "input_select.general_display_2_ics_request" not in references
+    package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
+    assert package["substitutions"]["canvas_ics_view_entity"] == DISPLAY_VIEW
+    command_sources = [sensor for sensor in package["text_sensor"] if sensor["platform"] == "homeassistant"]
+    assert [sensor["entity_id"] for sensor in command_sources] == ["${canvas_ics_view_entity}"]
+    assert not any(sensor["platform"] == "homeassistant" for sensor in package.get("sensor", []))
 
 
-# Intent: the display checks for Home Assistant clock corrections as often as it checks for images.
-# Why: a long time-sync interval would make fresh images look expired after Home Assistant's clock moves back.
+# Intent: keep the Home Assistant time sync at the same interval as the image download.
+# Why: the firmware compares a rendered frame's timestamp against that synchronized clock.
 def test_display_resynchronizes_its_clock_at_the_download_interval():
     package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
     clock = next(source for source in package["time"] if source["id"] == "canvas_ha_time")
@@ -57,352 +103,786 @@ def test_display_resynchronizes_its_clock_at_the_download_interval():
     assert clock["update_interval"] == image["update_interval"] == "10s"
 
 
-# Intent: the touchscreen reacts to both settled outcomes and the live state of a pending request.
-# Why: a renderer running every 25 seconds can miss the entire interval of unconfirmed feedback.
-def test_display_feedback_follows_live_home_assistant_subscriptions():
-    package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
-    helper = next(sensor for sensor in package["text_sensor"] if sensor["id"] == "canvas_ics_request_state")
-    automation = next(sensor for sensor in package["text_sensor"] if sensor["id"] == "canvas_ics_touch_automation")
-    busy = next(sensor for sensor in package["sensor"] if sensor["id"] == "canvas_ics_pending_runs")
-    substitutions = package["substitutions"]
-    assert helper["platform"] == automation["platform"] == busy["platform"] == "homeassistant"
-    assert helper["entity_id"] == "${canvas_ics_request_entity}"
-    assert substitutions["canvas_ics_request_entity"] == PENDING
-    assert automation["entity_id"] == busy["entity_id"] == "${canvas_ics_automation_entity}"
-    assert substitutions["canvas_ics_automation_entity"] == AUTOMATION
-    assert "attribute" not in automation and busy["attribute"] == "current"
-    for source, valid, reading in (
-        (helper, "solar_display::charger_request_known(x)", "REQUEST_STATE"),
-        (automation, "!x.empty()", "AUTOMATION_STATE"),
-        (busy, "x >= 0", "ACTIVE_RUNS"),
-    ):
-        record = source["on_value"][0]["lambda"]
-        assert f"if (id(canvas_ha_connections) == 1 && {valid})" in record
-        assert f"id(canvas_ics_feedback_missing) &= ~solar_display::{reading};" in record
-        assert source["on_value"][1] == {"script.execute": "show_ics_request_feedback"}
-    scripts = {script["id"]: script["then"] for script in package["script"]}
-    feedback = scripts["show_ics_request_feedback"][0]["lambda"]
-    assert 'const bool enabled = id(canvas_ics_touch_automation).state == "on";' in feedback
-    assert "const bool ready = id(canvas_ha_connections) == 1 && id(canvas_ics_feedback_missing) == 0;" in feedback
-    assert "!ready || !enabled || !solar_display::charger_request_known(request) || !(active_runs >= 0)" in feedback
-    assert re.search(r'if \(unavailable\)\s*\{\s*feedback = "Charger buttons unavailable";', feedback)
-    assert "!solar_display::charger_request_idle(request, active_runs)" in feedback
-    assert "id(canvas_pressed_control).clear();" in feedback
-    assert "if (!pending && !unavailable)" in feedback
-    assert 'const bool starting = showing && !unavailable && request == "starting";' in feedback
-    assert 'const bool stopping = showing && !unavailable && request == "stopping";' in feedback
-    for state, message in (("starting_timeout", "Start not confirmed"), ("stopping_timeout", "Stop not confirmed")):
-        assert re.search(rf'request == "{state}"\)\s*\{{\s*feedback = "{message}";', feedback)
-    assert {"script.execute": "show_ics_request_feedback"} in scripts["check_canvas_freshness"][0]["if"]["then"]
-    page = next(page for page in package["lvgl"]["pages"] if page["id"] == "canvas_dashboard")
-    touch = next(
-        widget["button"] for widget in page["widgets"] if widget.get("button", {}).get("id") == "canvas_touch_button"
-    )
-    press = touch["on_press"][0]["lambda"]
-    assert 'id(canvas_ics_touch_automation).state == "on"' in press
-    assert "id(canvas_ha_connections) == 1 && id(canvas_ics_feedback_missing) == 0" in press
-    assert re.search(
-        r"charger_request_idle\(id\(canvas_ics_request_state\)\.state,\s+id\(canvas_ics_pending_runs\)\.state\)",
-        press,
-    )
-    assert "fresh(now, clock.timestamp)" in press
-    click = touch["on_click"][0]["if"]["condition"]["lambda"]
-    assert 'id(canvas_ics_touch_automation).state != "on"' in click
-    assert re.search(
-        r"if \(charger_button &&\s*\([^\n]*\n\s*id\(canvas_ha_connections\) != 1 "
-        r"\|\| id\(canvas_ics_feedback_missing\) != 0",
-        click,
-    )
-    assert "!solar_display::charger_request_idle(request, id(canvas_ics_pending_runs).state)" in click
-
-
-# Intent: a held tap is retired when Home Assistant disconnects or the old frame expires before a new download.
-# Why: the release of that same tap must not submit a request from a stale frame.
-def test_display_retires_held_tap_before_a_reconnect_or_frame_refresh():
-    package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
-    connect = package["api"]["on_client_connected"][0]["lambda"]
-    disconnect = package["api"]["on_client_disconnected"][0]["lambda"]
-    assert "solar_display::is_home_assistant_client(client_info)" in connect
-    assert "solar_display::is_home_assistant_client(client_info)" in disconnect
-    assert "++id(canvas_ha_connections);" in connect
-    assert "id(canvas_ics_feedback_missing) = solar_display::ALL_FEEDBACK;" in connect
-    assert "id(canvas_pressed_control).clear();" in connect
-    assert "--id(canvas_ha_connections);" in disconnect
-    assert re.search(
-        r"if \(id\(canvas_ha_connections\) == 0\) \{[^}]*\bid\(canvas_pressed_control\).clear\(\);", disconnect
-    )
-    assert 'id(canvas_ics_touch_automation).publish_state("");' in connect
-    assert 'id(canvas_ics_request_state).publish_state("");' in connect
-    assert "id(canvas_ics_pending_runs).publish_state(std::numeric_limits<float>::quiet_NaN());" in connect
-    assert "publish_state" not in disconnect
-    download = package["image"][0]["on_download_finished"][0]["lambda"]
-    assert re.search(
-        r"!frame.freshness\(\).fresh\(now_ms, now.timestamp\)\) \{\s+id\(canvas_pressed_control\).clear\(\);",
-        download,
-    )
-    assert download.index("!frame.freshness().fresh(") < download.index("if (!cached)")
-
-
-# Intent: charger controls wait for the surviving client's values after a connection overlap.
-# Why: a sample received during overlap may belong to the connection that has just closed.
-def test_display_waits_for_feedback_after_an_overlapping_disconnect():
-    package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
-    disconnect = package["api"]["on_client_disconnected"][0]["lambda"]
-    surviving_connection = re.search(r"else if \(id\(canvas_ha_connections\) == 1\) \{([^}]*)\}", disconnect)[1]
-    assert "id(canvas_ics_feedback_missing) = solar_display::ALL_FEEDBACK;" in surviving_connection
-    assert "id(canvas_ics_feedback_reads) = solar_display::ALL_FEEDBACK;" in surviving_connection
-    assert "id(refresh_canvas_ics_feedback).execute();" in surviving_connection
-    script = next(script for script in package["script"] if script["id"] == "refresh_canvas_ics_feedback")
-    refresh = script["then"][0]["lambda"]
-    assert re.findall(r'\{"(\$\{[a-z_]+\})", "([a-z]*)", solar_display::([A-Z_]+)\}', refresh) == [
-        ("${canvas_ics_request_entity}", "", "REQUEST_STATE"),
-        ("${canvas_ics_automation_entity}", "", "AUTOMATION_STATE"),
-        ("${canvas_ics_automation_entity}", "current", "ACTIVE_RUNS"),
-    ]
-    assert "read.once = true;" in refresh
-    assert "if (client->send_message(read)) pending &= ~reading.bit;" in refresh
-    assert "canvas_ics_feedback_missing" not in refresh
-    interval = next(interval for interval in package["interval"] if interval["interval"] == "1s")
-    assert {"script.execute": "refresh_canvas_ics_feedback"} in interval["then"]
-
-
-# Intent: test the shipped display tap guards and exact Start/Stop feedback inside Home Assistant.
-# Why: a stale frame, duplicate tap or old failure must never send another charger request.
-async def test_public_display_example_with_actual_ha(tmp_path):
-    hass = HomeAssistant(str(tmp_path))
-    loader.async_setup(hass)
-    hass.config_entries = ConfigEntries(hass, {})
-    assert await bootstrap.async_load_base_functionality(hass)
+# Load the published automation and readiness helper into real Home Assistant.
+async def install_display(hass):
+    await asyncio.gather(condition.async_setup(hass), trigger.async_setup(hass))
     config = yaml.safe_load((PROJECT / "controls.yaml").read_text())
-    config["triggers"][1]["seconds"] = "/1"
-    age_check = config["conditions"][0]["conditions"][0]["conditions"][1]
-    age_check["value_template"] = age_check["value_template"].replace(">= 20", ">= 1")
     helper = yaml.safe_load((PROJECT / "request-helper.yaml").read_text())
-    calls = []
-    gate = asyncio.Event()
-    outcome = True
-
-    # Model the proxy response while holding the automation pending until the test releases it.
-    async def request(call):
-        direction = call.data["action"]
-        assert hass.states.get(PENDING).state == ("starting" if direction == "start" else "stopping")
-        calls.append(dict(call.data))
-        await gate.wait()
-        if outcome:
-            hass.states.async_set(
-                SESSION,
-                "on" if direction == "start" else "off",
-                {"stop_target": TARGET} if direction == "start" else {"can_start": True, "control_revision": REVISION},
-            )
-        return {"confirmed": outcome}
-
-    hass.services.async_register("ics_proxy", "session_command", request, supports_response=SupportsResponse.ONLY)
-    assert await async_setup_component(hass, "input_select", helper)
     assert await async_setup_component(hass, "automation", {"automation": [config]})
+    assert await async_setup_component(hass, "template", helper)
     await hass.async_start()
     await hass.async_block_till_done()
-    try:
-        for entity, state in {
-            "sensor.ics_display_screen_source": "Home Assistant",
-            "binary_sensor.ics_proxy_problem": "off",
-            "sensor.ics_proxy_control_mode": "App / schedule",
-            "binary_sensor.ics_proxy_vehicle_connected": "on",
-            "binary_sensor.ics_proxy_charging": "off",
-            "sensor.ics_proxy_power": "0",
-        }.items():
-            hass.states.async_set(entity, state)
-        hass.states.async_set(SESSION, "off", {"can_start": True, "control_revision": REVISION})
-        image_attributes = {
-            "assigned_views": [VIEW],
-            "current_view_id": VIEW,
-            "rendered_view_id": VIEW,
-            "notification_active": False,
-        }
+    assert hass.states.get(AUTOMATION).state == "on"
+    hass.states.async_set("sensor.ics_display_screen_source", "Home Assistant")
 
-        # Send the same event shape and rendered marker as the touchscreen.
-        def tap(starting, marker=None, *, age="1"):
-            hass.bus.async_fire(
-                "esphome.general_display_touch",
-                {
-                    "display": "general_display_2",
-                    "device_id": config["triggers"][0]["event_data"]["device_id"],
-                    "x": "120" if starting else "352",
-                    "y": "396",
-                    "canvas_age_seconds": age,
-                    "frame_control": (START_MARKER if starting else "stop:" + TARGET) if marker is None else marker,
-                },
-            )
 
-        # Wait for the actual Home Assistant automation to reach the expected state.
-        async def wait_for(check):
-            async with asyncio.timeout(5):
-                while not check():
-                    await asyncio.sleep(0.01)
+# Provide a renderer frame with optional routing or freshness variations.
+def publish_display_preview(hass, rendered_at, **overrides):
+    attributes = {
+        "assigned_views": [VIEW],
+        "current_view_id": VIEW,
+        "rendered_view_id": VIEW,
+        "notification_active": False,
+    }
+    hass.states.async_set(IMAGE, rendered_at.isoformat(), attributes | overrides)
 
-        # A feedback result is settled after Home Assistant has left the automation.
-        def settled(result):
-            return hass.states.get(PENDING).state == result and hass.states.get(AUTOMATION).attributes["current"] == 0
 
-        # The current renderer timestamp and the age of the physical frame both matter.
-        hass.states.async_set(IMAGE, (datetime.now(UTC) - timedelta(seconds=46)).isoformat(), image_attributes)
-        tap(True)
-        await asyncio.sleep(0.05)
-        assert calls == []
-        hass.states.async_set(IMAGE, datetime.now(UTC).isoformat(), image_attributes)
-        tap(True, age="45")
-        tap(True, "")
-        tap(True, f"start:{REVISION - 1:014x}")
-        await asyncio.sleep(0.05)
-        assert calls == []
-        tap(True)
-        await wait_for(lambda: len(calls) == 1)
-        tap(True)
-        tap(False)
-        await asyncio.sleep(0.1)
-        assert calls == [{"action": "start", "revision": REVISION}]
-        assert hass.states.get(PENDING).state == "starting"
-        gate.set()
-        await wait_for(lambda: settled("idle"))
-        assert hass.states.get(SESSION).state == "on"
-        assert hass.states.get("sensor.ics_proxy_power").state == "0"
-        gate.clear()
+# Send a touch event with the timestamp and generation of the pressed frame.
+def send_display_tap(hass, action, generation, *, age=1, frame=None, **overrides):
+    stamp = int(dt_util.now().timestamp()) if frame is None else frame
+    data = {
+        "display": "general_display_2",
+        "device_id": "replace-with-esphome-device-id",
+        "x": "120" if action == "start" else "352",
+        "y": "396",
+        "canvas_age_seconds": str(age),
+        "canvas_rendered_at_epoch": str(stamp),
+        "frame_control": f"v2:{action}:{generation}",
+    }
+    hass.bus.async_fire("esphome.general_display_touch", data | overrides)
 
-        # Session A is still on the physical frame while the proxy now reports B.
-        tap(False, "stop:" + "a" * 64)
-        tap(False, "")
-        await asyncio.sleep(0.1)
-        assert len(calls) == 1
-        rendered = Template((PROJECT / "view.html.jinja").read_text(), hass)
-        hass.states.async_set("sensor.ics_proxy_control_mode", "Local charging")
-        render_time = datetime.now(UTC)
-        html = rendered.async_render({"now": render_time}, parse_result=False)
-        assert "Paused locally" not in html and "Open session" in html
-        assert render_marker(html) == f"d51a2{int(render_time.timestamp()):08x}{TARGET}"
-        rerendered = render_time + timedelta(seconds=10)
-        html = rendered.async_render({"now": rerendered}, parse_result=False)
-        assert render_marker(html) == f"d51a2{int(rerendered.timestamp()):08x}{TARGET}"
-        tap(False)
-        await wait_for(lambda: len(calls) == 2)
-        assert calls[-1] == {"action": "stop_session", "target": TARGET}
-        gate.set()
-        await wait_for(lambda: settled("idle"))
-        assert hass.states.get(SESSION).state == "off"
 
-        hass.states.async_set("sensor.ics_proxy_control_mode", "App / schedule (cloud offline)")
-        hass.states.async_set("binary_sensor.ics_proxy_problem", "on")
-        template = Template((PROJECT / "view.html.jinja").read_text(), hass)
-        html = template.async_render({"now": render_time}, parse_result=False)
-        assert "Ready to start" in html
-        assert render_marker(html) == f"d51a1{int(render_time.timestamp()):08x}{REVISION:014x}"
-        # An unplugged charger in app/schedule mode can be locally healthy while the cloud is offline.
-        hass.states.async_set("binary_sensor.ics_proxy_vehicle_connected", "off")
-        hass.states.async_set(SESSION, "off", {"can_start": False, "control_revision": REVISION})
-        unplugged = template.async_render({"now": render_time}, parse_result=False)
-        assert "Vendor connection unavailable" in unplugged
-        assert "Charger control needs attention" not in unplugged
-        assert render_marker(unplugged) == f"d51a0{int(render_time.timestamp()):08x}"
-        hass.states.async_set("sensor.ics_proxy_control_mode", "Needs attention")
-        faulted = template.async_render({"now": datetime.now(UTC)}, parse_result=False)
-        assert "Charger control needs attention" in faulted
-        hass.states.async_set("binary_sensor.ics_proxy_vehicle_connected", "on")
-        hass.states.async_set(SESSION, "off", {"can_start": True, "control_revision": REVISION})
-        outcome = False
-        gate.clear()
-        tap(True)
-        await wait_for(lambda: len(calls) == 3)
-        pending_start = template.async_render({"now": render_time}, parse_result=False)
-        assert "Waiting for charger confirmation" not in pending_start
-        assert render_marker(pending_start) == f"d51a0{int(render_time.timestamp()):08x}"
-        # An unrelated session change cannot complete the waiting request.
-        hass.states.async_set(SESSION, "on", {"stop_target": TARGET})
-        assert hass.states.get(PENDING).state == "starting"
-        gate.set()
-        await wait_for(lambda: settled("starting_timeout"))
-        html = template.async_render({"now": render_time}, parse_result=False)
-        assert "Start not confirmed" not in html and "Open session" in html
-        hass.states.async_set(SESSION, "off", {"can_start": True, "control_revision": REVISION})
-        start_timeout_frame = template.async_render({"now": render_time}, parse_result=False)
-        assert "Start not confirmed" not in start_timeout_frame and "Ready to start" in start_timeout_frame
+# Wait for the display helper's expected feedback and validate its action generation.
+async def display_state(hass, feedback, action):
+    async with asyncio.timeout(5):
+        while True:
+            state = hass.states.get(DISPLAY_VIEW)
+            if state is not None and state.state.startswith(f"v2:{feedback}:{action}:"):
+                generation = state.state.rsplit(":", 1)[1]
+                if action == "none":
+                    assert generation == "-"
+                else:
+                    assert re.fullmatch(r"[a-f0-9]{32}", generation)
+                return generation
+            await asyncio.sleep(0.01)
 
-        hass.states.async_set(SESSION, "unavailable")
-        tap(False)
-        await asyncio.sleep(0.15)
-        assert len(calls) == 3
-        # Expiry removes the live feedback even if the same picture is still on screen.
-        await wait_for(lambda: settled("idle"))
-        hass.states.async_set(SESSION, "off", {"can_start": True, "control_revision": REVISION})
-        assert template.async_render({"now": render_time}, parse_result=False) == start_timeout_frame
 
-        hass.states.async_set(SESSION, "on", {"stop_target": TARGET})
-        idle_stop_frame = template.async_render({"now": render_time}, parse_result=False)
-        assert "Open session" in idle_stop_frame
-        gate.clear()
-        tap(False)
-        await wait_for(lambda: len(calls) == 4)
-        assert calls[-1] == {"action": "stop_session", "target": TARGET}
-        pending_stop = template.async_render({"now": render_time}, parse_result=False)
-        assert "Waiting for charger confirmation" not in pending_stop
-        assert render_marker(pending_stop) == f"d51a0{int(render_time.timestamp()):08x}"
-        gate.set()
-        await wait_for(lambda: settled("stopping_timeout"))
-        assert template.async_render({"now": render_time}, parse_result=False) == idle_stop_frame
-        await wait_for(lambda: settled("idle"))
-        # The next render can come after the entire unconfirmed interval. The helper carried it independently.
-        later = render_time + timedelta(seconds=25)
-        next_stop_frame = template.async_render({"now": later}, parse_result=False)
-        assert "Open session" in next_stop_frame and "Stop not confirmed" not in next_stop_frame
-        assert render_marker(next_stop_frame) == f"d51a2{int(later.timestamp()):08x}{TARGET}"
+# Intent: exercise the published renderer and touch automation through the real integration service.
+# Why: readiness shown on screen must match what the integration can send to the management peer.
+async def test_public_display_example_with_actual_ha(actual_hass, canvas_peer, monkeypatch):
+    from custom_components.ics_proxy import coordinator
 
-        # An interrupted action has no receipt to report. Its first cleanup tick after enabling restores feedback.
-        for starting, pending in ((True, "starting"), (False, "stopping")):
-            gate.clear()
-            previous_calls = len(calls)
-            hass.states.async_set(
-                SESSION, "off" if starting else "on",
-                {"can_start": True, "control_revision": REVISION} if starting else {"stop_target": TARGET},
-            )
-            tap(starting)
-            await wait_for(lambda: len(calls) == previous_calls + 1)
-            assert hass.states.get(PENDING).state == pending
-            await hass.services.async_call("automation", "turn_off", {"entity_id": AUTOMATION}, blocking=True)
-            assert hass.states.get(PENDING).state == pending
-            gate.set()
-            await hass.services.async_call("automation", "turn_on", {"entity_id": AUTOMATION}, blocking=True)
-            await wait_for(lambda: settled(pending + "_timeout"))
-            await wait_for(lambda: settled("idle"))
-            assert len(calls) == previous_calls + 1
+    hass, peer = actual_hass, canvas_peer
+    base = int(datetime.now(UTC).timestamp())
+    wall = base
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, 100 + wall - base))
+    peer["state"]["control_revision"] = REVISION
+    await setup_proxy(hass, peer["port"])
+    await install_display(hass)
+    monkeypatch.setattr(dt_util, "now", lambda *args: datetime.fromtimestamp(wall, UTC))
+    template = Template((PROJECT / "view.html.jinja").read_text(), hass)
+    wall += 3
+    frame = dt_util.now()
+    await display_state(hass, "unavailable", "none")
+    html = template.async_render({"now": frame}, parse_result=False)
+    assert "Charger buttons unavailable" in html and render_marker(html) == f"d51a0{wall:08x}"
 
-        # An unavailable touch automation cannot honor either rendered charger control.
-        await hass.services.async_call("automation", "turn_off", {"entity_id": AUTOMATION}, blocking=True)
-        assert hass.states.get(AUTOMATION).state == "off"
-        tap(False)
+    publish_display_preview(hass, frame)
+    start = await display_state(hass, "idle", "start")
+    html = template.async_render({"now": frame}, parse_result=False)
+    assert "Ready to start" in html
+    assert render_marker(html) == f"d51a0{wall:08x}d52a1{start}"
+
+    # New preview timestamps must not change the helper and trigger another render.
+    control_changes = []
+
+    # Observe publications of the helper state during unrelated preview updates.
+    @callback
+    def record_control_change(event):
+        control_changes.append(event)
+
+    unsubscribe = async_track_state_change_event(hass, DISPLAY_VIEW, record_control_change)
+    publish_display_preview(hass, frame - timedelta(seconds=46))
+    send_display_tap(hass, "start", start)
+    await hass.async_block_till_done()
+    unsubscribe()
+    assert control_changes == []
+    assert set(peer["commands"]) == {"status"}
+
+    for wrong_route in (
+        {"notification_active": True},
+        {"assigned_views": [VIEW, "other-view"]},
+        {"current_view_id": "other-view"},
+        {"rendered_view_id": "other-view"},
+    ):
+        publish_display_preview(hass, frame, **wrong_route)
+        send_display_tap(hass, "start", start)
+        await display_state(hass, "unavailable", "none")
         await hass.async_block_till_done()
-        assert len(calls) == 6
-        for automation_state in ("off", "unavailable", None):
-            if automation_state == "unavailable":
-                hass.states.async_set(AUTOMATION, automation_state, {"current": 1})
-            elif automation_state is None:
-                hass.states.async_remove(AUTOMATION)
-            for session_state, attributes in (
-                ("on", {"stop_target": TARGET}),
-                ("off", {"can_start": True, "control_revision": REVISION}),
-            ):
-                hass.states.async_set(SESSION, session_state, attributes)
-                html = template.async_render({"now": render_time}, parse_result=False)
-                assert "Charger buttons unavailable" in html
-                assert render_marker(html) == f"d51a0{int(render_time.timestamp()):08x}"
+        assert set(peer["commands"]) == {"status"}, wrong_route
+        html = template.async_render({"now": frame}, parse_result=False)
+        assert "Charger buttons unavailable" in html and render_marker(html) == f"d51a0{wall:08x}"
+        publish_display_preview(hass, frame)
+        assert await display_state(hass, "idle", "start") == start
 
-        # A timed-out helper already present when automation starts can also expire.
-        await hass.services.async_call(
-            "input_select", "select_option", {"entity_id": PENDING, "option": "stopping_timeout"}, blocking=True
+    for bad in (
+        {"device_id": "another-display"},
+        {"x": "352"},
+        {"canvas_age_seconds": "45"},
+        {"canvas_age_seconds": "44", "canvas_rendered_at_epoch": str(wall - 35)},
+        {"canvas_rendered_at_epoch": str(wall - 46)},
+        {"canvas_rendered_at_epoch": str(wall + 5)},
+        {"frame_control": f"start:{REVISION:014x}"},
+        {"frame_control": "v2:start:" + "0" * 32},
+    ):
+        send_display_tap(hass, "start", start, **bad)
+        await hass.async_block_till_done()
+    assert set(peer["commands"]) == {"status"}
+
+    peer.update(pending_receipt=True, receipt_delay=0.25)
+    send_display_tap(hass, "start", start)
+    await display_state(hass, "starting", "none")
+    assert render_marker(template.async_render({"now": frame}, parse_result=False)) == f"d51a0{wall:08x}"
+    send_display_tap(hass, "start", start)
+    stop = await display_state(hass, "idle", "stop")
+    assert stop != start
+    assert peer["commands"].count("start") == 1
+    [start_wire] = [request for request in peer["requests"] if request["command"] == "start"]
+    assert start_wire["canvas_owner"] == CANVAS_OWNER and start_wire["revision"] == REVISION
+
+    wall += 2
+    frame = dt_util.now()
+    publish_display_preview(hass, frame)
+    html = template.async_render({"now": frame}, parse_result=False)
+    assert "Open session" in html and render_marker(html) == f"d51a0{wall:08x}d52a2{stop}"
+    send_display_tap(hass, "start", start)
+    await hass.async_block_till_done()
+    send_display_tap(hass, "stop", stop)
+    await display_state(hass, "stopping", "none")
+    new_start = await display_state(hass, "idle", "start")
+    assert new_start not in (start, stop)
+    [stop_wire] = [request for request in peer["requests"] if request["command"] == "stop_session"]
+    assert stop_wire["target"] == TARGET and stop_wire["canvas_owner"] == CANVAS_OWNER
+    assert peer["commands"].count("start") == 1
+
+    await hass.services.async_call("automation", "turn_off", {"entity_id": AUTOMATION}, blocking=True)
+    await display_state(hass, "unavailable", "none")
+    html = template.async_render({"now": frame}, parse_result=False)
+    assert "Charger buttons unavailable" in html and render_marker(html) == f"d51a0{wall:08x}"
+    send_display_tap(hass, "start", new_start)
+    await hass.async_block_till_done()
+    assert peer["commands"].count("start") == 1
+
+
+# Intent: reject Start and Stop taps rendered before a wall-clock adjustment.
+# Why: a clock jump can make an old tap look current under the same displayed generation.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+@pytest.mark.parametrize("clock_change", ["rewind", "forward", "forward_then_rewind"])
+async def test_display_service_rejects_pre_adjustment_frames(
+    actual_hass, canvas_peer, monkeypatch, starting, clock_change
+):
+    from custom_components.ics_proxy import coordinator
+
+    hass, peer = actual_hass, canvas_peer
+    base = int(datetime.now(UTC).timestamp())
+    wall, elapsed = base, 100
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, elapsed))
+    if not starting:
+        peer["state"].update(charging_session_open=True, can_start=False, stop_target=TARGET)
+    peer["state"]["control_revision"] = REVISION
+    await setup_proxy(hass, peer["port"])
+    await install_display(hass)
+    publish_display_preview(hass, datetime.fromtimestamp(wall, UTC))
+    action = "start" if starting else "stop_session"
+    generation = await display_state(hass, "idle", "start" if starting else "stop")
+
+    # Submit the same offer with each frame timestamp through the real service.
+    async def tap_frame(epoch):
+        result = await call_session_command(hass, action, canvas_generation=generation, canvas_rendered_at_epoch=epoch)
+        return result["confirmed"]
+
+    wall, elapsed = base + 2, 102
+    assert not await tap_frame(base - 1)
+    original_frame = base + 123 if clock_change == "forward_then_rewind" else base + 3
+    arrival = {"rewind": (base + 33, 154), "forward": (base + 23, 114), "forward_then_rewind": (base + 128, 154)}
+    wall, elapsed = arrival[clock_change]
+    assert not await tap_frame(original_frame)
+    fence = {"rewind": base + 54, "forward": base + 23, "forward_then_rewind": base + 128}[clock_change]
+    elapsed += fence - wall
+    wall = fence
+    assert not await tap_frame(fence)
+    assert action not in peer["commands"]
+
+    wall += 12
+    elapsed += 12
+    assert await tap_frame(fence + 1)
+    [command] = [request for request in peer["requests"] if request["command"] == action]
+    assert command["revision"] == REVISION and command["canvas_owner"] == CANVAS_OWNER
+    assert command.get("target") == (None if starting else TARGET)
+
+
+# Intent: require a new displayed Start generation after a reload or entry replacement.
+# Why: the replacement may report the same owner and revision while old touch frames are still in transit.
+@pytest.mark.parametrize("operation", ["reload", "remove-add"])
+async def test_display_rejects_start_frame_from_before_entry_replacement(
+    actual_hass, canvas_peer, replacement_peer, monkeypatch, operation
+):
+    from custom_components.ics_proxy import coordinator
+
+    hass, peer = actual_hass, canvas_peer
+    base = int(datetime.now(UTC).timestamp())
+    wall = base
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, 100 + wall - base))
+    monkeypatch.setattr(dt_util, "now", lambda *args: datetime.fromtimestamp(wall, UTC))
+    peer["state"]["control_revision"] = replacement_peer["state"]["control_revision"] = REVISION
+    replacement_peer["state"]["canvas_owner"] = CANVAS_OWNER
+    entry = await setup_proxy(hass, peer["port"])
+    await install_display(hass)
+    publish_display_preview(hass, dt_util.now())
+    old_generation = await display_state(hass, "idle", "start")
+
+    wall += 3
+    if operation == "reload":
+        hass.config_entries.async_update_entry(entry, data={**entry.data, "port": replacement_peer["port"]})
+        assert await hass.config_entries.async_reload(entry.entry_id)
+    else:
+        assert not (await hass.config_entries.async_remove(entry.entry_id))["require_restart"]
+        await setup_proxy(hass, replacement_peer["port"])
+
+    new_generation = await display_state(hass, "idle", "start")
+    assert new_generation != old_generation
+    wall += 2
+    publish_display_preview(hass, dt_util.now())
+    send_display_tap(hass, "start", old_generation)
+    await hass.async_block_till_done()
+    assert set(peer["commands"]) == set(replacement_peer["commands"]) == {"status"}
+    send_display_tap(hass, "start", new_generation)
+    await display_state(hass, "idle", "stop")
+    [start] = [request for request in replacement_peer["requests"] if request["command"] == "start"]
+    assert start["revision"] == REVISION and start["canvas_owner"] == CANVAS_OWNER
+
+
+# Submit a real integration action and ask for its exact attempted request reference.
+async def call_session_command(hass, action, **fields):
+    return await hass.services.async_call(
+        "ics_proxy",
+        "session_command",
+        {"action": action, "include_request_reference": True, **fields},
+        blocking=True,
+        return_response=True,
+    )
+
+
+# Intent: a management command already in flight stays tied to the status that enabled it.
+# Why: a replacement proxy can advertise the same revision and Start capability at the same address.
+@pytest.mark.parametrize("surface", ["session_action", "start_button"])
+async def test_ordinary_start_does_not_reach_a_replacement_destination(actual_hass, canvas_peer, surface):
+    hass, peer = actual_hass, canvas_peer
+    peer["state"]["control_revision"] = REVISION
+    entry = await setup_proxy(hass, peer["port"])
+
+    # The active coordinator can learn the new owner before the waiting connection can write.
+    async def replace_owner():
+        peer["state"]["canvas_owner"] = REPLACEMENT_OWNER
+        await entry.runtime_data.async_refresh()
+
+    peer["before_handshake"] = replace_owner
+    if surface == "session_action":
+        result = await call_session_command(hass, "start", revision=REVISION)
+        assert result["confirmed"] is False and result["request_reference"] is not None
+    else:
+        with pytest.raises(HomeAssistantError, match="could not confirm this request"):
+            await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True)
+    (refused,) = [request for request in peer["requests"] if request["command"] == "start"]
+    assert refused["canvas_owner"] == CANVAS_OWNER and refused["revision"] == REVISION
+    assert entry.runtime_data.management_owner == REPLACEMENT_OWNER
+    assert peer["state"]["charging_session_open"] is False
+
+    assert (await call_session_command(hass, "start"))["confirmed"] is True
+    assert peer["state"]["charging_session_open"] is True
+    assert [request["canvas_owner"] for request in peer["requests"] if request["command"] == "start"] == [
+        CANVAS_OWNER,
+        REPLACEMENT_OWNER,
+    ]
+
+
+# Intent: revoke an ordinary Start whose management handshake still belongs to a retired integration.
+# Why: the original endpoint can remain reachable and ready after a local disable or retarget.
+@pytest.mark.parametrize("surface", ["session_action", "start_button"])
+@pytest.mark.parametrize("change", ["retarget", "disable"])
+async def test_ordinary_start_cannot_write_after_entry_retirement(
+    actual_hass, canvas_peer, replacement_peer, surface, change
+):
+    hass, peer = actual_hass, canvas_peer
+    entry = await setup_proxy(hass, peer["port"])
+    original = entry.runtime_data
+
+    # Retire the entry before the original socket can write a Start.
+    async def retire_entry():
+        if change == "retarget":
+            hass.config_entries.async_update_entry(entry, data={**entry.data, "port": replacement_peer["port"]})
+            assert await hass.config_entries.async_reload(entry.entry_id)
+            assert entry.runtime_data is not original
+            assert entry.runtime_data.client.port == replacement_peer["port"]
+        else:
+            assert await hass.config_entries.async_set_disabled_by(entry.entry_id, ConfigEntryDisabler.USER)
+            assert entry.state is ConfigEntryState.NOT_LOADED
+        assert "start" not in peer["commands"]
+
+    peer["before_handshake"] = retire_entry
+    if surface == "session_action":
+        result = await call_session_command(hass, "start", revision=0)
+        assert result == {"confirmed": False, "request_reference": None}
+    else:
+        with pytest.raises(HomeAssistantError, match="charger control entry is no longer active"):
+            await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True)
+    assert "before_handshake" not in peer
+    assert "start" not in peer["commands"] and not peer["state"]["charging_session_open"]
+    assert "start" not in replacement_peer["commands"]
+
+
+# Intent: a recorded disable revokes a pending ordinary Start even while the entry is still loaded.
+# Why: Home Assistant can be waiting for the entry lock before the coordinator learns it is being unloaded.
+@pytest.mark.parametrize("surface", ["session_action", "start_button"])
+async def test_ordinary_start_cannot_write_while_disable_waits_for_unload(actual_hass, canvas_peer, surface):
+    hass, peer = actual_hass, canvas_peer
+    entry = await setup_proxy(hass, peer["port"])
+    original = entry.runtime_data
+    disable_task = None
+
+    # Hold the management handshake until HA records the disable and waits to unload.
+    async def disable_entry():
+        nonlocal disable_task
+        disable_task = asyncio.create_task(
+            hass.config_entries.async_set_disabled_by(entry.entry_id, ConfigEntryDisabler.USER)
         )
-        await asyncio.sleep(1.1)
-        assert hass.states.get(PENDING).state == "stopping_timeout"
-        await hass.services.async_call("automation", "turn_on", {"entity_id": AUTOMATION}, blocking=True)
-        await wait_for(lambda: settled("idle"))
-        assert "Ready to start" in template.async_render({"now": datetime.now(UTC)}, parse_result=False)
-        assert len(calls) == 6
+        await asyncio.sleep(0)
+        assert entry.disabled_by is ConfigEntryDisabler.USER
+        assert entry.state is ConfigEntryState.LOADED and entry.runtime_data is original
+        assert original.notice.active and not disable_task.done()
+
+    try:
+        async with entry.setup_lock:
+            peer["before_handshake"] = disable_entry
+            if surface == "session_action":
+                result = await call_session_command(hass, "start", revision=0)
+                assert result == {"confirmed": False, "request_reference": None}
+            else:
+                with pytest.raises(HomeAssistantError, match="charger control entry is no longer active"):
+                    await hass.services.async_call(
+                        "button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True
+                    )
+            assert disable_task is not None
+            assert set(peer["commands"]) == {"status"}
+            assert peer["state"]["charging_session_open"] is False
     finally:
-        gate.set()
-        await hass.services.async_call("automation", "turn_off", {"entity_id": AUTOMATION}, blocking=True)
-        await hass.async_stop(force=True)
+        if disable_task is not None:
+            assert await disable_task
+    assert entry.state is ConfigEntryState.NOT_LOADED
+
+
+# Intent: an already-issued command keeps its original receipt lookup across entry retirement.
+# Why: a change of integration endpoint cannot undo a proxy write or transfer its receipt to another endpoint.
+async def test_ordinary_start_reads_its_receipt_after_entry_retirement(actual_hass, canvas_peer, replacement_peer):
+    hass, peer = actual_hass, canvas_peer
+    entry = await setup_proxy(hass, peer["port"])
+    original = entry.runtime_data
+    peer["pending_receipt"] = True
+
+    # Schedule the reload on the next handshake once the old peer accepts the command.
+    async def retarget_entry():
+        hass.config_entries.async_update_entry(entry, data={**entry.data, "port": replacement_peer["port"]})
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        assert entry.runtime_data is not original
+
+    # The accepted reply schedules the reload before the old client's first receipt read.
+    def retarget_after_start(command, _request, result):
+        if command == "start":
+            peer["before_handshake"] = retarget_entry
+        return result
+
+    peer["result_filter"] = retarget_after_start
+    result = await call_session_command(hass, "start", revision=0)
+    assert result["confirmed"] is True and result["request_reference"] is not None
+    assert entry.runtime_data.client.port == replacement_peer["port"]
+    assert peer["commands"].count("start") == peer["commands"].count("receipt") == 1
+    assert set(replacement_peer["commands"]) == {"status"}
+
+
+# Intent: each other HA command keeps the commissioned destination in its initiating status.
+# Why: Stop, Pause, Return, and timed Start can all affect a replacement with the same revision and readiness.
+@pytest.mark.parametrize(
+    "action,initial,effect,value",
+    [
+        ("stop_session", {"charging_session_open": True, "stop_target": TARGET}, "charging_session_open", False),
+        ("pause", {}, "desired_control", "paused"),
+        ("app_control", {"desired_control": "paused", "can_return": True}, "desired_control", "app"),
+        (
+            "start_test",
+            {},
+            "test_charge",
+            {"source": "local", "state": "armed", "duration_seconds": 120, "seconds_remaining": 120},
+        ),
+    ],
+)
+@pytest.mark.parametrize("refresh", [False, True], ids=["unobserved", "observed"])
+async def test_other_ordinary_commands_keep_the_initiating_destination(
+    actual_hass, canvas_peer, refresh, action, initial, effect, value
+):
+    hass, peer = actual_hass, canvas_peer
+    state = peer["state"]
+    state.update(control_revision=REVISION, management_owner_binding=True, **initial)
+    entry = await setup_proxy(hass, peer["port"])
+    original = state[effect]
+    assert original != value
+
+    # The replacement advertises the same revision and capabilities before the pending write reaches it.
+    async def replace_owner():
+        state["canvas_owner"] = REPLACEMENT_OWNER
+        if refresh:
+            await entry.runtime_data.async_refresh()
+
+    # Exercise each ordinary HA service instead of calling the underlying client directly.
+    async def issue():
+        if action == "stop_session":
+            return await call_session_command(hass, action, target=TARGET)
+        await hass.services.async_call("button", "press", {"entity_id": f"button.ics_proxy_{action}"}, blocking=True)
+        return None
+
+    peer["before_handshake"] = replace_owner
+    if action == "stop_session":
+        result = await issue()
+        assert result["confirmed"] is False and result["request_reference"] is not None
+    else:
+        with pytest.raises(HomeAssistantError, match="could not confirm this request"):
+            await issue()
+    assert state[effect] == original
+    assert entry.runtime_data.management_owner == REPLACEMENT_OWNER
+
+    result = await issue()
+    if action == "stop_session":
+        assert result["confirmed"] is True and result["request_reference"] is not None
+    assert state[effect] == value
+    requests = [request for request in peer["requests"] if request["command"] == action]
+    assert [request["canvas_owner"] for request in requests] == [CANVAS_OWNER, REPLACEMENT_OWNER]
+    assert all(request["revision"] == REVISION for request in requests)
+
+
+# Intent: a bound Pause still uses the restrictive path when the proxy revision has advanced.
+# Why: a stale dashboard can still pause the same charger, including with earlier proxy versions.
+@pytest.mark.parametrize("binding", [True, None], ids=["all-commands", "canvas-only"])
+async def test_pause_keeps_its_stale_revision_behavior_with_owner_status(actual_hass, canvas_peer, binding):
+    hass, peer = actual_hass, canvas_peer
+    if binding:
+        peer["state"]["management_owner_binding"] = True
+    await setup_proxy(hass, peer["port"])
+    peer["state"]["control_revision"] = REVISION
+
+    await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
+    (pause,) = [request for request in peer["requests"] if request["command"] == "pause"]
+    assert pause["revision"] == 0
+    assert pause.get("canvas_owner") == (CANVAS_OWNER if binding else None)
+    assert peer["state"]["local_hold_verified"] is True
+
+
+# Intent: an unchanged HA entry rejects a fresh frame or an in-flight write for its previous proxy.
+# Why: independent destinations at the same address can advertise the same revision and capabilities.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+@pytest.mark.parametrize("observed", [True, False], ids=["after-poll", "during-handshake"])
+async def test_canvas_rejects_replacement_at_the_same_endpoint(
+    actual_hass, canvas_peer, monkeypatch, starting, observed
+):
+    from custom_components.ics_proxy import coordinator
+
+    peer = canvas_peer
+    wall = 1000
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, wall))
+    peer["state"].update(control_revision=REVISION, charging_session_open=not starting, can_start=starting)
+    if not starting:
+        peer["state"]["stop_target"] = TARGET
+    entry = await setup_proxy(actual_hass, peer["port"])
+    runtime = entry.runtime_data
+    action = "start" if starting else "stop_session"
+    fields = {"revision": REVISION} if starting else {"target": TARGET}
+    old_frame = wall + 1
+    wall = old_frame + 1
+
+    # Swap the commissioned peer during the management upgrade when the caller still has the previous status.
+    async def replace_owner():
+        peer["state"]["canvas_owner"] = REPLACEMENT_OWNER
+
+    if observed:
+        await replace_owner()
+        await runtime.async_refresh()
+    else:
+        peer["before_handshake"] = replace_owner
+
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=old_frame, **fields)
+    assert result["confirmed"] is False
+    assert (result["request_reference"] is None) is observed
+    assert peer["state"]["charging_session_open"] is (not starting)
+    assert entry.runtime_data is runtime and runtime.client.port == peer["port"]
+    assert runtime.management_owner == REPLACEMENT_OWNER
+
+    # A frame stamped in the observation's whole second can still precede it.
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=wall, **fields)
+    assert result == {"confirmed": False, "request_reference": None}
+
+    # A subsequent poll of the same owner must preserve the observation floor.
+    wall += 2
+    new_frame = wall
+    wall += 1
+    await runtime.async_refresh()
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=new_frame, **fields)
+    assert result["confirmed"] is True
+    requests = [request for request in peer["requests"] if request["command"] == action]
+    assert [request["canvas_owner"] for request in requests] == (
+        [REPLACEMENT_OWNER] if observed else [CANVAS_OWNER, REPLACEMENT_OWNER]
+    )
+    assert all(request["revision"] == REVISION for request in requests)
+
+
+# Intent: a proxy without a valid owner marker still supports ordinary HA controls.
+# Why: only canvas requests rely on a commissioned destination to interpret the displayed render time.
+@pytest.mark.parametrize("owner", [None, "malformed"], ids=["legacy", "malformed"])
+async def test_canvas_requires_a_valid_status_owner(actual_hass, peer, monkeypatch, owner):
+    from custom_components.ics_proxy import coordinator
+
+    wall = 1000
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, wall))
+    if owner is not None:
+        peer["state"]["canvas_owner"] = owner
+    await setup_proxy(actual_hass, peer["port"])
+    wall += 2
+
+    result = await call_session_command(actual_hass, "start", revision=0, canvas_rendered_at_epoch=wall - 1)
+    assert result == {"confirmed": False, "request_reference": None}
+    assert set(peer["commands"]) == {"status"}
+
+    assert (await call_session_command(actual_hass, "start"))["confirmed"] is True
+    (command,) = [request for request in peer["requests"] if request["command"] == "start"]
+    assert "canvas_owner" not in command
+
+
+# Intent: only an ordinary Start may use the coordinator's current revision when no revision is supplied.
+# Why: a canvas Start must use the control the user actually saw.
+async def test_canvas_start_requires_the_displayed_revision(actual_hass, canvas_peer, monkeypatch):
+    from custom_components.ics_proxy import coordinator
+
+    peer = canvas_peer
+    wall = 1000
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, wall))
+    await setup_proxy(actual_hass, peer["port"])
+    wall += 2
+    result = await call_session_command(actual_hass, "start", canvas_rendered_at_epoch=wall - 1)
+    assert result == {"confirmed": False, "request_reference": None}
+    assert set(peer["commands"]) == {"status"}
+
+    # An ordinary HA call may still use the current revision.
+    result = await call_session_command(actual_hass, "start")
+    assert result["confirmed"] is True
+    assert result["request_reference"] is not None
+    (command,) = [request for request in peer["requests"] if request["command"] == "start"]
+    assert command["revision"] == 0
+    assert command["canvas_owner"] == CANVAS_OWNER
+
+
+# Intent: require fresh native session evidence for the displayed Stop target, even with the vendor offline.
+# Why: target equality alone does not show that the original session is still open.
+@pytest.mark.parametrize("invalid", ["closed", "unknown", "old_native", "old_status"])
+async def test_canvas_stop_rechecks_the_local_session(actual_hass, canvas_peer, monkeypatch, invalid):
+    from custom_components.ics_proxy import coordinator as proxy_coordinator
+
+    peer = canvas_peer
+    wall = 1000
+    monkeypatch.setattr(proxy_coordinator, "frame_clock", lambda: (wall, wall))
+    peer["state"].update(charging_session_open=True, can_start=False, stop_target=TARGET)
+    entry = await setup_proxy(actual_hass, peer["port"])
+    wall += 2
+    # Leave the old target in the coordinator, as it can remain between timer and poll updates.
+    coordinator = entry.runtime_data
+    if invalid in ("old_native", "old_status"):
+        key = "native_age_seconds" if invalid == "old_native" else "status_age_seconds"
+        coordinator.data[key] = 15
+        coordinator.received_at -= 0.1
+    else:
+        coordinator.data["charging_session_open"] = False if invalid == "closed" else None
+    result = await call_session_command(actual_hass, "stop_session", target=TARGET, canvas_rendered_at_epoch=wall - 1)
+    assert result == {"confirmed": False, "request_reference": None}
+    assert set(peer["commands"]) == {"status"}
+
+    peer["state"].update(healthy=False, local_healthy=True, cloud_connected=False)
+    await coordinator.async_refresh()
+    result = await call_session_command(actual_hass, "stop_session", target=TARGET, canvas_rendered_at_epoch=wall - 1)
+    assert result["confirmed"] is True
+    assert result["request_reference"] is not None
+    (command,) = [request for request in peer["requests"] if request["command"] == "stop_session"]
+    assert command["target"] == TARGET
+
+
+# Intent: stop an expired display action before its first management write and omit the attempt reference.
+# Why: a slow handshake can outlive a frame that was fresh when the action began.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+async def test_canvas_frame_can_expire_during_the_management_handshake(actual_hass, canvas_peer, monkeypatch, starting):
+    from custom_components.ics_proxy import coordinator
+
+    peer = canvas_peer
+    wall = 1000
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, wall))
+    if not starting:
+        peer["state"].update(charging_session_open=True, can_start=False, stop_target=TARGET)
+    await setup_proxy(actual_hass, peer["port"])
+    frame = wall + 1
+    wall = frame + 44
+    entered_handshake = False
+
+    # Advance the simulated frame clock just before the real protocol upgrade.
+    async def expire_frame():
+        nonlocal wall, entered_handshake
+        entered_handshake = True
+        wall += 1
+
+    # The real management socket upgrades only after the original frame has expired.
+    peer["before_handshake"] = expire_frame
+    action = "start" if starting else "stop_session"
+    fields = {"revision": 0} if starting else {"target": TARGET}
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=frame, **fields)
+    assert entered_handshake
+    assert result == {"confirmed": False, "request_reference": None}
+    assert set(peer["commands"]) == {"status"}
+
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=wall, **fields)
+    assert result["confirmed"] is True
+    assert result["request_reference"] is not None
+    assert peer["commands"].count(action) == 1
+    assert "receipt" not in peer["commands"]
+
+
+# Intent: recheck paired wall and elapsed time at the real WebSocket write boundary.
+# Why: a sizable clock change can arrive during handshake while both reported ages still appear fresh.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+@pytest.mark.parametrize(
+    "step,allowed",
+    [(-4, False), (-0.5, True), (0.5, True), (4, False)],
+    ids=["rewind", "backward-tolerance", "forward-tolerance", "forward"],
+)
+async def test_canvas_clock_step_during_handshake(actual_hass, canvas_peer, monkeypatch, starting, step, allowed):
+    from custom_components.ics_proxy import coordinator
+
+    peer = canvas_peer
+    wall, elapsed = 1000, 100
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, elapsed))
+    if not starting:
+        peer["state"].update(charging_session_open=True, can_start=False, stop_target=TARGET)
+    await setup_proxy(actual_hass, peer["port"])
+    wall, elapsed = 1002, 102
+
+    # The epoch remains in the past and within the normal age limit across every simulated change.
+    async def adjust_clock():
+        nonlocal wall, elapsed
+        wall += 6 + step
+        elapsed += 6
+
+    peer["before_handshake"] = adjust_clock
+    action = "start" if starting else "stop_session"
+    fields = {"revision": 0} if starting else {"target": TARGET}
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=1001, **fields)
+    assert elapsed == 108
+    assert result["confirmed"] is allowed
+    assert (result["request_reference"] is not None) is allowed
+    assert peer["commands"].count(action) == int(allowed)
+    if not allowed:
+        # Later frames must clear both the old clock and the adjusted clock's observed range.
+        advance = max(108 + 900, wall) - wall + 2
+        wall += advance
+        elapsed += advance
+        result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=wall - 1, **fields)
+        assert result["confirmed"] is True and result["request_reference"] is not None
+        assert peer["commands"].count(action) == 1
+
+
+# Intent: Start and Stop require the same fresh authority immediately before the first write.
+# Why: a frame can remain fresh while a newer status revokes the particular control it displayed.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+@pytest.mark.parametrize("interruption", ["control", "revision", "status-failure", "old-native", "old-status", "owner"])
+async def test_canvas_rechecks_observed_control_at_the_management_write(
+    actual_hass, canvas_peer, monkeypatch, starting, interruption
+):
+    from custom_components.ics_proxy import coordinator
+
+    peer = canvas_peer
+    wall = 1000
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, wall))
+    state = peer["state"]
+    state.update(control_revision=REVISION, charging_session_open=not starting, can_start=starting)
+    if not starting:
+        state["stop_target"] = TARGET
+    entry = await setup_proxy(actual_hass, peer["port"])
+    runtime = entry.runtime_data
+    wall += 2
+    previous = state.copy()
+    updates = {
+        "control": {"can_start": False} if starting else {"stop_target": "e" * 64},
+        "revision": {"control_revision": REVISION + 1},
+        "status-failure": {},
+        "old-native": {"native_age_seconds": 16},
+        "old-status": {"status_age_seconds": 16},
+        "owner": {"canvas_owner": REPLACEMENT_OWNER},
+    }
+    action = "start" if starting else "stop_session"
+    fields = {"revision": REVISION} if starting else {"target": TARGET}
+    observed = False
+
+    # Publish the superseding state before the socket upgrade lets the original command write.
+    async def supersede_control():
+        nonlocal observed
+        state.update(updates[interruption])
+        peer["status_failure"] = interruption == "status-failure"
+        await runtime.async_refresh()
+        observed = True
+        assert runtime.last_update_success is (interruption != "status-failure")
+
+    peer["before_handshake"] = supersede_control
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=wall - 1, **fields)
+    assert observed
+    assert result == {"confirmed": False, "request_reference": None}
+    assert set(peer["commands"]) == {"status"}
+    assert state["charging_session_open"] is (not starting)
+
+    # Confirm that normal refreshed control remains usable after the refused write.
+    state.update(previous)
+    peer["status_failure"] = False
+    await runtime.async_refresh()
+    wall += 2
+    result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=wall - 1, **fields)
+    assert result["confirmed"] is True and result["request_reference"] is not None
+    (command,) = [request for request in peer["requests"] if request["command"] == action]
+    assert command["revision"] == REVISION and command["canvas_owner"] == CANVAS_OWNER
+    assert command.get("target") == (None if starting else TARGET)
+
+
+# Intent: a waiting canvas operation cannot write after HA replaces its integration instance.
+# Why: the new runtime can publish the same owner, revision, and target while the old request is still in flight.
+@pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
+async def test_canvas_write_rejects_inflight_entry_reload(actual_hass, canvas_peer, monkeypatch, starting):
+    from custom_components.ics_proxy import coordinator
+
+    hass, peer = actual_hass, canvas_peer
+    wall = 1000
+    monkeypatch.setattr(coordinator, "frame_clock", lambda: (wall, wall))
+    peer["state"].update(control_revision=REVISION, charging_session_open=not starting, can_start=starting)
+    if not starting:
+        peer["state"]["stop_target"] = TARGET
+    entry = await setup_proxy(hass, peer["port"])
+    original = entry.runtime_data
+    wall += 2
+
+    # Use a real reload on the same endpoint before the original websocket handshake can finish.
+    async def reload_entry():
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        assert entry.runtime_data is not original
+        assert entry.runtime_data.management_owner == CANVAS_OWNER
+        assert entry.runtime_data.data["control_revision"] == REVISION
+
+    peer["before_handshake"] = reload_entry
+    action = "start" if starting else "stop_session"
+    fields = {"revision": REVISION} if starting else {"target": TARGET}
+    result = await call_session_command(hass, action, canvas_rendered_at_epoch=wall - 1, **fields)
+    assert entry.runtime_data is not original
+    assert result == {"confirmed": False, "request_reference": None}
+    assert set(peer["commands"]) == {"status"}
+
+    wall += 2
+    result = await call_session_command(hass, action, canvas_rendered_at_epoch=wall - 1, **fields)
+    assert result["confirmed"] is True and result["request_reference"] is not None
+    assert peer["commands"].count(action) == 1

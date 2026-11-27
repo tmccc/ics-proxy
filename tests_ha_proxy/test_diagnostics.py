@@ -97,6 +97,30 @@ async def test_actual_control_mode_sensor_explains_start_renewal(actual_hass, pe
     assert entry.runtime_data.data["healthy"] is True
 
 
+# Intent: fresh status explains a specific wait even when no native sample is safe for the dashboard.
+# Why: the charger can report a valid interim state before both sides of session closure agree.
+async def test_actual_control_mode_explains_exact_owner_closure(actual_hass, peer):
+    peer["state"].update(
+        state="reconciling",
+        healthy=False,
+        control_mode="waiting",
+        native_age_seconds=None,
+        health_blockers=["native_stale", "control_verification_pending"],
+        diagnostics=detail()
+        | {
+            "blockers": ["owner_session_closure_pending"],
+            "pending_commands": [],
+            "pending_command_count": 0,
+        },
+    )
+    entry = await setup(actual_hass, peer)
+    entity_id = "sensor.ics_proxy_control_mode"
+    assert "confirm the local session is closed" in actual_hass.states.get(entity_id).attributes["diagnostic_summary"]
+    peer["state"]["status_age_seconds"] = 16
+    await entry.runtime_data.async_refresh()
+    assert "status is unavailable or stale" in actual_hass.states.get(entity_id).attributes["diagnostic_summary"]
+
+
 # Intent: an unconfirmed Return has ended, while an accepted Return is still in progress.
 # Why: the owner needs to know whether to wait or press Return again.
 async def test_actual_control_mode_explains_unconfirmed_return(actual_hass, peer):
@@ -140,6 +164,7 @@ async def test_actual_control_mode_explains_unconfirmed_return(actual_hass, peer
         ),
         ("not_assessed", "pause_verification_pending", None, "physical zero output has not yet been verified"),
         ("not_assessed", "command_outcome_unknown", None, "unresolved outcome"),
+        ("not_assessed", "status_unavailable", None, "could not read all of its current status"),
         ("not_assessed", "cloud_start_pending", None, "cloud Start is awaiting its matching session"),
         ("verification_pending", "fault_latched", "measured_output_limit_exceeded", "validated measurements exceeded"),
     ],

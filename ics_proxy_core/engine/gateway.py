@@ -12,7 +12,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from datetime import UTC, datetime
 from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
@@ -30,7 +30,7 @@ from .command_outcomes import (
 )
 from .command_processor import CommandPriority, CommandProcessor
 from .connection_scope import ControlScope, control_scope_matches, current_control_scope
-from .control_decisions import StopPredecessors, StopZeroEvidence, VendorStopAlreadyAnsweredError
+from .control_decisions import StopZeroEvidence, VendorStopAlreadyAnsweredError
 from .delivery_reply import DeliveryReply, stop_result_shape_supported
 from .events import OBSERVATION_ACTIONS, validate_observation
 from .ics import TransactionQuery, is_transaction_query, unique_object
@@ -53,6 +53,7 @@ from .rpc import InboundCache, Peer, RegistrationDeferredError, Sender, Unavaila
 from .security import SecurityError
 from .start_handoff import NativeStartReport as NativeStartReport
 from .start_handoff import OwnedStartResult, StartHandoff
+from .stop_settlement import StopPredecessors
 from .store import ConflictError, Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
 from .vendor_read_recovery import recover_legacy_vendor_read
 
@@ -137,6 +138,9 @@ class StartReports(Protocol):
 
     def owner_start_seconds(self, tag: str, request_id: str | None, *, issued: bool) -> int | None: ...
 
+    # A simultaneous native wakeup cannot spend this same locally owned occurrence.
+    def local_schedule_blocks(self, tag: str, occurred: float | None) -> bool: ...
+
     # Establish any required owner hold before the gateway pins its ticket.
     async def prepare_hold(self, payload: dict[str, Any]) -> None: ...
 
@@ -201,7 +205,6 @@ class Gateway:
         self._inbound = InboundCache(journal=journal)
         self._observations = ObservationReceipts(journal)
         self._start_retry_waits: dict[str, tuple[str, float]] = {}
-        self._late_delivery_token: str | None = None
         self.failures: list[str] = []
 
     # Install the same decision queue on both peers and the existing local command owner.
@@ -619,7 +622,11 @@ class Gateway:
                             latest = self._tag_info(payload["idTag"])
                             info = (
                                 latest
-                                if self._tag_allowed(payload["idTag"]) or latest["status"] != "Accepted"
+                                if (
+                                    self._tag_allowed(payload["idTag"])
+                                    and not self.local_schedule_blocks(payload["idTag"])
+                                )
+                                or latest["status"] != "Accepted"
                                 else {"status": "Invalid"}
                             )
                         return info
@@ -803,6 +810,14 @@ class Gateway:
     def _local_tag(self, tag: str) -> bool:
         return any(tag.casefold() == approved.casefold() for approved in self.policy.allowed_tags)
 
+    # A real vendor Start grant remains exact; a saved-plan tag on its own cannot race the owner's occurrence.
+    def local_schedule_blocks(self, tag: str, occurred: float | None = None) -> bool:
+        return (
+            self.start_reports is not None
+            and not self.authorisation.allows(tag)
+            and self.start_reports.local_schedule_blocks(tag, occurred)
+        )
+
     # The local executor and charger reports consult the same managed Start lease.
     def owner_start_seconds(self, tag: str, request_id: str | None = None, *, issued: bool = False) -> int | None:
         if self.start_reports is None or not self.policy.is_owner_start_tag(tag):
@@ -933,6 +948,7 @@ class Gateway:
         if (
             not isinstance(tag, str)
             or self.retiring()
+            or self.local_schedule_blocks(tag)
             or self.journal.get("control", {}).get("inhibit")
             or not self.journal.phase.read().legacy_active
         ):
@@ -975,6 +991,7 @@ class Gateway:
         other_reply: VendorWriteReply | None = None
         other_answer: Frame | None = None
         dispatched = False
+        retained_predecessors = ExitStack()
         wire = "c-" + uuid.uuid4().hex
         priority = CommandPriority.RESTRICT if action == "RemoteStopTransaction" else CommandPriority.NORMAL
 
@@ -1102,13 +1119,20 @@ class Gateway:
                     raise DeniedError("cloud command no longer owns its original control scope")
                 require_transaction()
 
-            # Bind any earlier Stop attempts before queued work can outlast this session.
-            def admit() -> StopPredecessors | None:
+            # Bind and retain earlier Stop attempts before queued work can outlast this session.
+            def admit() -> None:
+                nonlocal stop_predecessors
                 require_origin()
                 if stop_evidence is None:
-                    return None
+                    return
                 assert local_transaction is not None and connection is not None
-                return self.controls.decisions.vendor_stop_predecessors(local_transaction, connection[0].boot)
+                stop_predecessors = self.controls.decisions.vendor_stop_predecessors(
+                    local_transaction, connection[0].boot
+                )
+                if stop_predecessors is not None and stop_predecessors.vendor_mutations:
+                    retained_predecessors.enter_context(
+                        self.journal.retain_vendor_stop_predecessors(stop_predecessors.vendor_mutations)
+                    )
 
             # The existing mutation owns the bound request and its translated physical target.
             def prepare_mutation(profile: int | None) -> str:
@@ -1126,9 +1150,9 @@ class Gateway:
                 return token_id
 
             if supervised and self.command_processor is not None:
-                stop_predecessors = await self.command_processor.run(admit, priority=priority)
+                await self.command_processor.run(admit, priority=priority)
             elif stop_evidence is not None:
-                stop_predecessors = self.decide(admit, priority=priority)
+                self.decide(admit, priority=priority)
             if write and action != "RemoteStopTransaction":
                 await self.controls.ensure_ceiling(guard=require_origin)
             if action == "RemoteStartTransaction":
@@ -1245,6 +1269,7 @@ class Gateway:
                 return reply_as(other_answer, token)
             text = build_call_error(token, "InternalError", "charger outcome is unconfirmed; request was not replayed")
         finally:
+            retained_predecessors.close()
             self.decide(finish, priority=priority)
         return text
 
@@ -1483,7 +1508,6 @@ class Gateway:
                         sent = False
                         received_reply: DeliveryReply | None = None
                         await_late = can_send is not None and item.action == "StartTransaction"
-                        sender = self.vendor.sender
 
                         # Persist possible delivery inside the CALL gate, immediately before send.
                         def before_send() -> None:
@@ -1517,8 +1541,7 @@ class Gateway:
                             keep_late_reply=await_late,
                         )
                     except UnavailableError:
-                        if await_late and sent and received_reply is None and self.vendor.sender is sender:
-                            self._late_delivery_token = item.token
+                        if sent and received_reply is None and self._start_reply_window_open(item):
                             self.decide(lambda: self._interrupted_delivery(item, None, True))
                             raise RecoveryRequiredError("cloud Start is awaiting its original reply") from None
                         self.decide(lambda: self._interrupted_delivery(item, received_reply, sent))
@@ -1642,17 +1665,20 @@ class Gateway:
                         current_head = self.journal.next_delivery()
                         assert current_head is not None
                         item = current_head
-                    self._latch_late_delivery(item)
-                    supersede_unknown_start_retry(self.journal, item)
+                    self._hold_unanswered_start(item)
             elif item.action == "StartTransaction":
                 with self.journal.atomic():
                     latch_start_delivery_fault(self.journal)
             raise RecoveryRequiredError("cloud delivery requires explicit reconciliation")
         return item
 
-    # Preserve provenance only for the exact Start that can still receive its original cloud reply.
-    def _latch_late_delivery(self, item: Delivery) -> None:
-        if item.action == "StartTransaction" and item.token == self._late_delivery_token:
+    # A matching reply can still settle this Start while its original receiver owns the window.
+    def _start_reply_window_open(self, item: Delivery) -> bool:
+        return item.action == "StartTransaction" and item.token in self.vendor.reply_windows()
+
+    # Hold charging at zero during the reply window. Only expiry or retirement ends an unanswered approval.
+    def _hold_unanswered_start(self, item: Delivery) -> None:
+        if self._start_reply_window_open(item):
             latch_start_delivery_fault(
                 self.journal,
                 {
@@ -1661,6 +1687,8 @@ class Gateway:
                     "late_delivery_token": item.token,
                 },
             )
+        else:
+            supersede_unknown_start_retry(self.journal, item)
 
     # Retain an actual interrupted reply, or distinguish a safely retryable unanswered request.
     def _interrupted_delivery(self, item: Delivery, received_reply: DeliveryReply | None, sent: bool) -> None:
@@ -1675,8 +1703,7 @@ class Gateway:
                     )
                     current_head = self.journal.next_delivery()
                     if current_head is not None:
-                        self._latch_late_delivery(current_head)
-                        supersede_unknown_start_retry(self.journal, current_head)
+                        self._hold_unanswered_start(current_head)
             except sqlite3.Error:
                 # Preserve cancellation/peer failure; recover the unanswered head on the next flush.
                 pass
@@ -1729,7 +1756,9 @@ class Gateway:
             if item.action == "StopTransaction":
                 reject_stop_reply(self.journal, item, answer, reason="cloud_call_error")
                 raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
-            if item.action == "StartTransaction" and not record_start_error(self.journal, item, answer):
+            if item.action == "StartTransaction" and not record_start_error(
+                self.journal, item, answer, waits=self._start_retry_waits
+            ):
                 return "deferred"
             raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
         if item.action == "StopTransaction" and not stop_result_shape_supported(answer[2]):

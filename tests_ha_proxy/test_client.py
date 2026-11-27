@@ -81,6 +81,8 @@ async def peer():
         if request.headers.get("Authorization") != "Bearer " + TOKEN:
             raise web.HTTPUnauthorized()
         socket = web.WebSocketResponse(protocols=["ics-proxy.v1"])
+        if (before_handshake := control.pop("before_handshake", None)) is not None:
+            await before_handshake()
         await socket.prepare(request)
         message = await socket.receive()
         if message.type != WSMsgType.TEXT:
@@ -89,6 +91,11 @@ async def peer():
         command = value["command"]
         control["commands"].append(command)
         control["requests"].append(copy.deepcopy(value))
+        owner_fields = {"management_owner", "canvas_owner"} & value.keys()
+        if command not in ("status", "receipt") and any(value[key] != state.get(key) for key in owner_fields):
+            await socket.send_json({"ok": False, "error": "not_ready"})
+            await socket.close()
+            return socket
         if command == "pause" and control.get("pre_admission_close") is not None:
             await socket.close(code=1013, message=control["pre_admission_close"].encode())
             return socket
@@ -424,7 +431,7 @@ async def test_deferred_pause_receipt_keeps_acceptance_classification(actual_has
     await setup(actual_hass, peer)
     peer["pending_receipt"], peer["receipt_delay"] = True, delay
     if delay:
-        with pytest.raises(HomeAssistantError, match="request was recorded; physical confirmation is still pending"):
+        with pytest.raises(HomeAssistantError, match="Its saved result could not be read"):
             await actual_hass.services.async_call(
                 "button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True
             )
@@ -575,6 +582,32 @@ async def test_temporary_pause_receipt_failure_retries_only_the_read(actual_hass
     pause, first, final = (request for request in peer["requests"] if request["command"] != "status")
     assert pause["command"] == "pause" and first["command"] == final["command"] == "receipt"
     assert first["request_id"] == final["request_id"] == pause["id"]
+
+
+# Intent: an HTTP 503 during receipt upgrade can recover after either first-reply outcome.
+# Why: a draining management listener can temporarily refuse the upgrade while the saved Pause survives.
+@pytest.mark.parametrize("drop_reply", [False, True], ids=["accepted-reply", "lost-reply"])
+async def test_receipt_upgrade_during_shutdown_retries_only_the_read(actual_hass, peer, drop_reply):
+    await setup(actual_hass, peer)
+    peer["lose_reply"] = drop_reply
+    peer["pending_receipt"] = True
+
+    # Refuse the first receipt upgrade after the original Pause has reached the peer.
+    async def refuse_receipt_upgrade():
+        assert [command for command in peer["commands"] if command != "status"] == ["pause"]
+        raise web.HTTPServiceUnavailable()
+
+    # Arrange the refusal after the Pause's own successful upgrade, including when its reply is lost.
+    async def prepare_pause_upgrade():
+        peer["before_handshake"] = refuse_receipt_upgrade
+
+    peer["before_handshake"] = prepare_pause_upgrade
+    await actual_hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True)
+    assert "before_handshake" not in peer
+    pause, receipt = (request for request in peer["requests"] if request["command"] != "status")
+    assert pause["command"] == "pause" and receipt["command"] == "receipt"
+    assert receipt["request_id"] == pause["id"] and receipt["id"] != pause["id"]
+    assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "Paused locally"
 
 
 # Intent: a possibly sent command needs an exact, readable receipt to confirm success.
@@ -744,6 +777,48 @@ async def test_pending_operation_label_does_not_invent_pause(actual_hass, peer, 
     peer["state"]["control_mode"] = "waiting"
     await entry.runtime_data.async_refresh()
     assert actual_hass.states.get("sensor.ics_proxy_control_mode").state == "Waiting for verification"
+
+
+# Intent: show pending control work only as long as the proxy status remains fresh.
+# Why: embedded and legacy status can carry a pending result after native evidence becomes unavailable.
+@pytest.mark.parametrize("legacy", [False, True], ids=["published-mode", "legacy-facts"])
+@pytest.mark.parametrize(
+    "mode,label,legacy_fields",
+    [
+        ("start_pending", "Start pending", {"fault": "start_operation_pending"}),
+        ("updating_current", "Updating current", {"fault": "current_update_pending"}),
+        ("pause_requested", "Pause requested", {"desired_control": "paused", "pause_pending": True}),
+        ("return_requested", "Return requested", {"desired_control": "paused", "return_pending": True}),
+    ],
+)
+async def test_pending_operation_label_expires_with_service_status(
+    actual_hass, peer, mode, label, legacy_fields, legacy
+):
+    peer["state"].update(
+        healthy=False,
+        local_healthy=False,
+        state="reconciling",
+        owner_control_enabled=False,
+        status_age_seconds=14,
+        native_age_seconds=None,
+        can_start=False,
+        can_start_test=False,
+        can_return=False,
+    )
+    if legacy:
+        peer["state"].update(legacy_fields)
+    else:
+        peer["state"]["control_mode"] = mode
+    await setup(actual_hass, peer)
+    entity_id = "sensor.ics_proxy_control_mode"
+    assert actual_hass.states.get(entity_id).state == label
+    calls = len(peer["commands"])
+
+    async with asyncio.timeout(3):
+        while actual_hass.states.get(entity_id).state != "Waiting for verification":
+            await asyncio.sleep(0.02)
+    assert len(peer["commands"]) == calls
+    assert "status is unavailable or stale" in actual_hass.states.get(entity_id).attributes["diagnostic_summary"]
 
 
 # Intent: the config flow rejects invalid credentials without sending controls or printing their content.

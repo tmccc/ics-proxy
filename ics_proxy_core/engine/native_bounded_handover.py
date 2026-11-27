@@ -43,6 +43,7 @@ from .policy import DeniedError
 from .recovery_contracts import ALLOW, GateDecision, Guard, Pending, Prerequisite, require_allowed
 from .rpc import IntroductionDeferredError, UnavailableError
 from .security import SecurityError, StaleEvidenceError
+from .session_closure import observe_closure
 from .station import StationChoice
 from .store import RecoveryRequiredError, StationZeroStorageError, encoded, fingerprint
 from .trial_allocation import initialize_allocation, verify_initial_history
@@ -206,9 +207,9 @@ class NativeBoundedHandover:
 
     # Managed recovery receives native availability directly after the same full audit and durable publication.
     async def read_result(
-        self, *, closed: bool = False, closing_local: int | None = None
+        self, *, closed: bool = False, owned: bool = False, closing_local: int | None = None
     ) -> HandoverEvidence | Pending:
-        return await self._read(closed=closed, as_result=True, closing_local=closing_local)
+        return await self._read(closed=closed, as_result=True, owned=owned, closing_local=closing_local)
 
     # One audit implementation owns strict verdicts, supersession, resource reconciliation and optional availability.
     async def _read(
@@ -243,22 +244,29 @@ class NativeBoundedHandover:
 
         # Interpret a complete HTTP result or failure in the decision that can publish its evidence.
         def settle(sample: HandoverEvidence | BaseException) -> HandoverEvidence | Pending:
-            content_current = False
+            sample_current = False
             strict_complete = False
+            owner_closure_wait = False
             resource_error: NativeContentError | None = None
             observed_route = route
 
-            # Only the newest resolved read may invalidate freshness; an older outcome cannot erase its successor.
-            def invalidate() -> None:
-                if sequence >= self.last_resolved_read:
-                    self.last_verified_at = 0
-
-            # Resolve failed or complete reads without letting an older HTTP result publish newer authority.
-            def current() -> bool:
+            # Every terminal outcome fences older in-flight reads, even when it cannot establish freshness.
+            def resolve() -> bool:
                 if sequence < self.last_resolved_read:
                     return False
                 self.last_resolved_read = sequence
-                return before == self.authority()
+                return True
+
+            # Withdraw the previous freshness only if this outcome still owns the observation order.
+            def invalidate() -> bool:
+                if not resolve():
+                    return False
+                self.last_verified_at = 0
+                return True
+
+            # Accept the outcome only under the Boot and journal authority captured before the native read.
+            def current() -> bool:
+                return resolve() and before == self.authority()
 
             try:
                 if isinstance(sample, BaseException):
@@ -269,9 +277,11 @@ class NativeBoundedHandover:
                         "native bounded audit was superseded by local authority",
                         reason=CurrentFailureReason.NATIVE_AUDIT_SUPERSEDED,
                     )
-                content_current = True
+                sample_current = True
                 observed_route = self.initial_listener_route(native) if allow_original_route else route
                 measured = self._inspect(native, route=observed_route)
+                if not native.is_fresh(5):
+                    raise StaleEvidenceError("native observation exceeded its freshness limit")
                 if (
                     selected_current is not None
                     and gateway.journal.current_change.read().settled_or_missing
@@ -316,11 +326,17 @@ class NativeBoundedHandover:
                         self.ordinary_source_observer(native)
                 if measured.exceeded:
                     raise _NativeMeasurementError(native, measured, self.authority(), sequence)
-                _require_ready(native, False, self.allow_unplugged, closing_local)
+                recovery = gateway.controls.decisions.recovery
+                if closing_local is not None or as_result:
+                    owner_closure_wait = recovery.owner_closure_gap(self, native, closing_local)
+                if closing_local is None or not owner_closure_wait:
+                    _require_ready(native, False, self.allow_unplugged, closing_local)
+                if not stop_only and (owned or as_result) and gateway.current_boot_seen(gateway._charger_epoch):
+                    recovery.recognize_owner_closure(self, native, inventory_audited=owned or attempt is not None)
             except NativeContentError as error:
                 invalidate()
                 # An adapter refusal may arrive after a newer Boot; validate its authority before freezing it as strict.
-                if not content_current and not current():
+                if not sample_current and not current():
                     if repair is not None:
                         repair.finish(attempt, "superseded")
                     raise AuditSupersededError("native content refusal was superseded by local authority") from error
@@ -343,7 +359,7 @@ class NativeBoundedHandover:
                 raise
             except (NativeTransportUnavailableError, StaleEvidenceError) as error:
                 invalidate()
-                applicable = current()
+                applicable = sample_current or current()
                 if repair is not None:
                     repair.finish(attempt, "availability" if applicable else "superseded")
                 if not applicable:
@@ -363,14 +379,20 @@ class NativeBoundedHandover:
                 raise
             except (SecurityError, DeniedError, RecoveryRequiredError, UnavailableError, TimeoutError) as error:
                 invalidate()
-                applicable = current()
+                applicable = sample_current or current()
                 if repair is not None:
                     repair.finish(attempt, "readiness" if applicable else "superseded")
-                if applicable and as_result and isinstance(error, NativeReadinessError) and error.unplugged_at_zero:
-                    local = error.native.physical.native_transaction_id
-                    active = gateway.journal.active()
-                    known = local == active or active is None and gateway.journal.latest_mapped_stop(local)
-                    if known or gateway.controls.decisions.recovery.closed_session_stop_wait(error.native):
+                if not applicable and not isinstance(error, AuditSupersededError):
+                    raise AuditSupersededError("native observation was superseded by local authority") from error
+                if applicable and as_result and isinstance(error, NativeReadinessError):
+                    recovery, journal = gateway.controls.decisions.recovery, gateway.journal
+                    local, active = error.native.physical.native_transaction_id, journal.active()
+                    known = local == active or active is None and journal.latest_mapped_stop(local)
+                    if (
+                        owner_closure_wait
+                        or error.unplugged_at_zero
+                        and (known or recovery.closed_session_stop_wait(error.native))
+                    ):
                         return Pending(Prerequisite.LIFECYCLE, str(error), error)
                 raise
             except sqlite3.Error as error:
@@ -384,9 +406,9 @@ class NativeBoundedHandover:
                 # A read failure that prevented comparison leaves an honest unknown fence, never an invented verdict.
                 raise
             except asyncio.CancelledError:
-                invalidate()
+                newest = invalidate()
                 if repair is not None:
-                    repair.finish(attempt, "availability")
+                    repair.finish(attempt, "availability" if newest else "superseded")
                 raise
             if repair is not None:
                 repair.finish(attempt, "validated")
@@ -395,6 +417,16 @@ class NativeBoundedHandover:
                 self._remember_stop_sample(native, sequence)
             if not stop_only and self.observation_listener is not None:
                 self.observation_listener(native)
+            # Pause still needs concrete evidence to retry a Stop for its exact open session.
+            if (
+                as_result
+                and owner_closure_wait
+                and not (
+                    native.physical.transaction_open
+                    and native.physical.native_transaction_id == gateway.journal.active()
+                )
+            ):
+                return Pending(Prerequisite.LIFECYCLE, "owner session awaits a matching Stop report and native zero")
             # A valid open source remains fresh while this particular operation awaits a closed station.
             if closed:
                 if as_result:
@@ -483,11 +515,20 @@ class NativeBoundedHandover:
 
     # Renew a retained ceiling after Boot without rewriting it or creating a missing station profile.
     async def require_retained_station(self, limit: float) -> None:
+        j = self.gateway.journal
+        closing_local = None
+        if limit == 0:
+            active = j.active()
+            closing_local = active if j.is_owner_session(active) else j.latest_owner_stop_id()
         try:
-            native = await self.read(owned=True)
+            native = await self.read(owned=True, closing_local=closing_local)
         except _NativeMeasurementError as error:
             raise UnavailableError("retained station awaits a settled measurement") from error
-        self.require_known_session(native)
+        owner_closure = closing_local is not None and self.gateway.controls.decisions.recovery.owner_closure_gap(
+            self, native, closing_local
+        )
+        if not owner_closure:
+            self.require_known_session(native)
         if self._selected_measurements(native, self._inspect(native)).exceeded:
             raise UnavailableError("retained station awaits a settled measurement")
         if not any(
@@ -495,7 +536,8 @@ class NativeBoundedHandover:
             for resource in native.physical.resources
         ):
             raise SecurityError("charger did not retain the commissioned station ceiling across Boot")
-        self.require_selected_output(native)
+        if not owner_closure:
+            self.require_selected_output(native)
 
     # Only a copy of the already validated USER scalar is normalized; original admission bytes are never rewritten.
     def binding_digest(self, native: HandoverEvidence) -> str:
@@ -593,7 +635,9 @@ class NativeBoundedHandover:
 
             try:
                 recovering = gateway.decide(
-                    lambda: decisions.prepare_introduction(self, claim, native, read_sequence),
+                    lambda: decisions.prepare_introduction(
+                        self, claim, native, read_sequence, selected_current=selected_current
+                    ),
                     priority=CommandPriority.RESTRICT,
                 )
                 if recovering and claim.first_zero:
@@ -666,7 +710,8 @@ class NativeBoundedHandover:
     def stop_zero_refusal(self, native: HandoverEvidence, *, local: int | None = None) -> str | None:
         g, j = self.gateway, self.gateway.journal
         self.require(native, closed=True)
-        self.require_known_session(native)
+        if not observe_closure(j.active(), native).confirms_idle:
+            raise NativeSessionPendingError("native and local transaction closure disagree")
         if not j.outcomes.stop_report_closed(local):
             raise NativeSessionPendingError("the exact Stop still awaits its charger report")
         present = self.book.owned_present(native.physical, record_unchanged=False)
@@ -696,17 +741,30 @@ class NativeBoundedHandover:
             self._stop_sample = sequence, scope, native
 
     # Reuse only the latest resolved sample of this session on the current commissioned charger connection.
-    def _current_stop_sample(self, local: int | None) -> HandoverEvidence | None:
+    def _current_stop_sample(self, local: int | None, *, include_closed: bool = False) -> HandoverEvidence | None:
         latest = self._stop_sample
+        markers = (local, None) if include_closed else (local,)
         if (
             latest is None
             or latest[0] != self.last_resolved_read
             or not control_scope_matches(self.gateway, latest[1])
-            or latest[2].physical.native_transaction_id != local
+            or latest[2].physical.native_transaction_id not in markers
             or not self.commissioned_binding_matches(latest[2])
         ):
             return None
         return latest[2]
+
+    # Either report can close first. Diagnostics require a fresh audit of the exact session or its closed marker.
+    def owner_closure_observed(self, local: int, now: float) -> bool:
+        sample = self._current_stop_sample(local, include_closed=True)
+        verified_at = self.last_verified_at
+        return (
+            sample is not None
+            and sample.physical.observed_at == verified_at
+            and 0 < verified_at <= now <= verified_at + 5
+            and sample.is_fresh(5)
+            and not any(sample.currents_a + sample.powers_w)
+        )
 
     # An ordinary Stop needs current verified open evidence. A protective Stop can use separate proof.
     def session_stop_verified(self, local: int) -> bool:
@@ -776,7 +834,11 @@ class NativeBoundedHandover:
         journal = self.gateway.journal
         active = journal.active()
         if active is None and journal.get("managed_mode"):
-            return journal.latest_mapped_stop_id() or journal.outcomes.latest_closed_session_stop_id()
+            return (
+                journal.latest_mapped_stop_id()
+                or journal.latest_owner_stop_id()
+                or journal.outcomes.latest_closed_session_stop_id()
+            )
         return active
 
     # A physical/ledger closure gap is ordinary pending evidence and never authority to adopt or stop a session.
@@ -1232,7 +1294,10 @@ class NativeBoundedHandover:
         if not native.physical.upstream_connected:
             self.save("awaiting_backend", backend_outage_at=native.physical.observed_at)
             return {"original_backend_connected": False, "native_limit_a": 6, "complete": False}
-        if state.get("backend_outage_at") is None or native.physical.observed_at <= state["backend_outage_at"]:
+        # The fresh original-route read started after this exact journal state was loaded.
+        # Wall-clock corrections between the two observations cannot reverse that order.
+        outage_at = state.get("backend_outage_at")
+        if isinstance(outage_at, bool) or not isinstance(outage_at, (int, float)) or not 0 < outage_at < float("inf"):
             raise UnavailableError("original backend needs a fresh observed offline-to-online transition")
         self.save("backend_verified", backend_verified_at=native.physical.observed_at)
         return {"original_backend_connected": True, "native_limit_a": 6, "complete": False}

@@ -11,26 +11,28 @@ import sys
 import time
 import uuid
 from contextlib import closing
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 
-from ics_proxy_core.engine import trial_handover_evidence
+from ics_proxy_core.engine import trial_evidence, trial_handover_evidence
 from ics_proxy_core.engine.native_bounded_handover import NativeBoundedHandover
 from ics_proxy_core.engine.native_http import NativeTransportUnavailableError, read_native
 from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
-from ics_proxy_core.engine.store import RecoveryRequiredError
+from ics_proxy_core.engine.store import JournalOwnerBusyError, RecoveryRequiredError
+from ics_proxy_core.engine.trial_evidence import UnpluggedEvidenceRequiredError
 from ics_proxy_core.engine.trial_session import save_private
 from ics_proxy_core.frames import basic_auth_header
 from tests.charge_rig import actual_stop, positive_flow, ready
 from tests.current_rig import commissioned
 from tests.handover_helpers import NativeVehiclePeer
-from tests.managed_rig import starts
+from tests.managed_rig import healthy, starts
 from tests.prototype_rig import BOOT
 from tests.tls_support import tls as tls
 from tools import restore_vendor
 from tools.managed_proxy import serve
-from tools.restore_vendor import run
+from tools.restore_vendor import RestoreFailure, RestoreReason, RestoreRefusalError, RestoreStage, run
 
 
 class RestorePeer(NativeVehiclePeer):
@@ -40,6 +42,7 @@ class RestorePeer(NativeVehiclePeer):
     def __init__(self, bench):
         super().__init__(bench)
         self.writes = []
+        self.user_limits_at_write = []
         self.lost_patch = None
         self.route_changed = False
         self.read_original_offline = asyncio.Event()
@@ -65,6 +68,7 @@ class RestorePeer(NativeVehiclePeer):
             self.requests.append(action)
             if action == "setConfig":
                 self.writes.append((data, self.bench.firmware.effective_limit(), self.bench.online))
+                self.user_limits_at_write.append(self.runtime_user)
                 self.configuration.update(data)
                 if "AmpLmt" in data:
                     self.runtime_user = int(data["AmpLmt"]) * 10
@@ -144,6 +148,7 @@ def journal_facts(path):
     return rows, json.loads(phase[0])
 
 
+# Read the real CLI failure report and check that it leaves no private paths in the output.
 async def failed_restore_cli(action, config, spec, native_port=80):
     child = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -172,14 +177,90 @@ async def failed_restore_cli(action, config, spec, native_port=80):
     return report
 
 
-async def test_invalid_restore_inputs_report_the_stage_without_private_paths(tmp_path):
-    report = await failed_restore_cli("check", tmp_path / "private-config.json", tmp_path / "private-spec.json")
-    assert report["restore_stage"] == "validate_inputs"
-    assert report["restore_reason"] == "inputs_unverified"
-    assert "configuration and commissioning files" in report["next_step"]
+# Intent: give useful restore guidance for known refusals while keeping unclassified error details private.
+# Why: journal or native failures can embed private data, including during an interrupted restoration.
+@pytest.mark.parametrize(
+    ("stage", "error", "reason", "error_name", "hint"),
+    [
+        (
+            RestoreStage.VERIFY_UNPLUGGED_MANAGED_PAUSE,
+            RestoreRefusalError(RestoreReason.SETTLED_PAUSE_REQUIRED, "private fixture detail"),
+            "settled_pause_required",
+            "RecoveryRequiredError",
+            "settled Pause with 6 A selected",
+        ),
+        (
+            RestoreStage.VERIFY_UNPLUGGED_MANAGED_PAUSE,
+            RestoreRefusalError(RestoreReason.RESTORE_RECORD_MISMATCH, "private fixture detail"),
+            "restore_record_mismatch",
+            "RecoveryRequiredError",
+            "matching set for this installation",
+        ),
+        (
+            RestoreStage.OPEN_JOURNAL,
+            JournalOwnerBusyError("private fixture detail"),
+            "journal_in_use",
+            "RecoveryRequiredError",
+            "Stop the proxy service",
+        ),
+        (
+            RestoreStage.VERIFY_UNPLUGGED_MANAGED_PAUSE,
+            UnpluggedEvidenceRequiredError("private fixture detail"),
+            "unplugged_idle_required",
+            "SecurityError",
+            "unplug the car",
+        ),
+        (
+            RestoreStage.VERIFY_UNPLUGGED_MANAGED_PAUSE,
+            RecoveryRequiredError("cleanup does not belong to this managed restoration"),
+            "restore_stage_failed",
+            "RecoveryRequiredError",
+            "Review the restore instructions for this stage",
+        ),
+        (
+            RestoreStage.VERIFY_VENDOR_CONNECTION,
+            TimeoutError("private fixture detail"),
+            "vendor_connection_unverified",
+            "TimeoutError",
+            "Check that the charger can reach iCS",
+        ),
+        (
+            RestoreStage.RESTORE_ORIGINAL_ROUTE,
+            TimeoutError("private fixture detail"),
+            "restore_stage_failed",
+            "TimeoutError",
+            "Review the restore instructions for this stage",
+        ),
+        (
+            RestoreStage.VERIFY_UNPLUGGED_MANAGED_PAUSE,
+            StaleEvidenceError("private fixture detail"),
+            "native_evidence_unavailable",
+            "StaleEvidenceError",
+            "reachable locally",
+        ),
+        (
+            RestoreStage.RESTORE_ORIGINAL_CURRENT,
+            NativeTransportUnavailableError("private fixture detail"),
+            "native_evidence_unavailable",
+            "NativeTransportUnavailableError",
+            "reachable locally",
+        ),
+    ],
+)
+def test_restore_guidance_matches_observed_stage_without_private_details(stage, error, reason, error_name, hint):
+    report = RestoreFailure.capture(stage, error).value()
+    assert report == {
+        "restore_failed": error_name,
+        "complete": False,
+        "restore_stage": stage.value,
+        "restore_reason": reason,
+        "next_step": report["next_step"],
+    }
+    assert hint in report["next_step"] and "private fixture detail" not in json.dumps(report)
 
 
-# Preserve the phase that first interrupted a vendor restore.
+# Intent: report the original restore error and stage when closing the maintenance session also fails.
+# Why: a close failure should identify the close stage only when it is the first failure.
 @pytest.mark.parametrize("transfer_failed", [False, True])
 async def test_maintenance_close_preserves_restore_stage(tmp_path, tls, unused_tcp_port, monkeypatch, transfer_failed):
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, cli_route=True, native_peer=RestorePeer) as test:
@@ -190,12 +271,12 @@ async def test_maintenance_close_preserves_restore_stage(tmp_path, tls, unused_t
         close = restore_vendor.TrialSession.close
 
         # Bypass profile work to isolate stage reporting during route transfer and close.
-        async def cleanup_profiles(session, report_stage):
+        async def cleanup_profiles(session):
             pass
 
         # Record the route stage before simulating transfer success or failure.
         async def finish_restore(handover, patch, close_listener, *, report_stage):
-            report_stage("restore_original_route")
+            report_stage(RestoreStage.RESTORE_ORIGINAL_ROUTE)
             if transfer_failed:
                 raise NativeTransportUnavailableError("test route observation interrupted")
             return {"complete": True}
@@ -215,6 +296,15 @@ async def test_maintenance_close_preserves_restore_stage(tmp_path, tls, unused_t
             assert stages[-1] == ("restore_original_route" if transfer_failed else "close_maintenance_session")
 
 
+# Intent: report invalid restore inputs with the validation stage and a corrective action.
+# Why: the operator needs enough information to fix the configuration without exposing private paths.
+async def test_invalid_restore_inputs_report_the_stage_without_private_paths(tmp_path):
+    report = await failed_restore_cli("check", tmp_path / "private-config.json", tmp_path / "private-spec.json")
+    assert report["restore_stage"] == "validate_inputs"
+    assert report["restore_reason"] == "inputs_unverified"
+    assert "configuration and commissioning files" in report["next_step"]
+
+
 # Intent: input checks run offline and restoration refuses an already-owned journal before contacting the charger.
 # Why: a running proxy can keep operating while an installer checks inputs, and it must remain the only owner.
 async def test_restore_check_is_offline(tmp_path, tls, unused_tcp_port, monkeypatch):
@@ -226,7 +316,7 @@ async def test_restore_check_is_offline(tmp_path, tls, unused_tcp_port, monkeypa
         config, spec = tmp_path / "trial.json", spec_file(tmp_path, test.rig)
         port = test.rig.prepared.observer.port
         assert await run("check", config, spec, port) == 0
-        with pytest.raises(RecoveryRequiredError, match="journal already has an active owner"):
+        with pytest.raises(JournalOwnerBusyError, match="journal already has an active owner"):
             await run("restore", config, spec, port)
         report = await failed_restore_cli("restore", config, spec, port)
         assert report["restore_failed"] == "RecoveryRequiredError"
@@ -234,6 +324,148 @@ async def test_restore_check_is_offline(tmp_path, tls, unused_tcp_port, monkeypa
         assert report["restore_reason"] == "journal_in_use"
         assert "Stop the proxy service" in report["next_step"]
         assert peer.requests == reads and not peer.writes
+
+
+# Intent: identify missing or malformed maintenance credentials before contacting the charger.
+# Why: the offline native check succeeds independently and later restore stages can resume without TLS files.
+@pytest.mark.parametrize("malformed_basic", [False, True], ids=["missing-key", "invalid-utf8"])
+async def test_restore_reports_invalid_maintenance_credentials(
+    tmp_path, tls, unused_tcp_port, monkeypatch, malformed_basic
+):
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
+    ) as test:
+        await stop_paused(test)
+        rig = test.rig
+        config, spec = tmp_path / "trial.json", spec_file(tmp_path, rig)
+        if malformed_basic:
+            credential = rig.prepared.config.incoming_secret
+            assert credential is not None
+            save_private(credential, {"username": rig.prepared.config.identity, "password": "\ud800"})
+        else:
+            credential = rig.prepared.config.private_key
+            credential.unlink()
+        port = rig.prepared.observer.port
+        reads = list(rig.peer.requests)
+
+        assert await run("check", config, spec, port) == 0
+        report = await failed_restore_cli("restore", config, spec, port)
+        assert report["restore_stage"] == "validate_maintenance_credentials"
+        assert report["restore_reason"] == "maintenance_credentials_unverified"
+        assert report["restore_failed"] == "SecurityError"
+        assert "private key" in report["next_step"]
+        assert str(credential) not in json.dumps(report)
+        assert rig.peer.requests == reads and not rig.peer.writes
+
+
+# Intent: report a timed-out LAN snapshot before touching charger settings.
+# Why: the overall snapshot can reach its deadline even when an individual native request has succeeded.
+async def test_restore_reports_native_snapshot_deadline(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
+    ) as test:
+        await stop_paused(test)
+        rig = test.rig
+        config, spec = tmp_path / "trial.json", spec_file(tmp_path, rig)
+        stages = []
+
+        # Return the device identity, then yield so the aggregate read can reach its deadline.
+        async def read(observer, action, data=None):
+            if action == "getConfig":
+                return {"Id": observer.config.identity, "bPSN": observer.config.hardware_identity}
+            await asyncio.sleep(0)
+            pytest.fail("the aggregate native deadline did not interrupt the snapshot")
+
+        with monkeypatch.context() as snapshot:
+            snapshot.setattr(trial_evidence, "asyncio", SimpleNamespace(timeout=lambda _: asyncio.timeout(0)))
+            snapshot.setattr(trial_evidence.NativeObserver, "_read", read)
+            with pytest.raises(NativeTransportUnavailableError) as error:
+                await run("restore", config, spec, rig.prepared.observer.port, report_stage=stages.append)
+        report = RestoreFailure.capture(stages[-1], error.value).value()
+        assert report["restore_stage"] == "verify_unplugged_managed_pause"
+        assert report["restore_reason"] == "native_evidence_unavailable"
+        assert not rig.peer.writes
+
+
+# Intent: preserve the distinct vendor failure when completed native reads show that the backend stays offline.
+# Why: an offline vendor connection needs different recovery guidance from a failed native read.
+async def test_restore_reports_vendor_wait_deadline(monkeypatch):
+    journal = SimpleNamespace(
+        phase=SimpleNamespace(read=lambda: SimpleNamespace(value="backend_restore_pending")),
+        get=lambda *args: {"route_restored": True},
+    )
+
+    # Keep native observations succeeding while the vendor connection stays offline.
+    async def observe_backend():
+        return {"original_backend_connected": False}
+
+    # Fail the test if restoration tries to change settings before the vendor is verified.
+    async def patch(*args):
+        pytest.fail("restore attempted to change settings while the vendor link was offline")
+
+    handover = SimpleNamespace(gateway=SimpleNamespace(journal=journal), observe_backend=observe_backend)
+    monkeypatch.setattr(
+        restore_vendor, "asyncio", SimpleNamespace(timeout=lambda _: asyncio.timeout(0), sleep=asyncio.sleep)
+    )
+    stages = []
+    with pytest.raises(TimeoutError) as error:
+        await restore_vendor.finish_restore(handover, patch, report_stage=stages.append)
+    report = RestoreFailure.capture(stages[-1], error.value).value()
+    assert report["restore_stage"] == "verify_vendor_connection"
+    assert report["restore_reason"] == "vendor_connection_unverified"
+
+
+# Intent: tell the operator how to establish Pause before any restore change has been made.
+# Why: starting the proxy to request Pause is only possible before restoration begins.
+async def test_restore_reports_missing_managed_pause(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
+    ) as test:
+        rig = test.rig
+        assert (await healthy(test.controller))["owner_control_enabled"]
+        await test.session.close()
+        rig.bench.online = False
+        rig.bench.cp, rig.bench.connection = "A", "Unplug"
+        records, phase = journal_facts(rig.prepared.config.journal)
+
+        report = await failed_restore_cli(
+            "restore", tmp_path / "trial.json", spec_file(tmp_path, rig), rig.prepared.observer.port
+        )
+
+        assert report["restore_stage"] == "verify_unplugged_managed_pause"
+        assert report["restore_reason"] == "settled_pause_required"
+        assert "Start the proxy service and request Pause charger in Home Assistant" in report["next_step"]
+        assert "stop the proxy service and rerun restore" in report["next_step"]
+        assert journal_facts(rig.prepared.config.journal) == (records, phase)
+        assert not rig.peer.writes
+
+
+# Intent: keep the service retired when a resumed restore cannot verify the native current.
+# Why: an interrupted current write has already committed cleanup intent even if it never returned a reply.
+async def test_restore_keeps_proxy_stopped_after_interrupted_write(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
+    ) as test:
+        rig = test.rig
+        await stop_paused(test)
+        peer = rig.peer
+        args = ("restore", tmp_path / "trial.json", spec_file(tmp_path, rig), rig.prepared.observer.port)
+        peer.lost_patch = {"AmpLmt": "6"}
+        report = await failed_restore_cli(*args)
+        assert report["restore_stage"] == "verify_6_a_and_remove_proxy_profiles"
+        assert report["restore_reason"] == "native_evidence_unavailable"
+        records, phase = journal_facts(rig.prepared.config.journal)
+        assert phase == "rollback"
+
+        assert peer.configuration["AmpLmt"] == "6"
+        peer.runtime_user = 320
+        report = await failed_restore_cli(*args)
+
+        assert report["restore_stage"] == "verify_6_a_and_remove_proxy_profiles"
+        assert report["restore_reason"] == "restore_stage_failed"
+        assert "Keep the proxy stopped" in report["next_step"]
+        assert journal_facts(rig.prepared.config.journal) == (records, phase)
+        assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}]
 
 
 # Intent: a plugged vehicle blocks managed restoration before any saved configuration or profile changes.
@@ -246,7 +478,7 @@ async def test_restore_refuses_plugged_vehicle_before_any_write(tmp_path, tls, u
         peers_before = list(test.rig.bench.device_calls)
         config, spec = tmp_path / "trial.json", spec_file(tmp_path, test.rig)
         port = test.rig.prepared.observer.port
-        with pytest.raises((SecurityError, RecoveryRequiredError)):
+        with pytest.raises(UnpluggedEvidenceRequiredError, match="fresh matching unplugged zero-power evidence"):
             await run("restore", config, spec, port)
         report = await failed_restore_cli("restore", config, spec, port)
         assert report["restore_failed"] == "SecurityError"
@@ -461,20 +693,29 @@ def expire_evidence_on_connect(monkeypatch, target):
     monkeypatch.setattr(restore_vendor, "read_native", request)
 
 
-# Intent: verify managed32 handback and retry when any of the three writes is prevented or loses a reply.
-# Why: expired evidence must prevent transmission, and a lost reply must never duplicate an applied setting.
+# Intent: rehearse handback from each managed native bound and interrupt every applicable write.
+# Why: an applied write must survive a lost reply, and the 6 A bound needs no preliminary current write.
 @pytest.mark.parametrize(
-    ("interruption", "stage"),
-    [(None, None), *((kind, stage) for kind in ("reply", "connect") for stage in ("lower", "route", "raise"))],
+    ("native_bound", "interruption", "stage"),
+    [
+        pytest.param(bound, kind, stage, id=f"{bound}a-{kind or 'uninterrupted'}-{stage or 'all'}")
+        for bound in (6, 32)
+        for kind, stage in [
+            (None, None),
+            *((kind, stage) for kind in ("reply", "connect") for stage in ("lower", "route", "raise")),
+        ]
+        if bound == 32 or stage != "lower"
+    ],
 )
-async def test_restore_from_managed32_keeps_history(
-    tmp_path, tls, unused_tcp_port, monkeypatch, capsys, interruption, stage
+async def test_restore_keeps_history_for_each_managed_bound(
+    tmp_path, tls, unused_tcp_port, monkeypatch, capsys, native_bound, interruption, stage
 ):
-    async with commissioned(
-        tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
-    ) as test:
+    prepare = partial(commissioned, current=6) if native_bound == 32 else ready
+    async with prepare(tmp_path, tls, unused_tcp_port, monkeypatch, cli_route=True, native_peer=RestorePeer) as test:
         rig = test.rig
         peer, bench = rig.peer, rig.bench
+        assert peer.runtime_user == native_bound * 10
+        assert (test.session.journal.get("managed_current_capability") is not None) is (native_bound == 32)
         await stop_paused(test)
         db_path = rig.prepared.config.journal
         records, _ = journal_facts(db_path)
@@ -486,6 +727,7 @@ async def test_restore_from_managed32_keeps_history(
         first_call = len(bench.device_calls)
         first_limit = len(bench.received_limits)
         route = {key: rig.spec.original_configuration[key] for key in rig.spec.trial_route}
+        lower_writes = [{"AmpLmt": "6"}] if native_bound == 32 else []
         target = {"lower": {"AmpLmt": "6"}, "route": route, "raise": {"AmpLmt": "32"}}.get(stage)
         failure = NativeTransportUnavailableError
         if interruption == "reply":
@@ -512,7 +754,7 @@ async def test_restore_from_managed32_keeps_history(
                     await asyncio.wait_for(restore_task, 10)
                 if interruption == "connect":
                     await asyncio.wait_for(peer.empty_connection.wait(), 1)
-                    assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}]
+                    assert [patch for patch, _, _ in peer.writes] == lower_writes
                 assert peer.route_changed == (interruption == "reply") and peer.runtime_user == 60
                 rig.prepared.config.certificate.unlink()
                 rig.prepared.config.private_key.unlink()
@@ -527,7 +769,7 @@ async def test_restore_from_managed32_keeps_history(
                     await asyncio.wait_for(restore_task, 5)
                 if interruption == "connect":
                     await asyncio.wait_for(peer.empty_connection.wait(), 1)
-                    assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}, route]
+                    assert [patch for patch, _, _ in peer.writes] == [*lower_writes, route]
                     assert peer.configuration == rig.spec.configuration("original")
                 else:
                     assert peer.configuration == rig.spec.original_configuration
@@ -541,8 +783,11 @@ async def test_restore_from_managed32_keeps_history(
                 task.cancel()
             await asyncio.gather(restore_task, charger_task, return_exceptions=True)
 
-        assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}, route, {"AmpLmt": "32"}]
-        assert peer.writes[0][1] == 0 and peer.writes[1][2] is False and peer.writes[-1][2] is True
+        assert [patch for patch, _, _ in peer.writes] == [*lower_writes, route, {"AmpLmt": "32"}]
+        if lower_writes:
+            assert peer.writes[0][1] == 0
+        assert peer.user_limits_at_write == ([320, 60, 60] if lower_writes else [60, 60])
+        assert peer.writes[-2][2] is False and peer.writes[-1][2] is True
         assert peer.configuration == rig.spec.original_configuration and peer.runtime_user == 320
         assert not bench.firmware.profiles and bench.firmware.plans == plans and bench.history == history
         assert all(limit == 0 for limit in bench.received_limits[first_limit:])
@@ -558,7 +803,6 @@ async def test_restore_from_managed32_keeps_history(
         }
         stages = {
             "open_restore_journal",
-            "validate_maintenance_credentials",
             "verify_unplugged_managed_pause",
             "verify_6_a_and_remove_proxy_profiles",
             "restore_original_route",
@@ -567,3 +811,45 @@ async def test_restore_from_managed32_keeps_history(
         }
         assert all(report == {"restore_stage": report.get("restore_stage")} for report in output[:-1])
         assert {report["restore_stage"] for report in output[:-1]} == stages
+
+        recheck_stages = []
+        writes = list(peer.writes)
+        assert await run(*args, report_stage=recheck_stages.append) == 0
+        assert recheck_stages == ["open_restore_journal", "verify_restored_configuration"]
+        assert peer.writes == writes and journal_facts(db_path) == (records, "complete")
+
+
+# Intent: resume a route write that succeeded before a lost reply and a backward host clock correction.
+# Why: the journal and fresh independent observations establish order even when their wall times reverse.
+async def test_restore_reconnect_after_backward_host_clock_correction(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(
+        tmp_path, tls, unused_tcp_port, monkeypatch, 6, cli_route=True, native_peer=RestorePeer
+    ) as test:
+        rig = test.rig
+        await stop_paused(test)
+        records, _ = journal_facts(rig.prepared.config.journal)
+        wall_time, clock_offset = time.time, 120
+        monkeypatch.setattr(time, "time", lambda: wall_time() + clock_offset)
+        peer, bench = rig.peer, rig.bench
+        route = {key: rig.spec.original_configuration[key] for key in rig.spec.trial_route}
+        args = ("restore", tmp_path / "trial.json", spec_file(tmp_path, rig), rig.prepared.observer.port)
+        peer.lost_patch = route
+        async with asyncio.timeout(10), asyncio.TaskGroup() as tasks:
+            tasks.create_task(cleanup_charger(test))
+            with pytest.raises(NativeTransportUnavailableError):
+                await run(*args)
+        assert peer.route_changed and not bench.online and peer.runtime_user == 60
+        assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}, route]
+
+        bench.online = True
+        clock_offset = 0
+        resume_stages = []
+        assert await asyncio.wait_for(run(*args, report_stage=resume_stages.append), 5) == 0
+        assert resume_stages == [
+            "open_restore_journal",
+            "restore_original_route",
+            "verify_vendor_connection",
+            "restore_original_current",
+        ]
+        assert [patch for patch, _, _ in peer.writes] == [{"AmpLmt": "6"}, route, {"AmpLmt": "32"}]
+        assert peer.runtime_user == 320 and journal_facts(rig.prepared.config.journal) == (records, "complete")

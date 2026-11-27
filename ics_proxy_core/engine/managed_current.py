@@ -16,7 +16,7 @@ from .managed_intent import ControlIntent
 from .managed_records import CurrentFailure, CurrentFailureReason
 from .native_bounded import NativeBoundedSpec
 from .policy import DeniedError
-from .recovery_contracts import AuthorityStamp, Pending, Prerequisite
+from .recovery_contracts import CurrentRecoverySettlement, Pending, Prerequisite
 from .rpc import UnavailableError
 from .security import SecurityError
 from .store import Journal, RecoveryRequiredError, fingerprint
@@ -59,7 +59,7 @@ class ManagedCurrentLimits:
     def __init__(self, controller: ManagedController) -> None:
         self.controller = controller
         self.worker: asyncio.Task[None] | None = None
-        self._settling_overlap: tuple[str, AuthorityStamp, int | None] | None = None
+        self._settling_overlap: CurrentRecoverySettlement | None = None
         self._closing = False
         self.journal.db.execute(
             "CREATE TABLE IF NOT EXISTS managed_current_requests(id TEXT PRIMARY KEY,current_a INTEGER)"
@@ -252,14 +252,28 @@ class ManagedCurrentLimits:
         if not restore:
             return outcome if isinstance(outcome, Pending) else None
         assert not isinstance(outcome, Pending)
-        local = outcome
-        progress = await c.recovery.restore(continuing_local=local)
+        lifecycle = self.journal.lifecycle_position()
+        progress = await c.recovery.restore(expected, continuing_local=outcome)
         if not progress.shared:
             return progress.pending
-        published = c.authority()
+        published = progress.operation.published_authority if progress.operation is not None else None
         if published is None:
             return Pending(Prerequisite.SUPERSEDED, "current recovery lost its confirmed authority")
-        return decisions.complete_current_recovery(self, change, published, local)
+        # Use the same fresh station proof for the first receipt write and any retry.
+        self._settling_overlap = CurrentRecoverySettlement(change["id"], published, lifecycle)
+        settled, pending = await decisions.retry_current_recovery(self, change, expected)
+        if settled:
+            return pending
+        if pending is not None and pending.reason in (Prerequisite.SOURCE, Prerequisite.LIFECYCLE):
+            # Fresh contradictory evidence revokes the previous release while that exact authority still owns it.
+            reclaim = c.commands.decide(
+                lambda: c.authority() == published and decisions.reclaim_current_recovery(self, change, expected),
+                priority=CommandPriority.RESTRICT,
+            )
+            if reclaim:
+                await self.protect_overlap()
+            return pending
+        return Pending(Prerequisite.ZERO_PROOF, "current recovery awaits a verified station ceiling")
 
     # Hand the real Start report to the current recovery's decision owner.
     async def prepare_native_report(self, payload: dict[str, Any]) -> NativeStartReport | None:

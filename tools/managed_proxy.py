@@ -19,6 +19,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from ics_proxy_core.engine.local_control import join_retirement  # noqa: E402
 from ics_proxy_core.engine.managed import ManagedController  # noqa: E402
 from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings  # noqa: E402
 from ics_proxy_core.engine.managed_view import health_snapshot, publish_poll  # noqa: E402
@@ -130,6 +131,44 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
     published: dict[str, Any] = {"running": True, "state": "starting"}
     api: ManagementServer | None = None
     incident: IncidentRecorder | None = None
+
+    # Retire all service users and publish the final report before propagating caller cancellation.
+    async def retire() -> bool:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        notify("STOPPING=1\nSTATUS=Checking final charger hold")
+        try:
+            try:
+                if api is not None:
+                    await api.close()
+            finally:
+                try:
+                    if controller is not None:
+                        await controller.current.close()
+                        await controller.charging.close()
+                        await controller.session_stop.close()
+                        if controller.pause_task is not None:
+                            await asyncio.gather(controller.pause_task, return_exceptions=True)
+                finally:
+                    await session.close()
+        finally:
+            if incident is not None:
+                incident.close()
+            shutdown_uncertain = (session.final_status or {}).get("shutdown_attempt_uncertain") is not False
+            if writer is not None:
+                await writer.close(
+                    {
+                        "running": False,
+                        "state": "stopped",
+                        "checked_at": time.time(),
+                        "pid": os.getpid(),
+                        "shutdown_uncertain": shutdown_uncertain,
+                    }
+                )
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.remove_signal_handler(sig)
+        return shutdown_uncertain
+
     try:
         if session.journal.phase.read().cleanup:
             raise RecoveryRequiredError("managed service cannot start after charger restoration has begun")
@@ -183,39 +222,7 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
                 pass
     finally:
         request_stop()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        notify("STOPPING=1\nSTATUS=Checking final charger hold")
-        try:
-            try:
-                if api is not None:
-                    await api.close()
-            finally:
-                try:
-                    if controller is not None:
-                        await controller.current.close()
-                        await controller.charging.close()
-                        await controller.session_stop.close()
-                        if controller.pause_task is not None:
-                            await asyncio.gather(controller.pause_task, return_exceptions=True)
-                finally:
-                    await session.close()
-        finally:
-            if incident is not None:
-                incident.close()
-            shutdown_uncertain = (session.final_status or {}).get("shutdown_attempt_uncertain") is not False
-            if writer is not None:
-                await writer.close(
-                    {
-                        "running": False,
-                        "state": "stopped",
-                        "checked_at": time.time(),
-                        "pid": os.getpid(),
-                        "shutdown_uncertain": shutdown_uncertain,
-                    }
-                )
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                loop.remove_signal_handler(sig)
+        shutdown_uncertain = await join_retirement(asyncio.create_task(retire()))
     return 2 if shutdown_uncertain else 0
 
 

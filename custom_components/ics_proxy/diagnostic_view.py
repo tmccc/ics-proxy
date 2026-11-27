@@ -18,11 +18,16 @@ REASONS = {
         "A manufacturer cloud Start is awaiting its matching session; further controls remain blocked."
     ),
     "charger_disconnected": "The charger connection is unavailable.",
+    "owner_session_closure_pending": (
+        "The proxy is waiting for the charger reports to confirm the local session is closed."
+    ),
     "cloud_disconnected": "The manufacturer cloud connection is unavailable.",
+    "cloud_status_pending": "The manufacturer cloud is connected. The proxy is waiting for its next status check.",
     "boot_unverified": "The current charger connection has not completed registration verification.",
     "pause_verification_pending": "Pause is requested; physical zero output has not yet been verified.",
     "lifecycle_acknowledgement_pending": "A genuine session event is awaiting the manufacturer's acknowledgement.",
     "command_outcome_unknown": "A previously issued command has an unresolved outcome.",
+    "status_unavailable": "The proxy could not read all of its current status.",
     "vendor_reply_storage_pending": "The charger answered, and the proxy is saving the reply.",
     "delivery_storage_pending": "Delivery is waiting for required journal storage to recover.",
     "preservation_review_required": "Preserved configuration or charger resources require operator review.",

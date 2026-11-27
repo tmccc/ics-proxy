@@ -56,7 +56,7 @@ def observe_notice_callbacks(monkeypatch):
         callbacks.append(action)
         return original(hass, delay, action)
 
-    monkeypatch.setattr(coordinator, "time", SimpleNamespace(monotonic=lambda: clock.value))
+    monkeypatch.setattr(coordinator, "time", SimpleNamespace(monotonic=lambda: clock.value, time=lambda: clock.value))
     monkeypatch.setattr(notice_module, "async_call_later", later)
     return clock, callbacks, notice_module
 
@@ -181,6 +181,7 @@ async def test_held_status_crosses_entry_replacement(
             assert entry.state is ConfigEntryState.NOT_LOADED
             assert not old.notice.active and old.cancel_timer is None
             before_notice = dict(_async_get_or_create_notifications(hass))
+            assert old.notification_id not in before_notice
             saved(None)
             old.update_notification(True)
             assert dict(_async_get_or_create_notifications(hass)) == before_notice
@@ -197,19 +198,24 @@ async def test_held_status_crosses_entry_replacement(
         if release_order == "old-first":
             gate.release[0].set()
             await finished(old_read)
-            # The current owner has not supplied a result yet: an old healthy snapshot cannot dismiss its fault.
-            assert old.notification_id in _async_get_or_create_notifications(hass)
+            # The late result cannot change the notice state left by reload or explicit disable.
+            visible = old.notification_id in _async_get_or_create_notifications(hass)
+            assert visible == (transition == "reload")
             assert old.cancel_timer is None
-            gate.release[1].set()
-            await finished(replacing)
-        else:
-            gate.release[1].set()
-            await finished(replacing)
-            assert_current(hass, entry, healthy=new_healthy, revision=1)
+        gate.release[1].set()
+        await finished(replacing)
+        if transition == "disable-enable" and not new_healthy:
+            notice = entry.runtime_data.notice
+            assert notice.problem_since == clock.value and not notice.notified and notice.cancel_timer is not None
+            assert notice.notification_id not in _async_get_or_create_notifications(hass)
+            clock.value += 61
+            callbacks[-1](None)
+        current = assert_current(hass, entry, healthy=new_healthy, revision=1)
+        if release_order == "new-first":
             gate.release[0].set()
             await finished(old_read)
             assert old.cancel_timer is None
-        current = assert_current(hass, entry, healthy=new_healthy, revision=1)
+            assert_current(hass, entry, healthy=new_healthy, revision=1)
         assert current is not old and entry.disabled_by is None
         assert len(gate.request_ids) == len(set(gate.request_ids))
         # Old callbacks remain inert after both success and ongoing fault of the replacement owner.
@@ -265,3 +271,50 @@ async def test_held_status_after_terminal_cleanup_before_reactivation(actual_has
     finally:
         gate.release_all()
         await cleanup_tasks([read])
+
+
+# Intent: discard an outstanding status response after HA records disable and before unload starts.
+# Why: the disabled entry must stop publishing state and notifications even while its setup lock is held.
+@pytest.mark.parametrize("status_failure", [False, True], ids=["healthy-reply", "closed-socket"])
+async def test_held_status_after_disable_before_unload(actual_hass, peer, monkeypatch, status_failure):
+    hass = actual_hass
+    clock, callbacks, _ = observe_notice_callbacks(monkeypatch)
+    entry = await setup(hass, peer)
+    old = entry.runtime_data
+    if not status_failure:
+        await establish_outage(hass, peer, old, clock, callbacks, visible=True)
+
+    peer["state"].update(healthy=True, control_revision=1)
+    peer["status_failure"] = status_failure
+    gate = StatusGate()
+    peer["response_gate"] = gate
+    read = hass.async_create_background_task(old.async_refresh(), "ics-test-disabling-poll", eager_start=False)
+    tasks = [read]
+    try:
+        await asyncio.wait_for(gate.entered[0].wait(), 3)
+        data, received_at, expiry = old.data, old.received_at, old.cancel_timer
+        outage = (old.problem_since, old.notice.detail, old.notified, old.notice.cancel_timer)
+        notifications = dict(_async_get_or_create_notifications(hass))
+        async with entry.setup_lock:
+            disabling = asyncio.create_task(
+                hass.config_entries.async_set_disabled_by(entry.entry_id, ConfigEntryDisabler.USER)
+            )
+            tasks.append(disabling)
+            await asyncio.sleep(0)
+            assert entry.disabled_by is ConfigEntryDisabler.USER
+            assert entry.state is ConfigEntryState.LOADED and old.notice.active and not disabling.done()
+
+            clock.value += 1
+            gate.release[0].set()
+            await finished(read)
+            assert old.data is data and old.received_at == received_at and old.cancel_timer is expiry
+            assert (old.problem_since, old.notice.detail, old.notified, old.notice.cancel_timer) == outage
+            assert dict(_async_get_or_create_notifications(hass)) == notifications
+            gate.release[1].set()
+            await old.async_refresh()
+            assert not gate.entered[1].is_set()
+        assert await finished(disabling)
+        assert entry.state is ConfigEntryState.NOT_LOADED
+    finally:
+        gate.release_all()
+        await cleanup_tasks(tasks)

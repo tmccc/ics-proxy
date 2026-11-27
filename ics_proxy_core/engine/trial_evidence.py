@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..constants import HUB_PROFILE_ID
 from .native_faults import NativeContentError
-from .native_http import read_native
+from .native_http import NativeTransportUnavailableError, read_native
 from .policy import DeniedError, integer, number
 from .security import SecurityError, StaleEvidenceError
 from .station import anchor_epoch
@@ -20,6 +20,10 @@ from .trial_config import TrialConfig, basic_secret
 
 if TYPE_CHECKING:
     from .trial_handover_evidence import HandoverEvidence
+
+
+class UnpluggedEvidenceRequiredError(SecurityError):
+    """Fresh evidence did not show an unplugged vehicle at zero current and power."""
 
 
 @dataclass(frozen=True, repr=False)
@@ -186,7 +190,9 @@ class Evidence:
     def require_disconnected(self, identity: str, max_age: float = 30) -> None:
         self.require_fresh(identity, max_age)
         if self.cp != "A" or self.connection != "Unplug" or self.current_a != 0 or self.power_w != 0:
-            raise SecurityError("trial requires fresh matching unplugged zero-power evidence and a closed session")
+            raise UnpluggedEvidenceRequiredError(
+                "trial requires fresh matching unplugged zero-power evidence and a closed session"
+            )
 
 
 class NativeObserver:
@@ -240,23 +246,28 @@ class NativeObserver:
     async def observe_handover(self) -> HandoverEvidence:
         from .trial_handover_evidence import handover_evidence
 
-        async with asyncio.timeout(15):
-            started = time.time()
-            elapsed_start = time.monotonic()
-            config = await self._read("getConfig")
-            if (
-                not isinstance(config, dict)
-                or config.get("Id") != self.config.identity
-                or config.get("bPSN") != self.config.hardware_identity
-            ):
-                raise NativeContentError("identity", "connected native identities do not match the configured charger")
-            values = {}
-            for name in ("SMART", "SETPLAN", "SESSION", "METER", "CONNECTOR", "OCPP", "STATE"):
-                values[name] = await self._read("statistics", name)
-            values["TRANSACTIONS"] = await self._read("getTransaction", {})
-            if encoded(await self._read("getConfig")) != encoded(config):
-                raise StaleEvidenceError("native configuration changed during the connected audit")
-            return replace(handover_evidence(config, values, started), observed_monotonic=elapsed_start)
+        try:
+            async with asyncio.timeout(15):
+                started = time.time()
+                elapsed_start = time.monotonic()
+                config = await self._read("getConfig")
+                if (
+                    not isinstance(config, dict)
+                    or config.get("Id") != self.config.identity
+                    or config.get("bPSN") != self.config.hardware_identity
+                ):
+                    raise NativeContentError(
+                        "identity", "connected native identities do not match the configured charger"
+                    )
+                values = {}
+                for name in ("SMART", "SETPLAN", "SESSION", "METER", "CONNECTOR", "OCPP", "STATE"):
+                    values[name] = await self._read("statistics", name)
+                values["TRANSACTIONS"] = await self._read("getTransaction", {})
+                if encoded(await self._read("getConfig")) != encoded(config):
+                    raise StaleEvidenceError("native configuration changed during the connected audit")
+                return replace(handover_evidence(config, values, started), observed_monotonic=elapsed_start)
+        except TimeoutError:
+            raise NativeTransportUnavailableError("complete native observation exceeded its deadline") from None
 
     # Recheck native identity and configuration around one complete bounded physical snapshot.
     async def _observe(self, include_history: bool) -> Evidence:

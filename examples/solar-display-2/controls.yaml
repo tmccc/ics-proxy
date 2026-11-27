@@ -14,111 +14,46 @@ triggers:
     event_data:
       display: general_display_2
       device_id: "replace-with-esphome-device-id"
-  - trigger: time_pattern
-    id: clear_feedback
-    seconds: "/5"
 variables:
-  touch_data: "{{ trigger.event.data if trigger.id == 'touch' else {} }}"
+  touch_data: "{{ trigger.event.data }}"
   touch_x: "{{ touch_data.get('x', '') | int(-1) }}"
   touch_y: "{{ touch_data.get('y', '') | int(-1) }}"
+  touch_action: "{{ 'start' if 20 <= touch_x < 232 else 'stop' }}"
   canvas_age: "{{ touch_data.get('canvas_age_seconds', '') | float(-1) }}"
+  canvas_rendered_at: "{{ touch_data.get('canvas_rendered_at_epoch', '') | int(0) }}"
   frame_control: "{{ touch_data.get('frame_control', '') }}"
-  start_revision: >-
-    {{ frame_control[6:] | int(-1, 16)
-       if frame_control is string and frame_control.startswith('start:') and frame_control | length == 20 else -1 }}
-  request_feedback: "{{ states('input_select.general_display_2_ics_request') }}"
 conditions:
-  - condition: or
-    conditions:
-      - condition: and
-        conditions:
-          - condition: trigger
-            id: clear_feedback
-          - condition: template
-            value_template: >-
-              {% set feedback = states.input_select.general_display_2_ics_request %}
-              {{ (request_feedback in ['starting', 'stopping']
-                  and this is mapping and this.attributes.current | int(-1) == 0)
-                 or (request_feedback in ['starting_timeout', 'stopping_timeout']
-                     and as_timestamp(now()) - as_timestamp(feedback.last_changed) >= 20) }}
-      - condition: and
-        conditions:
-          - condition: trigger
-            id: touch
-          - condition: template
-            value_template: >-
-              {{ 0 <= (canvas_age | float(-1)) < 45 and 366 <= touch_y < 428
-                 and (20 <= touch_x < 232 or 248 <= touch_x < 460) }}
-          - condition: state
-            entity_id: sensor.ics_display_screen_source
-            state: Home Assistant
-          - condition: template
-            value_template: >-
-              {% set image = 'image.ics_display_preview' %}
-              {% set rendered = as_timestamp(states(image), none) %}
-              {{ rendered is not none and 0 <= as_timestamp(now()) - rendered < 45
-                 and state_attr(image, 'assigned_views') == ['replace-with-editor-view-id']
-                 and state_attr(image, 'current_view_id') == 'replace-with-editor-view-id'
-                 and state_attr(image, 'rendered_view_id') == 'replace-with-editor-view-id'
-                 and state_attr(image, 'notification_active') == false }}
-          - condition: template
-            value_template: >-
-              {{ request_feedback in ['idle', 'starting_timeout', 'stopping_timeout'] }}
-          - condition: or
-            conditions:
-              - condition: and
-                conditions:
-                  - condition: template
-                    value_template: >-
-                      {{ 20 <= touch_x < 232 and start_revision >= 0
-                         and start_revision == state_attr('binary_sensor.ics_proxy_session_open', 'control_revision') }}
-                  - condition: state
-                    entity_id: binary_sensor.ics_proxy_session_open
-                    state: 'off'
-                  - condition: template
-                    value_template: "{{ state_attr('binary_sensor.ics_proxy_session_open', 'can_start') is sameas true }}"
-              - condition: and
-                conditions:
-                  - condition: template
-                    value_template: "{{ 248 <= touch_x < 460 }}"
-                  - condition: state
-                    entity_id: binary_sensor.ics_proxy_session_open
-                    state: 'on'
-                  - condition: template
-                    value_template: >-
-                      {{ frame_control is string and frame_control.startswith('stop:') and frame_control | length == 69
-                         and frame_control[5:] == state_attr('binary_sensor.ics_proxy_session_open', 'stop_target') }}
+  - condition: template
+    value_template: >-
+      {{ 0 <= (canvas_age | float(-1)) < 45 and 366 <= touch_y < 428
+         and (20 <= touch_x < 232 or 248 <= touch_x < 460) }}
+  - condition: state
+    entity_id: sensor.ics_display_screen_source
+    state: Home Assistant
+  - condition: template
+    value_template: >-
+      {% set image = 'image.ics_display_preview' %}
+      {% set rendered = as_timestamp(states(image), none) %}
+      {% set received_at = as_timestamp(now()) %}
+      {% set received_age = received_at - canvas_rendered_at %}
+      {# The display adds one second for clock rounding. A larger age reversal can hide an expired tap. #}
+      {{ 0 < canvas_rendered_at < 2**32 and 0 <= received_age < 45
+         and (canvas_age | float(-1)) <= received_age + 1
+         and rendered is not none and 0 <= received_at - rendered < 45
+         and state_attr(image, 'assigned_views') == ['replace-with-editor-view-id']
+         and state_attr(image, 'current_view_id') == 'replace-with-editor-view-id'
+         and state_attr(image, 'rendered_view_id') == 'replace-with-editor-view-id'
+         and state_attr(image, 'notification_active') == false }}
+  - condition: template
+    value_template: >-
+      {% set live = states('sensor.general_display_2_ics_control').split(':') -%}
+      {{ live | length == 4 and live[0] == 'v2' and live[1] in ['idle', 'starting_timeout', 'stopping_timeout']
+         and live[2] == touch_action and live[3] | length == 32
+         and live[3] | reject('in', '0123456789abcdef') | list | length == 0
+         and frame_control == ('v2:' ~ touch_action ~ ':' ~ live[3]) }}
 actions:
-  - if:
-      - condition: trigger
-        id: clear_feedback
-    then:
-      - action: input_select.select_option
-        target:
-          entity_id: input_select.general_display_2_ics_request
-        data:
-          option: >-
-            {{ request_feedback ~ '_timeout' if request_feedback in ['starting', 'stopping'] else 'idle' }}
-      - stop: Update touchscreen feedback after interruption or expiry
-  - variables:
-      starting: "{{ 20 <= touch_x < 232 }}"
-      pending_request: "{{ 'starting' if starting else 'stopping' }}"
-      stop_target: "{{ frame_control[5:] if not starting else none }}"
-      proxy_result: {}
-  - action: input_select.select_option
-    target:
-      entity_id: input_select.general_display_2_ics_request
-    data:
-      option: "{{ pending_request }}"
-  # Only this action's exact proxy receipt can clear the pending state successfully.
   - action: ics_proxy.session_command
-    continue_on_error: true
-    data: "{{ {'action': 'start', 'revision': start_revision} if starting else {'action': 'stop_session', 'target': stop_target} }}"
+    data: >-
+      {{ {'action': 'start' if touch_action == 'start' else 'stop_session',
+          'command_generation': frame_control.split(':')[2], 'rendered_at_epoch': canvas_rendered_at} }}
     response_variable: proxy_result
-  - action: input_select.select_option
-    target:
-      entity_id: input_select.general_display_2_ics_request
-    data:
-      option: >-
-        {{ 'idle' if proxy_result is mapping and proxy_result.get('confirmed') is sameas true
-           else pending_request ~ '_timeout' }}

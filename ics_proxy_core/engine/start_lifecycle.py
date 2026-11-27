@@ -7,10 +7,10 @@ import sqlite3
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
-from .managed_intent import ControlIntent, insert_request
+from .managed_intent import LOCAL_SCHEDULE_OCCURRENCE, ControlIntent, insert_request
 from .policy import DeniedError
 from .security import SecurityError
 from .start_handoff import StartHandoffContext, StartPublication
@@ -28,6 +28,7 @@ from .start_settlement import (
 from .store import RecoveryRequiredError, encoded, fingerprint
 
 if TYPE_CHECKING:
+    from .local_schedule_window import ScheduleCutoff
     from .managed_charging import ChargeLease
     from .store import Journal
     from .trial_handover_evidence import HandoverEvidence
@@ -184,7 +185,12 @@ class StartLifecycle:
         except SecurityError, DeniedError, RecoveryRequiredError:
             return False, False
         if unissued is not None:
-            self.retire(unissued)
+            try:
+                self.retire(unissued)
+            except sqlite3.Error as error:
+                if self.journal.db.in_transaction:
+                    raise
+                raise RecoveryRequiredError("verified unsent Start settlement awaits journal storage") from error
             closed = self.retirement(RetirementRule.CLOSED)
         if closed is not None:
             try:
@@ -313,13 +319,32 @@ class StartLifecycle:
         self.journal.control.hold(control, start_pending=False)
 
     # Admission owns the new metadata and receipt row, while retaining an older wire receipt until preparation.
-    def admit(self, lease: ChargeLease, action: str, startup: float, duration: float) -> None:
+    def admit(
+        self,
+        lease: ChargeLease,
+        action: str,
+        startup: float,
+        duration: float,
+        *,
+        schedule_cutoff: ScheduleCutoff | None = None,
+    ) -> None:
         j = self.journal
         accepted_at = time.time()
         local = lease.source == "local"
         state = "accepted" if local else "completed"
         result = {"accepted_at": accepted_at} if local else {"armed": True, "charging_started": False}
         with j.atomic():
+            if lease.schedule is not None:
+                assert schedule_cutoff is not None
+                j.put(
+                    LOCAL_SCHEDULE_OCCURRENCE,
+                    {
+                        "request": lease.identifier,
+                        "window": asdict(lease.schedule),
+                        "local": None,
+                        "cutoff_clock": asdict(schedule_cutoff),
+                    },
+                )
             j.put(
                 "managed_test_charge",
                 {
@@ -630,6 +655,7 @@ class StartLifecycle:
             for wire in self.journal.outcomes.owner_wires("ticket", ticket)
         )
 
+    # Match a pending local Start only while its control claim is still outstanding.
     def pending_local_tag(self, tag: str) -> bool:
         return bool(self.journal.get("control", {}).get("start_pending")) and self._matches_pending_receipt(
             self.receipt(), tag
@@ -797,6 +823,15 @@ class StartLifecycle:
                 },
             )
             j.control.project(control, start_pending=False)
+
+            if receipt.get("owner_authorized") is True:
+                occurrence = j.get(LOCAL_SCHEDULE_OCCURRENCE, {})
+                if (
+                    occurrence
+                    and occurrence.get("request") == receipt.get("request_id")
+                    and occurrence.get("local") is None
+                ):
+                    j.put(LOCAL_SCHEDULE_OCCURRENCE, {**occurrence, "local": local})
 
     # A current physical Pause proof may annotate the exact existing wire evidence without rewriting its outcome.
     def pause_verified(self, receipt: dict[str, Any], revision: int) -> None:

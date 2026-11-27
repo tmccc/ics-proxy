@@ -214,7 +214,12 @@ class SqlFault:
                 db.set_trace_callback(after_saved)
             return
         predicate = "OLD.token='" + self.token + "'"
-        if self.kind == "delete":
+        if self.kind == "mapping":
+            db.execute(
+                "CREATE TRIGGER ack_storage_refusal BEFORE UPDATE OF vendor ON transactions "
+                "WHEN NEW.vendor IS NOT NULL BEGIN SELECT RAISE(ABORT,'synthetic mapping storage refusal'); END"
+            )
+        elif self.kind == "delete":
             db.execute(
                 "CREATE TRIGGER ack_storage_refusal BEFORE DELETE ON outbox WHEN "
                 + predicate
@@ -502,6 +507,15 @@ async def test_cloud_ack_storage_recovery(
 ):
     await storage_recovery_case(
         tmp_path, tls, unused_tcp_port, monkeypatch, capsys, selected, action, failure, replaced
+    )
+
+
+# Intent: retain the accepted Start reply across a refused mapping write and retry publication only.
+# Why: a rolled-back local write does not contradict the already correlated vendor acceptance.
+@pytest.mark.parametrize("replaced", [False, True], ids=["same-process", "replacement"])
+async def test_start_mapping_write_refusal_retains_ack(tmp_path, tls, unused_tcp_port, monkeypatch, capsys, replaced):
+    await storage_recovery_case(
+        tmp_path, tls, unused_tcp_port, monkeypatch, capsys, 6, "StartTransaction", "mapping", replaced
     )
 
 

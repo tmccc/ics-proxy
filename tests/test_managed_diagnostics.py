@@ -5,17 +5,23 @@ import json
 import sqlite3
 import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
+from ics_proxy_core.engine import trial_handover_evidence
 from ics_proxy_core.engine.managed_diagnostics import snapshot
 from ics_proxy_core.engine.managed_native_repair import AUDITS, REVOCATIONS, NativeRepairAudits
 from ics_proxy_core.engine.managed_view import health_snapshot, publish_poll, refresh_for_read, with_reporting
 from ics_proxy_core.engine.native_faults import NativeContentError
+from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
 from ics_proxy_core.engine.store import fingerprint
 from tests.current_rig import adjustable
 from tests.managed_rig import healthy
-from tests.prototype_rig import START
+from tests.prototype_rig import BOOT, START
+from tests.runtime_rig import until
+from tests.test_managed_local_schedule import MIDNIGHT, connection, overnight, status
+from tests.test_managed_local_schedule_cutoff import begin, close
 from tests.test_managed_service_cli import healthy_status
 from tests.tls_support import tls as tls
 from tools import managed_proxy
@@ -28,6 +34,18 @@ def test_health_explains_pending_cloud_start():
     result = health_snapshot(healthy_status(10000) | {"cloud_start_pending": True}, 10000)
     assert result["healthy"] is False and result["local_healthy"] is False
     assert result["health_blockers"] == ["cloud_start_pending"]
+
+
+# Intent: a legacy status file may omit the evidence field and an explicit unknown requires verification.
+# Why: a file health check must distinguish compatibility from a failed journal read.
+def test_health_distinguishes_unreadable_from_absent_vendor_command_evidence():
+    legacy = healthy_status(10000)
+    assert "operator_reconciliation_required" not in legacy
+    assert health_snapshot(legacy, 10000)["healthy"]
+    for evidence, blocker in ((None, "status_unavailable"), (True, "command_outcome_unknown")):
+        result = health_snapshot(legacy | {"operator_reconciliation_required": evidence}, 10000)
+        assert result["healthy"] is False and result["local_healthy"] is False
+        assert result["health_blockers"] == [blocker]
 
 
 # Intent: a cloud outage and a simultaneous local verification failure both remain visible without changing health.
@@ -100,6 +118,105 @@ async def test_status_refresh_projects_new_and_settled_lifecycle_queue(tmp_path,
         current = refresh_for_read(c, queued)
         assert current["pending_lifecycle_events"] == 0 and current["sessions"][0]["cloud_acknowledged"]
         assert "lifecycle_acknowledgement_pending" not in current["diagnostics"]["blockers"]
+
+
+# Intent: fresh proof of either side of an exact owner closure explains the saved hold.
+# Why: an inconclusive lifecycle reading cannot establish readiness, but it is current diagnostic evidence.
+@pytest.mark.parametrize("ocpp_first", [False, True], ids=["native-first", "ocpp-first"])
+async def test_exact_owner_closure_has_a_fresh_lifecycle_blocker(
+    tmp_path, tls, unused_tcp_port, monkeypatch, ocpp_first
+):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "owner-closure-diagnostics") as test:
+            c, journal, bench = test.controller, test.session.journal, rig.bench
+            local, meter_start = await begin(test, clock)
+            bench.vendor_available = True
+            await until(lambda: test.session.runtime.vendor_registered, timeout=20)
+            clock.now = MIDNIGHT + 30
+            if ocpp_first:
+                await close(test, clock, local, meter_start)
+            bench.firmware.active = local if ocpp_first else None
+            bench.cp, bench.connection = "A", "Unplug"
+            bench.firmware.requested_current = 0
+            rig.peer.permission_enabled = False
+
+            await c.tick()
+            poll = await c.tick()
+            assert poll["state"] == "reconciling" and poll["cloud_connected"] is True
+            assert journal.outcomes.stop_report_closed(local) is ocpp_first
+            assert bench.firmware.effective_limit() == 0 and not journal.fault.latched()
+            before = journal.db.total_changes, list(bench.device_calls)
+            reporting = Reporting(managed_proxy.ROOT)
+            now = time.time()
+            published = publish_poll(c, poll, pid=1, started=now, expires=now + 3600, observe=reporting.observe)
+            live = refresh_for_read(c, published)
+            reason = "owner_session_closure_pending"
+            assert reason in published["diagnostics"]["blockers"]
+            assert reason in live["diagnostics"]["blockers"]
+            assert not live["local_hold_verified"] and live["native_observed_at"] is None
+            assert reason not in snapshot(c, live, now=c.native.last_verified_at + 6)["blockers"]
+            with monkeypatch.context() as elapsed:
+                elapsed.setattr(
+                    trial_handover_evidence, "time",
+                    SimpleNamespace(time=time.time, monotonic=lambda: time.monotonic() + 6),
+                )
+                assert reason not in snapshot(c, live)["blockers"]
+            assert (journal.db.total_changes, bench.device_calls) == before
+
+            gateway = test.session.gateway
+            boot, sequence = gateway.boot_observation, c.native.last_resolved_read
+            assert (await bench.call(test.charger, "new-boot-same-configuration", "BootNotification", BOOT))[0] == 3
+            assert gateway.boot_observation != boot and c.native.last_resolved_read == sequence
+            live = refresh_for_read(c, published)
+            assert live["boot_verified"] and reason not in live["diagnostics"]["blockers"]
+            poll = await c.tick()
+            assert c.native.last_resolved_read > sequence and reason in snapshot(c, poll)["blockers"]
+
+            if not ocpp_first:
+                await close(test, clock, local, meter_start)
+            bench.firmware.active = None
+            bench.cp, bench.connection = "B", "Plug"
+            verified = await status(test, lambda value: value["normal_start_ready"])
+            assert reason not in snapshot(c, verified)["blockers"]
+
+
+# Intent: natural owner closure retains automatic handback while a fresh native read remains unavailable.
+# Why: waiting for that read while the manufacturer connection is registered is not a cloud failure.
+async def test_owner_closure_pause_does_not_report_a_cloud_failure(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "owner-closure-online") as test:
+            c, bench = test.controller, rig.bench
+            local, meter_start = await begin(test, clock)
+            bench.vendor_available = True
+            await until(lambda: test.session.runtime.vendor_registered, timeout=20)
+            clock.now = MIDNIGHT + 30
+            await close(test, clock, local, meter_start)
+            bench.firmware.active = local
+            bench.cp, bench.connection = "B", "Plug"
+            bench.firmware.requested_current = 0
+            assert (await c.tick())["state"] == "reconciling"
+            bench.firmware.active = None
+            observe = c.native.observe
+            observations = 0
+
+            # Let independent closure resolve before a read failure interrupts automatic handback.
+            async def lose_read_after_closure():
+                nonlocal observations
+                observations += 1
+                if observations > 1:
+                    raise NativeTransportUnavailableError("independent charger reading is unavailable")
+                return await observe()
+
+            with monkeypatch.context() as outage:
+                outage.setattr(c.native, "observe", lose_read_after_closure)
+                poll = await c.tick()
+            live = refresh_for_read(c, poll)
+            assert live["desired_control"] == "paused" and live["cloud_connected"] is True
+            assert "pause_reason" not in live
+            assert c.requests.offline_pause_current(c.requests.intent())
+            assert bench.firmware.effective_limit() == 0
+            restored = await status(test, lambda value: value["normal_start_ready"])
+            assert restored["desired_control"] == "app" and restored["cloud_connected"] is True
 
 
 # Intent: strict/unknown audit markers affect only their exact fault, without authorizing any recovery action.

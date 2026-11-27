@@ -2,16 +2,19 @@
 """Offline Stop retry must not erase a durable response awaiting ordinary settlement."""
 
 import time
+from contextlib import closing
 from dataclasses import replace
 
 import pytest
 
 from ics_proxy_core import commands
+from ics_proxy_core.engine.command_outcomes import CommandOutcomes
 from ics_proxy_core.engine.delivery_reply import DeliveryReply
 from ics_proxy_core.engine.managed_debt_recovery import debt_candidate
 from ics_proxy_core.engine.managed_intent import ManagedRequests
 from ics_proxy_core.engine.managed_recovery_zero import require_original_zero
 from ics_proxy_core.engine.native_bounded import capture_native_bounded_baseline
+from ics_proxy_core.engine.stop_settlement import StopAttempt, StopPredecessors, predecessor_stop_reply
 from ics_proxy_core.engine.store import Journal, RecoveryRequiredError
 from ics_proxy_core.engine.trial_allocation import initialize_allocation, observe_history
 from ics_proxy_core.engine.trial_evidence import Resource, profile_projection
@@ -107,3 +110,46 @@ def test_invalid_saved_stop_result_is_not_storage_only(tmp_path):
         assert reply is not None and not reply.storage_only(j)
     finally:
         j.close()
+
+
+# Intent: both Stop readers recognize the same exact Accepted reply before its primary write is restored.
+# Why: a reopen may leave the original charger reply available only in a validated retained checkpoint.
+def test_retained_forwarded_stop_is_visible_to_both_reply_readers(tmp_path):
+    path = tmp_path / "forwarded-stop.sqlite"
+    action, wire = "RemoteStopTransaction", "charger-stop-wire"
+    with closing(Journal(path, IDENTITY)) as journal:
+        local = journal.start("original-start", START)["transactionId"]
+        mutation = journal.mutation_intent("vendor", action, {"transactionId": 42})
+        journal.bind_vendor_command(
+            mutation, request="vendor-stop", vendor_epoch=1, boot="charger-boot", wire=wire, local=local, profile=None
+        )
+        journal.record_vendor_result(mutation, "dispatched")
+        journal.db.execute(
+            "CREATE TRIGGER refuse_stop_reply BEFORE UPDATE OF wire_result ON vendor_command_scope "
+            "WHEN NEW.wire_result='Accepted' BEGIN SELECT RAISE(ABORT, 'reply write unavailable'); END"
+        )
+        reply = journal.outcomes.capture(mutation, action, wire, [3, wire, {"status": "Accepted"}])
+        assert reply is not None and not journal.outcomes.publish(reply)
+        expected = StopAttempt("vendor", mutation, wire)
+        earlier = StopPredecessors(local, vendor_mutations=(mutation,))
+        assert journal.outcomes.accepted_stop_attempt(local) == expected
+        assert predecessor_stop_reply(journal.outcomes, local, earlier) == "Accepted"
+
+    with closing(Journal(path, IDENTITY)) as journal:
+        # An evidence reader on the reopened journal sees only what was saved, before promotion can succeed.
+        outcomes = CommandOutcomes(journal)
+        command = outcomes.vendor(mutation)
+        assert command is not None and command.wire_result == "dispatched" and not command.saving_reply
+        assert predecessor_stop_reply(outcomes, local, earlier) == "Accepted"
+        assert outcomes.accepted_stop_attempt(local) == expected
+        assert outcomes.accepted_stop_attempt(local + 1) is None
+        wrong_session = StopPredecessors(local + 1, vendor_mutations=(mutation,))
+        assert predecessor_stop_reply(outcomes, local + 1, wrong_session) is None
+        assert not outcomes.stop_report_closed(local)
+
+        journal.db.execute("DROP TRIGGER refuse_stop_reply")
+        journal.outcomes.retry()
+        promoted = outcomes.vendor(mutation)
+        assert promoted is not None and promoted.wire_result == "Accepted"
+        assert outcomes.accepted_stop_attempt(local) == expected
+        assert predecessor_stop_reply(outcomes, local, earlier) == "Accepted"

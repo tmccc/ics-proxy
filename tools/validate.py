@@ -164,7 +164,7 @@ def audit_qualification(path, source, metadata, python, results, collection_exec
     engine_packages = {}
     phase_audits = {}
     for suite in sorted(required):
-        batch = Path(bundle["phases"][suite]).resolve()
+        batch = (ROOT / bundle["phases"][suite]).resolve()
         config = json.loads((batch / "config.json").read_text())
         if config.get("suite") != suite or config.get("workers") != 20 or config.get("mode") != "full":
             raise ValueError("qualification phase requires its entire suite in full mode with 20 workers")

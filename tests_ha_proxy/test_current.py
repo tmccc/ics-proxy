@@ -58,6 +58,8 @@ async def current_peer():
         if request.headers.get("Authorization") != "Bearer " + TOKEN:
             raise web.HTTPUnauthorized()
         socket = web.WebSocketResponse(protocols=["ics-proxy.v1"])
+        if (before_handshake := control.pop("before_handshake", None)) is not None:
+            await before_handshake()
         await socket.prepare(request)
         value = await socket.receive_json()
         command = value["command"]
@@ -69,6 +71,12 @@ async def current_peer():
             result = receipts[value["request_id"]]
         elif command in ("set_current", "start"):
             fields = {"id", "command", "revision"} | ({"current_a"} if command == "set_current" else set())
+            if "canvas_owner" in value:
+                fields.add("canvas_owner")
+                if value["canvas_owner"] != state.get("canvas_owner"):
+                    await socket.send_json({"id": value["id"], "ok": False, "error": "not_ready"})
+                    await socket.close()
+                    return socket
             assert set(value) == fields
             permitted = state["can_set_current"] if command == "set_current" else state["can_start"]
             if command == "set_current":
@@ -130,10 +138,41 @@ async def test_selector_lifecycle_is_passive_and_has_integer_current_metadata(ac
     assert current_peer["state"]["requested_current_a"] == 6
 
 
+# Intent: an in-flight selection retains the commissioned destination of its original status.
+# Why: a replacement with the same idle readiness and revision must not inherit another charger's current change.
+@pytest.mark.parametrize("refresh", [False, True], ids=["unobserved", "observed"])
+async def test_current_selection_keeps_the_initiating_destination(actual_hass, current_peer, refresh):
+    hass, peer = actual_hass, current_peer
+    original, replacement = "b" * 64, "c" * 64
+    state = peer["state"]
+    state.update(canvas_owner=original, management_owner_binding=True)
+    entry = await setup(hass, peer)
+    selection = {"entity_id": "number.ics_proxy_charge_current_a", "value": 16}
+
+    # Change only the commissioned marker before upgrading the command websocket.
+    async def replace_owner():
+        state["canvas_owner"] = replacement
+        if refresh:
+            await entry.runtime_data.async_refresh()
+
+    peer["before_handshake"] = replace_owner
+    with pytest.raises(HomeAssistantError, match="could not confirm this request"):
+        await hass.services.async_call("number", "set_value", selection, blocking=True)
+    assert state["requested_current_a"] == state["native_limit_a"] == state["station_ceiling_a"] == 6
+    assert entry.runtime_data.management_owner == replacement
+
+    await hass.services.async_call("number", "set_value", selection, blocking=True)
+    assert state["requested_current_a"] == state["native_limit_a"] == state["station_ceiling_a"] == 16
+    requests = [request for request in peer["requests"] if request["command"] == "set_current"]
+    assert [request["canvas_owner"] for request in requests] == [original, replacement]
+    assert all(request["revision"] == 0 and request["current_a"] == 16 for request in requests)
+
+
 # Intent: explicit selection sends exactly one integer request and keeps a paused station at actual zero.
 # Why: choosing a future resume current is distinct from starting or returning authority to the app.
 @pytest.mark.parametrize("paused", [False, True], ids=["app", "paused"])
 async def test_explicit_current_selection_uses_receipt_and_does_not_start(actual_hass, current_peer, paused):
+    current_peer["state"].update(canvas_owner="b" * 64, management_owner_binding=True)
     if paused:
         current_peer["state"].update(
             desired_control="paused", local_hold_verified=True, owner_control_enabled=False, station_ceiling_a=0
@@ -146,7 +185,8 @@ async def test_explicit_current_selection_uses_receipt_and_does_not_start(actual
     )
     assert hass.states.get("number.ics_proxy_charge_current_a").state == "16"
     request = next(v for v in current_peer["requests"] if v["command"] == "set_current")
-    assert set(request) == {"id", "command", "revision", "current_a"}
+    assert set(request) == {"id", "command", "revision", "current_a", "canvas_owner"}
+    assert request["canvas_owner"] == current_peer["state"]["canvas_owner"]
     assert request["revision"] == 0 and type(request["current_a"]) is int and request["current_a"] == 16
     assert current_peer["commands"].count("set_current") == current_peer["commands"].count("receipt") == 1
     assert set(current_peer["commands"]) <= {"status", "set_current", "receipt"}

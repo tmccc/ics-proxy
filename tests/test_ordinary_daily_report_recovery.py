@@ -7,6 +7,8 @@ import uuid
 import pytest
 
 from ics_proxy_core.constants import HUB_PROFILE_ID
+from ics_proxy_core.engine.managed_sources import ORDINARY_SOURCE
+from ics_proxy_core.engine.recovery_contracts import Pending
 from ics_proxy_core.frames import build_call
 from tests.current_rig import selected_ready
 from tests.managed_rig import healthy, starts
@@ -117,6 +119,46 @@ async def test_daily_wire_start_during_ordinary_hold_requires_exact_native_sourc
         assert not any(f[2] == "RemoteStopTransaction" for f in b.rig.bench.device_calls)
         await close_session(b.rig, b.session, b.charger, local)
         await healthy(b.controller)
+
+
+# Intent: a newer failed observation retires the captured zero proof before a daily report commits.
+# Why: the committed source can stay unchanged when native availability is lost.
+async def test_held_daily_report_rechecks_its_native_sample_at_commit(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with selected_ready(tmp_path, tls, unused_tcp_port, monkeypatch, 6, native_peer=InterruptedNativePeer) as b:
+        await idle_outage(b)
+        b.rig.peer.unavailable = False
+        g, j, native = b.session.gateway, b.session.journal, b.controller.native
+        decide_report = g.decide_report
+        counter = j.get("next_transaction")
+        expired = False
+
+        # Invalidate native evidence just before the daily report decision.
+        async def with_newer_unavailable_observation(decision):
+            nonlocal expired
+            if not expired:
+                expired = True
+                source = j.get(ORDINARY_SOURCE)
+                assert source and native.last_verified_at > 0
+                b.rig.peer.unavailable = True
+                try:
+                    assert isinstance(await native.read_result(), Pending)
+                finally:
+                    b.rig.peer.unavailable = False
+                assert native.last_verified_at == 0 and j.get(ORDINARY_SOURCE) == source
+            return await decide_report(decision)
+
+        monkeypatch.setattr(g, "decide_report", with_newer_unavailable_observation)
+        body = START | {"idTag": "NATIVE_TIMER"}
+        refused = await b.rig.bench.call(b.charger, "superseded-daily", "StartTransaction", body)
+        assert expired and refused[0] == 4
+        assert j.active() is None and j.get("next_transaction") == counter and not j.known_start(body)
+        assert b.rig.bench.firmware.effective_limit() == 0
+
+        accepted = await b.rig.bench.call(b.charger, "fresh-daily", "StartTransaction", body)
+        assert accepted[0] == 3 and accepted[2]["idTagInfo"]["status"] == "Accepted"
+        local = accepted[2]["transactionId"]
+        assert j.active() == local and b.rig.bench.firmware.effective_limit() == 0
+        await close_session(b.rig, b.session, b.charger, local)
 
 
 # Intent: a daily report missing its timestamp receives a correlated error even when cloud approval has expired.

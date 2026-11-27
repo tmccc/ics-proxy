@@ -492,27 +492,52 @@ class Peer:
 
             yield call
 
-    # Bound native preparation independently, retiring its sockets promptly on Stop, disconnect or cancellation.
+    # Run the same preparation lifecycle for RPC validation and a retained profile's independent read.
     async def _validate(
         self, action: str, payload: dict[str, Any], future: asyncio.Future[Frame], preemptible: bool
     ) -> Guard | GateDecision | None:
         if self.validate_send is None:
             return None
-        validation = asyncio.ensure_future(self.validate_send(action, payload))
+        return await self.wait_for_validation(
+            self.validate_send(action, payload),
+            preemptible=preemptible,
+            peer_reply=future,
+            timeout=self.validation_timeout,
+        )
+
+    # Retire native preparation and its sockets before yielding the outgoing gate to restrictive work.
+    async def wait_for_validation[T](
+        self,
+        preparation: Awaitable[T],
+        *,
+        preemptible: bool,
+        peer_reply: asyncio.Future[Frame] | None = None,
+        timeout: float | None = None,
+    ) -> T:
+        validation = asyncio.ensure_future(preparation)
         signal = self.gate.restrictive_waiting if preemptible else asyncio.Event()
         restrictive = asyncio.create_task(signal.wait())
         cancellation: asyncio.CancelledError | None = None
         try:
-            async with asyncio.timeout(self.validation_timeout):
-                done, _ = await asyncio.wait((validation, restrictive, future), return_when=asyncio.FIRST_COMPLETED)
-                if validation.done():
-                    validation.result()  # A completed strict/storage refusal precedes simultaneous preemption.
-                if signal.is_set():
-                    raise ValidationPreemptedError("request was not sent; restrictive control superseded validation")
-                if future in done:
-                    future.result()  # A retired peer's exception must terminate its audit before any dispatch.
-                    raise UnavailableError("request was not sent; peer replied before dispatch")
-                decision = await validation
+            async with asyncio.timeout(timeout):
+                while True:
+                    waiters = (validation, restrictive) if peer_reply is None else (validation, restrictive, peer_reply)
+                    done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+                    # A completed strict/storage refusal precedes simultaneous preemption.
+                    validated = validation in done
+                    if validated:
+                        validation.result()
+                    if signal.is_set():
+                        raise ValidationPreemptedError(
+                            "request was not sent; restrictive control superseded validation"
+                        )
+                    if peer_reply is not None and peer_reply in done:
+                        peer_reply.result()  # A retired peer's exception must terminate its audit before any dispatch.
+                        raise UnavailableError("request was not sent; peer replied before dispatch")
+                    if validated:
+                        break
+                    # The Stop that woke this wait canceled. Keep watching for the next Stop or disconnect.
+                    restrictive = asyncio.create_task(signal.wait())
         except asyncio.CancelledError as error:
             cancellation = error
             raise
@@ -542,7 +567,7 @@ class Peer:
                 raise failure  # Native cancellation can itself fail required durable audit publication.
         if preemptible and self.gate.restrictive_waiting.is_set():
             raise ValidationPreemptedError("request was not sent; restrictive control superseded validation")
-        return decision
+        return validation.result()
 
     # Send one request only while the caller owns the outgoing gate.
     async def _call_locked(
@@ -614,7 +639,6 @@ class Peer:
                     if isinstance(permitted, Pending):
                         return permitted
                 message = build_call(unique_id, action, actual)
-                self.diagnostics.sending(action, len(unique_id))
                 if on_dispatch is not None:
                     on_dispatch(action)
                 if owner_scope is not None:
@@ -636,11 +660,13 @@ class Peer:
                 dispatched = True
                 if on_receive is not None or owner_wire is not None:
                     self._receivers[unique_id] = (priority, received)
+                self.diagnostics.sending(action, len(unique_id))
                 await sender(message)
                 if on_sent is not None:
                     sent = on_sent
                     self.decide(lambda: sent(action), priority=priority)
-                self.diagnostics.phase = "awaiting_reply"
+                if not future.done():
+                    self.diagnostics.phase = "awaiting_reply"
                 answer = await future
                 processing_reply = True
                 result = self.decide(lambda: self._accept_reply(action, actual, answer, on_reply), priority=priority)

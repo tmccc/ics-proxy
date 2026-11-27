@@ -107,6 +107,14 @@ async def test_start_preparation_survives_controlled_task_loss(tmp_path, model_t
                         assert c.requests.receipt(identifier)["state"] == "uncertain"
                         assert c.charging.state()["state"] == "interrupted"
                         assert rig.bench.firmware.effective_limit() == 0
+                        first_attempts = len(attempts)
+                        status = await c.tick()
+                        assert status["state"] == "reconciling"
+                        assert len(attempts) > first_attempts and not replacement.journal.db.in_transaction
+                        assert c.requests.receipt(pause)["state"] == "accepted"
+                        assert c.requests.receipt(identifier)["state"] == "uncertain"
+                        assert c.charging.state()["state"] == "interrupted"
+                        assert rig.bench.firmware.effective_limit() == 0
                     finally:
                         replacement.journal.db.execute("DROP TRIGGER fail_unsent_retire")
                 assert (await healthy(c))["local_hold_verified"]

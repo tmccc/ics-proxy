@@ -36,6 +36,9 @@ flowchart LR
 - Use the same exact reply evidence during normal operation and recovery. The request, possible dispatch,
   definite charger reply, and verified physical outcome are separate facts. A refused reply write can leave an
   independent checkpoint for that attempt. Retrying publication uses that evidence without sending the command again.
+- [Session closure](../ics_proxy_core/engine/session_closure.py) matches native evidence to the journal lifecycle.
+  A caller binds verified closure to the original closing report before saving proof. Pause and shutdown also
+  need a verified zero station profile. An ended session can still leave a positive offer for a future session.
 - Check recovery before allowing positive current again. The owner combines the saved intent, current charger Boot,
   native evidence, and the journal. Reconciliation can preserve reports for normal delivery without performing a
   new charging action.
@@ -64,10 +67,12 @@ flowchart LR
    [Command evidence](../ics_proxy_core/engine/command_outcomes.py) · [Stop settlement](../ics_proxy_core/engine/stop_settlement.py)
 
 Session Stop leaves app or schedule mode in place. Pause claims a zero hold and can also stop the exact session.
-With current independent zero evidence, Pause, the vendor app and Home Assistant session Stop can wait for an
-unanswered Stop on the same charger connection. A newer Pause can act after reconnecting. Lost zero or fresh
-draw can require a separately authorized protective Stop. A distinct vendor request for a still-open session can
-send another Stop if the proxy lacks a verified zero hold and no unresolved Stop already covers it. The
+With current independent zero evidence, Pause, scheduled cutoff, managed shutdown, the vendor app, and Home
+Assistant session Stop can wait for an unanswered Stop on the same charger connection. A confirmed forwarded
+reply is available to these decisions from its original wire record, memory, or an exact journal checkpoint.
+A newer Pause can act after reconnecting. Lost zero or fresh draw can require a separately authorized protective
+Stop. A distinct vendor request for a still-open session can send another Stop if the proxy lacks a verified zero
+hold and no unresolved Stop already covers it. The
 [settlement checks](../tools/check_control_settlement.py) cover both local and vendor request orders, including
 lost replies and overlapping Pause.
 
@@ -77,14 +82,17 @@ lost replies and overlapping Pause.
    before charger checks begin. The physical ticket is claimed later.
    [Request and preflight](../ics_proxy_core/engine/control_decisions.py)
 2. The recovery coordinator reads the charger. `prepare_release_attempt()` checks the fresh zero evidence and
-   rechecks the original intent, connection, and ticket. It binds an explicit Return to that zero-hold ticket
-   and Boot. The vendor registration must belong to the current charger connection and commissioned Boot details.
+   rechecks the original intent, connection, ticket, and journal lifecycle. It binds an explicit Return to that
+   zero-hold ticket and Boot. The vendor registration must belong to the current charger connection and Boot.
    [Recovery coordinator](../ics_proxy_core/engine/recovery_coordinator.py)
 3. `claim_release()` takes the physical ticket. The local executor rechecks the guard at the wire boundary.
-   A verified ceiling can publish shared control in `complete_release()`. Restoring zero uses the same release
-   ticket and still checks the original Boot. [Local executor](../ics_proxy_core/engine/local_control.py)
+   `complete_release()` rechecks the same ownership and lifecycle before publishing a verified ceiling. Restoring
+   zero uses the same release ticket and original Boot. [Local executor](../ics_proxy_core/engine/local_control.py)
 4. `settle_release()` uses the attempt's actual send, reply, verification, and rollback evidence to decide
    whether to finish, wait, or record a fault. [Release policy](../ics_proxy_core/engine/recovery_policy.py)
+
+Overlapping current recovery uses this release path to restore the previous ceiling. It saves the original
+receipt in the same decision turn that verifies the latest native observation, station ceiling, and lifecycle.
 
 The [developer guide](developer.md) describes the engine, model, Home Assistant, recovery discovery and installation
 rehearsal test suites.

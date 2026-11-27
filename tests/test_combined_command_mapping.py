@@ -8,29 +8,71 @@ import sqlite3
 import time
 import uuid
 from contextlib import closing
+from dataclasses import asdict
 
 import pytest
 
+from ics_proxy_core.engine.managed_combined_start_recovery import combined_candidate
 from ics_proxy_core.engine.managed_debt_recovery import KEY
-from ics_proxy_core.engine.store import ConflictError, RecoveryRequiredError, fingerprint
+from ics_proxy_core.engine.store import ConflictError, Journal, RecoveryRequiredError, fingerprint
 from ics_proxy_core.engine.trial_session import save_private
 from ics_proxy_core.frames import build_call_error
 from tests import conftest as _core_setup  # noqa: F401 - load the HA-free source package.
 from tests.charge_rig import ChargeRig
-from tests.cloud_start_helpers import two_later_sessions
+from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
 from tests.connected_rig import strategy_file
 from tests.handover_helpers import crash
-from tests.managed_rig import healthy, starts
+from tests.managed_rig import healthy, managed_bench, starts
 from tests.prototype_rig import START
 from tests.runtime_rig import until
 from tests.test_combined_recovery_proofs import selected_service
+from tests.test_managed_debt_reconciliation import repair_overlapping_history
 from tests.test_managed_stop_reply_recovery import pause, running
+from tests.test_native_history_recovery import closed_records
 from tests.tls_support import tls as tls
 from tests.trial_peer import Bench
 from tools import reconcile_managed_debt as debt_tool
 from tools import reconcile_managed_delivery as delivery_tool
 
 KIND = "vendor-start-mapping"
+
+
+# Intent: accept unrelated closed owner history and reject unrelated unmapped cloud debt.
+# Why: recovery must isolate one cloud mapping obligation before it can apply the candidate.
+@pytest.mark.parametrize("owner_authorized", [True, False], ids=["closed-owner-session", "orphaned-cloud-session"])
+def test_combined_candidate_distinguishes_closed_owner_history_from_unmapped_cloud_debt(tmp_path, owner_authorized):
+    with closing(Journal(tmp_path / "state.db", "SYNTHETIC")) as journal:
+        prior = journal.start("prior-start", START, owner_authorized=owner_authorized)["transactionId"]
+        journal.stop("prior-stop", {"transactionId": prior, "timestamp": START["timestamp"], "meterStop": 1100})
+        if not owner_authorized:
+            # Isolate an unrelated unmapped transaction with no queued pair for the other checks to reject.
+            journal.db.execute("DELETE FROM outbox WHERE local=?", (prior,))
+        assert journal.vendor_id(prior) is None and journal.next_delivery() is None
+
+        start = START | {"idTag": "CLOUD_OWNER", "timestamp": "2026-01-01T00:20:00Z", "meterStart": 1200}
+        mutation = journal.mutation_intent("vendor", "RemoteStartTransaction", {"idTag": start["idTag"]})
+        journal.mutation_finished(mutation, False)
+        local = journal.start("cloud-start", start)["transactionId"]
+        journal.stop("cloud-stop", {"transactionId": local, "timestamp": "2026-01-01T00:21:00Z", "meterStop": 1300})
+        journal.db.execute("UPDATE outbox SET state='ambiguous' WHERE local=? AND action='StartTransaction'", (local,))
+        head = journal.next_delivery()
+        assert head is not None
+        snapshot = {
+            "mutations": [dict(row) for row in journal.db.execute("SELECT * FROM mutations")],
+            "marker": None,
+            "grant": None,
+            "requests": [],
+            "deferred": None,
+            "fault": {"classification": "owner_control_or_delivery_uncertain"},
+            "head": asdict(head),
+            "outbox": [dict(row) for row in journal.db.execute("SELECT * FROM outbox ORDER BY seq")],
+            "transactions": [dict(row) for row in journal.db.execute("SELECT * FROM transactions ORDER BY local")],
+        }
+        if owner_authorized:
+            assert combined_candidate(journal, snapshot)["local_transaction_id"] == local
+        else:
+            with pytest.raises(RecoveryRequiredError, match="unrelated or unbound lifecycle"):
+                combined_candidate(journal, snapshot)
 
 
 class CompletedCommandReply:
@@ -236,6 +278,35 @@ def observe_completed_commands(monkeypatch):
 
     monkeypatch.setattr(Bench, "read_charger", read_charger)
     return completed
+
+
+# Intent: archive a missing original history row while retaining exact unresolved command and delivery records.
+# Why: each repair must be able to begin at verified zero when the other still owns its evidence.
+async def test_archive_history_before_combined_recovery(tmp_path, tls, unused_tcp_port, monkeypatch, capsys):
+    original = closed_records()
+    completed = observe_completed_commands(monkeypatch)
+    async with managed_bench(
+        tmp_path, tls, unused_tcp_port, bench_type=StartReplyBench, initial_history=original, cli_route=True
+    ) as rig:
+        async with running(rig, "combined-recovery-with-history") as (s, c, sock):
+            await healthy(c)
+            local, backend, observed = await fail_one_cycle(ChargeRig(rig, s, c, sock), completed, True, True, 0)
+
+        config, strategy = tmp_path / "trial.json", strategy_file(rig, tmp_path)
+        before = committed_state(rig.prepared.config.journal)
+        await repair_overlapping_history(rig, config, strategy, monkeypatch, capsys, original, "before-writes", KIND)
+        after = committed_state(rig.prepared.config.journal)
+        for key in ("mutations", "transactions", "outbox"):
+            assert before[key] == after[key]
+
+        proof_id = await reconcile_cycle(rig, tmp_path, capsys, local, backend, observed, True, True)
+        async with running(rig, "combined-recovery-history-archived") as (s, c, _):
+            await until(lambda: s.journal.next_delivery() is None)
+            assert s.journal.get(KEY)[proof_id]["proof"]["wire_ack"] is not None
+            assert s.journal.vendor_id(local) == backend["answer"]["transactionId"]
+            assert rig.bench.firmware.effective_limit() == 0
+            await pause(c)
+            assert (await healthy(c))["local_hold_verified"]
 
 
 # Intent: each separate failure and the combined failure recover through actual tools, real Stop ACK and fresh Pause.

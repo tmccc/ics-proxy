@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from datetime import timedelta
 from sys import float_info
 from typing import Any
@@ -17,10 +18,18 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import ProxyClient, ProxyError, management_owner_binding
 from .diagnostic_view import explanation
 from .notification import notice_for
+from .session_offers import SessionCommandOffers
 
 DOMAIN = "ics_proxy"
 LOGGER = logging.getLogger(__name__)
 AGE_FIELDS = ("status_age_seconds", "native_age_seconds")
+
+
+# Pair wall time with elapsed time so sampling variation does not look like a clock step.
+def frame_clock() -> tuple[float, float]:
+    before = time.monotonic()
+    wall = time.time()
+    return wall, (before + time.monotonic()) / 2
 
 
 # Bound before any float arithmetic: JSON integers can exceed the representable range without exceeding message size.
@@ -31,13 +40,6 @@ def usable_age(value: Any) -> bool:
 class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """A deliberate pause is normal; prolonged faults produce one persistent HA notification until recovery."""
 
-    async def command(self, action: str, revision: int, **fields: Any) -> None:
-        """Use the same status for the control revision and the commissioned destination."""
-        field, owner = management_owner_binding(self.data or {})
-        if owner is not None:
-            fields[field] = owner
-        await self.client.command(action, revision, **fields)
-
     # Setup and refresh only read status; neither HA restart nor unload sends any control command.
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         # Reports can already be several seconds old; poll before their strict 15-second native expiry.
@@ -47,8 +49,53 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.notice_generation = self.notice.claim(lambda: time.monotonic())
         self.notification_id = self.notice.notification_id
         self.received_at = time.monotonic()
+        self.management_owner: str | None = None
+        self.frame_activation: tuple[float, float] | None = None
+        self.session_offers = SessionCommandOffers(self)
         self.cancel_timer = None
         entry.async_on_unload(self.cancel_expiry)
+        entry.async_on_unload(self.session_offers.retire)
+
+    # Require a new frame after entry activation or the first observation of a different owner.
+    def mark_frame_activation(self) -> None:
+        self.frame_activation = frame_clock() if self.management_owner is not None else None
+
+    # Availability and actual writes use the same entry and notification generation.
+    def entry_is_current(self) -> bool:
+        entry = self.config_entry
+        return (
+            entry is not None
+            and entry.disabled_by is None
+            and self.hass.config_entries.async_get_entry(entry.entry_id) is entry
+            and self.notice.active
+            and self.notice.generation == self.notice_generation
+        )
+
+    # Recompute display command offers before publishing the update to entities.
+    @callback
+    def async_update_listeners(self) -> None:
+        self.session_offers.observe()
+        super().async_update_listeners()
+
+    # Keep a write bound to its original status and integration generation across the WebSocket handshake.
+    async def async_command(
+        self, action: str, revision: int, *, before_write: Callable[[], None] | None = None, **fields: Any
+    ) -> None:
+        status = self.data or {}
+        owner = status.get("management_owner")
+        if owner is not None and (
+            action in ("start", "stop_session") or status.get("management_owner_binding") is True
+        ):
+            fields[status["_management_owner_field"]] = owner
+
+        # HA records a disable before queued unload work can invalidate the coordinator generation.
+        def require_current_entry() -> None:
+            if not self.entry_is_current():
+                raise ProxyError("The charger control entry is no longer active")
+            if before_write is not None:
+                before_write()
+
+        await self.client.command(action, revision, before_write=require_current_entry, **fields)
 
     # Keep the existing coordinator inspection surface while its debounce belongs to the entry.
     @property
@@ -72,27 +119,22 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         return value + max(0, time.monotonic() - self.received_at)
 
+    # Physical session evidence can stay current when the vendor connection is unavailable.
+    @property
+    def fresh_native(self) -> bool:
+        ages = [self.age(key) for key in AGE_FIELDS]
+        return (self.data or {}).get("running") is True and all(a is not None and 0 <= a <= 15 for a in ages)
+
     # Health cannot outlive either the independent native reading or the service report which verified it.
     @property
     def fresh_healthy(self) -> bool:
-        data = self.data or {}
-        ages = [self.age(key) for key in AGE_FIELDS]
-        return (
-            data.get("running") is True
-            and data.get("healthy") is True
-            and all(a is not None and 0 <= a <= 15 for a in ages)
-        )
+        return self.fresh_native and (self.data or {}).get("healthy") is True
 
     # Explicit local health can retain safe native control during a manufacturer-cloud outage.
     @property
     def fresh_local_healthy(self) -> bool:
         data = self.data or {}
-        ages = [self.age(key) for key in AGE_FIELDS]
-        return (
-            data.get("running") is True
-            and data.get("local_healthy", data.get("healthy")) is True
-            and all(a is not None and 0 <= a <= 15 for a in ages)
-        )
+        return self.fresh_native and data.get("local_healthy", data.get("healthy")) is True
 
     # Retire a previous snapshot expiry when new data arrives or HA unloads the entry.
     @callback
@@ -152,14 +194,25 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # API errors are classified before HA logs them; tokens and server payloads never appear in UpdateFailed.
     async def _async_update_data(self) -> dict[str, Any]:
+        if not self.entry_is_current():
+            raise UpdateFailed("The charger proxy status belongs to an inactive entry")
         started = time.monotonic()
         try:
             value = dict(await self.client.request("status"))
+            owner_field, owner = management_owner_binding(value)
         except ProxyError:
-            self.update_notification(False, unavailable=True)
-            raise UpdateFailed("The local charger proxy is unavailable") from None
-        if not self.notice.active or self.notice.generation != self.notice_generation:
+            value = None
+        if not self.entry_is_current():
             raise UpdateFailed("The charger proxy status belongs to an inactive entry")
+        if value is None:
+            self.update_notification(False, unavailable=True)
+            raise UpdateFailed("The local charger proxy is unavailable")
+        # Keep the wire field with this snapshot so a later write uses the field that its peer advertised.
+        value["management_owner"] = owner
+        value["_management_owner_field"] = owner_field
+        if owner != self.management_owner:
+            self.management_owner = owner
+            self.mark_frame_activation()
         self.received_at = time.monotonic()
         transit = max(0, self.received_at - started)
         for key in AGE_FIELDS:

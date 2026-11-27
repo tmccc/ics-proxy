@@ -2,22 +2,30 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 from typing import Any
 
-from ics_proxy_core.engine.command_outcomes import decode_retained_owner_reply
+from ics_proxy_core.engine.command_outcomes import decode_retained_owner_reply, reply_identifier
 from ics_proxy_core.engine.gateway import timestamp as charger_timestamp
-from ics_proxy_core.engine.ics import unique_object
 from ics_proxy_core.engine.managed_diagnostics import timestamp as receipt_timestamp
 from ics_proxy_core.engine.policy import DeniedError
-from ics_proxy_core.engine.stop_settlement import STOP_NONTERMINAL_CLASSIFICATIONS, STOP_SESSION
+from ics_proxy_core.engine.stop_settlement import (
+    STOP_NONTERMINAL_CLASSIFICATIONS,
+    STOP_SESSION,
+    bound_stop_ids,
+    joined_stop_acceptance,
+    saved_stop_replies,
+)
 from tools.managed_incident import (
+    MANAGED_REQUEST_STATE,
     MAX_REPORT_EVENTS,
     UNKNOWN,
+    evidence_rows,
     identifier,
+    journal_tables,
     lifecycle_fields,
+    object_fields,
     observations,
     read_journal,
     reference,
@@ -37,15 +45,6 @@ REPLIES = {
 }
 
 
-# Duplicate JSON keys could make SQLite and Python choose different values for a request binding.
-def object_fields(value: object) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value, object_pairs_hook=unique_object) if isinstance(value, (str, bytes)) else None
-    except ValueError, RecursionError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
 # A lifecycle query requires a positive SQLite transaction ID.
 def local_id(value: object) -> int | None:
     return value if type(value) is int and 0 < value < 2**63 else None
@@ -53,7 +52,7 @@ def local_id(value: object) -> int | None:
 
 # The transport bounds CALL identifiers before dispatch.
 def wire_id(value: object) -> str | None:
-    return value if isinstance(value, str) and 0 < len(value) <= 36 else None
+    return value if isinstance(value, str) and len(value) <= 36 and reply_identifier(value) else None
 
 
 # Dispatch, an exact reply, and predecessor evidence are independently available.
@@ -70,23 +69,25 @@ def checkpoint_keys(origin: str, wire: str) -> tuple[str, str]:
 def owner_reply(db: sqlite3.Connection, tables: set[str], request: str, local: int) -> dict[str, Any]:
     primary = []
     if "owner_command_wires" in tables:
-        primary = db.execute(
+        primary = evidence_rows(
+            db,
             "SELECT wire,boot,reply,local FROM owner_command_wires WHERE request=? AND ticket=? AND action=? LIMIT 2",
             (request, request, STOP_ACTION),
-        ).fetchall()
-    if len(primary) > 1 or primary and (wire_id(primary[0][0]) is None or local_id(primary[0][3]) != local):
+        )
+    if primary and (len(primary) > 1 or wire_id(primary[0][0]) is None or local_id(primary[0][3]) != local):
         return wire_fields("possible_dispatch")
     if primary and primary[0][2] is not None:
         primary_reply = REPLIES.get(primary[0][2], UNKNOWN)
         return wire_fields("possible_dispatch", primary_reply, "wire_journal" if primary_reply != UNKNOWN else None)
 
     if not primary:
-        claim = db.execute(
+        claims = evidence_rows(
+            db,
             "SELECT CASE WHEN length(result)<=65536 THEN CAST(result AS BLOB) END FROM managed_requests "
             "WHERE id=? AND action=?",
             (request, STOP_SESSION),
-        ).fetchone()
-        binding = object_fields(claim[0]).get("_session_stop") if claim is not None else None
+        )
+        binding = object_fields(claims[0][0]).get("_session_stop") if claims else None
         if (
             not isinstance(binding, dict)
             or local_id(binding.get("local")) != local
@@ -94,17 +95,21 @@ def owner_reply(db: sqlite3.Connection, tables: set[str], request: str, local: i
             or binding["dispatched"] != 1
         ):
             return wire_fields()
+        if primary is None:
+            return wire_fields("possible_dispatch")
 
     checkpoints = []
     if "meta" in tables:
-        checkpoints = db.execute(
+        checkpoints = evidence_rows(
+            db,
             "WITH candidates AS (SELECT key,CASE WHEN length(value)<=8192 AND json_valid(value) THEN value END AS v "
             "FROM meta WHERE key GLOB 'retained_stop_owner:*' OR key GLOB 'retained_transaction_reply_owner:*') "
-            "SELECT key,v FROM candidates WHERE json_extract(v,'$.request')=? AND json_extract(v,'$.ticket')=? "
+            "SELECT key,CAST(v AS BLOB) FROM candidates WHERE json_extract(v,'$.request')=? "
+            "AND json_extract(v,'$.ticket')=? "
             "AND json_extract(v,'$.action')=? AND json_extract(v,'$.local')=? LIMIT 3",
             (request, request, STOP_ACTION, local),
-        ).fetchall()
-    if len(checkpoints) == 3:
+        )
+    if checkpoints is None or len(checkpoints) == 3:
         return wire_fields("possible_dispatch")
     matches: set[tuple[str, str]] = set()
     for key, value in checkpoints:
@@ -115,8 +120,7 @@ def owner_reply(db: sqlite3.Connection, tables: set[str], request: str, local: i
             or (row["request"], row["ticket"], row["action"]) != (request, request, STOP_ACTION)
             or row["limit_a"] is not None
             or wire is None
-            or not isinstance(boot, str)
-            or not boot
+            or not reply_identifier(boot)
             or not isinstance(reply, str)
             or reply not in DEFINITE_REPLIES
             or local_id(row.get("local")) != local
@@ -130,7 +134,7 @@ def owner_reply(db: sqlite3.Connection, tables: set[str], request: str, local: i
         if (
             not primary
             and "owner_command_wires" in tables
-            and db.execute("SELECT 1 FROM owner_command_wires WHERE wire=?", (wire,)).fetchone()
+            and evidence_rows(db, "SELECT 1 FROM owner_command_wires WHERE wire=?", (wire,)) != []
         ):
             continue  # This wire is already reserved for a different binding.
         matches.add((wire, reply))
@@ -154,9 +158,12 @@ def vendor_reply(db: sqlite3.Connection, tables: set[str], token: str, wire: obj
     if "meta" in tables:
         legacy, current = checkpoint_keys("vendor", exact_wire)
         matches: set[str] = set()
-        for key, value in db.execute(
-            "SELECT key,value FROM meta WHERE key IN (?,?) AND length(value)<=8192", (legacy, current)
-        ):
+        rows = evidence_rows(
+            db, "SELECT key,CAST(value AS BLOB) FROM meta WHERE key IN (?,?) AND length(value)<=8192", (legacy, current)
+        )
+        if rows is None:
+            return wire_fields("possible_dispatch")
+        for key, value in rows:
             saved = object_fields(value)
             status = saved.get("status")
             if (
@@ -177,11 +184,15 @@ def vendor_reply(db: sqlite3.Connection, tables: set[str], token: str, wire: obj
 # Only the scope of this retained mutation can identify the target session and charger call.
 def vendor_scope(db: sqlite3.Connection, tables: set[str], token: str) -> tuple[Any, Any, Any]:
     if "vendor_command_scope" in tables:
-        row = db.execute(
-            "SELECT local,wire_request,wire_result FROM vendor_command_scope WHERE mutation=?", (token,)
-        ).fetchone()
-        if row is not None:
-            return row[0], row[1], row[2]
+        rows = evidence_rows(
+            db, "SELECT local,wire_request,wire_result FROM vendor_command_scope WHERE mutation=?", (token,)
+        )
+        if rows:
+            return rows[0][0], rows[0][1], rows[0][2]
+        if rows is None:
+            targets = evidence_rows(db, "SELECT local FROM vendor_command_scope WHERE mutation=?", (token,))
+            if targets:
+                return targets[0][0], None, None
     return None, None, None
 
 
@@ -189,12 +200,12 @@ def vendor_scope(db: sqlite3.Connection, tables: set[str], token: str) -> tuple[
 def joined_owner_wire(db: sqlite3.Connection, tables: set[str], wire: str, local: int) -> dict[str, Any] | None:
     if "owner_command_wires" not in tables:
         return None
-    primary = db.execute(
-        "SELECT request,ticket,action,local,reply FROM owner_command_wires WHERE wire=?", (wire,)
-    ).fetchone()
+    rows = evidence_rows(db, "SELECT request,ticket,action,local,reply FROM owner_command_wires WHERE wire=?", (wire,))
+    if rows is None:
+        return None
     token = None
-    if primary is not None:
-        request, ticket, action, target, reply = primary
+    if rows:
+        request, ticket, action, target, reply = rows[0]
         if action != STOP_ACTION or target != local:
             return None
         token = identifier(request) or identifier(ticket)
@@ -208,10 +219,16 @@ def joined_owner_wire(db: sqlite3.Connection, tables: set[str], wire: str, local
     matches: set[tuple[str, str]] = set()
     legacy, current = checkpoint_keys("owner", wire)
     if "meta" in tables:
-        for key, value in db.execute(
-            "SELECT key,CAST(value AS BLOB) FROM meta WHERE key IN (?,?) AND length(value)<=8192", (legacy, current)
-        ):
-            saved = decode_retained_owner_reply(db, object_fields(value))
+        checkpoints = evidence_rows(
+            db, "SELECT key,CAST(value AS BLOB) FROM meta WHERE key IN (?,?) AND length(value)<=8192", (legacy, current)
+        )
+        if checkpoints is None:
+            return {"request": reference(token), "reply": UNKNOWN, "reply_source": None} if token else None
+        for key, value in checkpoints:
+            try:
+                saved = decode_retained_owner_reply(db, object_fields(value))
+            except sqlite3.Error, UnicodeError:
+                continue
             if (
                 saved is not None
                 and (saved.wire, saved.action, saved.local) == (wire, STOP_ACTION, local)
@@ -228,61 +245,74 @@ def joined_owner_wire(db: sqlite3.Connection, tables: set[str], wire: str, local
     return None
 
 
+# Terminal replies survive journal rotation only for the original joined request or wire named by the receipt.
+def saved_joined_replies(
+    binding: dict[str, Any], request: str
+) -> tuple[dict[tuple[str, str], str], dict[str, tuple[str, str]]]:
+    requests: dict[tuple[str, str], str] = {}
+    wires: dict[str, tuple[str, str]] = {}
+    for attempt, reply in saved_stop_replies(binding, request, limit=MAX_REPORT_EVENTS):
+        status = DEFINITE_REPLIES[reply]
+        requests.setdefault((attempt.origin, attempt.identifier), status)
+        if attempt.origin == "local" and attempt.wire is not None:
+            wires.setdefault(attempt.wire, (attempt.identifier, status))
+    return requests, wires
+
+
 # An overlap borrows evidence only from attempts explicitly named in this receipt and bound to the same session.
 def joined_attempts(
     db: sqlite3.Connection, tables: set[str], request: str, local: int, binding: dict[str, Any]
 ) -> list[dict[str, Any]]:
     attempts = []
-    accepted = binding.get("accepted_attempt")
-    if (
-        isinstance(accepted, dict)
-        and accepted.keys() == {"origin", "identifier", "wire"}
-        and accepted["origin"] in ("local", "vendor")
-        and (predecessor := identifier(accepted["identifier"])) is not None
-        and predecessor != request
-        and wire_id(accepted["wire"]) is not None
-    ):
-        attempts.append(
-            {
-                "origin": accepted["origin"],
-                "request": reference(predecessor),
-                "reply": "accepted",
-                "reply_source": "joined_receipt",
-            }
-        )
+    saved = None
+    if (accepted := joined_stop_acceptance(binding, request)) is not None:
+        saved = {"request": reference(accepted.identifier), "reply": "accepted", "reply_source": "joined_receipt"}
+    saved_requests, saved_wires = saved_joined_replies(binding, request)
     for origin, key in (("local", "local_attempts"), ("vendor", "vendor_attempts")):
-        tokens = binding.get(key)
-        if not isinstance(tokens, list):
-            continue
-        unique = dict.fromkeys(token for item in tokens if (token := identifier(item)) is not None and token != request)
-        for token in tuple(unique)[:MAX_REPORT_EVENTS]:
-            wire = wire_fields()
+        tokens = tuple(item for item in bound_stop_ids(binding, key, request) if identifier(item) is not None)
+        for token in tokens[:MAX_REPORT_EVENTS]:
+            reply = wire_fields()
             if origin == "local":
-                wire = owner_reply(db, tables, token, local)
-            elif (
-                "mutations" in tables
-                and db.execute(
-                    "SELECT 1 FROM mutations WHERE token=? AND origin='vendor' AND action=?", (token, STOP_ACTION)
-                ).fetchone()
+                reply = owner_reply(db, tables, token, local)
+            elif "mutations" in tables and evidence_rows(
+                db, "SELECT 1 FROM mutations WHERE token=? AND origin='vendor' AND action=?", (token, STOP_ACTION)
             ):
                 scope_local, call, result = vendor_scope(db, tables, token)
                 if scope_local == local:
-                    wire = vendor_reply(db, tables, token, call, result)
+                    reply = vendor_reply(db, tables, token, call, result)
+            if accepted is not None and (accepted.origin, accepted.identifier) == (origin, token):
+                if saved is None:
+                    continue
+                if reply["reply"] != "accepted":
+                    reply = saved
+                saved = None
+            elif (known := saved_requests.get((origin, token))) is not None and reply["reply"] != known:
+                reply = {"reply": known, "reply_source": "joined_receipt"}
             attempts.append(
                 {
                     "origin": origin,
                     "request": reference(token),
-                    "reply": wire["reply"],
-                    "reply_source": wire["reply_source"],
+                    "reply": reply["reply"],
+                    "reply_source": reply["reply_source"],
                 }
             )
-    wires = binding.get("owner_wire_attempts")
-    if isinstance(wires, list):
-        unique_wires = dict.fromkeys(wire for item in wires if (wire := wire_id(item)) is not None)
-        for wire in tuple(unique_wires)[:MAX_REPORT_EVENTS]:
-            evidence = joined_owner_wire(db, tables, wire, local)
-            if evidence is not None:
-                attempts.append({"origin": "local", **evidence})
+    wires = tuple(item for item in bound_stop_ids(binding, "owner_wire_attempts", request) if wire_id(item) is not None)
+    for wire in wires[:MAX_REPORT_EVENTS]:
+        evidence = joined_owner_wire(db, tables, wire, local)
+        if accepted is not None and accepted.origin == "local" and accepted.wire == wire:
+            if saved is None:
+                continue
+            if evidence is None or evidence["reply"] != "accepted":
+                evidence = saved
+            saved = None
+        elif (checkpoint := saved_wires.get(wire)) is not None:
+            predecessor, status = checkpoint
+            if evidence is None or evidence["reply"] != status:
+                evidence = {"request": reference(predecessor), "reply": status, "reply_source": "joined_receipt"}
+        if evidence is not None:
+            attempts.append({"origin": "local", **evidence})
+    if accepted is not None and saved is not None:
+        attempts.insert(0, {"origin": accepted.origin, **saved})
     return attempts
 
 
@@ -293,12 +323,19 @@ def local_stop(
     if "managed_requests" not in tables:
         return None, None, wire_fields()
     db.create_function("incident_reference", 1, reference, deterministic=True)
-    rows = db.execute(
-        "SELECT id,revision,state,CASE WHEN length(result)<=65536 THEN result END FROM managed_requests "
-        "WHERE action=? AND (? IS NULL OR incident_reference(id)=?) ORDER BY rowid DESC LIMIT ?",
-        (STOP_SESSION, request_reference, request_reference, 1 if request_reference is None else 2),
-    ).fetchall()
-    if len(rows) != 1 or (token := identifier(rows[0][0])) is None:
+    selection = (
+        "FROM managed_requests WHERE action=? AND (? IS NULL OR incident_reference(id)=?) ORDER BY rowid DESC LIMIT ?"
+    )
+    parameters = (STOP_SESSION, request_reference, request_reference, 1 if request_reference is None else 2)
+    rows = evidence_rows(
+        db,
+        f"SELECT id,revision,{MANAGED_REQUEST_STATE},"
+        f"CASE WHEN length(result)<=65536 THEN CAST(result AS BLOB) END {selection}",
+        parameters,
+    )
+    if rows is None:
+        rows = evidence_rows(db, f"SELECT id,revision,{MANAGED_REQUEST_STATE},NULL {selection}", parameters)
+    if not rows or len(rows) != 1 or (token := identifier(rows[0][0])) is None:
         return None, None, wire_fields()
     row = rows[0]
     revision, state = row[1:3]
@@ -311,7 +348,7 @@ def local_stop(
         "request": reference(token),
         "action": STOP_SESSION,
         "revision": revision if type(revision) is int and 0 <= revision < 2**53 else None,
-        "state": state if state in ("accepted", "running", "uncertain", "completed", "failed") else UNKNOWN,
+        "state": state or UNKNOWN,
         "accepted_at": receipt_timestamp(result.get("accepted_at")),
         "classification": classification
         if classification in ("stop_not_sent", "stop_rejected", *STOP_NONTERMINAL_CLASSIFICATIONS)
@@ -333,18 +370,20 @@ def local_stop(
 
 # Vendor mutations lack receipt timestamps and retain their own insertion order.
 def vendor_stop(db: sqlite3.Connection, tables: set[str]) -> tuple[dict[str, Any] | None, int | None, dict[str, Any]]:
-    row = None
+    rows = None
     if "mutations" in tables:
-        row = db.execute(
-            "SELECT token,state FROM mutations WHERE origin='vendor' AND action=? ORDER BY rowid DESC LIMIT 1",
+        rows = evidence_rows(
+            db,
+            "SELECT token,CASE WHEN state IN ('pending','uncertain','confirmed') THEN state END "
+            "FROM mutations WHERE origin='vendor' AND action=? ORDER BY rowid DESC LIMIT 1",
             (STOP_ACTION,),
-        ).fetchone()
-    if row is None or (token := identifier(row[0])) is None:
+        )
+    if not rows or (token := identifier(rows[0][0])) is None:
         return None, None, wire_fields()
     request = {
         "request": reference(token),
         "action": STOP_ACTION,
-        "state": row[1] if row[1] in ("pending", "uncertain", "confirmed") else UNKNOWN,
+        "state": rows[0][1] or UNKNOWN,
     }
     local, wire, result = vendor_scope(db, tables, token)
     return request, local_id(local), vendor_reply(db, tables, token, wire, result)
@@ -354,27 +393,12 @@ def vendor_stop(db: sqlite3.Connection, tables: set[str]) -> tuple[dict[str, Any
 def journal_fields(
     db: sqlite3.Connection, *, vendor: bool, request_reference: str | None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    tables = {name for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    tables = journal_tables(db)
     request, local, wire = vendor_stop(db, tables) if vendor else local_stop(db, tables, request_reference)
-    lifecycle = "unbound" if request is not None and local is None else UNKNOWN
-    mapping, stop_at = UNKNOWN, None
-    delivery: list[dict[str, Any]] = []
-    if local is not None and "transactions" in tables:
-        row = db.execute(
-            "SELECT stop IS NOT NULL,vendor IS NOT NULL,CASE WHEN json_valid(stop) THEN "
-            "CASE WHEN json_extract(stop,'$.transactionId')=local THEN json_extract(stop,'$.timestamp') END "
-            "END FROM transactions WHERE local=?",
-            (local,),
-        ).fetchone()
-        if row is not None:
-            lifecycle, mapping = "closed" if row[0] else "open", "recorded" if row[1] else "unmapped"
-            if isinstance(row[2], str) and len(row[2]) <= 64:
-                try:
-                    stop_at = charger_timestamp(row[2]).isoformat()
-                except DeniedError:
-                    pass
-            if {"outbox", "delivery_replies"} <= tables:
-                _, _, delivery = lifecycle_fields(db, local)
+    lifecycle, mapping, delivery = (
+        lifecycle_fields(db, tables, local) if request is not None else (UNKNOWN, UNKNOWN, [])
+    )
+    stop_at = reported_stop_at(db, local) if lifecycle == "closed" and local is not None else None
     return {
         "available": True,
         "request": request,
@@ -383,6 +407,23 @@ def journal_fields(
         "cloud_mapping": mapping,
         "pending_delivery": delivery,
     }, wire
+
+
+# A timestamp is optional even when a recorded closing report proves the lifecycle.
+def reported_stop_at(db: sqlite3.Connection, local: int) -> str | None:
+    rows = evidence_rows(
+        db,
+        "SELECT CASE WHEN json_valid(stop) THEN "
+        "CASE WHEN json_extract(stop,'$.transactionId')=local THEN json_extract(stop,'$.timestamp') END "
+        "END FROM transactions WHERE local=?",
+        (local,),
+    )
+    if rows and isinstance(timestamp := rows[0][0], str) and len(timestamp) <= 64:
+        try:
+            return charger_timestamp(timestamp).isoformat()
+        except DeniedError:
+            pass
+    return None
 
 
 def stop_incident_report(

@@ -17,6 +17,20 @@ STOP_TEST = "tests/test_managed_session_stop.py"
 STOP_JOIN = f"{STOP_TEST}::test_joined_session_stop_settles_from_late_rejection"
 STOP_PUBLICATION = f"{STOP_TEST}::test_accepted_stop_closure_survives_publication_refusal"
 STOP_RESTART = "tests/test_managed_stop_replacement.py::test_unmapped_stop_replacement_waits_for_native_closure"
+STOP_NATIVE_FIRST_PROCESS = (
+    "tests/test_real_process_death.py::test_process_cut_after_queued_stop_observes_native_closure"
+)
+SCHEDULE = "tests/test_managed_local_schedule.py"
+SCHEDULE_CUTOFF = "tests/test_managed_local_schedule_cutoff.py"
+CUTOFF_REPLACEMENT = f"{SCHEDULE_CUTOFF}::test_cutoff_retains_elapsed_deadline_across_replacement"
+CUTOFF_REWIND = f"{SCHEDULE_CUTOFF}::test_observed_cutoff_survives_refused_claim_and_wall_rewind"
+CUTOFF_CLOSED_REPORT = f"{SCHEDULE_CUTOFF}::test_cutoff_holds_zero_when_stop_report_arrives_first"
+SCHEDULE_VENDOR_RETURN = f"{SCHEDULE}::test_cloud_returns_before_local_schedule_sends_start"
+STOP_INCIDENT = "tests/test_managed_stop_incident.py"
+SCHEDULE_CLOSURE = "tests/test_managed_scheduled_closure.py"
+CUTOFF_RETAINED_CLOSURE = f"{SCHEDULE_CLOSURE}::test_cutoff_checks_retained_stop_closure_after_replacement"
+SCHEDULE_CLOSURE_CHECKPOINT = f"{SCHEDULE_CLOSURE}::test_schedule_closure_checkpoint_survives_replacement"
+INCIDENT_WAL = "tests/test_managed_incident.py::test_incident_respects_the_published_live_wal_boundary"
 PAUSE_OVERLAP = (
     "tests/test_managed_cloud_zero_controls.py::test_local_pause_and_cloud_stop_share_unanswered_stop_at_zero"
 )
@@ -30,6 +44,12 @@ SHUTDOWN_JOIN = (
     "tests/test_journal_fault_recovery.py::test_shutdown_waits_for_exact_prior_stops_or_an_independent_attempt"
 )
 HA_TEST = "tests_ha_proxy/test_client.py::test_session_stop_shares_the_vendor_wire_in_either_order"
+HA_DISPLAY = "tests_ha_proxy/test_display_example.py"
+HA_DISPLAY_STOP = f"{HA_DISPLAY}::test_canvas_stop_rechecks_the_local_session"
+HA_DISPLAY_HANDSHAKE = f"{HA_DISPLAY}::test_canvas_frame_can_expire_during_the_management_handshake"
+HA_DISPLAY_CLOCK_STEP = f"{HA_DISPLAY}::test_display_service_rejects_pre_adjustment_frames"
+HA_DISPLAY_REPLACEMENT = f"{HA_DISPLAY}::test_display_rejects_start_frame_from_before_entry_replacement"
+HA_DISPLAY_DESTINATION = f"{HA_DISPLAY}::test_canvas_rejects_replacement_at_the_same_endpoint"
 
 SUITES = {
     "engine": (
@@ -50,6 +70,11 @@ SUITES = {
             f"{STOP_JOIN}[rejection-first-local-wire-busy]",
             f"{STOP_JOIN}[rejection-first-vendor-wire-busy]",
             f"{STOP_TEST}::test_session_stop_awaits_closure_when_session_closes_in_gate",
+            f"{STOP_TEST}::test_queued_stop_keeps_original_closure_across_boot[boot]",
+            f"{STOP_TEST}::test_queued_stop_keeps_original_closure_across_boot[reconnect]",
+            f"{STOP_TEST}::test_queued_stop_keeps_original_closure_across_boot[expiry]",
+            f"{STOP_TEST}::test_queued_stop_keeps_original_closure_across_boot[open]",
+            f"{STOP_TEST}::test_queued_stop_keeps_original_closure_across_boot[new-session]",
             f"{STOP_TEST}::test_verified_closure_survives_stop_reply_window[Accepted]",
             f"{STOP_TEST}::test_verified_closure_survives_stop_reply_window[Rejected]",
             f"{STOP_TEST}::test_verified_closure_survives_stop_reply_window[expired]",
@@ -62,6 +87,7 @@ SUITES = {
             f"{STOP_TEST}::test_exact_stop_rejection_fences_receipt_after_replacement[vendor]",
             f"{STOP_TEST}::test_replacement_settles_only_saved_verified_stop_closure[old-receipt]",
             f"{STOP_TEST}::test_replacement_settles_only_saved_verified_stop_closure[verified-closure]",
+            f"{STOP_TEST}::test_replacement_settles_only_saved_verified_stop_closure[unsent-report-only]",
             f"{STOP_PUBLICATION}[next-poll]",
             f"{STOP_PUBLICATION}[marker-refused]",
             f"{STOP_PUBLICATION}[replacement]",
@@ -69,6 +95,10 @@ SUITES = {
             f"{STOP_RESTART}[exact-stop-proof-unplugged]",
             f"{STOP_RESTART}[report-only-plugged]",
             f"{STOP_RESTART}[report-only-unplugged]",
+            f"{STOP_NATIVE_FIRST_PROCESS}[checkpoint-saved]",
+            f"{STOP_NATIVE_FIRST_PROCESS}[both-writes-refused]",
+            f"{STOP_TEST}::test_replacement_validates_retained_stop_closure_binding[legacy]",
+            f"{STOP_TEST}::test_replacement_validates_retained_stop_closure_binding[report]",
             f"{STOP_TEST}::test_live_stop_confirmation_uses_elapsed_time[-30]",
             f"{STOP_TEST}::test_live_stop_confirmation_uses_elapsed_time[30]",
             f"{STOP_TEST}::test_queued_stop_cannot_dispatch_after_expiry_write_rolls_back",
@@ -85,9 +115,61 @@ SUITES = {
             f"{SHUTDOWN_JOIN}[legacy]",
             f"{JOURNAL_TEST}[startup]",
             f"{JOURNAL_TEST}[live-retry]",
+            f"{CUTOFF_REPLACEMENT}[same]",
+            f"{CUTOFF_REPLACEMENT}[changed]",
+            f"{CUTOFF_REPLACEMENT}[unknown]",
+            f"{CUTOFF_REPLACEMENT}[legacy]",
+            f"{CUTOFF_REWIND}[at-end-cutoff-saved]",
+            f"{CUTOFF_REWIND}[at-end-cutoff-retained-in-memory]",
+            f"{CUTOFF_REWIND}[before-start-cutoff-saved]",
+            f"{CUTOFF_REWIND}[before-start-cutoff-retained-in-memory]",
+            f"{CUTOFF_CLOSED_REPORT}[native-unavailable]",
+            f"{SCHEDULE_CUTOFF}::test_cutoff_leaves_settled_early_stop_in_app_mode",
+            f"{STOP_TEST}::test_blocked_poll_records_scheduled_session_stop_closure",
+            f"{STOP_TEST}::test_management_start_then_session_stop_at_zero_watts",
+            f"{SCHEDULE_CLOSURE}::test_scheduled_closure_survives_interrupted_poll[native-audit]",
+            f"{SCHEDULE_CLOSURE}::test_scheduled_closure_survives_interrupted_poll[charge-publication]",
+            f"{SCHEDULE_CLOSURE}::test_scheduled_closure_survives_marker_refusal_and_replacement",
+            f"{CUTOFF_RETAINED_CLOSURE}[accept-before-exact]",
+            f"{CUTOFF_RETAINED_CLOSURE}[accept-before-other-report]",
+            f"{CUTOFF_RETAINED_CLOSURE}[reject-before-exact]",
+            f"{CUTOFF_RETAINED_CLOSURE}[reject-after-exact]",
+            f"{CUTOFF_RETAINED_CLOSURE}[reject-after-other-report]",
+            f"{SCHEDULE_CLOSURE_CHECKPOINT}[exact]",
+            f"{SCHEDULE_CLOSURE_CHECKPOINT}[not-observed]",
+            f"{SCHEDULE_CLOSURE_CHECKPOINT}[stop-storage-refused]",
+            "tests/test_managed_api.py::test_management_connections_leave_pause_available[busy]",
+            f"{SCHEDULE_VENDOR_RETURN}[vendor-lost-during-rollback-automatic-return]",
+            f"{SCHEDULE}::test_overlapping_timezone_change_does_not_repeat_local_occurrence",
+            "tests/test_vendor_stop_rotation.py::test_queued_vendor_stop_keeps_reply_through_rotation[Accepted]",
+            f"{STOP_INCIDENT}::test_legacy_joined_stop_report_retains_its_primary_reply",
+            f"{STOP_INCIDENT}::test_saved_vendor_rejection_survives_joined_receipt_settlement",
+            f"{STOP_INCIDENT}::test_joined_owner_checkpoint_must_match_pause_claim[wrong-ticket]",
+            f"{STOP_INCIDENT}::test_legacy_shutdown_checkpoint_must_match_original_target[wrong-boot]",
+            f"{INCIDENT_WAL}[published]",
         ),
     ),
-    "ha": ("offline_ha_validate.py", (f"{HA_TEST}[local]", f"{HA_TEST}[vendor]")),
+    "ha": (
+        "offline_ha_validate.py",
+        (
+            f"{HA_TEST}[local]",
+            f"{HA_TEST}[vendor]",
+            f"{HA_DISPLAY}::test_canvas_start_requires_the_displayed_revision",
+            f"{HA_DISPLAY_STOP}[old_native]",
+            f"{HA_DISPLAY_STOP}[closed]",
+            f"{HA_DISPLAY_HANDSHAKE}[start]",
+            f"{HA_DISPLAY_HANDSHAKE}[stop]",
+            f"{HA_DISPLAY_CLOCK_STEP}[forward_then_rewind-start]",
+            f"{HA_DISPLAY_CLOCK_STEP}[forward_then_rewind-stop]",
+            f"{HA_DISPLAY_REPLACEMENT}[reload]",
+            f"{HA_DISPLAY_REPLACEMENT}[remove-add]",
+            f"{HA_DISPLAY_DESTINATION}[after-poll-start]",
+            f"{HA_DISPLAY_DESTINATION}[during-handshake-start]",
+            f"{HA_DISPLAY}::test_ordinary_start_does_not_reach_a_replacement_destination[session_action]",
+            f"{HA_DISPLAY}::test_ordinary_start_does_not_reach_a_replacement_destination[start_button]",
+            f"{HA_DISPLAY}::test_pause_keeps_its_stale_revision_behavior_with_owner_status[all-commands]",
+        ),
+    ),
 }
 
 

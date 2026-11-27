@@ -10,9 +10,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import stat
 import sys
+import tempfile
 import time
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
@@ -36,6 +38,7 @@ from ics_proxy_core.engine.station import StationChoice  # noqa: E402
 from ics_proxy_core.engine.store import RecoveryRequiredError, fingerprint  # noqa: E402
 from ics_proxy_core.engine.trial_config import TrialConfig  # noqa: E402
 from ics_proxy_core.engine.trial_evidence import profile_projection  # noqa: E402
+from ics_proxy_core.engine.trial_session import validate_state_path  # noqa: E402
 from tools.rollback_recovery_state import RECOVERY_METADATA, recovery_history_settled  # noqa: E402
 
 
@@ -172,14 +175,15 @@ def schema_digest(db: sqlite3.Connection) -> str:
     return hashlib.sha256(json.dumps([version, application, objects], separators=(",", ":")).encode()).hexdigest()
 
 
-# Take the existing single-owner lock without creating it, then read real WAL contents in one SQLite snapshot.
+# Lock the stopped owner and read a private copy so SQLite cannot modify the journal's sidecars.
 @contextmanager
 def stopped_journal(path: Path):
     info = path.lstat()
     require(
         stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077, "journal_unavailable"
     )
-    descriptor = os.open(str(path) + ".lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    lock_path = Path(str(path) + ".lock")
+    descriptor = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, "rb") as lock:
         held = os.fstat(lock.fileno())
         require(
@@ -190,10 +194,26 @@ def stopped_journal(path: Path):
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RollbackRefusedError("journal_owner_running") from None
-        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as db:
-            db.execute("PRAGMA query_only=ON")
-            db.execute("BEGIN")
-            yield db
+        try:
+            validate_state_path(path)
+        except SecurityError:
+            raise RollbackRefusedError("journal_unavailable") from None
+        require(
+            os.path.samestat(info, path.lstat()) and os.path.samestat(held, lock_path.lstat()),
+            "journal_unavailable",
+        )
+        with tempfile.TemporaryDirectory(prefix="ics-rollback-") as directory:
+            snapshot = Path(directory) / "journal.sqlite"
+            shutil.copyfile(path, snapshot)
+            # Retain uncheckpointed WAL and interrupted rollback evidence. SQLite rebuilds shared memory locally.
+            for suffix in ("-wal", "-journal"):
+                source = Path(str(path) + suffix)
+                if source.exists():
+                    shutil.copyfile(source, Path(str(snapshot) + suffix))
+            with closing(sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as db:
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                yield db
 
 
 # Keep known allocation and both configured identities tied to the preserved transaction ledger.

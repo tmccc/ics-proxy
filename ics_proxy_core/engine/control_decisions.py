@@ -27,13 +27,16 @@ from .current_policy import (
     current_source_decision,
     original_current_plan,
 )
+from .local_schedule import SCHEDULE_CUTOFF, ScheduleCloudReturnedError, ScheduleCutoffError
+from .local_schedule_cutoff import record_cutoff_pause, scheduled_cutoff_target
 from .managed_facts import ManagedFacts
 from .managed_intent import (
-    OFFLINE_PAUSE,
     ControlIntent,
     ManagedRequests,
     PauseRequest,
     ReturnSettlement,
+    automatic_pause_cause,
+    record_automatic_pause,
     request_pending,
     write_intent,
 )
@@ -77,14 +80,15 @@ from .security import SecurityError, StaleEvidenceError
 from .start_handoff import NativeStartReport, OwnedStartResult, StartHandoff, StartHandoffContext, StartPublication
 from .start_policy import ACTIVE, owner_tag_separate, start_refusal
 from .start_settlement import RetirementCandidate, StartFailureAction, StartFailureFacts, settle_start
-from .stop_settlement import StopAcceptance
+from .stop_settlement import StopPredecessors, predecessor_stop_reply
 from .store import RecoveryRequiredError, StationZeroStorageError, encoded, fingerprint
 from .trial_evidence import Resource, profile_projection
 
 if TYPE_CHECKING:
-    from .command_outcomes import OwnerWire, TransactionReplyStatus
+    from .command_outcomes import TransactionReplyStatus
     from .gateway import Gateway
     from .local_control import LocalControl
+    from .local_schedule_window import ScheduleWindow
     from .managed import ManagedController
     from .managed_charging import ChargeLease, ManagedCharging
     from .managed_current import ManagedCurrentLimits
@@ -140,17 +144,6 @@ class StopZeroEvidence(Protocol):
 
     # Report whether the latest evidence still covers the exact open session at zero.
     def stop_zero_verified(self, local: int) -> bool: ...
-
-
-@dataclass(frozen=True)
-class StopPredecessors:
-    """The earlier Stop attempts that could cover this request at admission."""
-
-    accepted: StopAcceptance | None = None
-    local_requests: tuple[str, ...] = ()
-    owner_wires: tuple[str, ...] = ()
-    vendor_mutations: tuple[str, ...] = ()
-    unidentified_shutdown_stop: bool = False
 
 
 class StopDecision(Enum):
@@ -212,7 +205,8 @@ class ControlDecisions:
     # Attach the decision owner to the local executor's existing journal and peer.
     def __init__(self, control: LocalControl) -> None:
         self.control, self.journal, self.peer = control, control.journal, control.peer
-        self._protective_stop: tuple[int, str | None, int, str] | None = None
+        self._protective_stop_scope: tuple[int, str | None, int] | None = None
+        self._protective_stop_tickets: set[str] = set()
         self.schedule = ScheduleControl(self)
         self.recovery = RecoveryControl(self)
         self.shutdown_requested = False
@@ -366,6 +360,24 @@ class ControlDecisions:
 
         return guard
 
+    # A close and reopen can change the journal even if the active ID is empty again.
+    def release_ownership_decision(self, attempt: ReleaseAttempt) -> GateDecision:
+        decision = attempt.positive_guard()
+        if isinstance(decision, Pending):
+            return decision
+        if attempt.lifecycle is not None and self.journal.lifecycle_position() != attempt.lifecycle:
+            return Pending(Prerequisite.LIFECYCLE, "charging records changed during release verification")
+        return ALLOW
+
+    # Delivery work can arrive after preflight, while the positive write is still unsent.
+    def release_positive_decision(self, controller: ManagedController, attempt: ReleaseAttempt) -> GateDecision:
+        decision = self.release_ownership_decision(attempt)
+        if isinstance(decision, Pending):
+            return decision
+        if controller.session.gateway.vendor._pending or not ManagedFacts(controller).cloud_queue_empty():
+            return Pending(Prerequisite.CLOUD_DELIVERY, "shared control awaits the current cloud acknowledgement")
+        return ALLOW
+
     # Keep resource observations and their zero verdict together.
     def release_zero_decision(
         self, controller: ManagedController, native: HandoverEvidence, allow_offline: bool, continuing_local: int | None
@@ -457,10 +469,10 @@ class ControlDecisions:
         self, c: ManagedController, attempt: ReleaseAttempt, native: HandoverEvidence | Pending
     ) -> RestoreProgress | ReleaseAttempt:
         g, j = c.session.gateway, self.journal
-        guard, expected_intent = attempt.positive_guard, attempt.intent
+        expected_intent = attempt.intent
         connection = (attempt.scope, attempt.control_revision)
         ticket, return_request, continuing_local = attempt.before_ticket, attempt.request_id, attempt.continuing_local
-        decision = guard()
+        decision = self.release_ownership_decision(attempt)
         if isinstance(decision, Pending):
             return RestoreProgress(RestoreState.WAITING, decision)
         if isinstance(native, Pending):
@@ -478,7 +490,7 @@ class ControlDecisions:
             or j.get("control", {}).get("uncertain")
         ):
             raise UnavailableError("managed release authority changed during its native check")
-        decision = guard()
+        decision = self.release_ownership_decision(attempt)
         if isinstance(decision, Pending):
             return RestoreProgress(RestoreState.WAITING, decision)
         if expected_intent.mode == "paused":
@@ -487,6 +499,8 @@ class ControlDecisions:
                 if not isinstance(ticket, str):
                     raise RecoveryRequiredError("Return requires its current zero hold ticket")
                 c.requests.bind_return(return_request, expected_intent, ticket, connection[0].boot)
+        elif continuing_local is None:
+            c.local_schedule.observe_closed(native)
         return attempt
 
     # Physical claim, publication and rollback
@@ -578,7 +592,7 @@ class ControlDecisions:
         return_request, expected_intent = attempt.request_id, attempt.intent
         if not c.publication_is_current(authority):
             return Pending(Prerequisite.SUPERSEDED, "release publication was superseded")
-        decision = attempt.positive_guard()
+        decision = self.release_ownership_decision(attempt)
         if isinstance(decision, Pending):
             return decision
         j.put("managed_owner_epoch", attempt.scope.epoch)
@@ -604,7 +618,7 @@ class ControlDecisions:
     ) -> RestoreProgress:
         g, j = c.session.gateway, self.journal
         expected_intent, return_request = attempt.intent, attempt.request_id
-        decision = ALLOW if result.published else attempt.positive_guard()
+        decision = ALLOW if result.published else self.release_ownership_decision(attempt)
         disposition = release_disposition(
             attempt.purpose,
             result,
@@ -711,10 +725,10 @@ class ControlDecisions:
         # This verified idle sample already saw these attempts, regardless of when their records were created.
         prior_attempts = [attempt_key(record) for record in native.history if record["transactionId"] == -1]
         with j.atomic():
-            outage_pause = c.requests.offline_pause_current(intent)
+            automatic_pause = c.requests.offline_pause_current(intent)
             expected = write_intent(j, intent, intent.mode)
-            if outage_pause:
-                j.put(OFFLINE_PAUSE, expected.revision)
+            if automatic_pause:
+                record_automatic_pause(j, expected, automatic_pause_cause(j, intent))
             j.current_change.accept(
                 identifier, value, previous_value, intent, j.get("next_transaction"), prior_attempts
             )
@@ -995,19 +1009,26 @@ class ControlDecisions:
         worker._settling_overlap = None
         return None
 
+    # Every recovery step keeps the exact selection and intent that requested the rollback.
+    def _owns_current_recovery(
+        self, worker: ManagedCurrentLimits, change: dict[str, Any], expected: ControlIntent
+    ) -> bool:
+        c = worker.controller
+        current = self.journal.current_change.read()
+        return (
+            not c.stopping
+            and c.requests.intent() == expected
+            and current.recovering
+            and current.identifier == change["id"]
+        )
+
     # Reclaim only the current operation's own zero if earlier restoration failed to settle.
     def reclaim_current_recovery(
         self, worker: ManagedCurrentLimits, change: dict[str, Any], expected: ControlIntent
     ) -> bool:
         c, j = worker.controller, self.journal
         g = c.session.gateway
-        current = j.current_change.read()
-        if (
-            c.stopping
-            or c.requests.intent() != expected
-            or not current.recovering
-            or current.identifier != change["id"]
-        ):
+        if not self._owns_current_recovery(worker, change, expected):
             return False
         if g.controls.desired() != 0:
             with j.atomic():
@@ -1029,12 +1050,7 @@ class ControlDecisions:
         if c.native.authority() != native_authority or c.native.last_resolved_read != sequence:
             return False, Pending(Prerequisite.SUPERSEDED, "current recovery observation was superseded")
         current = j.current_change.read()
-        if (
-            c.stopping
-            or c.requests.intent() != expected
-            or not current.recovering
-            or current.identifier != change["id"]
-        ):
+        if not self._owns_current_recovery(worker, change, expected):
             return False, None
         decision = c.native.session_decision(native)
         if isinstance(decision, Pending):
@@ -1063,53 +1079,78 @@ class ControlDecisions:
                 return False, decision
         return True, local
 
-    # Retry a failed receipt write only after the restored limit and exact session are still verified.
+    # Bind native verification and receipt publication to the same decision turn.
     async def retry_current_recovery(
         self, worker: ManagedCurrentLimits, change: dict[str, Any], expected: ControlIntent
     ) -> tuple[bool, Pending | None]:
         c, j = worker.controller, self.journal
         g = c.session.gateway
-        if worker._settling_overlap is not None and not c.stopping:
-            identifier, authority, local = worker._settling_overlap
-            if identifier == change["id"] and c.authority() == authority and j.active() == local and g.controls.ready:
-                native = await c.native.read_result()
-                if c.stopping or c.requests.intent() != expected:
-                    return True, Pending(Prerequisite.SUPERSEDED, "current recovery yielded to newer control")
-                if (
-                    not isinstance(native, Pending)
-                    and c.authority() == authority
-                    and g.controls.ready
-                    and g.controls.desired() == change["previous_a"]
-                    and c.native.session_decision(native) is ALLOW
-                    and (
-                        current_source_decision(g, None)
-                        if local is None
-                        else current_session_decision(g, native, local)
-                    )
-                    is ALLOW
-                ):
-                    return True, self.complete_current_recovery(worker, change, authority, local)
+        proof = worker._settling_overlap
+        if proof is None:
+            return False, None
+        if (
+            proof.identifier != change["id"]
+            or not self._owns_current_recovery(worker, change, expected)
+            or c.authority() != proof.authority
+            or not g.controls.ready
+        ):
             worker._settling_overlap = None
-        return False, None
+            return False, None
+        if j.lifecycle_position() != proof.lifecycle:
+            worker._settling_overlap = None
+            return False, Pending(Prerequisite.LIFECYCLE, "charger lifecycle changed during current recovery")
 
-    # Settle only the previous current and authority this recovery verified.
-    def complete_current_recovery(
-        self, worker: ManagedCurrentLimits, change: dict[str, Any], authority: AuthorityStamp, local: int | None
-    ) -> Pending | None:
-        # The restored receipt may be retried only under the authority and session it verified.
-        def settle() -> Pending | None:
-            if worker.controller.authority() != authority or self.journal.active() != local:
-                return Pending(Prerequisite.SUPERSEDED, "current recovery lost its confirmed authority")
+        native = await c.native.read_result(owned=True)
+        native_authority, sequence = c.native.authority(), c.native.last_resolved_read
+
+        # Recheck the observed ceiling and ownership inside the decision turn before restoring the receipt.
+        def settle() -> tuple[bool, Pending | None]:
+            if worker._settling_overlap != proof:
+                return True, Pending(Prerequisite.SUPERSEDED, "current recovery verification was superseded")
+            worker._settling_overlap = None
+            if not self._owns_current_recovery(worker, change, expected) or c.authority() != proof.authority:
+                return True, Pending(Prerequisite.SUPERSEDED, "current recovery yielded to newer control")
+            if j.lifecycle_position() != proof.lifecycle:
+                return False, Pending(Prerequisite.LIFECYCLE, "charger lifecycle changed during current recovery")
+            if (
+                isinstance(native, Pending)
+                or c.native.authority() != native_authority
+                or c.native.last_resolved_read != sequence
+                or not native.is_fresh(5)
+                or not g.controls.ready
+                or g.controls.desired() != change["previous_a"]
+            ):
+                return False, None
+            local = proof.lifecycle[1]
+            decision = c.native.session_decision(native)
+            if decision is ALLOW:
+                decision = (
+                    current_source_decision(g, None) if local is None else current_session_decision(g, native, local)
+                )
+            if isinstance(decision, Pending):
+                return False, decision
+            previous = change["previous_a"]
             try:
-                with self.journal.atomic():
+                c.session.book.require_confirmed_station(native.physical.resources, previous)
+                measured = c.native._inspect(native).selected(previous)
+            except DeniedError, StaleEvidenceError:
+                return False, None  # A later attempt can restore the missing proof under zero.
+            if native.output_limit_a > previous or measured.exceeded:
+                self.reclaim_current_recovery(worker, change, expected)
+                return True, Pending(Prerequisite.ZERO_PROOF, "native output exceeds the restored current ceiling")
+            try:
+                with j.atomic():
                     self.restore_previous_current(worker, recovery=change)
             except sqlite3.Error as error:
-                worker._settling_overlap = (change["id"], authority, local)
-                return Pending(Prerequisite.RECONCILIATION, "current recovery awaits its receipt write", error)
-            worker._settling_overlap = None
-            return None
+                worker._settling_overlap = proof
+                return True, Pending(Prerequisite.RECONCILIATION, "current recovery awaits its receipt write", error)
+            return True, None
 
-        return worker.controller.commands.decide(settle)
+        settled, pending = c.commands.decide(settle)
+        # A contradictory reading already claimed the exact hold and still needs its wire proof.
+        if settled and pending is not None and pending.reason is Prerequisite.ZERO_PROOF:
+            await self.protect_current_overlap(worker)
+        return settled, pending
 
     # Accept a delayed genuine original-plan report under this operation's zero, without inventing its lifecycle.
     async def prepare_current_report(
@@ -1291,7 +1332,15 @@ class ControlDecisions:
 
     # Acceptance and its one-shot deadline commit before any positive effect; duplicate identifiers return receipts.
     def accept_start(
-        self, charging: ManagedCharging, identifier: str, action: str, revision: int, startup: float, duration: float
+        self,
+        charging: ManagedCharging,
+        identifier: str,
+        action: str,
+        revision: int,
+        startup: float,
+        duration: float,
+        *,
+        schedule: ScheduleWindow | None = None,
     ) -> dict[str, Any]:
         c, j = charging.controller, self.journal
         previous = c.requests.existing(identifier, action, revision)
@@ -1308,8 +1357,18 @@ class ControlDecisions:
                 if action == "start"
                 else "test requires current shared six-ampere authority and no pending work"
             )
-        lease = charging._start_lease(identifier, action, revision)
-        j.starts.admit(lease, action, startup, duration)
+        schedule_cutoff = None
+        if schedule is not None:
+            remaining, schedule_cutoff = c.local_schedule.sample_cutoff(schedule)
+            startup = min(startup, remaining)
+            if startup <= 0:
+                raise DeniedError("the scheduled Start window closed before admission")
+        lease = charging._start_lease(identifier, action, revision, schedule=schedule, startup=startup)
+        if schedule is not None and (not lease.normal or lease.owner_start_tag is None):
+            raise DeniedError("a local schedule requires its bounded owner Start authorization")
+        j.starts.admit(lease, action, startup, duration, schedule_cutoff=schedule_cutoff)
+        if schedule_cutoff is not None and schedule_cutoff.epoch is None:
+            c.local_schedule.process_deadline = identifier, schedule_cutoff.deadline
         charging._launch_start(lease)
         return c.requests.receipt(identifier)
 
@@ -1324,7 +1383,6 @@ class ControlDecisions:
             # The original request must still own a live lease.
             charging.lease is not lease
             or c.stopping
-            or monotonic() >= lease.deadline
             or c.requests.intent() != ControlIntent(lease.mode, lease.revision)
             # The same charger connection and commissioned scope must still be current.
             or g._charger_epoch != lease.epoch
@@ -1361,6 +1419,10 @@ class ControlDecisions:
             )
         ):
             raise DeniedError("managed test Start permission expired or was superseded")
+        if monotonic() >= lease.deadline and not c.local_schedule.cutoff_elapsed(lease):
+            raise DeniedError("managed test Start permission expired or was superseded")
+        # Reconnection can revoke charging while the initial hold still verifies zero on its own ticket.
+        c.local_schedule.require_lease(lease, finishing_initial_zero=stopping and lease.initial_zero_ticket is not None)
 
     # Bind only the exact initial hold for the admitted lease on the current Boot.
     def bind_initial_start_zero(self, lease: ChargeLease) -> None:
@@ -1412,7 +1474,12 @@ class ControlDecisions:
 
     # Use the failed reply's lease and actual recorded effects before settling Start.
     def settle_failed_start(
-        self, charging: ManagedCharging, lease: ChargeLease, error: Exception, effects: bool
+        self,
+        charging: ManagedCharging,
+        lease: ChargeLease,
+        error: Exception,
+        effects: bool,
+        result: OwnedStartResult | None,
     ) -> None:
         j = self.journal
         record = j.starts.load(wire=False, request_id=lease.identifier)
@@ -1445,7 +1512,19 @@ class ControlDecisions:
             charging.changed.set()
             j.starts.retire_refused()
         else:
-            charging.stop(lease, "start_not_confirmed", failure=cause)
+            c = charging.controller
+            cutoff = isinstance(error, ScheduleCutoffError) and (result is None or not result.remote_start_dispatched)
+            cloud_returned = isinstance(error, ScheduleCloudReturnedError)
+            charging.stop(
+                lease,
+                SCHEDULE_CUTOFF if cutoff else "start_not_confirmed",
+                failure=cause,
+                allow_schedule_return=(
+                    (cutoff or cloud_returned)
+                    and (result is None or result.failure is error)
+                    and c.local_schedule.verified_unsent_zero(lease, result)
+                ),
+            )
         charging.record_failure_diagnostic(cause)
 
     # The held listener consumes an existing receipt under verified zero and cannot authorize another Start.
@@ -1503,6 +1582,8 @@ class ControlDecisions:
     def restore_charging_request(self, charging: ManagedCharging) -> None:
         controller = charging.controller
         saved = charging.state()
+        if self.recovery.restore_owner_closure(charging, saved):
+            return
         if saved.get("state") in ACTIVE:
             with self.journal.atomic():
                 ownership = controller.requests.pause_ownership()
@@ -1521,9 +1602,15 @@ class ControlDecisions:
                     and receipt.get("stage") in ("issued", "accepted")
                 )
                 if not ownership.supersedes(saved.get("revision")):
-                    if not preserve:
-                        write_intent(self.journal, intent, "paused", coalesce=refused)
-                    self._claim_internal_pause(controller, "test", saved["id"])
+                    occurrence = (
+                        controller.local_schedule.due_owner_occurrence(saved["id"]) if intent.mode == "app" else None
+                    )
+                    if occurrence is not None:
+                        record_cutoff_pause(controller, occurrence, intent)
+                    else:
+                        if not preserve:
+                            write_intent(self.journal, intent, "paused", coalesce=refused)
+                        self._claim_internal_pause(controller, "test", saved["id"])
                 self.journal.starts.interrupted(saved, preserve)
         self.journal.starts.retire_refused()
 
@@ -1535,7 +1622,13 @@ class ControlDecisions:
 
     # Retire only the timed test's target, or the matching normal Start's own pending evidence.
     def expire_start(
-        self, charging: ManagedCharging, lease: ChargeLease, reason: str, failure: dict[str, Any] | None
+        self,
+        charging: ManagedCharging,
+        lease: ChargeLease,
+        reason: str,
+        failure: dict[str, Any] | None,
+        *,
+        allow_schedule_return: bool = False,
     ) -> bool:
         state = charging.state()
         if charging.lease is not lease or state.get("state") == "stopping":
@@ -1548,14 +1641,29 @@ class ControlDecisions:
             return False
         with j.atomic():
             intent = c.requests.intent()
+            # The lease timer can revoke the Start before the wire worker verifies its own zero.
+            if (
+                reason == "deadline"
+                and intent == ControlIntent("app", lease.revision)
+                and lease.mode == "app"
+                and state.get("start_rpc_accepted") is False
+                and c.local_schedule.cutoff_elapsed(lease)
+            ):
+                receipt = j.starts.receipt()
+                if receipt.get("request_id") != lease.identifier or receipt.get("stage") in ("prepared", "unsent"):
+                    reason = SCHEDULE_CUTOFF
             preserve = (
                 lease.normal
+                and (reason != SCHEDULE_CUTOFF or j.active() is not None)
                 and intent.mode == "app"
                 and intent.revision == lease.revision
                 and charging.state().get("independent_seen") is True
             )
             if intent.mode != "paused" and not preserve:
+                automatic_return = allow_schedule_return and intent == ControlIntent("app", lease.revision)
                 self._claim_test_pause(c, intent, lease.identifier)
+                if automatic_return:
+                    record_automatic_pause(j, c.requests.intent(), "local_charge")
             elif self.failed_start_zero_needed(charging, lease, reason, failure):
                 c.session.gateway.controls._claim(True)
             j.starts.expire(lease, reason, preserve, failure, target=target)
@@ -1636,6 +1744,13 @@ class ControlDecisions:
         # A replay can return its stored result, while a new Start must retain its original introduction.
         def check() -> None:
             gateway._require_epoch("charger", epoch)
+            tag = payload.get("idTag")
+            if (
+                isinstance(tag, str)
+                and gateway.local_schedule_blocks(tag, occurred.timestamp())
+                and not gateway.journal.known_start(payload)
+            ):
+                raise DeniedError("the owner already reserved this native schedule occurrence")
             if (
                 gateway.journal.phase.read().supervised
                 and (boot is None or gateway.boot_observation != boot)
@@ -2082,6 +2197,7 @@ class ControlDecisions:
         if lease.owner_start_tag is not None and not owner_tag_separate(initial, lease.owner_start_tag):
             raise DeniedError("the dedicated owner tag overlaps the charger's schedule")
         charging.guard(lease)
+        require_allowed(c.local_schedule.positive_decision(initial))
         if j.active() is not None:
             raise DeniedError("another session began before the Start's idle hold")
 
@@ -2205,11 +2321,8 @@ class ControlDecisions:
         def accepted() -> bool:
             if not protective:
                 return self.journal.outcomes.accepted_stop(local)
-            scope = self._protective_stop
-            return (
-                scope is not None
-                and scope[:3] == (local, self.control.boot(), self.control._revision)
-                and self.journal.outcomes.accepted_stop(local, ticket=scope[3])
+            return self._protective_stop_scope == (local, self.control.boot(), self.control._revision) and any(
+                self.journal.outcomes.accepted_stop(local, ticket=ticket) for ticket in self._protective_stop_tickets
             )
 
         return self.peer.decide(accepted, priority=CommandPriority.RESTRICT)
@@ -2334,7 +2447,7 @@ class ControlDecisions:
             local, boot, reuse=_StopReuse.INCLUDE_CURRENT_BOOT_UNANSWERED, session_only=True
         )
         if decision is StopDecision.ACCEPTED:
-            return StopPredecessors(accepted=outcomes.accepted_stop_attempt(local))
+            return StopPredecessors(local, accepted=outcomes.accepted_stop_attempt(local))
         if decision is StopDecision.WAIT_FOR_REPORT:
             return self._waiting_stop_predecessors(local, boot)
         return None
@@ -2367,6 +2480,7 @@ class ControlDecisions:
                     unidentified_shutdown_stop = True
         owner_wires = outcomes.unanswered_owner_stop_wires(local, boot, represented_requests=local_requests)
         return StopPredecessors(
+            local=local,
             local_requests=local_requests,
             owner_wires=tuple(dict.fromkeys((*owner_wires, *shutdown_wires))),
             vendor_mutations=vendor_mutations,
@@ -2379,25 +2493,8 @@ class ControlDecisions:
         session = outcomes.session(local)
         if session is None or not session.closed:
             raise DeniedError("cloud Stop lost its original open session")
-        if earlier.accepted is not None:
-            raise VendorStopAlreadyAnsweredError("Accepted")
-
-        # One acceptance settles this attempt. A refusal needs a reply from every represented wire.
-        def owner_status(wires: tuple[OwnerWire, ...]) -> TransactionReplyStatus | None:
-            replies = {wire.reply for wire in wires if wire.action == "RemoteStopTransaction" and wire.local == local}
-            if "Accepted" in replies:
-                return "Accepted"
-            return "Rejected" if replies == {"Rejected"} else None
-
-        replies = [
-            *(owner_status(outcomes.owner_wires("request", request)) for request in earlier.local_requests),
-            *(owner_status(outcomes.owner_wires("wire", wire)) for wire in earlier.owner_wires),
-            *(outcomes.status(mutation) for mutation in earlier.vendor_mutations),
-        ]
-        if "Accepted" in replies:
-            raise VendorStopAlreadyAnsweredError("Accepted")
-        if replies and not earlier.unidentified_shutdown_stop and all(status == "Rejected" for status in replies):
-            raise VendorStopAlreadyAnsweredError("Rejected")
+        if (reply := predecessor_stop_reply(outcomes, local, earlier)) is not None:
+            raise VendorStopAlreadyAnsweredError(reply)
         raise RecoveryRequiredError("cloud Stop awaits the charger's original reply")
 
     # Additional reuse requires verified zero for this session.
@@ -2443,7 +2540,19 @@ class ControlDecisions:
         if self._stop_send_decision(local, boot, protective=protective, reuse=reuse) is not StopDecision.SEND:
             return False
         if protective:
-            self._protective_stop = local, boot, self.control._revision, ticket
+            scope = (local, boot, self.control._revision)
+            windows = frozenset(self.peer.reply_windows())
+            # A preceding acceptance has already been checked above. Keep earlier tickets only while
+            # their exact replies can still arrive under this same protection.
+            self._protective_stop_tickets = {
+                prior
+                for prior in self._protective_stop_tickets
+                if scope == self._protective_stop_scope
+                and windows
+                and any(wire.wire in windows for wire in self.journal.outcomes.owner_wires("ticket", prior))
+            }
+            self._protective_stop_tickets.add(ticket)
+            self._protective_stop_scope = scope
         return True
 
     # Use the same predecessors at admission and when reconsidering an unbound request at the wire.
@@ -2551,6 +2660,9 @@ class ControlDecisions:
         requests: ManagedRequests | None,
     ) -> Frame:
         connection, local = current_control_scope(gateway), self.journal.active()
+        scheduled = scheduled_cutoff_target(self.journal)
+        if scheduled is not None and local not in (None, scheduled):
+            raise RecoveryRequiredError("the scheduled cutoff cannot Stop a replacement session")
         intent, request = None, None
         if requests is not None:
             try:
@@ -2573,6 +2685,8 @@ class ControlDecisions:
                 gateway.retiring()
                 or not control_scope_matches(gateway, connection)
                 or self.journal.active() not in (None, local)
+                or (current_target := scheduled_cutoff_target(self.journal)) is not None
+                and local not in (None, current_target)
                 or intent is not None
                 and requests is not None
                 and requests.intent() != intent
@@ -2823,13 +2937,21 @@ class ControlDecisions:
             except RecoveryRequiredError:
                 pass  # Unknown Start and lifecycle facts remain authoritative even at fresh native zero.
             else:
-                with j.atomic():
-                    c.require_paused(native)
-                    require_settled_debt(c)
-                    for record in records:
-                        complete_record(c, record)
-                    if internal:
-                        g.controls._complete(j.get("control")["ticket"], uncertain=False)
+                try:
+                    with j.atomic():
+                        c.require_paused(native)
+                        require_settled_debt(c)
+                        for record in records:
+                            complete_record(c, record)
+                        if internal:
+                            g.controls._complete(j.get("control")["ticket"], uncertain=False)
+                            intent = c.requests.intent()
+                            if c.local_schedule.cutoff_pause_unsent(intent):
+                                record_automatic_pause(j, intent, "local_charge")
+                except sqlite3.Error as error:
+                    if j.db.in_transaction:
+                        raise
+                    raise RecoveryRequiredError("verified Pause settlement awaits journal storage") from error
                 if any(isinstance(record, RetirementCandidate) for record in records):
                     j.starts.set_lease(None)
                     c.charging.changed.set()
@@ -2926,7 +3048,7 @@ class ControlDecisions:
                 return native.still_drawing(sample, sequence) and native.commissioned_binding_matches(sample)
 
             if not ceiling_failed and not station_flowing():
-                return StopProof(require_scope)
+                return StopProof(require_scope, station_flowing)
             native.require_known_session(sample)
 
             # Recheck the independent session proof before sending Stop without a confirmed zero.
@@ -2950,6 +3072,7 @@ class ControlDecisions:
                 on_claim=bind,
                 owner=("shutdown", attempt, local, connection),
                 priority=CommandPriority.SHUTDOWN,
+                stop_zero=native,
             )
         except StopReplyUnconfirmedError:
             # The independent final checks may still establish actual closure and an owned physical zero.

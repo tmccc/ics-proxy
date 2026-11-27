@@ -14,6 +14,11 @@ from tools.offline_validate import network_guard
 
 sys.addaudithook(network_guard)
 
+CLOSURE_CHECKPOINTS = {
+    "after-native-first-stop-checkpoint": "retained_session_stop_native_first_closures",
+    "after-verified-stop-closure-checkpoint": "retained_session_stop_closures",
+}
+
 
 class Gate:
     """An exact request-owned SQL boundary can freeze this process without running graceful engine cleanup."""
@@ -156,7 +161,23 @@ class ObservedConnection(sqlite3.Connection):
     # Post-COMMIT means execute actually returned; SQLite's pre-statement trace alone cannot establish durability.
     def execute(self, sql, parameters=(), /):
         self.checkpoint(sql, parameters, True)
-        result = super().execute(sql, parameters)
+        phase = Gate.phase
+        checkpoint = CLOSURE_CHECKPOINTS.get(phase)
+        closure_checkpoint = (
+            checkpoint is not None
+            and not Gate.fired
+            and sql.startswith("INSERT OR REPLACE INTO meta")
+            and parameters[:1] == (checkpoint,)
+            and Gate.identifier in json.loads(parameters[1])
+        )
+        try:
+            result = super().execute(sql, parameters)
+        except sqlite3.Error:
+            if closure_checkpoint:
+                Gate.freeze(self, phase)
+            raise
+        if closure_checkpoint:
+            Gate.freeze(self, phase)
         self.checkpoint(sql, parameters, False)
         return result
 

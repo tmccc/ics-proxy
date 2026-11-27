@@ -53,7 +53,7 @@ def combined_candidate(j: Journal, snapshot: dict[str, Any]) -> dict[str, Any]:
         or pair[1]["local"] != local
         or pair[1]["payload"] != transaction["stop"]
         or pair[1]["state"] != "queued"
-        or any(row["local"] != local and row["vendor"] is None for row in snapshot["transactions"])
+        or any(row["local"] != local for row in j.unmapped_cloud_sessions())
         or any(row["stop"] is None for row in snapshot["transactions"])
         or any(
             row["token"] != head["token"]

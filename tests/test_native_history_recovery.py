@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from ics_proxy_core.engine.delivery_reply import DeliveryReply
 from ics_proxy_core.engine.gateway import decode
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_current import capability_value
@@ -1272,6 +1273,7 @@ async def test_cold_history_acknowledgement_keeps_queued_exact_stop(
         ("StopTransaction", "error"),
         ("StopTransaction", "bad-info"),
         ("StartTransaction", "accepted"),
+        ("StartTransaction", "late-accepted"),
         ("StartTransaction", "active"),
         ("StartTransaction", "denied"),
         ("StatusNotification", "accepted"),
@@ -1283,7 +1285,8 @@ async def test_cold_history_omission_with_saved_delivery_reply(
     tmp_path, tls, unused_tcp_port, monkeypatch, capsys, action, response
 ):
     originals = closed_records()
-    settles = response == "accepted"
+    late = response == "late-accepted"
+    settles = response in ("accepted", "late-accepted")
     async with ready(
         tmp_path, tls, unused_tcp_port, monkeypatch, initial_history=originals, bench_type=StorageBench, cli_route=True
     ) as b:
@@ -1295,6 +1298,8 @@ async def test_cold_history_omission_with_saved_delivery_reply(
             rig.bench.start_replies = ["Blocked"]
         if action == "StatusNotification" and response == "bad-info":
             rig.bench.reply_authorization[action] = {"status": "invalid"}
+        if late:
+            b.session.gateway.vendor.timeout = 1.5
         held, local = await enqueue(b, action, 0, close_start=response != "active")
         if action == "MeterValues":
             await close_local(b, local, 3)
@@ -1314,9 +1319,22 @@ async def test_cold_history_omission_with_saved_delivery_reply(
             )
         else:
             fault.install(journal.db)
+        if late:
+            await until(lambda: journal.fault.read({}).get("late_delivery_token") == held.token)
         held.release.set()
+
+        # Verify the exact held reply through the normal or late-delivery recovery record.
+        def check_saved_reply(current: Journal) -> None:
+            if not late:
+                assert_retained(current, held, saved=True)
+                return
+            head = current.next_delivery()
+            assert head is not None and (head.token, head.state) == (held.token, "ambiguous")
+            reply = DeliveryReply.restore(current, head)
+            assert reply is not None and reply.answer == held.answer
+
         await until(lambda: b.session.runtime.status.delivery_blocked_cause == "storage")
-        assert_retained(journal, held, saved=True)
+        check_saved_reply(journal)
         prior_fault = journal.fault.read({})
         await b.controller.charging.close()
         await crash(b.session)
@@ -1332,7 +1350,7 @@ async def test_cold_history_omission_with_saved_delivery_reply(
             with pytest.raises(MissingOriginalHistoryError):
                 await refused.start()
             assert not refused.started and refused.journal.fault.read({}) == prior_fault
-            assert_retained(refused.journal, held, saved=True)
+            check_saved_reply(refused.journal)
             assert before == (rig.bench.device_calls, rig.bench.calls)
             if not settles:
                 assert refused.journal.get("managed_stop_reply_rejection") is None
@@ -1351,9 +1369,10 @@ async def test_cold_history_omission_with_saved_delivery_reply(
             with pytest.raises(MissingOriginalHistoryError):
                 await refused.start()
             assert not refused.started and before == (rig.bench.device_calls, rig.bench.calls)
-            assert refused.journal.db.execute(
-                "SELECT 1 FROM delivery_replies WHERE token=?", (held.token,)
-            ).fetchone() is None
+            assert (
+                refused.journal.db.execute("SELECT 1 FROM delivery_replies WHERE token=?", (held.token,)).fetchone()
+                is None
+            )
             tail = refused.journal.next_delivery()
             if action in ("StartTransaction", "MeterValues"):
                 assert tail is not None

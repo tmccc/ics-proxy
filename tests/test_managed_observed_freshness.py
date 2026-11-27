@@ -65,6 +65,40 @@ async def test_charger_lifecycle_change_retires_older_live_measurement(
             await actual_stop(b, local)
 
 
+# Intent: a newer native audit retires older displayed power even when the same session and wall time remain.
+# Why: a newer observation can supersede the displayed sample even when both audits share a timestamp.
+async def test_auxiliary_audit_retires_older_displayed_power(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
+        c, journal = b.controller, b.session.journal
+        local = await positive_flow(b, "daily")
+        published = dict(await healthy(c), running=True, certificate_remaining_seconds=86400)
+        current = refresh_for_read(c, published)
+        assert current["power_w"] == 1440 and current["charging_session_open"] is True
+        previous = c.current_native_sample()
+        observed_at = published["native_observed_at"]
+        b.rig.peer.paused = True
+        b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+
+        # Hold wall time constant across the two real audits so only the sequence distinguishes them.
+        with monkeypatch.context() as clock:
+            clock.setattr(trial_evidence, "time", SimpleNamespace(time=lambda: observed_at, monotonic=time.monotonic))
+            newer = await c.native.read(closing_local=local, stop_only=True)
+        assert newer.physical.observed_at == observed_at and newer.physical.power_w == 0
+        assert newer.physical.native_transaction_id == journal.active() == local
+        assert c.current_native_sample() is previous
+        assert c.session_stop.target() == current["stop_target"] is not None
+
+        stale = refresh_for_read(c, published)
+        assert stale["power_w"] is None and stale["charging_session_open"] is None
+        assert stale["native_age_seconds"] is None and stale["stop_target"] is None
+
+        fresh = refresh_for_read(c, dict(await healthy(c), running=True, certificate_remaining_seconds=86400))
+        assert fresh["power_w"] == 0 and fresh["charging_session_open"] is True
+        assert fresh["stop_target"] == current["stop_target"]
+        c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+        await actual_stop(b, local)
+
+
 # Intent: record a genuine Stop when the optional tag cache cannot be read.
 # Why: an optional authorization detail must never keep a closed session open in the journal.
 async def test_stop_records_closure_when_tag_cache_read_fails(tmp_path, tls, unused_tcp_port, monkeypatch):
@@ -448,7 +482,8 @@ async def test_expired_session_stop_sample_stays_expired_after_wall_rebase(
 
         with monkeypatch.context() as reader:
             reader.setattr(c.native, "observe", slow_observation)
-            await c.native.read()
+            with pytest.raises(StaleEvidenceError):
+                await c.native.read()
             assert not c.native.session_stop_verified(local)
         await c.native.read()
         assert c.native.session_stop_verified(local)

@@ -13,10 +13,16 @@ from typing import TYPE_CHECKING, Any
 
 from .managed_diagnostics import snapshot as diagnostic_snapshot
 from .managed_facts import ManagedFacts
-from .managed_intent import OFFLINE_PAUSE
+from .managed_intent import OFFLINE_PAUSE, automatic_pause_cause
 from .managed_release_wait import awaiting_known_stops, awaiting_observations
 from .native_faults import STATION_CEILING_LOST
-from .native_history import latest_completion_available
+from .native_history import (
+    CompletionOrder,
+    NativeHistoryReading,
+    completion_agrees,
+    completion_order,
+    latest_completion_available,
+)
 from .store import Journal
 from .supervision import ControlProof, HealthVerdict, PollStatus
 
@@ -46,6 +52,7 @@ def render_poll(
         return observed_status(c, poll_base(c), native, verdict)
     except sqlite3.Error:
         c.status_authority = None
+        c.status_native_sequence = None
         c.status_latest_closed = None
         c.status_vendor_epoch = None
         return {
@@ -75,7 +82,11 @@ def finite_number(value: object) -> float | None:
 
 # A fresh file or API response must still prove the applicable app or intentional zero-hold authority.
 def health_snapshot(
-    value: dict[str, Any], now: float | None = None, *, delivery_blocked: bool = False
+    value: dict[str, Any],
+    now: float | None = None,
+    *,
+    delivery_blocked: bool = False,
+    cloud_status_current: bool = True,
 ) -> dict[str, Any]:
     current = time.time() if now is None else now
     checked, native = finite_number(value.get("checked_at")), finite_number(value.get("native_observed_at"))
@@ -83,6 +94,8 @@ def health_snapshot(
     native_age = current - native if native is not None else math.inf
     remaining = finite_number(value.get("certificate_remaining_seconds"))
     certificate_valid = remaining is not None and remaining - max(age, 0) > 1800
+    # Older reports omitted this field. An explicit null means the current command evidence could not be read.
+    reconciliation = value.get("operator_reconciliation_required", False)
     paused = value.get("desired_control") == "paused"
     selected = finite_number(value.get("requested_current_a", 6))
     native_ceiling = 32 if value.get("current_capability") is True else 6
@@ -109,12 +122,13 @@ def health_snapshot(
         and value.get("preservation_failed") is False
         and not delivery_blocked
         and value.get("cloud_start_pending") is not True
-        and value.get("operator_reconciliation_required") is not True
+        and reconciliation is False
         and selected is not None
         and 6 <= selected <= native_ceiling
         and value.get("native_limit_a") == native_ceiling
         and certificate_valid
     )
+    cloud_registered = value.get("cloud_connected") is True
     blockers = [
         reason
         for passed, reason in (
@@ -124,18 +138,20 @@ def health_snapshot(
             (value.get("charger_connected") is not False, "charger_disconnected"),
             (value.get("boot_verified") is not False, "boot_unverified"),
             (value.get("cloud_start_pending") is not True, "cloud_start_pending"),
-            (value.get("operator_reconciliation_required") is not True, "command_outcome_unknown"),
+            (reconciliation is not True, "command_outcome_unknown"),
+            (type(reconciliation) is bool, "status_unavailable"),
             (bool(authority), "control_verification_pending"),
             (certificate_valid, "certificate_validity_insufficient"),
             (value.get("cloud_connected") is not False, "cloud_disconnected"),
+            (not cloud_registered or cloud_status_current, "cloud_status_pending"),
         )
         if not passed
     ]
-    if not local_okay and not any(reason != "cloud_disconnected" for reason in blockers):
+    if not local_okay and not any(reason not in ("cloud_disconnected", "cloud_status_pending") for reason in blockers):
         blockers.append("local_health_unverified")
     return {
         **value,
-        "healthy": local_okay and value.get("cloud_connected") is True,
+        "healthy": local_okay and cloud_registered and cloud_status_current,
         "local_healthy": local_okay,
         "status_age_seconds": age if math.isfinite(age) else None,
         "native_age_seconds": native_age if math.isfinite(native_age) else None,
@@ -167,82 +183,61 @@ def session_history(journal: Journal) -> list[dict[str, Any]]:
 
 @dataclass(frozen=True)
 class ChargerHistorySummary:
-    """Redacted history, valid Stop times by transaction, and the last session's energy."""
+    """Redacted history, valid Stop and Start times by transaction, and the last session's energy."""
 
     sessions: list[dict[str, Any]]
     complete: bool
-    completed: dict[int, int]
+    completed: dict[int, tuple[int, int]]
     last_energy: float | None
     latest_completion_known: bool
 
 
-# Use the known transaction order for managed charges, even when the charger clock moves backwards.
+# Summarize redacted history and expose the latest energy only when its completion is known.
 def summarize_charger_history(
-    records: tuple[dict[str, Any], ...], latest_closed: int | None = None
+    records: tuple[dict[str, Any], ...], latest_closed: int | None = None, *, as_of: float | None = None
 ) -> ChargerHistorySummary:
     summaries: list[dict[str, Any]] = []
-    completed: dict[int, int] = {}
-    energy: dict[int, float] = {}
-    latest_times = (0, 0)
+    completed: dict[int, tuple[int, int]] = {}
+    latest_order: CompletionOrder = (0, 0)
     latest_energy: float | None = None
-    newest_unreadable = 0.0
-    unreadable_recent = False
-    latest_time = time.time() + 30
+    complete = True
+    checked_at = time.time() if as_of is None else as_of
     for record in records:
-        identifier = record.get("transactionId")
-        if identifier == -1:
+        # Failed unassigned attempts are retained separately and never constitute a session.
+        raw_identifier = record.get("transactionId")
+        if type(raw_identifier) is int and raw_identifier == -1:
             continue
-        raw_start, stop = record.get("startTime"), record.get("stopTime", 0)
-        start = raw_start if type(raw_start) is int else 0
-        first, last = record.get("meterStart"), record.get("meterStop", 0)
-        start_valid = 0 < start <= latest_time
-        stop_valid = type(stop) is int and 0 <= stop <= latest_time
-        if (
-            not start_valid
-            or not stop_valid
-            or type(identifier) is not int
-            or type(first) is not int
-            or type(last) is not int
-            or not 0 <= first <= 10**12
-            or not 0 <= last <= 10**12
-            or stop != 0
-            and (stop < start or last < first)
-        ):
-            # A row with a reversed clock can still threaten the latest completion through its newer Start time.
-            newest_unreadable = max(
-                newest_unreadable, start if start_valid else math.inf, stop if stop_valid else math.inf
-            )
-            if latest_closed is not None and (type(identifier) is not int or identifier >= latest_closed):
-                unreadable_recent = True
-            continue
-        if stop:
-            completed[identifier] = stop
-            energy[identifier] = (last - first) / 1000
-            times = stop, start
-            if times > latest_times:
-                latest_times, latest_energy = times, energy[identifier]
-            elif times == latest_times and latest_energy != energy[identifier]:
+        reading = NativeHistoryReading.read(record, checked_at)
+        identifier, start, stop = reading.identifier, reading.start, reading.stop
+        energy = reading.energy
+        if stop != 0:
+            order = completion_order(identifier, start, stop, latest_closed)
+            if order > latest_order:
+                latest_order, latest_energy = order, energy
+            elif not completion_agrees(latest_order, latest_energy, order, energy):
                 latest_energy = None
+        if not reading.valid:
+            complete = False
+            continue
+        assert identifier is not None and start is not None and stop is not None
+        if stop:
+            completed[identifier] = stop, start
         summaries.append(
             {
                 "started_at": datetime.fromtimestamp(start, UTC).isoformat(),
                 "stopped_at": datetime.fromtimestamp(stop, UTC).isoformat() if stop else None,
-                "energy_kwh": energy[identifier] if stop else None,
+                "energy_kwh": energy,
             }
         )
-    complete = newest_unreadable == 0
-    if latest_closed is None:
-        # Coincident timestamps can establish energy only when the matching records agree.
-        latest_known = complete if not completed else latest_energy is not None and latest_times[0] > newest_unreadable
-    else:
-        # The journal can receive the Stop before native history includes that same assigned ID.
-        latest_energy = energy.get(latest_closed)
-        latest_known = not unreadable_recent and max(completed, default=None) == latest_closed
+    latest_known = latest_energy is not None or (latest_closed is None and latest_order == (0, 0))
+    # The journal can receive the Stop before native history includes that same assigned ID.
+    if latest_closed is not None and latest_order[0] != latest_closed:
+        latest_known = False
     return ChargerHistorySummary(
         sorted(summaries, key=lambda r: r["started_at"], reverse=True)[:20],
         complete,
         completed,
-        latest_energy,
+        latest_energy if latest_known else None,
         latest_known,
     )
 
@@ -300,6 +295,7 @@ def poll_status(
 ) -> dict[str, Any]:
     value = poll_base(c, pending=pending) if base is None else dict(base)
     gateway = c.session.gateway
+    c.status_native_sequence = None
     c.status_vendor_epoch = gateway._vendor_epoch
     value["cloud_connected"] = c.session.runtime.vendor_registered
     value["state"] = result.state
@@ -342,7 +338,8 @@ def observed_status(
             history_read = True
     except sqlite3.Error:
         closed, archive, history_read = None, None, False
-    history = summarize_charger_history(native.history, closed)
+    history_checked_at = time.time()
+    history = summarize_charger_history(native.history, closed, as_of=history_checked_at)
     records_missing = bool(archive and (archive.get("missing_records") or archive.get("missing_attempts")))
     # A previously completed charge can come back damaged or open under the same transaction ID.
     check_archive = archive and (
@@ -353,7 +350,12 @@ def observed_status(
     latest_known = (
         history_read
         and history.latest_completion_known
-        and (not check_archive or latest_completion_available(j, history.completed, closed))
+        and (
+            not check_archive
+            or latest_completion_available(
+                j, history.completed, closed, latest_energy=history.last_energy, as_of=history_checked_at
+            )
+        )
     )
     try:
         can_set_current = c.current.available(native)
@@ -364,6 +366,7 @@ def observed_status(
         can_set_current = test_start_ready = normal_start_ready = False
     c.status_latest_closed = closed
     c.status_authority = c.authority()
+    c.status_native_sequence = c.native.last_resolved_read
     c.status_vendor_epoch = g._vendor_epoch
     return {
         **base,
@@ -533,8 +536,9 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         result["charger_connected"] = False
     if not g.current_boot_seen(g._charger_epoch):
         result["boot_verified"] = False
-    if not c.session.runtime.vendor_registered or c.status_vendor_epoch != g._vendor_epoch:
-        result["cloud_connected"] = False
+    # Show today's registration immediately. Full health still requires a poll on this vendor connection.
+    cloud_status_current = result.get("cloud_connected") is True and c.status_vendor_epoch == g._vendor_epoch
+    result["cloud_connected"] = c.session.runtime.vendor_registered
     current, observed = c.authority(), c.status_authority
     current_worker, start_worker = c.current.worker, c.charging.worker
     pending_fault = None
@@ -546,7 +550,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         pending_fault = "owner_release_pending"
     pause_pending = c.requests.pending_pause()
     station_lost = c.session.book.station_ceiling_lost()
-    # A pending Pause may show the last sample for the same session, but a new lifecycle needs a new reading.
+    # A pending Pause can retain the published sample until a newer audit or lifecycle supersedes it.
     native = c.latest_native
     sample_available = (
         result.get("charger_connected") is True
@@ -557,6 +561,7 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         and native is not None
         and native.is_fresh(15)
         and c.native.last_verified_at != 0
+        and c.status_native_sequence == c.native.last_resolved_read
         and pending_fault is None
         and not station_lost
     )
@@ -579,8 +584,8 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
             test_charge=None,
         )
     result.setdefault("last_session_energy_kwh", None)
-    uncertain = result.get("operator_reconciliation_required") is True
-    supervising = not c.stopping and not j.fault.latched() and not station_lost and not uncertain
+    command_evidence_clear = result["operator_reconciliation_required"] is False
+    supervising = not c.stopping and not j.fault.latched() and not station_lost and command_evidence_clear
     scope_current = same_session and current == observed and supervising
     intent_current = result.get("desired_control") == intent.mode and result.get("control_revision") == intent.revision
     if not (scope_current and intent_current):
@@ -626,11 +631,20 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         owner_control_enabled=proof.shared,
         local_hold_verified=proof.hold_verified,
     )
-    if intent.mode == "paused" and (j.get(OFFLINE_PAUSE) is True or c.requests.offline_pause_current(intent)):
+    # Keep the cause of the current Pause separate from today's cloud connectivity.
+    automatic = intent.mode == "paused" and c.requests.offline_pause_current(intent)
+    pause_cause = automatic_pause_cause(j, intent) if automatic else None
+    if intent.mode == "paused" and (
+        j.get(OFFLINE_PAUSE) is True
+        or pause_cause == "cloud_connection_failed"
+        or (automatic and pause_cause is None and not c.session.runtime.vendor_registered)
+    ):
         result["pause_reason"] = "cloud_connection_failed"
     else:
         result.pop("pause_reason", None)
-    result = health_snapshot(result, delivery_blocked=runtime.delivery_blocked)
+    result = health_snapshot(
+        result, delivery_blocked=runtime.delivery_blocked, cloud_status_current=cloud_status_current
+    )
     fresh = all(
         age is not None and 0 <= age <= 15 for age in (result["status_age_seconds"], result["native_age_seconds"])
     )

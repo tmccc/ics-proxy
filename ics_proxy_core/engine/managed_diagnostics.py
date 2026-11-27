@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from .managed_intent import unfinished_owner_requests
 from .managed_native_repair import AUDITS, REVOCATIONS, repair_pending, repair_revoked, repair_sources
 from .security import SecurityError
+from .stop_settlement import STOP_SESSION, resolve_joined_stop_acceptance, stop_receipt_rejected
 from .store import RecoveryRequiredError, fingerprint
 
 if TYPE_CHECKING:
@@ -148,15 +149,23 @@ def pending_commands(c: ManagedController, now: float) -> tuple[list[dict[str, A
         )
     ]
     commands = []
+    journal = c.session.journal
+    outcomes = journal.outcomes
     for row in rows[:5]:
-        command = c.session.journal.outcomes.owner(row["id"], include_wires=True, row=row)
+        command = outcomes.owner(row["id"], include_wires=True, row=row)
         if command is None:
             raise ValueError("diagnostic receipt metadata is unavailable")
         accepted = timestamp(command.result.get("accepted_at"))
         age = now - accepted if accepted is not None and accepted <= now else None
-        confirmation = (
-            "reply_received" if command.reply_known else "unknown" if command.state == "uncertain" else "pending"
+        reply_known = command.reply_known or (
+            command.action == STOP_SESSION
+            and (
+                resolve_joined_stop_acceptance(outcomes, command.identifier, command.result.get("_session_stop"))
+                is not None
+                or stop_receipt_rejected(journal, command.identifier)
+            )
         )
+        confirmation = "reply_received" if reply_known else "unknown" if command.state == "uncertain" else "pending"
         commands.append(
             {
                 "action": command.action if command.action in ACTIONS else "other",
@@ -178,12 +187,27 @@ def snapshot(c: ManagedController, status: dict[str, Any], now: float | None = N
         fault, blockers, recovery = fault_summary(c)
         commands, count = pending_commands(c, current)
         gateway, journal = c.session.gateway, c.session.journal
+        reconciliation = status.get("operator_reconciliation_required", False)
+        owner_closure_pending = False
+        if (
+            fault is None
+            and status.get("state") == "reconciling"
+            and status.get("fault") is None
+            and status.get("charger_connected") is True
+            and status.get("boot_verified") is True
+        ):
+            owner_recovery = gateway.controls.decisions.recovery
+            local = owner_recovery.held_owner_closure(c)
+            if local is None and owner_recovery.held_owner_stop_pending(c):
+                local = journal.active()
+            owner_closure_pending = local is not None and c.native.owner_closure_observed(local, current)
         for present, reason in (
             (status.get("fault") == "native_observation_unavailable", "native_observation_unavailable"),
             (status.get("fault") == "current_update_pending", "current_update_pending"),
             (status.get("fault") == "start_operation_pending", "start_operation_pending"),
             (gateway.authorisation.pending(), "cloud_start_pending"),
             (status.get("charger_connected") is False, "charger_disconnected"),
+            (owner_closure_pending, "owner_session_closure_pending"),
             (status.get("cloud_connected") is False, "cloud_disconnected"),
             (status.get("boot_verified") is False, "boot_unverified"),
             (
@@ -191,7 +215,8 @@ def snapshot(c: ManagedController, status: dict[str, Any], now: float | None = N
                 "pause_verification_pending",
             ),
             (bool(status.get("pending_lifecycle_events")), "lifecycle_acknowledgement_pending"),
-            (bool(status.get("operator_reconciliation_required")), "command_outcome_unknown"),
+            (reconciliation is True, "command_outcome_unknown"),
+            (type(reconciliation) is not bool, "status_unavailable"),
             (bool(status.get("vendor_reply_storage_pending")), "vendor_reply_storage_pending"),
             (c.session.runtime.status.delivery_blocked_cause == "storage", "delivery_storage_pending"),
             (

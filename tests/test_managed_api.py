@@ -19,9 +19,13 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import InvalidStatus
 
 from ics_proxy_core.engine import managed_api
+from ics_proxy_core.engine.gateway import decode
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings
+from ics_proxy_core.engine.managed_diagnostics import snapshot
 from ics_proxy_core.engine.store import RecoveryRequiredError
+from ics_proxy_core.engine.trial_session import ManagedRefusal
+from tests.charge_rig import actual_stop, positive_flow, ready
 from tests.current_rig import adjustable
 from tests.managed_rig import healthy, introduced, managed_bench, managed_session, starts
 from tests.management_peer import TOKEN, call
@@ -35,11 +39,22 @@ async def test_management_pause_overtakes_queued_current(tmp_path, tls, unused_t
     async with adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
         c = b.controller
         before = list(b.rig.bench.received_limits)
-        api = ManagementServer(ManagementSettings(19001, tmp_path / "unused", TOKEN), c, lambda: {})
+        published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
+        api = ManagementServer(ManagementSettings(19001, tmp_path / "unused", TOKEN), c, lambda: published)
         current, pause = uuid.uuid4().hex, uuid.uuid4().hex
         revision = c.requests.intent().revision
+        status = api.read_only(uuid.uuid4().hex, "status")["result"]
+        owner = status["management_owner"]
+        assert status["canvas_owner"] == owner
+        another_owner = ("1" if owner[0] != "1" else "2") + owner[1:]
+        selection = {"id": current, "command": "set_current", "revision": revision, "current_a": 16}
+        with pytest.raises(managed_api.UnavailableError, match="management owner has changed"):
+            await api.dispatch(json.dumps({**selection, "management_owner": another_owner}))
+        with pytest.raises(managed_api.SecurityError, match="management owner is invalid"):
+            await api.dispatch(json.dumps({**selection, "management_owner": owner, "canvas_owner": another_owner}))
+        assert c.requests.receipt(current)["state"] == "not_found"
         ordinary = asyncio.create_task(
-            api.dispatch(json.dumps({"id": current, "command": "set_current", "revision": revision, "current_a": 16})),
+            api.dispatch(json.dumps({**selection, "management_owner": owner})),
             eager_start=True,
         )
         restrictive = asyncio.create_task(
@@ -131,12 +146,14 @@ async def test_management_connections_leave_pause_available(tmp_path, tls, unuse
                 assert status["management_owner"] == status["canvas_owner"]
                 if mode == "idle":
                     refused_id = uuid.uuid4().hex
+                    owner = status["management_owner"]
+                    other_owner = ("1" if owner[0] != "1" else "2") + owner[1:]
                     refused = await call(
                         dashboard,
                         "pause",
                         id=refused_id,
                         revision=c.requests.intent().revision,
-                        management_owner="0" * 64,
+                        management_owner=other_owner,
                     )
                     assert refused == {"ok": False, "error": "not_ready"}
                     assert c.requests.receipt(refused_id)["state"] == "not_found"
@@ -262,6 +279,154 @@ async def test_real_management_socket_reads_and_idempotent_pause(
                     assert controller.requests.intent().mode == "paused"
             finally:
                 await api.close()
+
+
+# Intent: saved Current and Stop receipts remain replayable while a strict introduction refusal awaits storage.
+# Why: an exact retry reads the original result and can never authorize a new charger write.
+async def test_management_replays_bound_receipts_during_introduction_refusal(
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch
+):
+    async with adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+        c, bench = b.controller, b.rig.bench
+        published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
+        port = unused_tcp_port_factory()
+        api = ManagementServer(ManagementSettings(port, tmp_path / "unused-token", TOKEN), c, lambda: published)
+        await api.start()
+        try:
+            async with connect(
+                f"ws://127.0.0.1:{port}/management",
+                additional_headers={"Authorization": "Bearer " + TOKEN},
+                subprotocols=["ics-proxy.v1"],
+            ) as socket:
+                current = {"id": uuid.uuid4().hex, "revision": c.requests.intent().revision, "current_a": 16}
+                assert (await call(socket, "set_current", **current))["ok"]
+                await c.current.settle()
+                assert (await call(socket, "receipt", request_id=current["id"]))["result"]["state"] == "completed"
+
+                local = await positive_flow(b, "daily")
+                await healthy(c)
+                target = c.session_stop.target()
+                assert target is not None
+                stop = {"id": uuid.uuid4().hex, "revision": c.requests.intent().revision, "target": target}
+                assert (await call(socket, "stop_session", **stop))["ok"]
+                await actual_stop(b, local)
+                assert (await call(socket, "receipt", request_id=stop["id"]))["result"]["state"] == "completed"
+
+                before = list(bench.device_calls)
+                other_target = ("a" if target[0] != "a" else "b") + target[1:]
+                pending = ManagedRefusal("native_authority_or_preservation_failed", {})
+                with monkeypatch.context() as refusal:
+                    refusal.setattr(b.session, "_introduction_refusal", pending)
+                    for command, request, conflict in (
+                        ("set_current", current, {"current_a": 20}),
+                        ("stop_session", stop, {"target": other_target}),
+                    ):
+                        saved = (await call(socket, "receipt", request_id=request["id"]))["result"]
+                        expected = {"id": request["id"], "ok": True, "result": saved}
+                        assert await call(socket, command, **request) == expected
+                        assert await call(socket, command, **(request | conflict)) == {
+                            "ok": False,
+                            "error": "invalid_request",
+                        }
+                    fresh = uuid.uuid4().hex
+                    assert await call(socket, "set_current", id=fresh, revision=stop["revision"], current_a=20) == {
+                        "ok": False,
+                        "error": "not_ready",
+                    }
+                    assert (await call(socket, "receipt", request_id=fresh))["result"]["state"] == "not_found"
+                assert bench.device_calls == before
+        finally:
+            await api.close()
+
+
+# Intent: a status read cannot restore control hints when it cannot read the outcome of a forwarded command.
+# Why: a temporary journal read failure must never appear to resolve a live unanswered Stop.
+async def test_management_withholds_authority_when_vendor_command_evidence_cannot_be_read(
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch
+):
+    async with ready(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
+        c, g, j, bench = b.controller, b.session.gateway, b.session.journal, b.rig.bench
+        g.charger.timeout = 0.25
+        local = await positive_flow(b, "daily")
+        published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
+        published["diagnostics"] = snapshot(c, published)
+        send, delayed = b.charger.send, None
+
+        # Retain the real reply after the simulated charger answered the exact forwarded Stop.
+        async def delay_reply(raw):
+            nonlocal delayed
+            frame = decode(raw)
+            if frame[0] == 3 and any(
+                message[1] == frame[1] and message[2] == "RemoteStopTransaction" for message in bench.device_calls
+            ):
+                delayed = raw
+                return
+            await send(raw)
+
+        # Refuse only the real query's read of the command binding table.
+        def deny_scope(action, first, second, database, trigger):
+            return (
+                sqlite3.SQLITE_DENY
+                if action == sqlite3.SQLITE_READ and first == "vendor_command_scope"
+                else sqlite3.SQLITE_OK
+            )
+
+        monkeypatch.setattr(b.charger, "send", delay_reply)
+        port = unused_tcp_port_factory()
+        api = ManagementServer(ManagementSettings(port, tmp_path / "unused", TOKEN), c, lambda: published)
+        await api.start()
+        try:
+            async with connect(
+                f"ws://127.0.0.1:{port}/management",
+                additional_headers={"Authorization": "Bearer " + TOKEN},
+                subprotocols=["ics-proxy.v1"],
+                proxy=None,
+            ) as socket:
+                initial = (await call(socket, "status"))["result"]
+                assert initial["healthy"] and initial["stop_target"]
+                reply = await bench.cloud_call(
+                    "unanswered-stop", "RemoteStopTransaction", {"transactionId": j.vendor_id(local)}
+                )
+                assert reply[:3] == [4, "unanswered-stop", "InternalError"] and delayed is not None
+                uncertain = (await call(socket, "status"))["result"]
+                assert not uncertain["healthy"] and uncertain["operator_reconciliation_required"] is True
+                assert "command_outcome_unknown" in uncertain["diagnostics"]["blockers"]
+
+                j.db.set_authorizer(deny_scope)
+                try:
+                    unreadable = (await call(socket, "status"))["result"]
+                finally:
+                    j.db.set_authorizer(None)
+                for key in (
+                    "vendor_write_uncertain",
+                    "vendor_reply_storage_pending",
+                    "operator_reconciliation_required",
+                ):
+                    assert unreadable[key] is None
+                assert unreadable["state"] == "degraded" and unreadable["control_mode"] == "attention"
+                assert unreadable["stop_target"] is None and unreadable["can_pause"]
+                for key in (
+                    "healthy",
+                    "local_healthy",
+                    "owner_control_enabled",
+                    "can_start",
+                    "can_set_current",
+                    "can_return",
+                ):
+                    assert unreadable[key] is False
+                for blockers in (unreadable["health_blockers"], unreadable["diagnostics"]["blockers"]):
+                    assert "status_unavailable" in blockers and "command_outcome_unknown" not in blockers
+
+                readable = (await call(socket, "status"))["result"]
+                assert not readable["healthy"] and readable["operator_reconciliation_required"] is True
+                await send(delayed)
+                await until(lambda: not g.vendor_write_evidence().unresolved)
+                restored = (await call(socket, "status"))["result"]
+                assert restored["healthy"] and restored["operator_reconciliation_required"] is False
+                assert j.active() == local
+                assert sum(frame[2] == "RemoteStopTransaction" for frame in bench.device_calls) == 1
+        finally:
+            await api.close()
 
 
 # Intent: missing/wrong/duplicate credentials, browser origins and modified paths cannot reach command dispatch.

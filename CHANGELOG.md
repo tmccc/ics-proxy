@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Preserve exact Stop, Pause and closure evidence across delayed charger reports, temporary journal write
+  failures and proxy replacement.
+- Recheck charger evidence before restoring current or returning control to iCS. Preserve pending command
+  outcomes and saved acknowledgements through native history repair.
+- Keep Solar Display request feedback bound to the exact command across reconnects and reject stale controls.
+  Home Assistant uses generic session-control fields and accepts earlier automation fields.
+- Block new proxy-run overnight Starts until a charger-enforced cutoff is verified. Keep cutoff and recovery
+  for existing scheduled occurrences.
+
 ## 0.3.0-rc1
 
 - Rehearse rollback of exact standalone builds with a settled journal and a pre-upgrade backup.

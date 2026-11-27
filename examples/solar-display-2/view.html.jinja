@@ -31,15 +31,16 @@
 {% set watts = states('sensor.ics_proxy_power') | float(none) %}
 {% set mode = states('sensor.ics_proxy_control_mode') %}
 {% set healthy = is_state('binary_sensor.ics_proxy_problem', 'off') %}
-{% set session = states('binary_sensor.ics_proxy_session_open') %}
-{% set request = states('input_select.general_display_2_ics_request') %}
-{% set automation_enabled = is_state('automation.general_display_2_ics_charger_buttons', 'on') %}
-{% set request_available = automation_enabled and request in ['idle', 'starting', 'stopping', 'starting_timeout', 'stopping_timeout'] %}
-{% set busy = request in ['starting', 'stopping'] or state_attr('automation.general_display_2_ics_charger_buttons', 'current') | int(0) > 0 %}
-{% set start_revision = state_attr('binary_sensor.ics_proxy_session_open', 'control_revision') %}
-{% set start_ok = request_available and not busy and session == 'off' and start_revision is integer and 0 <= start_revision < 2**53 and state_attr('binary_sensor.ics_proxy_session_open', 'can_start') is sameas true %}
-{% set stop_target = state_attr('binary_sensor.ics_proxy_session_open', 'stop_target') %}
-{% set stop_ok = request_available and not busy and session == 'on' and stop_target is string and stop_target | length == 64 %}
+{% set control = states('sensor.general_display_2_ics_control').split(':') %}
+{% set request_available = control | length == 4 and control[0] == 'v2'
+   and control[1] in ['idle', 'starting', 'stopping', 'starting_timeout', 'stopping_timeout']
+   and control[2] in ['start', 'stop', 'none'] %}
+{% set action = control[2] if request_available else 'none' %}
+{% set generation = control[3] if request_available else '-' %}
+{% set ready = request_available and control[1] in ['idle', 'starting_timeout', 'stopping_timeout']
+   and generation | length == 32 and generation | reject('in', '0123456789abcdef') | list | length == 0 %}
+{% set start_ok = ready and action == 'start' %}
+{% set stop_ok = ready and action == 'stop' %}
 {% set ics_state = 'CHARGING' if charging == 'on' else 'CONNECTED' if charging == 'off' and connected == 'on' else 'UNPLUGGED' if charging == 'off' and connected == 'off' else 'STATE UNKNOWN' %}
 {% set accent = '#70e1b7' if charging == 'on' else '#9cb6d4' %}
 {% if not request_available %}
@@ -62,7 +63,8 @@
 <div style="position:relative;width:240px;height:240px;background:#0b1119;color:#f4f7fb;font-family:Nunito,Arial,sans-serif;line-height:1.1;box-sizing:border-box">
   {# The timestamp ages this exact PNG, including frames without charger buttons. #}
   {% set timestamp = '%08x' | format(now_epoch | int) if now_epoch is not none and 0 < now_epoch < 2**32 else '' %}
-  {% set marker = ('d51a2' ~ timestamp ~ stop_target if stop_ok else 'd51a1' ~ timestamp ~ ('%014x' | format(start_revision)) if start_ok else 'd51a0' ~ timestamp) if timestamp else '' %}
+  {% set command_marker = 'd52a1' ~ generation if start_ok else 'd52a2' ~ generation if stop_ok else '' %}
+  {% set marker = 'd51a0' ~ timestamp ~ command_marker if timestamp else '' %}
   {% set levels = ['20', '60', 'a0', 'e0'] %}
   {% for digit in marker %}
     {% set value = digit | int(base=16) %}

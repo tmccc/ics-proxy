@@ -65,7 +65,7 @@ async def test_adversarial_setup_outage_and_recovery(actual_hass, peer, monkeypa
     module = importlib.import_module("custom_components.ics_proxy.coordinator")
     notices = importlib.import_module("custom_components.ics_proxy.notification")
     clock = SimpleNamespace(value=1000.0)
-    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock.value))
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock.value, time=lambda: clock.value))
     if origin == "reload":
         entry = await setup(hass, peer)
     validation = {"allow": origin == "first"}

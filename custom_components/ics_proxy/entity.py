@@ -30,5 +30,4 @@ class ProxyEntity(CoordinatorEntity[ProxyCoordinator]):
     # Live physical values additionally need a current independent native observation.
     @property
     def native_fresh(self) -> bool:
-        age = self.coordinator.age("native_age_seconds")
-        return self.service_fresh and isinstance(age, (int, float)) and 0 <= age <= 15
+        return self.coordinator.fresh_native

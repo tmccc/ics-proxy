@@ -5,7 +5,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <limits>
 #include <string>
 #include <string_view>
 
@@ -20,12 +19,7 @@ namespace solar_display {
 
 enum class ChargerButton { NONE, START, STOP };
 
-enum ChargerFeedback : uint8_t {
-  REQUEST_STATE = 1 << 0,
-  AUTOMATION_STATE = 1 << 1,
-  ACTIVE_RUNS = 1 << 2,
-  ALL_FEEDBACK = REQUEST_STATE | AUTOMATION_STATE | ACTIVE_RUNS,
-};
+enum class ChargerFeedback { UNKNOWN, UNAVAILABLE, IDLE, STARTING, STOPPING, STARTING_TIMEOUT, STOPPING_TIMEOUT };
 
 // A deliberate tap starts and ends inside the same charger button.
 inline ChargerButton charger_button_at(int x, int y) {
@@ -39,19 +33,138 @@ inline bool is_home_assistant_client(std::string_view name) {
   return name.starts_with("Home Assistant");
 }
 
-// Match the Home Assistant touch automation's eligible feedback states.
-inline bool charger_request_idle(const std::string &request, float active_runs) {
-  return active_runs == 0 &&
-         (request == "idle" || request == "starting_timeout" || request == "stopping_timeout");
+inline constexpr std::string_view HEX_DIGITS{"0123456789abcdef"};
+
+inline bool valid_generation(std::string_view value) {
+  return value.size() == 32 && value.find_first_not_of(HEX_DIGITS) == std::string_view::npos;
 }
 
-inline bool charger_request_known(const std::string &request) {
-  return charger_request_idle(request, 0) || request == "starting" || request == "stopping";
+inline std::string canvas_control(ChargerButton button, std::string_view generation) {
+  std::string control = button == ChargerButton::START ? "v2:start:" : "v2:stop:";
+  control.append(generation);
+  return control;
 }
 
 struct CanvasMarker {
   uint32_t rendered_at{0};
   std::string control;
+};
+
+inline CanvasMarker parse_canvas_marker(std::string_view cells) {
+  constexpr size_t render_cells = 13;
+  constexpr size_t offer_cells = 37;
+  if (cells.size() < render_cells || !cells.starts_with("d51a") || cells[4] < '0' || cells[4] > '2') return {};
+  uint32_t rendered_at = 0;
+  for (char digit : cells.substr(5, 8)) {
+    const auto value = HEX_DIGITS.find(digit);
+    if (value == std::string_view::npos) return {};
+    rendered_at = (rendered_at << 4) | static_cast<uint32_t>(value);
+  }
+  // Legacy frames can still show measurements. Mask their painted controls without activating them.
+  if (cells[4] != '0') return {rendered_at, "legacy"};
+  const auto offer = cells.substr(render_cells, offer_cells);
+  if (!offer.starts_with("d52a")) return {rendered_at, {}};
+  if (offer.size() != offer_cells || (offer[4] != '1' && offer[4] != '2') || !valid_generation(offer.substr(5))) {
+    return {rendered_at, "invalid"};
+  }
+  const auto button = offer[4] == '1' ? ChargerButton::START : ChargerButton::STOP;
+  return {rendered_at, canvas_control(button, offer.substr(5))};
+}
+
+struct CanvasControlState {
+  ChargerFeedback feedback{ChargerFeedback::UNKNOWN};
+  ChargerButton button{ChargerButton::NONE};
+  std::string control;
+
+  bool actionable_feedback() const {
+    return feedback == ChargerFeedback::IDLE || feedback == ChargerFeedback::STARTING_TIMEOUT ||
+           feedback == ChargerFeedback::STOPPING_TIMEOUT;
+  }
+
+  static CanvasControlState parse(std::string_view value) {
+    if (!value.starts_with("v2:")) return {};
+    value.remove_prefix(3);
+    const auto first = value.find(':');
+    if (first == std::string_view::npos) return {};
+    const auto feedback = parse_feedback(value.substr(0, first));
+    if (feedback == ChargerFeedback::UNKNOWN) return {};
+    value.remove_prefix(first + 1);
+    if (value == "none:-") return {feedback, ChargerButton::NONE, {}};
+    const auto second = value.find(':');
+    if (second == std::string_view::npos || !valid_generation(value.substr(second + 1))) return {};
+    const auto action = value.substr(0, second);
+    if (action != "start" && action != "stop") return {};
+    const auto button = action == "start" ? ChargerButton::START : ChargerButton::STOP;
+    return {feedback, button, canvas_control(button, value.substr(second + 1))};
+  }
+
+ private:
+  static ChargerFeedback parse_feedback(std::string_view label) {
+    if (label == "idle") return ChargerFeedback::IDLE;
+    if (label == "starting") return ChargerFeedback::STARTING;
+    if (label == "stopping") return ChargerFeedback::STOPPING;
+    if (label == "starting_timeout") return ChargerFeedback::STARTING_TIMEOUT;
+    if (label == "stopping_timeout") return ChargerFeedback::STOPPING_TIMEOUT;
+    if (label == "unavailable") return ChargerFeedback::UNAVAILABLE;
+    return ChargerFeedback::UNKNOWN;
+  }
+};
+
+// Compare the single live offer with the image. A submitted offer stays unusable while HA processes the tap.
+class CanvasControlView {
+ public:
+  static constexpr uint32_t ADMISSION_RECHECK_MS = 3000;
+
+  const CanvasControlState &state() const { return this->state_; }
+
+  void invalidate() {
+    this->state_ = {};
+    // Discard the old connection's recheck while preserving any acknowledgment already observed.
+    this->recheck_sent_ = false;
+  }
+
+  void observe(std::string_view value) {
+    this->state_ = CanvasControlState::parse(value);
+    if (this->submitted_.empty()) return;
+    if (this->state_.feedback == ChargerFeedback::STARTING || this->state_.feedback == ChargerFeedback::STOPPING ||
+        (!this->state_.control.empty() && this->state_.control != this->submitted_)) {
+      this->acknowledged_ = true;
+    }
+    if (this->recheck_sent_ && !this->acknowledged_ && this->state_.actionable_feedback() &&
+        this->state_.control == this->submitted_) {
+      this->submitted_.clear();
+      this->recheck_sent_ = false;
+    }
+  }
+
+  bool allows(ChargerButton button, std::string_view displayed) const {
+    return button != ChargerButton::NONE && button == this->state_.button && this->state_.actionable_feedback() &&
+           displayed == this->state_.control && displayed != this->submitted_;
+  }
+
+  void submitted(std::string_view control, uint32_t now) {
+    this->submitted_ = control;
+    this->last_recheck_ms_ = now;
+    this->recheck_sent_ = this->acknowledged_ = false;
+  }
+
+  // If HA did not admit a tap, the view may never have changed. Read it again before allowing a deliberate retry.
+  bool needs_recheck(uint32_t now) const {
+    return !this->acknowledged_ && !this->submitted_.empty() && this->state_.control == this->submitted_ &&
+           this->state_.actionable_feedback() && now - this->last_recheck_ms_ >= ADMISSION_RECHECK_MS;
+  }
+
+  void recheck_sent(uint32_t now) {
+    this->recheck_sent_ = true;
+    this->last_recheck_ms_ = now;
+  }
+
+ private:
+  CanvasControlState state_;
+  std::string submitted_;
+  bool acknowledged_{false};
+  bool recheck_sent_{false};
+  uint32_t last_recheck_ms_{0};
 };
 
 // The server's clock supplies the age at download. Elapsed time keeps that
@@ -77,6 +190,8 @@ class CanvasFreshness {
   }
 
   void note_fetch(uint32_t now) { this->last_fetch_ms_ = now; }
+
+  uint32_t rendered_at() const { return this->rendered_at_; }
 
   uint32_t render_age_ms(uint32_t now, int64_t epoch) {
     if (this->render_age_ms_ >= MAX_AGE_MS) return MAX_AGE_MS;
@@ -195,12 +310,9 @@ class StableCanvasFrame : public esphome::image::Image {
   // Read the timestamp and control target from the same image before displaying it.
   static CanvasMarker read_marker(const esphome::image::Image &source) {
     if (!valid_picture_(source)) return {};
-    constexpr char hex[]{"0123456789abcdef"};
     std::string marker;
-    constexpr int header_cells = 5;
-    constexpr int render_cells = header_cells + 8;
-    int cells = render_cells;
-    uint32_t rendered_at = 0;
+    constexpr int cells = 13 + 5 + 32;
+    marker.reserve(cells);
     for (int i = 0; i < cells; ++i) {
       const auto pixel = source.get_pixel(7 + 6 * i, 477);
       const int r = (pixel.r >> 6);
@@ -208,19 +320,11 @@ class StableCanvasFrame : public esphome::image::Image {
       // The renderer resamples the PNG. Allow ringing around each cell's colour.
       if (pixel.b < 40 || pixel.b > 74 ||
           pixel.r < 8 + r * 64 || pixel.r > 56 + r * 64 ||
-          pixel.g < 8 + g * 64 || pixel.g > 56 + g * 64) return {};
+          pixel.g < 8 + g * 64 || pixel.g > 56 + g * 64) break;
       const int digit = 4 * r + g;
-      marker += hex[digit];
-      if (i == 3 && marker != "d51a") return {};
-      if (i == 4) {
-        if (marker == "d51a1") cells += 14;
-        else if (marker == "d51a2") cells += 64;
-        else if (marker != "d51a0") return {};
-      }
-      if (header_cells <= i && i < render_cells) rendered_at = (rendered_at << 4) | digit;
+      marker += HEX_DIGITS[digit];
     }
-    if (marker[4] == '0') return {rendered_at, {}};
-    return {rendered_at, (marker[4] == '1' ? "start:" : "stop:") + marker.substr(render_cells)};
+    return parse_canvas_marker(marker);
   }
 
   bool ready() const { return this->front_ != nullptr; }
@@ -228,6 +332,8 @@ class StableCanvasFrame : public esphome::image::Image {
   size_t last_copy_bytes() const { return this->last_copy_bytes_; }
   const std::array<DirtyRegion, DIRTY_REGION_COUNT> &dirty_regions() const { return this->dirty_regions_; }
   CanvasFreshness &freshness() { return this->freshness_; }
+  CanvasFreshness &pressed_freshness() { return this->pressed_freshness_; }
+  CanvasControlView &control_view() { return this->control_view_; }
 
  protected:
   static bool valid_picture_(const esphome::image::Image &source) {
@@ -280,6 +386,8 @@ class StableCanvasFrame : public esphome::image::Image {
   size_t last_copy_bytes_{0};
   std::array<DirtyRegion, DIRTY_REGION_COUNT> dirty_regions_{};
   CanvasFreshness freshness_{};
+  CanvasFreshness pressed_freshness_{};
+  CanvasControlView control_view_{};
 };
 
 inline StableCanvasFrame &canvas_frame() {

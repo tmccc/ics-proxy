@@ -47,7 +47,7 @@ async def test_completed_validation_and_queued_zero_preserve_their_distinct_outc
 
     # This plain observer runs after the restrictive task completes and before the waiting Peer resumes.
     def record_witness():
-        phase = pending_call_locals(positive, Peer._validate.__code__)
+        phase = pending_call_locals(positive, Peer.wait_for_validation.__code__)
         restrictive = phase.get("restrictive")
         value = validation.exception() if validation.done() and not validation.cancelled() else None
         witnesses.append(
@@ -98,7 +98,7 @@ async def test_completed_validation_and_queued_zero_preserve_their_distinct_outc
     )
     try:
         await asyncio.wait_for(entered.wait(), 1)
-        phase = pending_call_locals(positive, Peer._validate.__code__)
+        phase = pending_call_locals(positive, Peer.wait_for_validation.__code__)
         assert phase.get("validation") is validation and "done" not in phase
         assert not validation.done() and not peer.gate.restrictive_waiting.is_set() and not sent
 

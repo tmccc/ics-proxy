@@ -2,11 +2,15 @@
 """Independent process cuts and a read-only report used to select the matching replay."""
 
 import asyncio
+import fcntl
 import hashlib
 import json
+import shutil
 import socket
 import uuid
+from contextlib import closing
 from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -22,8 +26,9 @@ from tests.process_helpers import process_rig
 from tests.runtime_rig import until
 from tests.tls_support import tls as tls
 from tests.trial_helpers import config_files
-from tools import managed_proxy
+from tools import managed_incident, managed_proxy
 from tools.managed_incident import MAX_REPORT_EVENTS, incident_report, reference
+from tools.managed_stop_incident import stop_incident_report
 
 
 # Obtain the exact same read-only report as the CLI for this independent process fixture.
@@ -282,28 +287,164 @@ def test_incident_cli_uses_local_read_only_sources(tmp_path, tls, capsys, monkey
     assert not config.journal.exists() and sorted(tmp_path.iterdir()) == before
 
 
-# Intent: read the saved request from a checkpointed journal in a read-only backup directory.
-# Why: SQLite must not need to create a WAL index in the archive to report its contents.
-def test_incident_reads_a_read_only_checkpointed_backup(tmp_path):
+# Intent: read stopped journal snapshots with and without uncheckpointed records.
+# Why: reporting must retain committed WAL records without creating sidecars or changing source files.
+@pytest.mark.parametrize("read_only", [False, True], ids=["writable", "read-only"])
+@pytest.mark.parametrize(
+    "sidecars",
+    [(), ("-wal",), ("-shm",), ("-wal", "-shm"), ("-wal", "-shm", ".lock")],
+    ids=["checkpointed", "uncheckpointed", "index-only", "paired-backup", "stopped-owner"],
+)
+def test_incident_reads_stopped_journal_without_writes(tmp_path, read_only, sidecars):
     archive = tmp_path / "backup"
     archive.mkdir(mode=0o700)
     path = archive / "journal.sqlite"
     request = uuid.uuid4().hex
+    source = tmp_path / "fixture.sqlite" if sidecars else path
+    journal = Journal(source, "OFFLINE001")
+    try:
+        requests = ManagedRequests(journal)
+        journal.db.execute("PRAGMA wal_autocheckpoint=0")
+        if "-wal" in sidecars:
+            journal.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        requests.accept(request, "start", 0)
+        if sidecars == ("-shm",):
+            journal.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        if sidecars:
+            shutil.copy2(source, path)
+            for suffix in sidecars:
+                shutil.copy2(Path(str(source) + suffix), Path(str(path) + suffix))
+    finally:
+        journal.close()
+    files_before = {file.name: file.read_bytes() for file in archive.iterdir()}
+    if read_only:
+        archive.chmod(0o500)
+    try:
+        events = archive / "events.jsonl"
+        saved = incident_report(path, events)["journal"]
+        assert saved["available"] is True and saved["request"]["request"] == reference(request)
+        assert {file.name: file.read_bytes() for file in archive.iterdir()} == files_before
+        assert stop_incident_report(path, events)["journal"]["available"] is True
+        assert {file.name: file.read_bytes() for file in archive.iterdir()} == files_before
+    finally:
+        archive.chmod(0o700)
+
+
+# Intent: retry the snapshot when the owner closes the journal during the copy.
+# Why: a clean exit checkpoints the journal and removes sidecars the reader may have observed.
+def test_incident_reads_journal_as_owner_closes(tmp_path, monkeypatch):
+    path = tmp_path / "journal.sqlite"
+    request = uuid.uuid4().hex
+    journal = Journal(path, "OFFLINE001")
+    files_after_close = {}
+
+    # Trigger checkpoint and sidecar removal after the first database copy.
+    def close_during_copy(source, target):
+        shutil.copyfile(source, target)
+        if source == path and not files_after_close:
+            journal.close()
+            files_after_close.update({file.name: file.read_bytes() for file in tmp_path.iterdir()})
+
+    try:
+        ManagedRequests(journal).accept(request, "start", 0)
+        monkeypatch.setattr(managed_incident, "shutil", SimpleNamespace(copyfile=close_during_copy))
+        saved = incident_report(path, tmp_path / "events.jsonl")["journal"]
+    finally:
+        journal.close()
+    assert saved["available"] is True and saved["request"]["request"] == reference(request)
+    assert set(files_after_close) == {"journal.sqlite", "journal.sqlite.lock"}
+    assert {file.name: file.read_bytes() for file in tmp_path.iterdir()} == files_after_close
+
+
+# Intent: report the latest committed request after the source WAL changes during a copy.
+# Why: a copy that missed a commit must be retried without updating the original SQLite index.
+def test_incident_retries_when_live_wal_changes_during_copy(tmp_path, monkeypatch):
+    path = tmp_path / "journal.sqlite"
+    wal = path.with_name(path.name + "-wal")
+    request = uuid.uuid4().hex
+    journal = Journal(path, "OFFLINE001")
+    files_after_commit = {}
+
+    # Commit another request at the point where the reader has just copied the old WAL.
+    def commit_during_wal_copy(source, target):
+        shutil.copyfile(source, target)
+        if source == wal and not files_after_commit:
+            requests.accept(request, "start", 0)
+            files_after_commit.update({file.name: file.read_bytes() for file in tmp_path.iterdir()})
+
+    try:
+        requests = ManagedRequests(journal)
+        journal.db.execute("PRAGMA wal_autocheckpoint=0")
+        journal.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        requests.accept(uuid.uuid4().hex, "start", 0)
+        monkeypatch.setattr(managed_incident, "shutil", SimpleNamespace(copyfile=commit_during_wal_copy))
+        saved = incident_report(path, tmp_path / "events.jsonl")["journal"]
+        assert saved["available"] is True and saved["request"]["request"] == reference(request)
+        assert {file.name: file.read_bytes() for file in tmp_path.iterdir()} == files_after_commit
+    finally:
+        journal.close()
+
+
+# Intent: use the active SQLite writer's published commit boundary when the WAL already contains a later commit frame.
+# Why: rebuilding the index from the untrimmed copy can show a request before the owner's commit finishes.
+@pytest.mark.parametrize("index_state", ["published", "checkpointed", "missing", "torn"])
+def test_incident_respects_the_published_live_wal_boundary(tmp_path, index_state):
+    source = tmp_path / "source.sqlite"
+    archive = tmp_path / "archive"
+    archive.mkdir(mode=0o700)
+    path = archive / "journal.sqlite"
+    wal, index, lock = (Path(str(path) + suffix) for suffix in ("-wal", "-shm", ".lock"))
+    source_index = Path(str(source) + "-shm")
+    first, next_request = (uuid.uuid4().hex for _ in range(2))
+    journal = Journal(source, "OFFLINE001")
+    try:
+        journal.db.execute("PRAGMA wal_autocheckpoint=0")
+        requests = ManagedRequests(journal)
+        requests.accept(first, "start", 0)
+        if index_state == "checkpointed":
+            journal.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        published = source_index.read_bytes()
+        requests.accept(next_request, "start", 0)
+        shutil.copy2(source, path)
+        shutil.copy2(Path(str(source) + "-wal"), wal)
+        if index_state != "missing":
+            shutil.copy2(source_index, index)
+            if index_state == "torn":
+                published = published[:48] + source_index.read_bytes()[48:]
+            index.write_bytes(published)
+        shutil.copy2(Path(str(source) + ".lock"), lock)
+    finally:
+        journal.close()
+
+    files = {file.name: file.read_bytes() for file in archive.iterdir()}
+    events = archive / "events.jsonl"
+    # Simulate the active owner with the two independently generated on-disk commit boundaries.
+    with lock.open("rb") as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        live = incident_report(path, events)["journal"]
+        if index_state in ("missing", "torn"):
+            assert live == {"available": False, "intent": None, "request": None, "start": None}
+        else:
+            assert live["available"] is True and live["request"]["request"] == reference(first)
+    stopped = incident_report(path, events)["journal"]
+    assert stopped["available"] is True and stopped["request"]["request"] == reference(next_request)
+    assert {file.name: file.read_bytes() for file in archive.iterdir()} == files
+
+
+# Intent: refuse journal aliases that lack the live owner's path-specific lock and WAL index.
+# Why: raw recovery of a hard-linked live WAL can report a commit the original writer has yet to publish.
+def test_incident_refuses_an_aliased_live_journal(tmp_path):
+    path, alias = tmp_path / "journal.sqlite", tmp_path / "alias.sqlite"
+    request = uuid.uuid4().hex
     journal = Journal(path, "OFFLINE001")
     try:
         ManagedRequests(journal).accept(request, "start", 0)
+        alias.hardlink_to(path)
+        Path(str(alias) + "-wal").hardlink_to(Path(str(path) + "-wal"))
+        for candidate in (path, alias):
+            assert incident_report(candidate, tmp_path / "events.jsonl")["journal"]["available"] is False
     finally:
         journal.close()
-    files_before = sorted(archive.iterdir())
-    assert files_before == [path, archive / "journal.sqlite.lock"]
-    archived_bytes = path.read_bytes()
-    archive.chmod(0o500)
-    try:
-        saved = incident_report(path, archive / "events.jsonl")["journal"]
-        assert saved["available"] is True and saved["request"]["request"] == reference(request)
-        assert sorted(archive.iterdir()) == files_before and path.read_bytes() == archived_bytes
-    finally:
-        archive.chmod(0o700)
 
 
 # Intent: the incident command selects a retained local Stop by its redacted request reference.
@@ -328,7 +469,8 @@ def test_incident_cli_selects_the_exact_stop_reference(tmp_path, tls, capsys):
 
 # Intent: a newer unsent local Start remains the incident selected after cloud test metadata replaces it.
 # Why: the report must never attach an older command's physical reply to the latest owner request.
-def test_incident_uses_latest_local_request_even_without_wire_receipt(tmp_path):
+@pytest.mark.parametrize("damaged_state", [False, True])
+def test_incident_uses_latest_local_request_even_without_wire_receipt(tmp_path, damaged_state):
     path = tmp_path / "journal.db"
     event_path = tmp_path / "journal.start-events.jsonl"
     old, new, cloud, ticket = (uuid.uuid4().hex for _ in range(4))
@@ -340,18 +482,37 @@ def test_incident_uses_latest_local_request_even_without_wire_receipt(tmp_path):
         journal.put("local_start_receipt", {"request_id": old, "ticket": ticket, "stage": "accepted"})
         requests.accept(new, "start", 1)
         requests.finish(new, "failed", {"classification": "preflight_refused_unsent"})
+        if damaged_state:
+            journal.db.execute("UPDATE managed_requests SET state=CAST(? AS TEXT) WHERE id=?", (b"\xff", new))
         requests.accept(cloud, "arm_cloud_test", 1)
         journal.put("managed_test_charge", {"id": cloud, "source": "cloud", "state": "armed"})
+        managed_proxy.event(
+            event_path,
+            {
+                "run": uuid.uuid4().hex,
+                "sequence": 1,
+                "at": 1,
+                "event": "start_reply",
+                "request": reference(old),
+                "ticket": reference(ticket),
+                "reply": "accepted",
+            },
+        )
         learned = incident_report(path, event_path)
         saved = learned["journal"]
         assert saved["request"] == {
             "request": hashlib.sha256(new.encode()).hexdigest()[:32],
             "action": "start",
             "revision": 1,
-            "state": "failed",
+            "state": "unknown" if damaged_state else "failed",
         }
         assert saved["start"] is None
-        assert learned["wire"]["ticket"] is None and learned["wire"]["observed_reply"] == "unknown"
+        assert learned["wire"] == {
+            "request": reference(new),
+            "ticket": None,
+            "send": "unknown",
+            "observed_reply": "unknown",
+        }
     finally:
         journal.close()
 
@@ -391,6 +552,32 @@ def test_incident_reads_the_exact_saved_start_reply(tmp_path, wire_reply, shown,
     assert result["journal"]["start"]["lifecycle"] == "unbound"
     assert result["wire"]["send"] == "matching_reply" and result["wire"]["observed_reply"] == "unknown"
     assert result["waiting_for_evidence"] == [waiting]
+
+
+# Intent: reject stored Start replies whose wire, Boot, session or limit fields fail validation.
+# Why: a matching request and ticket alone cannot prove that the charger replied to the original Start.
+@pytest.mark.parametrize(
+    "override",
+    [{"wire": "bad-wire"}, {"boot": "bad-boot"}, {"local": 42}, {"limit": 6}],
+    ids=["wire", "boot", "local", "limit"],
+)
+def test_incident_rejects_a_misbound_primary_start_reply(tmp_path, override):
+    path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"
+    request, ticket = uuid.uuid4().hex, uuid.uuid4().hex
+    with closing(Journal(path, "OFFLINE001")) as journal:
+        ManagedRequests(journal).accept(request, "start", 0)
+        journal.put("local_start_receipt", {"request_id": request, "ticket": ticket, "stage": "issued", "local": None})
+        fields = {"wire": "l-" + uuid.uuid4().hex, "boot": uuid.uuid4().hex, "local": None, "limit": None}
+        journal.db.execute(
+            "INSERT INTO owner_command_wires VALUES(:wire,:request,:ticket,:boot,"
+            "'RemoteStartTransaction',:local,:limit,'Accepted')",
+            {**fields, **override, "request": request, "ticket": ticket},
+        )
+
+    report = incident_report(path, events)
+    assert report["journal"]["start"]["saved_reply"] == "unknown"
+    assert report["wire"]["send"] == "unknown"
+    assert report["waiting_for_evidence"] == ["start_outcome_or_lifecycle"]
 
 
 # Intent: show a real reply checkpoint before the normal wire receipt or Start result is published.
@@ -544,6 +731,90 @@ def test_incident_preserves_historical_start_receipt(tmp_path, stage):
         assert report["journal"]["start"]["lifecycle"] == "unbound"
     finally:
         journal.close()
+
+
+# Intent: keep the exact Start and its charge evidence when optional metadata cannot be decoded.
+# Why: a saved intent or owner state can be damaged independently of the receipt and transaction.
+@pytest.mark.parametrize("key", ["managed_control_intent", "managed_test_charge"])
+def test_incident_keeps_bound_start_with_unreadable_metadata(tmp_path, key):
+    path, events = tmp_path / "journal.db", tmp_path / "missing-events.jsonl"
+    request, ticket = uuid.uuid4().hex, uuid.uuid4().hex
+    with closing(Journal(path, "OFFLINE001")) as journal:
+        ManagedRequests(journal).accept(request, "start", 0)
+        journal.put(
+            "local_start_receipt", {"request_id": request, "ticket": ticket, "stage": "accepted", "local": None}
+        )
+        journal.db.execute("INSERT OR REPLACE INTO meta VALUES(?,CAST(? AS TEXT))", (key, b'{"bad":"\xff"}'))
+
+    report = incident_report(path, events)
+    assert report["journal"]["available"]
+    assert report["journal"]["request"]["request"] == reference(request)
+    assert report["journal"]["start"]["ticket"] == reference(ticket)
+    assert report["journal"]["start"]["saved_reply"] == "accepted"
+
+
+# Intent: keep readable lifecycle and queued evidence when an optional journal table is absent or has an old schema.
+# Why: the Start and Stop reports gather independent facts from the same private snapshot.
+@pytest.mark.parametrize(
+    "missing", ["outbox", "replies", "reply_fields", "delivery_state", "transactions", "mapping", "closure"]
+)
+def test_incident_keeps_independent_lifecycle_and_delivery(tmp_path, missing):
+    path, events = tmp_path / "journal.db", tmp_path / "missing-events.jsonl"
+    start, ticket, stop = (uuid.uuid4().hex for _ in range(3))
+    with closing(Journal(path, "OFFLINE001")) as journal:
+        requests = ManagedRequests(journal)
+        requests.accept(start, "start", 0)
+        requests.finish(start, "completed", {})
+        requests.accept(stop, "stop_session", 1)
+        requests.finish(stop, "completed", {"session_stopped": True, "_session_stop": {"local": 42}})
+        journal.put("local_start_receipt", {"request_id": start, "ticket": ticket, "stage": "accepted", "local": 42})
+        journal.db.execute(
+            "INSERT INTO transactions(local,connector,start,stop,vendor) VALUES(42,1,'{}',?,99)",
+            (json.dumps({"transactionId": 42, "timestamp": "2026-11-01T01:00:00Z"}),),
+        )
+        if missing == "outbox":
+            journal.db.execute("DROP TABLE outbox")
+        else:
+            journal.db.execute(
+                "INSERT INTO outbox(token,action,payload,local,state) "
+                "VALUES('delivery','StopTransaction','{}',42,'queued')"
+            )
+        if missing in ("outbox", "replies", "reply_fields"):
+            journal.db.execute("DROP TABLE delivery_replies")
+        if missing == "reply_fields":
+            journal.db.execute("CREATE TABLE delivery_replies(token TEXT PRIMARY KEY)")
+            journal.db.execute("INSERT INTO delivery_replies VALUES('delivery')")
+        if missing == "delivery_state":
+            journal.db.execute(
+                "INSERT INTO outbox(token,action,payload,local,state) "
+                "VALUES('other','StartTransaction','{}',42,CAST(? AS TEXT))",
+                (b"\xff",),
+            )
+        if missing == "transactions":
+            journal.db.execute("DROP TABLE transactions")
+        if missing == "mapping":
+            journal.db.execute("ALTER TABLE transactions RENAME COLUMN vendor TO old_vendor")
+        if missing == "closure":
+            journal.db.execute("ALTER TABLE transactions RENAME COLUMN stop TO old_stop")
+
+    start_report = incident_report(path, events)
+    stop_report = stop_incident_report(path, events)
+    delivery = [] if missing == "outbox" else [{"event": "StopTransaction", "state": "queued", "reply_saved": False}]
+    if missing == "delivery_state":
+        delivery.append({"event": "StartTransaction", "state": "unknown", "reply_saved": False})
+    for report, request in ((start_report, start), (stop_report, stop)):
+        assert report["journal"]["available"]
+        assert report["journal"]["request"]["request"] == reference(request)
+        assert report["observations"] == [] and report["sampled_status"] is None
+    lifecycle = start_report["journal"]["start"]
+    assert lifecycle["saved_reply"] == "accepted"
+    for facts in (lifecycle, stop_report["journal"]):
+        assert facts["lifecycle"] == ("unknown" if missing in ("transactions", "closure") else "closed")
+        assert facts["cloud_mapping"] == ("unknown" if missing in ("transactions", "mapping") else "recorded")
+        assert facts["pending_delivery"] == delivery
+    expected_timestamp = None if missing in ("transactions", "closure") else "2026-11-01T01:00:00+00:00"
+    assert stop_report["journal"]["charger_reported_stop_at"] == expected_timestamp
+    assert start_report["waiting_for_evidence"] == (["cloud_delivery"] if delivery else [])
 
 
 # Intent: project only exact retained reply and lifecycle records, with a bounded and redacted event excerpt.

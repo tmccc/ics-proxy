@@ -49,6 +49,7 @@ class ScheduleControl:
                     catalogue.setdefault(fingerprint(tag.casefold()), []).append(identifier)
             if catalogue != j.get("managed_schedule_tags"):
                 j.put("managed_schedule_tags", catalogue)
+            c.local_schedule.observe_native_occurrence(n)
         self.attest_bound_vendor(n, original)
         self.bind_deferred_start(gateway, charging, n, original)
 
@@ -127,6 +128,17 @@ class ScheduleControl:
         tag = start["idTag"]
         catalogue = j.get("managed_schedule_tags")
         if catalogue is None:
+            return
+        plan = original_current_plan(n, original)
+        plan_tag = plan.get("idTag") if plan is not None else None
+        if (
+            plan is not None
+            and plan.get("kindType") == "Recurring"
+            and isinstance(plan_tag, str)
+            and plan_tag.casefold() == tag.casefold()
+        ):
+            # This exact report belongs to the commissioned schedule. Its command candidates remain outstanding.
+            j.put("managed_deferred_start", {})
             return
         digest = fingerprint(tag.casefold())
         if known_plan_source(j, n) or digest in catalogue and n.session_plan_id is None:
@@ -361,6 +373,7 @@ class ScheduleControl:
             ordinary.require_authority(None)
         except (RecoveryRequiredError, UnavailableError, TimeoutError) as error:
             raise UnavailableError("ordinary daily report awaits fresh closed native zero") from error
+        observation = c.native.last_resolved_read
         source = j.get(ORDINARY_SOURCE)
         control = j.get("control", {})
         station = j.db.execute(
@@ -381,6 +394,9 @@ class ScheduleControl:
                 or not ordinary.active()
                 or j.get(ORDINARY_HOLD) != hold
                 or j.get(ORDINARY_SOURCE) != source
+                or c.native.last_resolved_read != observation
+                or c.native.last_verified_at != native.physical.observed_at
+                or not native.is_fresh(5)
                 or j.active() != identifier
                 or g._charger_epoch != epoch
                 or g.boot_observation != boot

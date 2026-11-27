@@ -6,7 +6,7 @@ import json
 import logging
 import sqlite3
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -14,7 +14,8 @@ from ..frames import Frame
 from .delivery_reply import DeliveryReply
 from .ics import unique_object
 from .plans import PlanBook
-from .stop_settlement import STOP_SESSION, StopAcceptance, stop_rejections
+from .session_closure import ClosingReport
+from .stop_settlement import PAUSE_STOP_HISTORY, STOP_SESSION, StopAttempt, joined_stop_acceptance, stop_rejections
 from .store import Delivery, RecoveryRequiredError, encoded
 from .trial_evidence import profile_projection
 
@@ -38,7 +39,7 @@ def transaction_reply_status(frame: Frame) -> TransactionReplyStatus | None:
 
 
 # JSON can contain lone surrogates that cannot be bound to SQLite text parameters.
-def _reply_identifier(value: object) -> bool:
+def reply_identifier(value: object) -> bool:
     return isinstance(value, str) and value.isprintable()
 
 
@@ -179,7 +180,7 @@ class OwnerCommand:
     wires: tuple[OwnerWire, ...]
     sessions: tuple[SessionEffect, ...]
 
-    # A real reply is reporting evidence even when local completion or physical closure still awaits proof.
+    # A real reply is reporting evidence. Storage order is independent of dispatch and receipt order.
     @property
     def reply_known(self) -> bool:
         if self.action in ("start", "start_test"):
@@ -191,7 +192,7 @@ class OwnerCommand:
             relevant = [wire for wire in self.wires if wire.action == "RemoteStopTransaction"]
         else:
             relevant = [wire for wire in self.wires if wire.action == "SetChargingProfile" and wire.limit_a]
-        return bool(relevant) and relevant[-1].reply in ("Accepted", "Rejected", "NotSupported", "Unknown")
+        return any(wire.reply in ("Accepted", "Rejected", "NotSupported", "Unknown") for wire in relevant)
 
 
 @dataclass(frozen=True)
@@ -238,10 +239,10 @@ def decode_retained_owner_reply(db: sqlite3.Connection, saved: dict[str, Any]) -
     if (
         action not in ("RemoteStartTransaction", "RemoteStopTransaction")
         or saved["reply"] not in ("Accepted", "Rejected")
-        or not _reply_identifier(saved["wire"])
+        or not reply_identifier(saved["wire"])
         or len(saved["wire"]) > 36
-        or not _reply_identifier(saved["ticket"])
-        or any(value is not None and not _reply_identifier(value) for value in (saved["request"], saved["boot"]))
+        or not reply_identifier(saved["ticket"])
+        or any(value is not None and not reply_identifier(value) for value in (saved["request"], saved["boot"]))
         or saved["limit_a"] is not None
         or (action == "RemoteStartTransaction" and local is not None)
         or (action == "RemoteStopTransaction" and (type(local) is not int or not 0 < local < 2**63))
@@ -260,7 +261,23 @@ def decode_retained_owner_reply(db: sqlite3.Connection, saved: dict[str, Any]) -
     return reply
 
 
-# A pending session Stop and the latest shutdown retain independent dispatch claims.
+# A Pause's latest claim may change while a prior wire still awaits durable publication.
+def _bound_pause_stop(result: dict[str, Any], reply: OwnerWire) -> dict[str, Any] | None:
+    if reply.request is None or reply.request == reply.ticket or reply.boot is None:
+        return None
+    history = result.get(PAUSE_STOP_HISTORY)
+    historical = history.get(reply.wire) if isinstance(history, dict) else None
+    for bound in (result.get("_stop"), historical):
+        if (
+            isinstance(bound, dict)
+            and type(bound.get("local")) is int
+            and (bound.get("ticket"), bound["local"], bound.get("boot")) == (reply.ticket, reply.local, reply.boot)
+        ):
+            return bound
+    return None
+
+
+# A named Stop must retain its original session Stop or Pause claim.
 def _owner_stop_claim_matches(db: sqlite3.Connection, reply: OwnerWire) -> bool:
     if db.execute("SELECT 1 FROM sqlite_schema WHERE name='managed_requests'").fetchone():
         claims = db.execute(
@@ -268,6 +285,8 @@ def _owner_stop_claim_matches(db: sqlite3.Connection, reply: OwnerWire) -> bool:
             (reply.request, reply.ticket, STOP_SESSION),
         ).fetchall()
         for request, action, raw in claims:
+            if raw is None:
+                return False
             try:
                 result = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
             except ValueError, RecursionError:
@@ -294,29 +313,34 @@ def _owner_stop_claim_matches(db: sqlite3.Connection, reply: OwnerWire) -> bool:
                     return False
                 return True
             elif action == "pause":
-                bound = result.get("_stop")
-                if (
-                    isinstance(bound, dict)
-                    and bound.get("ticket") == reply.ticket
-                    and (bound.get("local"), bound.get("boot")) != (reply.local, reply.boot)
-                ):
-                    return False
+                return _bound_pause_stop(result, reply) is not None
             else:
                 return False
-    if reply.request is None:
-        row = db.execute("SELECT CAST(value AS BLOB) FROM meta WHERE key='trial_shutdown_attempt'").fetchone()
-        try:
-            shutdown = json.loads(row[0].decode("utf-8"), object_pairs_hook=unique_object) if row is not None else {}
-        except ValueError, RecursionError:
+        if (
+            reply.request is None
+            and db.execute(
+                "SELECT 1 FROM managed_requests WHERE action='pause' AND "
+                "CASE WHEN json_valid(result) THEN json_extract(result,'$._stop.ticket')=? OR EXISTS ("
+                f"SELECT 1 FROM json_each(result,'$.{PAUSE_STOP_HISTORY}') h "
+                "WHERE h.key=? OR json_extract(CASE WHEN h.type='object' THEN h.value END,'$.ticket')=?) END LIMIT 1",
+                (reply.ticket, reply.wire, reply.ticket),
+            ).fetchone()
+        ):
             return False
-        if isinstance(shutdown, dict) and shutdown.get("ticket") == reply.ticket and "stop_wire" in shutdown:
-            return (shutdown["stop_wire"], shutdown.get("boot"), shutdown.get("local")) == (
-                reply.wire,
-                reply.boot,
-                reply.local,
-            )
-    # Session-only Stops use the request ID as their ticket and require the claim above.
-    return reply.request != reply.ticket
+    if reply.request is not None:
+        return False
+    row = db.execute("SELECT CAST(value AS BLOB) FROM meta WHERE key='trial_shutdown_attempt'").fetchone()
+    try:
+        shutdown = json.loads(row[0].decode("utf-8"), object_pairs_hook=unique_object) if row is not None else {}
+    except ValueError, RecursionError:
+        return False
+    if isinstance(shutdown, dict) and shutdown.get("ticket") == reply.ticket:
+        return (
+            type(shutdown.get("local")) is int
+            and (shutdown["local"], shutdown.get("boot")) == (reply.local, reply.boot)
+            and ("stop_wire" not in shutdown or shutdown["stop_wire"] == reply.wire)
+        )
+    return True  # Internal protective Stops can have no named request or shutdown claim.
 
 
 class CommandOutcomes:
@@ -542,7 +566,7 @@ class CommandOutcomes:
                 not isinstance(payload, dict)
                 or not isinstance(wire, str)
                 or len(wire) > 36
-                or not _reply_identifier(wire)
+                or not reply_identifier(wire)
                 or key.partition(":")[2] != wire
                 or (reply := decode(payload)) is None
                 or key != self._reply_key(source, reply)
@@ -575,15 +599,39 @@ class CommandOutcomes:
                 valid.append(reply)
         return tuple(valid)
 
+    # Once the primary wire owns its exact scope, it no longer needs an older Pause claim.
+    def pending_pause_stop_claims(self, request: str, result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        claims = {}
+        for wire in (*self._retained_owner_replies(), *self._owner_writes.values()):
+            if (
+                wire.request == request
+                and wire.action == "RemoteStopTransaction"
+                and wire.reply in (None, "Accepted", "Rejected")
+                and (bound := _bound_pause_stop(result, wire)) is not None
+                and not self.journal.db.execute(
+                    "SELECT 1 FROM owner_command_wires WHERE wire=?", (wire.wire,)
+                ).fetchone()
+            ):
+                claims[wire.wire] = {"ticket": bound["ticket"], "local": bound["local"], "boot": bound["boot"]}
+        return claims
+
     # A forwarded checkpoint still belongs to the original vendor mutation and exact charger call.
     def _retained_vendor_replies(self) -> tuple[ForwardedReply, ...]:
         return self._retained_replies("vendor", self._decode_vendor_reply)
+
+    # Inspect the affirmed checkpoint using the same original mutation and wire binding as recovery.
+    def retained_vendor_stop_replies(self) -> dict[tuple[str, str], TransactionReplyStatus]:
+        return {
+            (reply.mutation, reply.wire): reply.status
+            for reply in self._retained_vendor_replies()
+            if reply.action == "RemoteStopTransaction"
+        }
 
     # Accept a definite retained vendor reply only for its original forwarded attempt.
     def _decode_vendor_reply(self, saved: dict[str, Any]) -> ForwardedReply | None:
         if (
             saved.keys() != {"mutation", "action", "wire", "status"}
-            or not _reply_identifier(saved["mutation"])
+            or not reply_identifier(saved["mutation"])
             or saved["action"] not in ("RemoteStartTransaction", "RemoteStopTransaction")
             or saved["status"] not in ("Accepted", "Rejected")
         ):
@@ -688,19 +736,21 @@ class CommandOutcomes:
         row = self.journal.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()
         return SessionEffect(local, row["stop"] is not None) if row is not None else None
 
+    # A closure checkpoint must bind the exact saved body as well as the allocated ID.
+    def closing_report(self, local: int) -> ClosingReport | None:
+        row = self.journal.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()
+        return ClosingReport.from_record(local, row["stop"]) if row is not None else None
+
     # Idle requires ledger closure, including the original target if the operation already had one.
     def stop_report_closed(self, local: int | None = None) -> bool:
-        if self.journal.active() is not None:
-            return False
-        session = self.session(local)
-        return local is None or (session is not None and session.closed)
+        return self.journal.active() is None and (local is None or self.closing_report(local) is not None)
 
     # A matched reply stays with its exact allocated session across Boot and process replacement.
     def accepted_stop(self, local: int | None, *, ticket: str | None = None) -> bool:
         return self.accepted_stop_attempt(local, ticket=ticket) is not None
 
     # Keep the actual predecessor when a session-only request joins an already accepted Stop.
-    def accepted_stop_attempt(self, local: int | None, *, ticket: str | None = None) -> StopAcceptance | None:
+    def accepted_stop_attempt(self, local: int | None, *, ticket: str | None = None) -> StopAttempt | None:
         if local is None:
             return None
         for wire in (*self._retained_owner_replies(), *self._owner_writes.values()):
@@ -710,7 +760,7 @@ class CommandOutcomes:
                 and wire.reply == "Accepted"
                 and (ticket is None or wire.ticket == ticket)
             ):
-                return StopAcceptance("local", wire.request or wire.ticket, wire.wire)
+                return StopAttempt("local", wire.request or wire.ticket, wire.wire)
         saved = self.journal.db.execute(
             "SELECT COALESCE(request,ticket),wire FROM owner_command_wires WHERE local=:local "
             "AND action='RemoteStopTransaction' AND reply='Accepted' AND (:ticket IS NULL OR ticket=:ticket) "
@@ -718,29 +768,61 @@ class CommandOutcomes:
             {"local": local, "ticket": ticket},
         ).fetchone()
         if saved is not None:
-            return StopAcceptance("local", saved[0], saved[1])
-        return self._accepted_forwarded_stop(local) if ticket is None else None
+            return StopAttempt("local", saved[0], saved[1])
+        if ticket is not None:
+            return None
+        return next((attempt for attempt, reply in self.forwarded_stop_replies(local) if reply == "Accepted"), None)
 
-    # A forwarded Stop has the same session effect while its exact reply is being saved or already durable.
-    def _accepted_forwarded_stop(self, local: int) -> StopAcceptance | None:
+    # Apply the same exact Stop binding to accepted predecessors and named reply reads.
+    def forwarded_stop_replies(
+        self, local: int, mutations: tuple[str, ...] | None = None
+    ) -> Iterator[tuple[StopAttempt, TransactionReplyStatus]]:
+        if mutations == ():
+            return
+        if mutations is None:
+            selection = "AND s.wire_result IN ('Accepted','dispatched') ORDER BY m.rowid"
+            bindings: tuple[int | str, ...] = (local,)
+        else:
+            selection = (
+                "AND s.wire_request IS NOT NULL "
+                "AND EXISTS (SELECT 1 FROM transactions t WHERE t.local=s.local) "
+                "AND m.token IN (SELECT value FROM json_each(?))"
+            )
+            bindings = (local, encoded(mutations))
         rows = self.journal.db.execute(
-            "SELECT token,wire_request,wire_result FROM vendor_command_scope JOIN mutations ON mutation=token "
-            "WHERE local=? AND origin='vendor' AND action='RemoteStopTransaction' "
-            "AND wire_result IN ('Accepted','dispatched') ORDER BY mutations.rowid",
-            (local,),
+            "SELECT m.token,s.wire_request,s.wire_result FROM vendor_command_scope s "
+            "JOIN mutations m ON s.mutation=m.token WHERE s.local=? AND m.origin='vendor' "
+            f"AND m.action='RemoteStopTransaction' {selection}",
+            bindings,
         )
-        for row in rows:
-            if row["wire_result"] == "Accepted":
-                return StopAcceptance("vendor", row["token"], row["wire_request"])
-            reply = self._received(row["token"])
-            if (
-                isinstance(reply, ForwardedReply)
-                and reply.action == "RemoteStopTransaction"
-                and reply.wire == row["wire_request"]
-                and reply.status == "Accepted"
+        scoped = {row["token"]: row for row in rows}
+        retained = None
+        for mutation in scoped if mutations is None else mutations:
+            row = scoped.get(mutation)
+            if row is None:
+                continue
+            wire, saved = row["wire_request"], row["wire_result"]
+            attempt = StopAttempt("vendor", mutation, wire)
+            if saved == "Accepted":
+                yield attempt, "Accepted"
+                continue
+            if saved == "Rejected":
+                yield attempt, "Rejected"
+                continue
+            if wire is None:
+                continue
+            reply = self._received(mutation)
+            if isinstance(reply, ForwardedReply) and (reply.mutation, reply.action, reply.wire) == (
+                mutation,
+                "RemoteStopTransaction",
+                wire,
             ):
-                return StopAcceptance("vendor", reply.mutation, reply.wire)
-        return None
+                yield attempt, reply.status
+                continue
+            if retained is None:
+                retained = self.retained_vendor_stop_replies()
+            if (status := retained.get((mutation, wire))) is not None:
+                yield attempt, status
 
     # Bind live reply windows to the exact local or vendor request and allocated session.
     def open_stop_replies(self, windows: tuple[str, ...]) -> tuple[tuple[str, str, int], ...]:
@@ -852,20 +934,25 @@ class CommandOutcomes:
         if self.journal.get("managed_mode") is None:
             return False
         rejections = stop_rejections(self.journal)
-        count = self.journal.db.execute(
+        joins = self.journal.db.execute(
             f"{rejections.prefix}"
-            "SELECT MAX(COALESCE(json_array_length(result,'$._session_stop.owner_wire_attempts'),0)) "
+            "SELECT id,json_extract(result,'$._session_stop') AS binding, "
+            "json_array_length(result,'$._session_stop.owner_wire_attempts') AS wires "
             "FROM managed_requests WHERE action='stop_session' AND state IN ('running','uncertain') "
             "AND json_extract(result,'$._session_stop.local')=? AND json_extract(result,'$._session_stop.joined')=1 "
             f"AND NOT {rejections.receipts}",
             (*rejections.bindings, local),
-        ).fetchone()[0]
-        return count is not None and (
-            count > 0
-            or self.accepted_stop(local)
-            or self.unanswered_vendor_stop(local)
-            or self.unanswered_shutdown_stop(local)
-        )
+        ).fetchall()
+        if not joins:
+            return False
+        # The joining receipt's exact acceptance remains after the earlier vendor mutation rotates out.
+        for join in joins:
+            if join["wires"]:
+                return True
+            binding = json.loads(join["binding"])
+            if binding["local"] == local and joined_stop_acceptance(binding, join["id"]) is not None:
+                return True
+        return self.accepted_stop(local) or self.unanswered_vendor_stop(local) or self.unanswered_shutdown_stop(local)
 
     # A closed session can retain a Stop wait only until the next connector lifecycle.
     def latest_closed_session_stop_id(self) -> int | None:

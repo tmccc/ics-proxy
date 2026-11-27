@@ -23,6 +23,10 @@ class ManagedStartReports:
     def owner_start_seconds(self, tag: str, request_id: str | None, *, issued: bool) -> int | None:
         return owner_start_seconds(self.charging, tag, request_id=request_id, issued=issued)
 
+    # Reuse the exact scheduled occurrence that currently owns the Start handoff.
+    def local_schedule_blocks(self, tag: str, occurred: float | None) -> bool:
+        return self.charging.controller.local_schedule.blocks_tag(tag, occurred)
+
     # A protected owner Start may first need a zero hold.
     async def prepare_hold(self, payload: dict[str, Any]) -> None:
         await self.charging.prepare_owner_report(payload)

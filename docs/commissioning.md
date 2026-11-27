@@ -96,13 +96,30 @@ identities used by the commissioned schedule. Keep this setting private with the
 When iCS is disconnected, a normal Start through authenticated management can use that identity for one request.
 The proxy verifies the current charger connection, idle state, selected ceiling, and existing command outcomes
 before issuing the Start. Use **Stop** to close that exact session, or **Pause charger** to keep a zero hold after
-closure. Cloud availability and charging readiness are reported separately. The saved timer, timed tests, and
-Return to app control follow their existing authorization and recovery rules.
+closure. Cloud availability and charging readiness are reported separately. Timed tests and Return to app
+control follow their existing authorization and recovery rules.
 
 Sessions started under this local authorization stay in the proxy journal with their charger reports and are
 available through the proxy's history, flagged as `local_only`. Their energy totals are available there.
 These sessions do not appear in the iCS app, because iCS did not authorize them. Keep the journal when updating
-the service. Before a downgrade, verify that the previous build supports the journal and its local sessions.
+the service. A downgrade involving locally authorized sessions needs a rehearsed build and journal pair that
+supports those records.
+
+### The midnight schedule during a vendor outage
+
+The proxy blocks new automatic overnight Starts during a vendor outage pending an independent charger cutoff.
+See [release qualification](release-process.md#qualify-the-overnight-outage-schedule). The commissioned
+charger schedule and manual owner Start follow their usual authorization rules.
+
+Keep any existing `owner_schedule_timezone` setting so the proxy can reconcile occurrences already in its
+journal. It identifies the local civil midnight and 06:00 endpoints, including on clock-change days. A previous
+occurrence retains its cutoff and exact session identity. The proxy requests a zero hold and Stop when that
+cutoff is due and verifies closure separately from the charger’s reply. If the host or charger connection is
+down, the proxy can act once it recovers.
+
+The prototype checks Linux kernel NTP synchronization at admission and immediately before sending Start.
+An unavailable or unsynchronized clock blocks a new Start. The service can start and recover during a time
+outage. The kernel can continue to report synchronization during holdover.
 
 ## Run the service
 
@@ -200,6 +217,10 @@ If a recorded history fault was caused only by missing records and those records
 the history tool can clear that exact fault while keeping strict history checking in place. If startup finds
 missing history and a saved vendor acknowledgement for a Stop report, the proxy can finish recording that
 report as acknowledged before checking whether history repair is available.
+
+When an uncertain vendor Start and its ambiguous delivery overlap with missing original history,
+acknowledge the history omission first. The acknowledgement retains the unresolved command and
+delivery for their separate reconciliation. Both steps require the existing verified zero hold.
 
 ## Roll back software
 

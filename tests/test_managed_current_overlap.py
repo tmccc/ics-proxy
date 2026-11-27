@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from ics_proxy_core.constants import HUB_PROFILE_ID
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.recovery_contracts import FailureKind, GateDecision, Pending, Prerequisite
 from ics_proxy_core.engine.rpc import UnavailableError
@@ -22,6 +23,7 @@ from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
 from tests.test_managed_boot_supersession import delay_reply
 from tests.test_managed_schedule_unnumbered import unnumbered
+from tests.test_native_read_supersession import OrderedNativePeer
 from tests.tls_support import tls as tls
 
 pytestmark = pytest.mark.asyncio
@@ -383,6 +385,210 @@ async def test_restart_during_pending_increase(tmp_path, tls, unused_tcp_port, m
             await introduced(b.rig, b.session, b.sock, "pending-current-replacement")
             assert not b.stops() and b.device.effective_limit() == 0
             await assert_daily_recovery(b, local, original, demand)
+
+
+# Intent: current recovery requires fresh native station inventory before the first or retried settlement.
+# Why: a previous composite reply cannot prove that the physical profile is still present.
+@pytest.mark.parametrize("lose_on_retry", [False, True], ids=["first-publication", "retry"])
+async def test_overlap_recovery_requires_live_station_before_settlement(
+    tmp_path, tls, unused_tcp_port, monkeypatch, lose_on_retry
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port) as b:
+        async with interrupted_increase(b, True) as (identifier, release):
+            local = await b.start_plan(9, demand=False)
+            await b.c.native.read()
+            async with asyncio.timeout(3):
+                while b.session.journal.next_delivery() is not None or b.session.gateway.vendor._pending:
+                    await asyncio.sleep(0.01)
+            b.c.current.worker.cancel()
+            await asyncio.gather(b.c.current.worker, return_exceptions=True)
+            release.set()
+        await crash(b.session)
+        b.session = managed_session(b.rig)
+        await b.session.start()
+        b.c = ManagedController(b.session)
+        j = b.session.journal
+        async with b.rig.charger(b.session) as b.sock:
+            await introduced(b.rig, b.session, b.sock, "station-loss-overlap")
+            before = b.c.requests.receipt(identifier)
+            assert before["state"] == "uncertain"
+            removed = []
+            if lose_on_retry:
+                j.db.execute(
+                    "CREATE TEMP TRIGGER refuse_current_result BEFORE UPDATE ON managed_requests "
+                    "WHEN NEW.state='failed' "
+                    "BEGIN SELECT RAISE(ABORT,'test settlement refusal'); END"
+                )
+                assert (await b.c.tick())["state"] == "reconciling"
+                assert b.c.requests.receipt(identifier) == before
+                assert j.current_change.read().recovering and b.device.effective_limit() == 6
+                j.db.execute("DROP TRIGGER refuse_current_result")
+                removed.append(b.device.profiles.pop(HUB_PROFILE_ID))
+            else:
+                actual_answer = b.device.answer
+
+                # Let the composite report be correct before the simulated profile disappears.
+                def station_vanishes_after_composite(action, payload):
+                    result = actual_answer(action, payload)
+                    if action == "GetCompositeSchedule" and b.device.effective_limit() == 6 and not removed:
+                        removed.append(b.device.profiles.pop(HUB_PROFILE_ID))
+                    return result
+
+                monkeypatch.setattr(b.device, "answer", station_vanishes_after_composite)
+
+            await b.c.tick()
+            assert removed and j.active() == local
+            assert b.c.requests.receipt(identifier) == before
+            assert j.current_change.read().recovering and not b.stops() and not starts(b.rig)
+            assert b.session.book.station_ceiling_lost()
+
+
+# Intent: revoke a restored positive offer in the same turn when fresh native evidence disagrees.
+# Why: the original session, lifecycle and independently observed current must still support the restored ceiling.
+@pytest.mark.parametrize(
+    "after_composite",
+    (
+        "original",
+        "source_changed",
+        "native_closed",
+        "ledger_closed",
+        "ledger_closed_before_commit",
+        "output_over_previous",
+        "draw_over_previous",
+        "transport_unavailable",
+    ),
+)
+async def test_first_overlap_settlement_distinguishes_conflict_from_unavailable(
+    tmp_path, tls, unused_tcp_port, monkeypatch, after_composite
+):
+    async with timer_bench(tmp_path, tls, unused_tcp_port, peer_type=OrderedNativePeer) as b:
+        async with interrupted_increase(b, True) as (identifier, release):
+            local = await b.start_plan(9, demand=True)
+            await b.c.native.read()
+            async with asyncio.timeout(3):
+                while b.session.journal.next_delivery() is not None or b.session.gateway.vendor._pending:
+                    await asyncio.sleep(0.01)
+            b.c.current.worker.cancel()
+            await asyncio.gather(b.c.current.worker, return_exceptions=True)
+            release.set()
+        await crash(b.session)
+        b.session = managed_session(b.rig)
+        await b.session.start()
+        b.c = ManagedController(b.session)
+        j = b.session.journal
+        async with b.rig.charger(b.session) as b.sock:
+            await introduced(b.rig, b.session, b.sock, "first-settlement-scope")
+            assert b.device.effective_limit() == 0
+            before = b.c.requests.receipt(identifier)
+            assert before["state"] == "uncertain"
+            result = b.device.answer
+            positive_composites = []
+            ledger_closes = after_composite in ("ledger_closed", "ledger_closed_before_commit")
+            queued_report = None
+            native_value = b.rig.peer.native
+
+            # Leave the charger profile and composite intact while its independent connector or meter disagrees.
+            def native_after_positive_composite(key):
+                value = native_value(key)
+                if positive_composites and b.device.effective_limit() == 6:
+                    if after_composite == "output_over_previous" and key == "CONNECTOR":
+                        value[0]["outLimit"] = 160
+                    elif after_composite == "draw_over_previous" and key == "METER":
+                        value[0]["meterData"].update(cur=[160, 0, 0], power=[3840, 0, 0, 3840])
+                return value
+
+            # Arrange the independent native change after the simulated charger confirms the previous limit.
+            def observe_after_positive_composite(action, payload):
+                answer = result(action, payload)
+                if action == "GetCompositeSchedule" and b.device.effective_limit() == 6:
+                    positive_composites.append(answer)
+                    if after_composite == "source_changed":
+                        b.rig.peer.plan_session = (local, 98765)
+                    elif after_composite == "native_closed":
+                        b.device.active = None
+                        b.device.requested_current = 0
+                        b.rig.peer.permission_enabled = False
+                        b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+                    elif after_composite == "transport_unavailable":
+                        b.rig.peer.unavailable = True
+                return answer
+
+            monkeypatch.setattr(b.device, "answer", observe_after_positive_composite)
+            monkeypatch.setattr(b.rig.peer, "native", native_after_positive_composite)
+            if after_composite == "ledger_closed":
+                read_result = b.c.native.read_result
+
+                # Deliver the closing report during settlement and let the independent native marker lag behind it.
+                async def read_after_closing_report(**kwargs):
+                    if b.c.current._settling_overlap is not None and j.active() == local:
+                        assert b.device.effective_limit() == 6
+                        await b.close_transaction(local)
+                        b.device.active = local
+                    return await read_result(**kwargs)
+
+                monkeypatch.setattr(b.c.native, "read_result", read_after_closing_report)
+            elif after_composite == "ledger_closed_before_commit":
+                read_result = b.c.native.read_result
+
+                # Give the already observed Stop the earlier turn while the current receipt still awaits publication.
+                def record_closing_report():
+                    assert positive_composites and b.device.effective_limit() == 6
+                    assert b.c.requests.receipt(identifier) == before and j.active() == local
+                    j.stop(
+                        uuid.uuid4().hex,
+                        {
+                            "transactionId": local,
+                            "meterStop": START["meterStart"],
+                            "timestamp": datetime.fromtimestamp(b.clock.now, UTC).isoformat(),
+                        },
+                    )
+
+                # Submit the journal update in the normal decision queue after the actual native read completes.
+                async def queue_closure_after_read(**kwargs):
+                    nonlocal queued_report
+                    native = await read_result(**kwargs)
+                    if b.c.current._settling_overlap is not None and queued_report is None:
+                        assert native.physical.transaction_open and native.physical.native_transaction_id == local
+                        queued_report = asyncio.create_task(b.c.commands.run(record_closing_report), eager_start=True)
+                    return native
+
+                monkeypatch.setattr(b.c.native, "read_result", queue_closure_after_read)
+            try:
+                status = await b.c.tick()
+                if after_composite == "ledger_closed_before_commit":
+                    assert queued_report is not None and j.outcomes.stop_report_closed(local)
+                    await queued_report
+                receipt = b.c.requests.receipt(identifier)
+                change = j.current_change.read().value
+                assert positive_composites and not b.stops() and not starts(b.rig)
+                assert j.active() == (None if ledger_closes else local)
+                if after_composite == "original":
+                    assert receipt["state"] == "failed" and b.device.effective_limit() == 6
+                else:
+                    assert receipt == before and j.current_change.read().recovering
+                    if after_composite != "transport_unavailable":
+                        assert status["state"] == "reconciling"
+                        assert b.device.effective_limit() == 0 and b.device.current == 0
+                        assert b.session.gateway.controls.desired() == 0
+                        if after_composite in ("source_changed", "native_closed"):
+                            assert change["continuing_local"] is None
+                    else:
+                        assert b.rig.peer.unavailable_requests and b.c.native.last_verified_at == 0
+                        assert b.device.effective_limit() == 6
+                if after_composite == "native_closed":
+                    assert change["native_open"] is False
+                    await b.close_transaction(local)
+                elif ledger_closes:
+                    b.device.active = None
+                    b.device.requested_current = 0
+                    b.rig.peer.permission_enabled = False
+                    b.rig.bench.cp, b.rig.bench.connection = "B", "Plug"
+                if after_composite == "native_closed" or ledger_closes:
+                    assert (await healthy(b.c))["station_ceiling_a"] == 6
+                    assert b.c.requests.receipt(identifier)["state"] == "failed" and not b.stops() and not starts(b.rig)
+            finally:
+                b.rig.peer.unavailable = False
+                b.rig.peer.plan_session = (local, 9)
 
 
 # Intent: actual automatic recovery owns the transaction that settles metadata and its process-replaced receipt.

@@ -1,54 +1,57 @@
 # Solar Display 2 example
 
-This example uses the iCS Home Assistant entities and the proxy’s shared control decisions. Each image carries
-its render time and, when a charger button is available, the exact control revision or open Stop target.
-The touchscreen requires a fresh download and a render less than 45 seconds old. A cached response can confirm
-the download while the render continues to age. When either expires, the touchscreen shows its offline dashboard.
-A new render can restore the dashboard after a Home Assistant clock correction. If the clock moves backward
-and the renderer serves an older image again, a previously expired image can reappear.
+The Home Assistant integration publishes the eligible charger action, its generation, and request feedback in
+`sensor.ics_proxy_display_command`. The display template sensor exposes that state while the touch automation is
+enabled and the preview reports the single assigned Cars & Charger view with no active notification. If the
+preview metadata is still loading, the first image shows disabled buttons. The valid preview then updates the
+template sensor so the renderer can draw the eligible button. A Start offer belongs to the current control revision
+and commissioned charger. A Stop offer also belongs to the verified open session.
 
-The Home Assistant automation verifies the device, screen, frame age, position and original marker before sending
-a request. Start also requires the current control revision and permission to start. Stop requires the target to
-match the current open session. The touchscreen shows pending and unconfirmed feedback for the exact request from
-the live Home Assistant helper, including between image downloads. While the automation is enabled, an
-unconfirmed message clears on the first five-second cleanup tick after 20 seconds, or when a new request
-replaces it. A charger tap must begin and end while the button is available and no request is pending.
-When Home Assistant reports the automation as off or unavailable, the touchscreen immediately greys out both
-charger buttons and ignores taps on them. If Home Assistant removes the automation without sending a state
-update, the previous button image can remain until the next render or the offline timeout. Home Assistant
-requires the automation to be installed and enabled to handle the tap. After reconnecting, the touchscreen
-waits for fresh request feedback before accepting a charger tap. If two Home Assistant connections overlap,
-the dashboard stays visible while its charger buttons are unavailable. After one connection closes, both
-buttons wait for the request helper, automation state and active-run count from the remaining connection.
-The offline dashboard hides request feedback.
+When a button is available, the renderer includes the action and generation in the image. The touchscreen enables
+that button only while the image and live state agree. The pressed generation and original render time travel with
+the tap. Home Assistant checks them again before sending the exact request to the proxy, including after opening
+the management connection. The proxy retains authority for charger commands and their receipts.
 
-If disabling the automation interrupts its wait for a Start or Stop, the first cleanup tick after re-enabling
-it marks the request unconfirmed. The charger buttons wait for that feedback to update before accepting another
-tap. The proxy can still settle the original request.
+Submitting a command retires the offer and shows pending feedback. After the exact receipt and a fresh status
+refresh, an eligible action gets a new generation, even if its control revision is unchanged. If the result is
+unconfirmed, live feedback lasts 20 elapsed seconds. An interrupted pending request that Home Assistant saved can
+return as unconfirmed after reload or restart. A later command always uses a newly issued generation.
 
-Use this with a compatible 480 × 480 ESPHome/LVGL touchscreen whose Home Assistant renderer provides the assigned
-view and display image. The canvas example is a package for an existing board configuration. The board supplies its
-display, touch and brightness components, its fallback dashboard, and the renderer integration.
+The touchscreen requires a fresh download and an image less than 45 seconds old. A cached response refreshes the
+download time while the image continues to age. A Home Assistant clock step can temporarily withhold a tap until
+a freshly rendered frame satisfies the action's time checks. During overlapping Home Assistant connections, the
+dashboard can stay visible while its buttons wait for a fresh command view from the surviving connection.
 
-1. Add the [request helper](request-helper.yaml) and [touch automation](controls.yaml) to Home Assistant.
-   Set the actual ESPHome device ID, image entity, screen-source sensor and view ID in the automation.
-2. Use [view.html.jinja](view.html.jinja) as the paired preview template. Its two optional vehicle cards expect
-   the example battery and cable entity names near the top. Leave them unavailable or use local equivalents.
-3. Adapt [esphome-canvas.yaml.example](esphome-canvas.yaml.example) to the board package and include
-   [canvas_frame.h](canvas_frame.h). Keep the image URL and image-scoped authorization in local ESPHome secrets.
-   The package synchronizes its Home Assistant clock every 10 seconds to check render times. Set the renderer to
-   update every 25 seconds or less with the example's 10-second download interval and 5-second HTTP timeout.
-   This leaves time for clock rounding and processing before the picture expires. Update the firmware, preview
-   template and touch automation together. You can keep the existing request helper with the same options.
-4. Confirm that the automation entity ID used by the view and the firmware's `canvas_ics_automation_entity`
-   substitution matches the installed automation.
-   In the view, write the quoted entity ID directly in both `is_state()` and `state_attr()` so GeekMagic
-   loads the automation’s state. Enable the automation in Home Assistant.
+## Installation and upgrade
 
-Start calls `ics_proxy.session_command` with `action: start` and the displayed revision. Stop calls it with
-`action: stop_session` and the displayed session target. The client returns confirmation for the exact request.
-The example leaves charging decisions, retries, and recovery with the proxy.
+Use a compatible 480 × 480 ESPHome/LVGL touchscreen. The board configuration supplies the display, touch and
+brightness components, a fallback dashboard, and the Home Assistant renderer integration.
 
-If Home Assistant offers Start but the display says **Charger buttons unavailable**, check that the touch
-automation is enabled, its entity ID matches both calls in the template, and the request helper is available.
-Once the frame refreshes, the display should say **Ready to start** when the proxy allows Start and no request is pending.
+1. Add the `template` configuration from [request-helper.yaml](request-helper.yaml) and install the
+   [touch automation](controls.yaml). Set the same preview image entity and view ID in both files. Set the actual
+   ESPHome device ID and screen-source sensor in the automation. Point the template sensor at the installed
+   automation and proxy command sensor.
+2. Install [view.html.jinja](view.html.jinja) as the display preview template. The renderer needs the literal
+   entity ID in its `states()` call to subscribe to the command view. Its optional vehicle cards can use the
+   example entity names or local equivalents.
+3. Adapt [esphome-canvas.yaml.example](esphome-canvas.yaml.example) to the board and include
+   [canvas_frame.h](canvas_frame.h). Set `canvas_ics_view_entity` to the display template sensor's entity ID.
+   Keep the image URL and image-scoped authorization in local ESPHome secrets. Set the renderer to update
+   every 25 seconds or less with the example's 10-second download interval and 5-second HTTP timeout.
+4. Update the integration, renderer, automation and firmware as a set. Once all four are present, confirm that
+   the touchscreen can show an enabled button only when the rendered offer matches the live command view.
+   The v2 footer retains the image timestamp in the earlier format so older firmware can still show the dashboard.
+   An actionable v2 button requires the matching v2 command view. Existing Home Assistant clients can still use
+   the earlier action fields. The old request helper and its expiry script can be removed after their last legacy
+   display is upgraded.
+
+The automation maps the display touch event to `ics_proxy.session_command` with `action`, `command_generation`,
+and `rendered_at_epoch`. The integration supplies the original revision and Stop target to the proxy. Install the
+updated integration before installing this automation. The integration still accepts the field names used by
+earlier releases of the automation.
+If the display says **Charger buttons unavailable**, check that the automation is enabled, the template sensor
+shows an eligible action, the preview reports the Cars & Charger view with no active notification, and the latest
+frame has downloaded.
+
+Run the offline firmware regression with `python -B examples/solar-display-2/tests/test_canvas_frame.py`.
+It uses `g++` with C++20 and tests the firmware header with a simulated clock.

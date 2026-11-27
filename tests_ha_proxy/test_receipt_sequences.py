@@ -85,6 +85,26 @@ async def test_receipt_identity_sequences(actual_hass, peer, control_peer, case,
         record_property("suffix_complete", suffix_complete)
 
 
+# Intent: report a confirmed replacement using the original saved command's reason.
+# Why: Home Assistant should explain why an accepted Pause ended when a newer Start replaced it.
+async def test_pause_reports_when_start_replaced_it(actual_hass, peer):
+    from custom_components.ics_proxy.api import ProxyError
+
+    entry = await setup(actual_hass, peer)
+    peer["pending_receipt"] = True
+
+    # Keep the admission reply intact and expose the replacement when Home Assistant reads the saved receipt.
+    def replaced(command, _request, result):
+        if command == "receipt":
+            return result | {"state": "failed", "result": {"classification": "superseded_by_start"}}
+        return result
+
+    peer["result_filter"] = replaced
+    with pytest.raises(ProxyError, match="A later Start replaced this Pause request"):
+        await entry.runtime_data.client.command("pause", peer["state"]["control_revision"])
+    assert peer["commands"].count("pause") == peer["commands"].count("receipt") == 1
+
+
 # Intent: a matching uncertain Start receipt acknowledges admission through each response path.
 # Why: after a lost reply only the original request's recognized receipt can prove it was recorded.
 @pytest.mark.parametrize(

@@ -158,6 +158,20 @@ async def test_denial_and_other_start_retry_recover_together(
                     ),
                     timeout=12,
                 )
+                if fault == "lost-again":
+                    head = s.journal.next_delivery()
+                    assert head is not None and head.state == "ambiguous" and head.transaction == ids[1]
+                    assert head.token in s.gateway.vendor.reply_windows()
+                    approved = [entry for entry in s.journal.get(KEY).values() if not entry.get("superseded")]
+                    assert len(approved) == 1 and approved[0]["completed"] is None
+                    assert approved[0]["proof"]["attestation"]["delivery_token"] == head.token
+                    assert s.journal.get("managed_control_fault") == approved[0]["proof"]["installed_fault"]
+                    assert s.journal.get(DENIALS)[str(ids[0])]["completed"] is None
+                    assert rig.bench.firmware.effective_limit() == 0
+                    # The original cloud receiver can still settle this exact retry until its connection closes.
+                    await rig.bench.cloud.close()
+                    await until(lambda: any(entry.get("superseded") for entry in s.journal.get(KEY).values()))
+                    assert head.token not in s.gateway.vendor.reply_windows()
                 assert s.journal.get("managed_control_fault") == first_fault
                 assert any(entry.get("superseded") for entry in s.journal.get(KEY).values())
                 assert s.journal.get(DENIALS)[str(ids[0])]["completed"] is None

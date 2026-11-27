@@ -84,10 +84,14 @@ class RecoveryCoordinator:
                 if intent is not None:
                     await self.restore(intent, offline_pause=True)
             elif work is RecoveryWork.ORDINARY:
-                if not decisions.cloud_ready(c):
+                owner_closure = decisions.held_owner_closure(c)
+                if owner_closure is not None:
+                    pending = await c.ordinary.recover_owner_closure(owner_closure)
+                elif decisions.cloud_ready(c) or decisions.held_owner_stop_pending(c):
+                    pending = await c.ordinary.recover()
+                else:
                     await c.ordinary.hold("restricted_introduction")
                     return Pending(Prerequisite.CLOUD, "ordinary recovery awaits the current cloud connection")
-                pending = await c.ordinary.recover()
                 if pending is not None:
                     return pending
             elif work is RecoveryWork.CONNECTION:
@@ -254,6 +258,7 @@ class RecoveryCoordinator:
             if isinstance(resumed, Pending):
                 return RestoreProgress(RestoreState.WAITING, resumed)
         ticket = j.get("control", {}).get("ticket")
+        lifecycle = j.lifecycle_position()
         native = await c.native.read_result(closed=continuing_local is None)
 
         attempt = ReleaseAttempt(
@@ -265,6 +270,7 @@ class RecoveryCoordinator:
             before_ticket=ticket,
             request_id=return_request,
             continuing_local=continuing_local,
+            lifecycle=lifecycle,
         )
         return c.commands.decide(lambda: decisions.prepare_release_attempt(c, attempt, native))
 
@@ -273,7 +279,7 @@ class RecoveryCoordinator:
         c = self.c
         g = c.session.gateway
         decisions = g.controls.decisions
-        guard, epoch = attempt.positive_guard, attempt.scope.epoch
+        epoch = attempt.scope.epoch
 
         # Only the successful child COMMIT can publish connection completion in memory.
         def committed(authority: AuthorityStamp) -> None:
@@ -281,8 +287,8 @@ class RecoveryCoordinator:
 
         result = await g.controls.release_result(
             attempt,
-            guard=guard,
-            context=c.session.book.positive_release_guard(guard),
+            guard=partial(decisions.release_ownership_decision, attempt),
+            context=c.session.book.positive_release_guard(partial(decisions.release_positive_decision, c, attempt)),
             rollback_guard=partial(decisions.require_release_boot, g, attempt),
             handoff=ReleaseHandoff(partial(decisions.publish_release, c, attempt, offline_pause), committed),
         )

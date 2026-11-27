@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -11,16 +12,18 @@ import re
 import shutil
 import sqlite3
 import stat
+import struct
 import tempfile
 import threading
 import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
+from ics_proxy_core.engine.ics import unique_object
 from ics_proxy_core.engine.incident_observation import IncidentObservation
 from ics_proxy_core.engine.managed_intent import OWNER_PAUSE, decode_intent, decode_pause_claim
 from ics_proxy_core.engine.security import SecurityError
@@ -30,6 +33,9 @@ MAX_EVENT_BYTES = 64 * 1024
 MAX_REPORT_EVENTS = 24
 UNKNOWN = "unknown"
 STAGES = ("prepared", "issued", "accepted", "rejected", "unsent", "reconciled")
+DELIVERY_STATES = {state.encode(): state for state in ("queued", "inflight", "ambiguous", "rejected")}
+# Project only known states so an unreadable value cannot mask the request's identity.
+MANAGED_REQUEST_STATE = "CASE WHEN state IN ('accepted','running','uncertain','completed','failed') THEN state END"
 
 
 # Accept only the engine's exact random UUID/ticket shape.
@@ -165,54 +171,94 @@ def observations(path: Path) -> list[dict[str, Any]]:
     return list(events)
 
 
+# Decode each optional object independently. Keep SQLite out of UTF-8 decoding of JSON payloads.
+def object_fields(value: object) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value, object_pairs_hook=unique_object) if isinstance(value, (str, bytes)) else None
+    except ValueError, RecursionError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+# An unavailable projection is distinct from a successful read with no matching rows.
+def evidence_rows(db: sqlite3.Connection, sql: str, parameters: tuple[Any, ...] = ()) -> list[tuple[Any, ...]] | None:
+    try:
+        return db.execute(sql, parameters).fetchall()
+    except sqlite3.Error, UnicodeError:
+        return None
+
+
+# Identify which optional journal projections the snapshot can supply.
+def journal_tables(db: sqlite3.Connection) -> set[str]:
+    return {name for (name,) in db.execute("SELECT name FROM sqlite_schema WHERE type='table'")}
+
+
 # Read small named metadata values without returning opaque payloads or entire journal rows.
 def metadata(db: sqlite3.Connection, key: str) -> dict[str, Any]:
-    row = db.execute("SELECT CASE WHEN length(value)<=8192 THEN value END FROM meta WHERE key=?", (key,)).fetchone()
-    try:
-        value = json.loads(row[0]) if row is not None and row[0] is not None else None
-    except ValueError, UnicodeError, RecursionError:
-        return {}
-    return value if isinstance(value, dict) else {}
+    rows = evidence_rows(db, "SELECT CAST(value AS BLOB) FROM meta WHERE key=? AND length(value)<=8192", (key,))
+    return object_fields(rows[0][0]) if rows else {}
 
 
 # Select a retained local Start by its exact management UUID, preserving unrelated historical receipts.
-def retained_start(db: sqlite3.Connection) -> tuple[str | None, dict[str, Any] | None]:
-    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='managed_requests'").fetchone() is None:
+def retained_start(db: sqlite3.Connection, tables: set[str]) -> tuple[str | None, dict[str, Any] | None]:
+    if "managed_requests" not in tables:
         return None, None
-    row = db.execute(
-        "SELECT id,action,revision,state FROM managed_requests "
-        "WHERE action IN ('start','start_test') ORDER BY rowid DESC LIMIT 1"
-    ).fetchone()
-    if row is None or (raw := identifier(row[0])) is None or type(row[2]) is not int or not 0 <= row[2] < 2**53:
+    rows = evidence_rows(
+        db,
+        f"SELECT id,action,revision,{MANAGED_REQUEST_STATE} FROM managed_requests "
+        "WHERE action IN ('start','start_test') ORDER BY rowid DESC LIMIT 1",
+    )
+    if not rows:
         return None, None
-    state = row[3] if row[3] in ("accepted", "running", "uncertain", "completed", "failed") else UNKNOWN
+    row = rows[0]
+    if (raw := identifier(row[0])) is None or type(row[2]) is not int or not 0 <= row[2] < 2**53:
+        return None, None
+    state = row[3] or UNKNOWN
     return raw, {"request": reference(raw), "action": row[1], "revision": row[2], "state": state}
 
 
-# Only the transaction named by this receipt can establish lifecycle or cloud delivery evidence.
-def lifecycle_fields(db: sqlite3.Connection, local: object) -> tuple[str, str, list[dict[str, Any]]]:
+# Receipt-bound lifecycle and delivery remain readable independently of either source's schema.
+def lifecycle_fields(db: sqlite3.Connection, tables: set[str], local: object) -> tuple[str, str, list[dict[str, Any]]]:
     if local is None:
         return "unbound", UNKNOWN, []
     if type(local) is not int or not 0 < local < 2**63:
         return UNKNOWN, UNKNOWN, []
-    row = db.execute("SELECT stop IS NOT NULL,vendor IS NOT NULL FROM transactions WHERE local=?", (local,)).fetchone()
-    if row is None:
-        return UNKNOWN, UNKNOWN, []
-    delivery = [
-        {
-            "event": action,
-            "state": state if state in ("queued", "inflight", "ambiguous", "rejected") else UNKNOWN,
-            "reply_saved": bool(reply_saved),
-        }
-        for action, state, reply_saved in db.execute(
-            "SELECT o.action,o.state,EXISTS(SELECT 1 FROM delivery_replies r WHERE r.token=o.token "
-            "AND r.action=o.action AND r.payload=o.payload AND r.local=o.local) "
-            "FROM outbox o WHERE o.local=? AND o.action IN ('StartTransaction','StopTransaction') "
-            "ORDER BY o.seq LIMIT 4",
+    delivery = pending_delivery_fields(db, tables, local)
+    if "transactions" not in tables:
+        return UNKNOWN, UNKNOWN, delivery
+    closure = evidence_rows(db, "SELECT stop IS NOT NULL FROM transactions WHERE local=?", (local,))
+    cloud = evidence_rows(db, "SELECT vendor IS NOT NULL FROM transactions WHERE local=?", (local,))
+    lifecycle = ("closed" if closure[0][0] else "open") if closure else UNKNOWN
+    mapping = ("recorded" if cloud[0][0] else "unmapped") if cloud else UNKNOWN
+    return lifecycle, mapping, delivery
+
+
+# Preserve queued delivery when the optional reply table is missing or unreadable.
+def pending_delivery_fields(db: sqlite3.Connection, tables: set[str], local: int) -> list[dict[str, Any]]:
+    if "outbox" not in tables:
+        return []
+    fields = "SELECT o.action,CAST(o.state AS BLOB)"
+    queued = (
+        "FROM outbox o WHERE o.local=? AND o.action IN ('StartTransaction','StopTransaction') ORDER BY o.seq LIMIT 4"
+    )
+    rows = None
+    if "delivery_replies" in tables:
+        rows = evidence_rows(
+            db,
+            f"{fields},EXISTS(SELECT 1 FROM delivery_replies r WHERE r.token=o.token "
+            f"AND r.action=o.action AND r.payload=o.payload AND r.local=o.local) {queued}",
             (local,),
         )
+    if rows is None:
+        rows = evidence_rows(db, f"{fields},0 {queued}", (local,))
+    return [
+        {
+            "event": action,
+            "state": DELIVERY_STATES.get(state, UNKNOWN),
+            "reply_saved": bool(reply_saved),
+        }
+        for action, state, reply_saved in rows or ()
     ]
-    return "closed" if row[0] else "open", "recorded" if row[1] else "unmapped", delivery
 
 
 # A checkpoint contains only the definite reply to an actual charger call.
@@ -223,10 +269,12 @@ def retained_start_reply(
     keys = (
         ((prefix + pending_wire[0],),)
         if pending_wire is not None
-        else db.execute("SELECT key FROM meta WHERE key GLOB ? AND length(key)=?", (prefix + "*", len(prefix) + 34))
+        else evidence_rows(
+            db, "SELECT key FROM meta WHERE key GLOB ? AND length(key)=?", (prefix + "*", len(prefix) + 34)
+        )
     )
     result = UNKNOWN
-    for (key,) in keys:
+    for (key,) in keys or ():
         wire = key[len(prefix) :]
         if not re.fullmatch(r"l-[a-f0-9]{32}", wire):
             continue
@@ -245,8 +293,8 @@ def retained_start_reply(
         if pending_wire is not None:
             if boot != pending_wire[1]:
                 continue
-        elif db.execute("SELECT 1 FROM owner_command_wires WHERE wire=?", (wire,)).fetchone() is not None:
-            # This ID already belongs to a different durable call.
+        elif evidence_rows(db, "SELECT 1 FROM owner_command_wires WHERE wire=?", (wire,)) != []:
+            # A checkpoint alone cannot displace a different or unreadable durable call.
             continue
         if result != UNKNOWN:
             return UNKNOWN
@@ -255,21 +303,30 @@ def retained_start_reply(
 
 
 # Read the exact saved wire receipt, with the completed Start stage available on older journals.
-def saved_start_reply(db: sqlite3.Connection, request: str, ticket: str, stage: str) -> str:
+def saved_start_reply(db: sqlite3.Connection, tables: set[str], request: str, ticket: str, stage: str) -> str:
     if stage in ("accepted", "rejected"):
         return stage
-    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_command_wires'").fetchone():
+    if "owner_command_wires" not in tables:
         return UNKNOWN
-    rows = db.execute(
+    rows = evidence_rows(
+        db,
         "SELECT wire,boot,local,limit_a,reply FROM owner_command_wires "
         "WHERE request=? AND ticket=? AND action='RemoteStartTransaction' LIMIT 2",
         (request, ticket),
-    ).fetchall()
-    if len(rows) > 1:
+    )
+    if rows is None or len(rows) > 1:
         return UNKNOWN
     pending_wire = None
     if rows:
         wire, boot, local, limit, reply = rows[0]
+        if (
+            not isinstance(wire, str)
+            or not re.fullmatch(r"(?:l-)?[a-f0-9]{32}", wire)
+            or (boot is not None and identifier(boot) is None)
+            or local is not None
+            or limit is not None
+        ):
+            return UNKNOWN
         if reply is not None:
             return {
                 "Accepted": "accepted",
@@ -279,41 +336,144 @@ def saved_start_reply(db: sqlite3.Connection, request: str, ticket: str, stage: 
                 "NotSupported": "other",
                 "Unknown": "other",
             }.get(reply, UNKNOWN)
-        if not isinstance(wire, str) or local is not None or limit is not None:
-            return UNKNOWN
         pending_wire = wire, boot
     return retained_start_reply(db, request, ticket, pending_wire) if stage in ("issued", "reconciled") else UNKNOWN
 
 
-# Read one private WAL snapshot with no service lock, normalization, socket or recovery call.
+# Confirm that the file or directory still has the identity and contents observed before copying.
+def same_snapshot_version(before: os.stat_result, current: os.stat_result) -> bool:
+    return os.path.samestat(before, current) and before.st_ctime_ns == current.st_ctime_ns
+
+
+# Journal sidecars and ownership apply to one name, so copies require private files with one link.
+def private_snapshot_file(info: os.stat_result) -> bool:
+    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.getuid() and not info.st_mode & 0o077
+
+
+# Probe the existing owner lock without creating it or keeping it across any copy.
+def journal_owner_active(path: Path) -> bool:
+    try:
+        descriptor = os.open(str(path) + ".lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    with os.fdopen(descriptor, "rb") as lock:
+        if not private_snapshot_file(os.fstat(descriptor)):
+            raise ValueError("incident requires a private regular journal lock")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+# Read the two SQLite WAL-index headers as data so SQLite cannot update the source shared memory.
+def read_wal_index(path: Path) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb", buffering=0) as index:
+        if not private_snapshot_file(os.fstat(descriptor)):
+            raise ValueError("incident requires a private regular WAL index")
+        return index.read(96)
+
+
+# The active writer can put a complete commit frame in the WAL before publishing it in the index.
+def restrict_live_wal(index: bytes, copied_wal: Path) -> bool:
+    header = index[:48]
+    if len(index) != 96 or header != index[48:] or header[12] != 1:
+        return False
+    version = struct.unpack_from("=I", header)[0]
+    if version != 3_007_000:
+        return False
+    first = second = 0
+    for word1, word2 in struct.iter_unpack("=II", header[:40]):
+        first = (first + word1 + second) & 0xFFFFFFFF
+        second = (second + word2 + first) & 0xFFFFFFFF
+    if (first, second) != struct.unpack_from("=II", header, 40):
+        return False
+
+    page_size, frames, pages, checksum1, checksum2 = struct.unpack_from("=HIIII", header, 14)
+    if frames == 0:
+        copied_wal.unlink(missing_ok=True)
+        return True
+    page_size = 65536 if page_size == 1 else page_size
+    if page_size not in (512, 1024, 2048, 4096, 8192, 16384, 32768, 65536) or pages == 0:
+        return False
+
+    with copied_wal.open("r+b") as wal:
+        wal_header = wal.read(32)
+        if len(wal_header) != 32:
+            return False
+        magic, wal_version, wal_page_size = struct.unpack_from(">III", wal_header)
+        if (
+            magic not in (0x377F0682, 0x377F0683)
+            or magic & 1 != header[13]
+            or (wal_version, wal_page_size) != (version, page_size)
+            or wal_header[16:24] != header[32:40]
+        ):
+            return False
+        frame_size = 24 + page_size
+        published_size = 32 + frames * frame_size
+        if os.fstat(wal.fileno()).st_size < published_size:
+            return False
+        wal.seek(published_size - frame_size)
+        frame = wal.read(24)
+        if (
+            len(frame) != 24
+            or int.from_bytes(frame[4:8], "big") != pages
+            or frame[8:16] != header[32:40]
+            or struct.unpack_from(">II", frame, 16) != (checksum1, checksum2)
+        ):
+            return False
+        wal.truncate(published_size)
+    return True
+
+
+# The original remains untouched even when SQLite reconstructs the WAL index on the private copy.
+def copy_snapshot(path: Path, copy: Path) -> bool:
+    parent = path.parent.stat()
+    active = journal_owner_active(path)
+    sidecars = {suffix: Path(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal")}
+    present = {suffix for suffix, source in sidecars.items() if os.path.lexists(source)}
+    sources = {"": path, **{suffix: source for suffix, source in sidecars.items() if suffix in present}}
+    observations = {suffix: source.lstat() for suffix, source in sources.items()}
+    if any(not private_snapshot_file(info) for info in observations.values()):
+        raise ValueError("incident requires private regular journal files")
+    if active and "-journal" in present:
+        return False
+    index_path = sidecars["-shm"]
+    index = read_wal_index(index_path) if active and present & {"-shm", "-wal"} else None
+    for suffix, source in sources.items():
+        if suffix != "-shm":
+            shutil.copyfile(source, Path(str(copy) + suffix))
+    copied_wal = Path(str(copy) + "-wal")
+    return (
+        all(same_snapshot_version(observations[suffix], source.lstat()) for suffix, source in sources.items())
+        and same_snapshot_version(parent, path.parent.stat())
+        and all(os.path.lexists(source) == (suffix in present) for suffix, source in sidecars.items())
+        and journal_owner_active(path) == active
+        and (index is None or index == read_wal_index(index_path) and restrict_live_wal(index, copied_wal))
+    )
+
+
+# Read a stable snapshot. SQLite may create a WAL or update its index even when opened with mode=ro.
 @contextmanager
 def read_journal(path: Path) -> Iterator[sqlite3.Connection]:
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+    if not private_snapshot_file(path.lstat()):
         raise ValueError("incident requires a private regular journal file")
-    with ExitStack() as resources:
-        sidecars = tuple(Path(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal"))
-        parent = path.parent.stat()
-        read_only = not parent.st_mode & 0o222 or not os.access(path.parent, os.W_OK)
-        if read_only and not any(os.path.lexists(sidecar) for sidecar in sidecars):
-            # SQLite may need a WAL index even to read a checkpointed backup. Build it only on the private copy.
-            directory = resources.enter_context(tempfile.TemporaryDirectory(prefix="ics-incident-"))
+    for _ in range(3):
+        with tempfile.TemporaryDirectory(prefix="ics-incident-") as directory:
             copy = Path(directory) / "journal.sqlite"
-            shutil.copyfile(path, copy)
-            current, current_parent = path.lstat(), path.parent.stat()
-            if (
-                not os.path.samestat(info, current)
-                or info.st_ctime_ns != current.st_ctime_ns
-                or not os.path.samestat(parent, current_parent)
-                or parent.st_ctime_ns != current_parent.st_ctime_ns
-                or any(os.path.lexists(sidecar) for sidecar in sidecars)
-            ):
-                raise ValueError("incident backup changed while being copied")
-            path = copy
-        db = resources.enter_context(closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.1)))
-        db.execute("PRAGMA query_only=ON")
-        db.execute("BEGIN")
-        yield db
+            try:
+                stable = copy_snapshot(path, copy)
+            except FileNotFoundError:
+                continue  # A checkpoint can remove sidecars during the copy.
+            if not stable:
+                continue
+            with closing(sqlite3.connect(copy.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as db:
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                yield db
+                return
+    raise ValueError("incident journal changed while being copied")
 
 
 # Assemble Start facts from the same SQLite read transaction.
@@ -321,6 +481,7 @@ def journal_facts(path: Path) -> dict[str, Any]:
     result: dict[str, Any] = {"available": False, "intent": None, "request": None, "start": None}
     try:
         with read_journal(path) as db:
+            tables = journal_tables(db)
             intent = intent_fields(metadata(db, "managed_control_intent"))
             claim = decode_pause_claim(metadata(db, OWNER_PAUSE))
             if intent is not None:
@@ -331,7 +492,7 @@ def journal_facts(path: Path) -> dict[str, Any]:
                 )
             wire = metadata(db, "local_start_receipt")
             owner = metadata(db, "managed_test_charge")
-            original, request = retained_start(db)
+            original, request = retained_start(db, tables)
             if request is not None and original == owner.get("id"):
                 current = owner.get("current_a")
                 if type(current) in (int, float) and 6 <= current <= 32:
@@ -341,13 +502,13 @@ def journal_facts(path: Path) -> dict[str, Any]:
             stage = wire.get("stage")
             if original is not None and wire.get("request_id") == original and ticket and stage in STAGES:
                 lifecycle, cloud_mapping, delivery = (
-                    lifecycle_fields(db, wire["local"]) if "local" in wire else (UNKNOWN, UNKNOWN, [])
+                    lifecycle_fields(db, tables, wire["local"]) if "local" in wire else (UNKNOWN, UNKNOWN, [])
                 )
                 published = owner.get("start_rpc_accepted") if owner.get("id") == original else None
                 start = {
                     "ticket": ticket,
                     "stage": stage,
-                    "saved_reply": saved_start_reply(db, original, wire["ticket"], stage),
+                    "saved_reply": saved_start_reply(db, tables, original, wire["ticket"], stage),
                     "authority_published": published if type(published) is bool else None,
                     "lifecycle": lifecycle,
                     "cloud_mapping": cloud_mapping,
@@ -460,7 +621,7 @@ def incident_report(journal: Path, event_path: Path) -> dict[str, Any]:
         "schema_version": 1,
         "journal": saved,
         "wire": {"request": request, "ticket": ticket, "send": transport, "observed_reply": reply},
-        "waiting_for_evidence": waiting if start.get("lifecycle", UNKNOWN) != UNKNOWN else None,
+        "waiting_for_evidence": waiting if start.get("lifecycle", UNKNOWN) != UNKNOWN or pending else None,
         "observations": timeline[-MAX_REPORT_EVENTS:],
         "sampled_status": sampled_status(journal.with_suffix(".status.json")),
     }

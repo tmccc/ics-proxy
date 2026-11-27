@@ -20,7 +20,7 @@ import pytest
 
 from ics_proxy_core.engine import managed_charging as charge_tests
 from ics_proxy_core.engine.managed import ManagedController
-from ics_proxy_core.engine.managed_intent import OFFLINE_PAUSE
+from ics_proxy_core.engine.managed_intent import AUTOMATIC_PAUSE_CAUSE, OFFLINE_PAUSE
 from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.rpc import UnavailableError
 from ics_proxy_core.engine.security import SecurityError
@@ -336,6 +336,7 @@ async def test_cloud_reconnect_flushes_observations_and_restores_only_its_own_pa
             c.command(uuid.uuid4().hex, "pause", intent.revision)
             status = await locally_ready(c)
             assert status["local_hold_verified"] and j.get(OFFLINE_PAUSE) is None
+            assert j.get(AUTOMATIC_PAUSE_CAUSE) is None
             intent = c.requests.intent()
         elif pause == "legacy":
             j.put(OFFLINE_PAUSE, True)
@@ -736,9 +737,12 @@ async def test_normal_start_owner_epoch_persistence_failure_keeps_pause_authorit
         assert len(starts(rig)) == 1
 
 
-# Intent: choosing a current while cloud recovery holds zero preserves the original automatic Return.
-# Why: the revision advances for a current selection, but the owner did not request a separate Pause.
-async def test_current_selection_preserves_the_automatic_outage_pause(tmp_path, tls, unused_tcp_port, monkeypatch):
+# Intent: choosing a current while cloud recovery holds zero carries the same automatic Return and any cause evidence.
+# Why: the revision changes, but the owner did not request a separate Pause or supply new cause evidence.
+@pytest.mark.parametrize("legacy", [False, True], ids=["cause-recorded", "unqualified-revision"])
+async def test_current_selection_preserves_the_automatic_outage_pause(
+    tmp_path, tls, unused_tcp_port, monkeypatch, legacy
+):
     async with replacement_offline(tmp_path, tls, unused_tcp_port, monkeypatch) as recovery:
         test = recovery.test
         c, j = test.controller, test.session.journal
@@ -747,18 +751,26 @@ async def test_current_selection_preserves_the_automatic_outage_pause(tmp_path, 
         assert status["local_hold_verified"]
         before = c.requests.intent()
         assert j.get(OFFLINE_PAUSE) == before.revision and j.next_delivery() is None
+        if legacy:
+            j.db.execute("DELETE FROM meta WHERE key=?", (AUTOMATIC_PAUSE_CAUSE,))
 
         receipt = await select(test, 24)
         assert c.requests.receipt(receipt)["state"] == "completed"
         selected = c.requests.intent()
         assert selected == before.next("paused") and j.get(OFFLINE_PAUSE) == selected.revision
+        expected = None if legacy else {"revision": selected.revision, "cause": "cloud_connection_failed"}
+        assert j.get(AUTOMATIC_PAUSE_CAUSE) == expected
         assert test.rig.bench.firmware.effective_limit() == 0
-        assert refresh_for_read(c, await locally_ready(c))["pause_reason"] == "cloud_connection_failed"
+        paused = await locally_ready(c)
+        assert refresh_for_read(c, paused)["pause_reason"] == "cloud_connection_failed"
 
         transport = test.session.runtime.transport
         transport.config = replace(transport.config, vendor_url=recovery.original_vendor_url)
-        await until(lambda: test.session.gateway.vendor_registration == "Accepted")
+        await until(lambda: test.session.runtime.vendor_registered)
+        reason = refresh_for_read(c, paused).get("pause_reason")
+        assert reason == (None if legacy else "cloud_connection_failed")
         restored = await healthy(c)
         assert c.requests.intent() == selected.next("app")
         assert j.get(OFFLINE_PAUSE) is None and restored["station_ceiling_a"] == 24
+        assert j.get(AUTOMATIC_PAUSE_CAUSE) is None
         assert not starts(test.rig)

@@ -1,6 +1,7 @@
 # Modified for the standalone iCS proxy repository.
 """Repeated cloud refusal and failures during its approved recovery retain real lifecycle evidence."""
 
+import asyncio
 import json
 import sqlite3
 import time
@@ -9,7 +10,7 @@ from contextlib import closing
 
 import pytest
 
-from ics_proxy_core.engine import managed_start_delivery
+from ics_proxy_core.engine import managed_start_delivery, rpc
 from ics_proxy_core.engine.delivery_reply import DeliveryReply
 from ics_proxy_core.engine.managed_debt_recovery import KEY, start_retry_candidate
 from ics_proxy_core.engine.security import SecurityError
@@ -143,6 +144,7 @@ def test_saved_late_start_reply_blocks_operator_retry(tmp_path, body):
     [
         "none",
         "error-once",
+        "late-accepted",
         "silent",
         "missing-id",
         pytest.param("bad-info", marks=pytest.mark.recovery_replay),
@@ -156,6 +158,8 @@ async def test_start_retry_can_itself_fail_and_recover(
     tmp_path, tls, unused_tcp_port, monkeypatch, capsys, recovery_fault
 ):
     monkeypatch.setattr(managed_start_delivery, "RETRY_INTERVAL", 0.01)
+    if recovery_fault == "silent":
+        monkeypatch.setattr(rpc, "LATE_REPLY_SECONDS", 0.25)
     async with mp.managed_bench(
         tmp_path, tls, unused_tcp_port, bench_type=StartReplyBench, native_peer=InterruptedNativePeer
     ) as rig:
@@ -225,7 +229,7 @@ async def test_start_retry_can_itself_fail_and_recover(
                     ),
                     timeout=10,
                 )
-                assert any(entry.get("superseded") for entry in s.journal.get(KEY).values())
+                await until(lambda: any(entry.get("superseded") for entry in s.journal.get(KEY).values()))
                 await pause(c)
             if recovery_fault == "exhaust-again":
                 await approve_retry(rig, tmp_path, capsys)
@@ -252,9 +256,22 @@ async def test_start_retry_can_itself_fail_and_recover(
                 assert any(entry.get("superseded") for entry in s.journal.get(KEY).values())
                 await pause(c)
             await approve_stop_after_start(rig, tmp_path, capsys)
+        late_reply = asyncio.Event() if recovery_fault == "late-accepted" else None
+        rig.bench.start_reply_gate = late_reply
         async with running(rig, "recovered-start-delivery") as (s, c, sock):
+            if late_reply is not None:
+                try:
+                    await until(lambda: s.journal.next_delivery().state == "ambiguous", timeout=8)
+                    assert retained.token in s.gateway.vendor.reply_windows()
+                    assert not any(entry.get("superseded") for entry in s.journal.get(KEY).values())
+                finally:
+                    late_reply.set()
             await until(lambda: s.journal.next_delivery() is None)
             assert s.journal.vendor_id(local) is not None
+            if late_reply is not None:
+                proofs = [entry["proof"] for entry in s.journal.get(KEY).values()]
+                assert proofs[0]["start_wire_ack"]["delivery_token"] == retained.token
+                assert proofs[0]["stop_wire_ack"] is not None
             stop = [f for f in rig.bench.lifecycle_wires if f[2] == "StopTransaction"]
             assert len(stop) == (2 if recovery_fault.startswith("stop-") else 1)
             assert all(

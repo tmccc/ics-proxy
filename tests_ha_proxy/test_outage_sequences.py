@@ -70,7 +70,7 @@ async def test_outage_lifecycle_sequences(actual_hass, peer, monkeypatch, record
         return result
 
     monkeypatch.setattr(coordinator.ProxyCoordinator, "__init__", traced_init)
-    monkeypatch.setattr(coordinator, "time", SimpleNamespace(monotonic=lambda: clock.value))
+    monkeypatch.setattr(coordinator, "time", SimpleNamespace(monotonic=lambda: clock.value, time=lambda: clock.value))
     monkeypatch.setattr(notification, "async_call_later", traced_later)
     peer["result_filter"] = response
     suffix_complete = False

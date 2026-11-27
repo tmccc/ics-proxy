@@ -442,6 +442,61 @@ def test_coverage_cli_forwards_chosen_collection_executors(tmp_path, monkeypatch
     assert "--include-coverage" in commands[0]
 
 
+# Intent: direct validation can use a caller-relative bundle with checkout-relative and absolute phase paths.
+# Why: operators can run the validator outside the checkout while keeping evidence in both locations.
+def test_validator_resolves_phase_paths_from_outside_checkout(tmp_path, monkeypatch):
+    from tools import validate
+
+    checkout, caller = tmp_path / "checkout", tmp_path / "caller"
+    caller.mkdir()
+    metadata = {"commit": "synthetic-commit", "source_digest": "synthetic-digest"}
+    batches = {
+        "engine-model": checkout / "artifacts/engine-model",
+        "ha-proxy": caller / "artifacts/ha-proxy",
+        "ha-proxy-2026.10": checkout / "artifacts/ha-proxy-2026.10",
+    }
+    for suite, batch in batches.items():
+        batch.mkdir(parents=True)
+        config = {"suite": suite, "workers": 20, "mode": "full", "expected_packages": {}}
+        (batch / "config.json").write_text(json.dumps(config))
+    phases = {
+        "engine-model": "artifacts/engine-model",
+        "ha-proxy": str(batches["ha-proxy"]),
+        "ha-proxy-2026.10": "artifacts/ha-proxy-2026.10",
+    }
+    bundle = caller / "bundle.json"
+    bundle.write_text(json.dumps(metadata | {"phases": phases}))
+    audited_batches = {}
+
+    # Capture the actual paths in the audit commands without launching workers.
+    def audited_step(name, command, results, *, cwd):
+        batch = Path(command[5])
+        config = json.loads((batch / "config.json").read_text())
+        audited_batches[config["suite"]] = batch
+        results[name] = True
+        audit = config | metadata | {"full_qualification_passed": True}
+        return subprocess.CompletedProcess(command, 0, json.dumps(audit))
+
+    monkeypatch.chdir(caller)
+    monkeypatch.setattr(validate, "ROOT", checkout)
+    monkeypatch.setattr(validate, "freeze", lambda repo, frozen: metadata)
+    monkeypatch.setattr(validate, "run_step", audited_step)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "validate",
+            "--tests-only",
+            "--deployment-target",
+            "qualification-only",
+            "--qualification-report",
+            bundle.name,
+        ],
+    )
+    assert validate.main() == 0
+    assert audited_batches == batches
+
+
 # Intent: the coverage CLI retains the validator's exact source and audit output when launched outside the checkout.
 # Why: the input bundle and cached audits can change after validation passes.
 @pytest.mark.parametrize("relative_bundle", [False, True], ids=["absolute-bundle", "relative-bundle"])

@@ -298,7 +298,8 @@ async def test_lost_ceiling_refuses_positive_selection(tmp_path, tls, unused_tcp
 # Intent: loss of the owned ceiling stops exactly the known charge during normal operation or after restart.
 # Why: a real Stop reply does not establish closure, recreate the missing profile, or silently verify Pause.
 @pytest.mark.parametrize(
-    "boundary", ["live", "reconnect", "restart", "loss_write", "prior-stop", "prior-stop-live", "prior-stop-no-draw"]
+    "boundary",
+    ["live", "reconnect", "restart", "loss_write", "prior-stop", "prior-stop-live", "prior-stop-no-draw", "late-reply"],
 )
 async def test_lost_ceiling_stops_the_known_open_session(tmp_path, tls, unused_tcp_port, monkeypatch, boundary):
     async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 16) as b:
@@ -317,6 +318,28 @@ async def test_lost_ceiling_stops_the_known_open_session(tmp_path, tls, unused_t
         firmware.profiles.pop(HUB_PROFILE_ID)
         assert firmware.current == (0 if boundary == "prior-stop-no-draw" else 32)
         mark = len(rig.bench.device_calls)
+        expected_sends = 1
+        if boundary == "late-reply":
+            expected_sends = 2
+            replies = []
+            sender = b.charger.send
+            monkeypatch.setattr(b.session.gateway.charger, "timeout", 0.25)
+
+            # Let the first exact acceptance arrive while a second protective attempt is outstanding.
+            async def delay_stop_reply(raw):
+                frame = decode(raw)
+                if frame[0] == 3 and any(
+                    call[1] == frame[1] and call[2] == "RemoteStopTransaction" for call in rig.bench.device_calls[mark:]
+                ):
+                    replies.append(raw)
+                    if len(replies) == 1:
+                        return
+                    if len(replies) == 2:
+                        await sender(replies[0])
+                        return
+                await sender(raw)
+
+            monkeypatch.setattr(b.charger, "send", delay_stop_reply)
 
         # Require a genuine Stop exchange, then deliver the independent device's lifecycle closure separately.
         async def expect_stop(c, charger):
@@ -336,7 +359,9 @@ async def test_lost_ceiling_stops_the_known_open_session(tmp_path, tls, unused_t
             status = await c.tick()
             assert status["state"] == "attention" and not status.get("local_hold_verified")
             fresh = rig.bench.device_calls[mark:]
-            assert [call[3] for call in fresh if call[2] == "RemoteStopTransaction"] == [{"transactionId": local}]
+            assert [call[3] for call in fresh if call[2] == "RemoteStopTransaction"] == [
+                {"transactionId": local}
+            ] * expected_sends
             assert not any(
                 call[2] in ("SetChargingProfile", "ClearChargingProfile", "RemoteStartTransaction") for call in fresh
             )
@@ -365,7 +390,7 @@ async def test_lost_ceiling_stops_the_known_open_session(tmp_path, tls, unused_t
             finally:
                 j.db.execute("DROP TRIGGER refuse_absence")
             return
-        if boundary in ("live", "prior-stop-live"):
+        if boundary in ("live", "prior-stop-live", "late-reply"):
             await expect_stop(b.controller, b.charger)
             return
 
@@ -517,6 +542,45 @@ async def test_pause_during_retained_ceiling_check_is_not_a_native_fault(tmp_pat
         assert not c.failures and not c.strict_failure_seen
         assert b.session.journal.get("managed_native_failure") is None
         assert (await healthy(c))["local_hold_verified"]
+
+
+# Intent: an accepted Pause can dispatch zero while the retained positive ceiling audit is still waiting.
+# Why: reading a retained positive ceiling must yield to a queued Pause before zero can reach the charger.
+async def test_pause_preempts_waiting_retained_ceiling_audit(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 16) as b:
+        c, g, rig = b.controller, b.session.gateway, b.rig
+        await healthy(c)
+        audit = g.controls.require_retained_station
+        assert audit is not None
+        entered, retired, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        # Hold the positive audit until Pause interrupts it and let the original audit handle any zero checks.
+        async def delay_positive_read(limit):
+            if limit > 0:
+                entered.set()
+                try:
+                    await release.wait()
+                finally:
+                    retired.set()
+            await audit(limit)
+
+        monkeypatch.setattr(g.controls, "require_retained_station", delay_positive_read)
+        assert (await rig.bench.call(b.charger, "boot-before-retained-audit", "BootNotification", BOOT))[0] == 3
+        poll = asyncio.create_task(c.tick())
+        mark = len(rig.bench.received_limits)
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            identifier = uuid.uuid4().hex
+            assert c.command(identifier, "pause", c.requests.intent().revision)["state"] == "accepted"
+            await until(lambda: rig.bench.received_limits[mark:] == [0], timeout=2)
+            assert retired.is_set()
+        finally:
+            release.set()
+            status = await poll
+        assert status["state"] == "reconciling"
+        assert not c.failures and not c.strict_failure_seen
+        assert (await healthy(c))["local_hold_verified"]
+        assert c.requests.receipt(identifier)["state"] == "completed"
 
 
 # Intent: a complete new composite above the selected limit triggers a protective hold even while idle.

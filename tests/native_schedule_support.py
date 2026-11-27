@@ -90,6 +90,7 @@ class SchedulerClock:
     def __init__(self, now: float) -> None:
         self._now = now
         self.elapsed = 0.0
+        self.synchronized = True
 
     # Expose the existing scenario driver's calendar input.
     @property

@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from hashlib import sha256
+from http import HTTPStatus
 from typing import Any
 
 import aiohttp
@@ -77,6 +78,20 @@ class ProxyError(Exception):
     """A fixed safe error, without credentials, URLs or raw peer bodies."""
 
 
+# A client uses the field advertised by its peer and accepts the original wire name from older proxies.
+def management_owner_binding(status: dict[str, Any]) -> tuple[str, str | None]:
+    legacy = "canvas_owner"
+    field = "management_owner" if "management_owner" in status else legacy
+    owner = status.get(field)
+    if field != legacy and legacy in status and status[legacy] != owner:
+        raise ProxyError("The local proxy reported inconsistent management ownership")
+    if isinstance(owner, str) and re.fullmatch(r"[a-f0-9]{64}", owner):
+        return field, owner
+    if field != legacy or status.get("management_owner_binding") is True:
+        raise ProxyError("The local proxy reported invalid management ownership")
+    return field, None
+
+
 class UnknownCommandOutcomeError(ProxyError):
     """The command may have reached the proxy, so only its saved result can settle it."""
 
@@ -100,20 +115,6 @@ async def _reject_redirect(
     return response
 
 
-# A client uses the field advertised by its peer and accepts the original wire name from older proxies.
-def management_owner_binding(status: dict[str, Any]) -> tuple[str, str | None]:
-    legacy = "canvas_owner"
-    field = "management_owner" if "management_owner" in status else legacy
-    owner = status.get(field)
-    if field != legacy and legacy in status and status[legacy] != owner:
-        raise ProxyError("The local proxy reported inconsistent management ownership")
-    if isinstance(owner, str) and re.fullmatch(r"[a-f0-9]{64}", owner):
-        return field, owner
-    if field != legacy or status.get("management_owner_binding") is True:
-        raise ProxyError("The local proxy reported invalid management ownership")
-    return field, None
-
-
 class ProxyClient:
     """Home Assistant shares the host network with the proxy; every connection is literal loopback only."""
 
@@ -129,9 +130,14 @@ class ProxyClient:
         self.session, self.port, self.token = session, port, token
 
     # One bounded websocket exchange has no reconnect or retry path and authenticates outside the message body.
-    async def request(self, command: str, **fields: Any) -> dict[str, Any]:
+    async def request(
+        self, command: str, *, before_write: Callable[[], None] | None = None, **fields: Any
+    ) -> dict[str, Any]:
         identifier = fields.pop("id", uuid.uuid4().hex)
         sending = False
+        protocols = ["ics-proxy.v1"]
+        if command == "pause":
+            protocols.insert(0, "ics-proxy.pause.v1")
         try:
             connector = self.session.connector
             if connector is None or connector.closed:
@@ -146,9 +152,11 @@ class ProxyClient:
                 async with session.ws_connect(
                     f"http://127.0.0.1:{self.port}/management",
                     headers={"Authorization": "Bearer " + self.token},
-                    protocols=["ics-proxy.pause.v1", "ics-proxy.v1"] if command == "pause" else ["ics-proxy.v1"],
+                    protocols=protocols,
                     max_msg_size=65536,
                 ) as connection:
+                    if before_write is not None:
+                        before_write()
                     sending = True
                     await connection.send_json({"id": identifier, "command": command, **fields})
                     message = await connection.receive()
@@ -169,7 +177,12 @@ class ProxyClient:
                         raise TypeError("The local charger proxy returned a non-text response")
                     response = message.json()
         except (aiohttp.ClientError, TimeoutError, ValueError, TypeError, RecursionError) as error:
-            if command == "receipt" and isinstance(error, (aiohttp.ClientConnectionError, TimeoutError)):
+            # The management listener can refuse a WebSocket upgrade with HTTP 503 during shutdown.
+            if command == "receipt" and (
+                isinstance(error, (aiohttp.ClientConnectionError, TimeoutError))
+                or isinstance(error, aiohttp.WSServerHandshakeError)
+                and error.status == HTTPStatus.SERVICE_UNAVAILABLE
+            ):
                 raise ReceiptUnavailableError("The saved command result is temporarily unavailable") from None
             if sending and command not in ("status", "history", "receipt"):
                 raise UnknownCommandOutcomeError(_UNKNOWN_OUTCOME) from None
@@ -222,7 +235,13 @@ class ProxyClient:
 
     # Send the control once and recover a lost first reply by reading the original request's receipt.
     async def command(
-        self, action: str, revision: int, *, report_reference: Callable[[str], None] | None = None, **fields: Any
+        self,
+        action: str,
+        revision: int,
+        *,
+        report_reference: Callable[[str], None] | None = None,
+        before_write: Callable[[], None] | None = None,
+        **fields: Any,
     ) -> None:
         supplied_id = "id" in fields
         identifier = fields.pop("id", uuid.uuid4().hex)
@@ -250,17 +269,31 @@ class ProxyClient:
                 return isinstance(receipt.get("target"), str) and receipt["target"] == fields.get("target")
             return True
 
-        if report_reference is not None:
-            # Match the operator report's redaction without exposing a usable receipt ID.
-            report_reference(sha256(identifier.encode("ascii")).hexdigest()[:32])
+        # A guarded request gets a reference only after it passes its last local check.
+        def prepare_write() -> None:
+            if before_write is not None:
+                before_write()
+            if report_reference is not None:
+                # Match the operator report's redaction without exposing a usable receipt ID.
+                report_reference(sha256(identifier.encode("ascii")).hexdigest()[:32])
+
+        if before_write is None:
+            prepare_write()
         try:
-            receipt: dict[str, Any] | None = await self.request(action, id=identifier, revision=revision, **fields)
+            receipt: dict[str, Any] | None = await self.request(
+                action,
+                id=identifier,
+                revision=revision,
+                before_write=prepare_write if before_write is not None else None,
+                **fields,
+            )
         except UnknownCommandOutcomeError:
             receipt = None
         if receipt is not None and not matches(receipt):
             raise ProxyError("The local charger proxy returned an invalid command receipt")
         receipt_id = identifier
         followed: set[str] = set()
+        reading_receipt = False
         try:
             # Both local Start commands can spend up to 60 seconds waiting for physical confirmation.
             async with asyncio.timeout(70 if action in ("start", "start_test") else 25):
@@ -285,7 +318,9 @@ class ProxyClient:
                         receipt_id = newer
                     else:
                         break
+                    reading_receipt = True
                     receipt = await self._receipt(receipt_id)
+                    reading_receipt = False
                     if receipt_id == identifier:
                         matched = matches(receipt, lookup=True)
                     else:
@@ -297,13 +332,17 @@ class ProxyClient:
         except TimeoutError, ProxyError:
             if receipt is None:
                 raise UnknownCommandOutcomeError(_UNKNOWN_OUTCOME) from None
-            raise ProxyError("The request was recorded; physical confirmation is still pending") from None
+            if reading_receipt:
+                raise ProxyError("The request was recorded. Its saved result could not be read.") from None
+            raise ProxyError("The request was recorded. The last saved result was still pending.") from None
         if receipt.get("state") == "uncertain":
             raise ProxyError(
                 "The proxy recorded the request. The charger outcome is uncertain. Check the charger status."
             )
         result = receipt.get("result")
         if receipt.get("state") == "failed" and isinstance(result, dict):
+            if action == "pause" and result.get("classification") == "superseded_by_start":
+                raise ProxyError("A later Start replaced this Pause request.")
             if action == "app_control" and result.get("classification") == "return_not_sent":
                 raise ProxyError("Return to app / schedule stopped before sending the release command.")
         if receipt.get("state") != "completed":

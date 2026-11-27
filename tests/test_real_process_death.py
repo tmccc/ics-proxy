@@ -247,6 +247,353 @@ async def test_process_saved_forwarded_stop_waits_for_closure(
         assert sum(frame[1] == wire for frame in bench.device_calls) == 1
 
 
+# Intent: replace the actual process after a queued Stop observes native closure but before the charger report.
+# Why: losing one or both writes must neither replay the Stop nor let positive current precede verified closure.
+@pytest.mark.recovery_replay
+@pytest.mark.parametrize("checkpoint_saved", [True, False], ids=["checkpoint-saved", "both-writes-refused"])
+async def test_process_cut_after_queued_stop_observes_native_closure(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, checkpoint_saved
+):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path, tls_for_case(tmp_path, model_tls), ports(), ports(), monkeypatch, timing="fast-poll"
+    ) as child:
+        rig, bench = child.rig, child.rig.bench
+        await child.start()
+        await child.status()
+        start = START | {"idTag": "NATIVE_TIMER"}
+        answer = await bench.call(child.socket, uuid.uuid4().hex, "StartTransaction", start)
+        assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted"
+        local = answer[2]["transactionId"]
+        original = await child.delivered(local)
+        open_status = await child.status(lambda status: bool(status.get("stop_target")))
+        target, revision = open_status["stop_target"], open_status["control_revision"]
+        intent = child.durable()["metadata"]["managed_control_intent"]
+        identifier = uuid.uuid4().hex
+        phase = "after-native-first-stop-checkpoint"
+        checkpoint = "retained_session_stop_native_first_closures"
+        journal_path = rig.prepared.config.journal
+        with closing(sqlite3.connect(journal_path, isolation_level=None)) as db:
+            db.execute(
+                "CREATE TRIGGER refuse_native_first_marker BEFORE UPDATE OF result ON managed_requests "
+                "WHEN NEW.action='stop_session' "
+                "AND json_type(NEW.result,'$._session_stop.native_closed_first') IS 'true' "
+                "BEGIN SELECT RAISE(ABORT,'native-first marker unavailable'); END"
+            )
+            if not checkpoint_saved:
+                db.execute(
+                    "CREATE TRIGGER refuse_native_first_checkpoint BEFORE INSERT ON meta "
+                    "WHEN NEW.key='retained_session_stop_native_first_closures' "
+                    "BEGIN SELECT RAISE(ABORT,'native-first checkpoint unavailable'); END"
+                )
+
+        # Hold a real wire RPC ahead of Stop while the independent native endpoint observes closure.
+        read_arrived, release_read = asyncio.Event(), asyncio.Event()
+
+        # Keep only the preceding read waiting so the pending Stop cannot get the send gate.
+        async def hold_read(action, _payload):
+            if action == "GetConfiguration":
+                read_arrived.set()
+                await release_read.wait()
+
+        bench.before_reply = hold_read
+        caller = asyncio.create_task(bench.cloud_call("held-before-session-stop", "GetConfiguration", {}))
+        try:
+            await asyncio.wait_for(read_arrived.wait(), 5)
+            await child.arm(phase, identifier)
+            request = await child.request("stop_session", id=identifier, revision=revision, target=target)
+            assert request["ok"] and request["result"]["state"] == "accepted"
+            bench.firmware.active = None
+            bench.firmware.requested_current = 0
+            bench.cp, bench.connection = "B", "Plug"
+            rig.peer.permission_enabled = False
+            gate = await child.gate(phase, identifier)
+            try:
+                snapshot = child.durable()
+                receipt = next(row for row in snapshot["requests"] if row["id"] == identifier)
+                binding = json.loads(receipt["result"])["_session_stop"]
+                assert not gate["transaction_open"] and receipt["state"] == "accepted"
+                assert binding["dispatched"] is False and "native_closed_first" not in binding
+                assert snapshot["metadata"].get(checkpoint) == (
+                    {identifier: [revision, target, local]} if checkpoint_saved else None
+                )
+                assert snapshot["transactions"] == [original]
+                assert not bench.remote_stop.is_set()
+            finally:
+                await child.kill()
+        finally:
+            bench.before_reply = None
+            release_read.set()
+            caller.cancel()
+            await asyncio.gather(caller, return_exceptions=True)
+
+        restart_mark = len(bench.received_limits)
+        await child.start()
+        state = await child.status(lambda status: status.get("boot_verified") is True)
+        assert state.get("stop_target") is None and state.get("can_start") is not True
+        pending = (await child.request("receipt", request_id=identifier))["result"]
+        assert pending["state"] == ("uncertain" if checkpoint_saved else "failed")
+        admitted = {"accepted_at": request["result"]["result"]["accepted_at"]}
+        assert pending["result"] == admitted | {"classification": "process_replaced"}
+        assert not bench.remote_stop.is_set()
+        assert child.durable()["transactions"] == [original | {"live": 0}]
+
+        # Neither a report for another ID nor the original native observation can settle the lifecycle by itself.
+        stop = {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"}
+        wrong = await bench.call(child.socket, uuid.uuid4().hex, "StopTransaction", stop | {"transactionId": local + 1})
+        assert wrong[0] == 4
+        assert (await child.request("receipt", request_id=identifier))["result"] == pending
+        assert not any(bench.received_limits[restart_mark:])
+        with closing(sqlite3.connect(journal_path, isolation_level=None)) as db:
+            db.execute("DROP TRIGGER refuse_native_first_marker")
+            db.execute("DROP TRIGGER IF EXISTS refuse_native_first_checkpoint")
+        assert (await bench.call(child.socket, uuid.uuid4().hex, "StopTransaction", stop))[0] == 3
+        closed = await child.delivered(local, closed=True)
+        await child.status(lambda status: status.get("charging_session_open") is False and status.get("healthy"))
+        receipt = await child.completed_control(identifier) if checkpoint_saved else pending
+        assert receipt["result"] == (admitted | {"session_stopped": True} if checkpoint_saved else pending["result"])
+        assert (await child.request("receipt", request_id=identifier))["result"] == receipt
+        assert closed == original | {"stop": closed["stop"], "stop_info": closed["stop_info"], "live": 0}
+        assert json.loads(closed["stop"]) == stop
+        snapshot = child.durable()
+        row = next(row for row in snapshot["requests"] if row["id"] == identifier)
+        assert row["revision"] == revision and json.loads(row["result"])["target"] == target
+        assert snapshot["metadata"]["managed_control_intent"] == intent
+        assert snapshot["outbox"] == [] and not bench.remote_stop.is_set()
+        assert len(child.kills) == 1 and child.kills[0]["pid"] != child.process.pid
+
+
+# Intent: replace the actual process after both closing observations but before publishing the exact Stop receipt.
+# Why: only saved physical proof can settle a receipt while independent native readings remain unavailable.
+@pytest.mark.recovery_replay
+@pytest.mark.parametrize("checkpoint_saved", [True, False], ids=["checkpoint-saved", "both-writes-refused"])
+async def test_process_cut_after_verified_stop_closure(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory, checkpoint_saved
+):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path,
+        tls_for_case(tmp_path, model_tls),
+        ports(),
+        ports(),
+        monkeypatch,
+        native_peer=InterruptedNativePeer,
+        timing="fast-poll",
+    ) as child:
+        rig, bench = child.rig, child.rig.bench
+        await child.start()
+        await child.status()
+        start = START | {"idTag": "NATIVE_TIMER"}
+        answer = await bench.call(child.socket, uuid.uuid4().hex, "StartTransaction", start)
+        assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted"
+        local = answer[2]["transactionId"]
+        original = await child.delivered(local)
+        open_status = await child.status(lambda status: bool(status.get("stop_target")))
+        target, revision = open_status["stop_target"], open_status["control_revision"]
+        intent = child.durable()["metadata"]["managed_control_intent"]
+        identifier = uuid.uuid4().hex
+        phase = "after-verified-stop-closure-checkpoint"
+        checkpoint = "retained_session_stop_closures"
+        journal_path = rig.prepared.config.journal
+        with closing(sqlite3.connect(journal_path, isolation_level=None)) as db:
+            db.execute(
+                "CREATE TRIGGER refuse_stop_closure_marker BEFORE UPDATE OF result ON managed_requests "
+                f"WHEN NEW.id='{identifier}' AND (NEW.state='completed' "
+                "OR json_type(NEW.result,'$._session_stop.closure_verified') IS 'true') "
+                "BEGIN SELECT RAISE(ABORT,'Stop closure publication unavailable'); END"
+            )
+            if not checkpoint_saved:
+                db.execute(
+                    "CREATE TRIGGER refuse_stop_closure_checkpoint BEFORE INSERT ON meta "
+                    f"WHEN NEW.key='{checkpoint}' "
+                    "BEGIN SELECT RAISE(ABORT,'Stop closure checkpoint unavailable'); END"
+                )
+
+        request = await child.request("stop_session", id=identifier, revision=revision, target=target)
+        assert request["ok"] and request["result"]["state"] == "accepted"
+
+        # The ordinary peer sends the actual reply, which must commit before the independent closure.
+        def stop_replies():
+            with closing(sqlite3.connect(journal_path.as_uri() + "?mode=ro", uri=True)) as db:
+                return db.execute(
+                    "SELECT reply FROM owner_command_wires WHERE request=? AND action='RemoteStopTransaction'",
+                    (identifier,),
+                ).fetchall()
+
+        await until(lambda: stop_replies() == [("Accepted",)])
+        await child.arm(phase, identifier)
+        stop = {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"}
+        assert (await bench.call(child.socket, uuid.uuid4().hex, "StopTransaction", stop))[0] == 3
+        gate = await child.gate(phase, identifier)
+        try:
+            snapshot = child.durable()
+            (closed,) = snapshot["transactions"]
+            assert not gate["transaction_open"] and json.loads(closed["stop"]) == stop
+            saved = snapshot["metadata"].get(checkpoint, {})
+            assert (identifier in saved) is checkpoint_saved
+            receipt = next(row for row in snapshot["requests"] if row["id"] == identifier)
+            assert receipt["state"] == "running"
+            assert "closure_verified" not in json.loads(receipt["result"])["_session_stop"]
+        finally:
+            await child.kill()
+
+        with closing(sqlite3.connect(journal_path, isolation_level=None)) as db:
+            db.execute("DROP TRIGGER refuse_stop_closure_marker")
+            db.execute("DROP TRIGGER IF EXISTS refuse_stop_closure_checkpoint")
+
+        native, config_reads = rig.peer.native, 0
+
+        # Allow the mandatory startup audit on retry, then interrupt the supervised closure reads.
+        def native_until_startup_audit(key):
+            nonlocal config_reads
+            value = native(key)
+            if key == "config":
+                config_reads += 1
+                if config_reads == 2:
+                    rig.peer.unavailable = True
+            return value
+
+        restart_mark = len(bench.received_limits)
+        rig.peer.unavailable = True
+        restarting = asyncio.create_task(child.start())
+        try:
+            assert (await asyncio.wait_for(rig.peer.failed_reads.get(), 5))["action"] == "getConfig"
+            with monkeypatch.context() as outage:
+                outage.setattr(rig.peer, "native", native_until_startup_audit)
+                rig.peer.unavailable = False
+                await restarting
+                assert (await asyncio.wait_for(rig.peer.failed_reads.get(), 5))["action"] == "getConfig"
+                assert config_reads == 2 and not any(bench.received_limits[restart_mark:])
+                pending = (await child.request("receipt", request_id=identifier))["result"]
+                assert pending["state"] == ("completed" if checkpoint_saved else "uncertain")
+                assert pending["revision"] == revision and pending["target"] == target
+                if not checkpoint_saved:
+                    assert pending["result"]["classification"] == "process_replaced"
+                    assert "session_stopped" not in pending["result"]
+        finally:
+            rig.peer.unavailable = False
+            if not restarting.done():
+                restarting.cancel()
+                await asyncio.gather(restarting, return_exceptions=True)
+
+        settled = await child.completed_control(identifier)
+        assert settled["action"] == "stop_session" and settled["target"] == target and settled["revision"] == revision
+        assert settled["result"] == {"accepted_at": request["result"]["result"]["accepted_at"], "session_stopped": True}
+        if checkpoint_saved:
+            assert settled == pending
+        await child.status(lambda status: status.get("charging_session_open") is False and status.get("healthy"))
+        delivered = await child.delivered(local, closed=True)
+        assert delivered == original | {"stop": closed["stop"], "stop_info": delivered["stop_info"], "live": 0}
+        assert child.durable()["metadata"]["managed_control_intent"] == intent
+        assert [frame[3] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
+            {"transactionId": local}
+        ]
+        assert len(child.kills) == 1 and child.kills[0]["pid"] != child.process.pid
+
+
+# Intent: a real late rejection remains the original Stop result after both closure observations and process death.
+# Why: verified physical closure cannot convert an independently retained rejection into command success.
+@pytest.mark.recovery_replay
+async def test_process_recovers_checkpointed_late_stop_rejection(
+    tmp_path, model_tls, monkeypatch, unused_tcp_port_factory
+):
+    ports = unused_tcp_port_factory
+    async with process_rig(
+        tmp_path, tls_for_case(tmp_path, model_tls), ports(), ports(), monkeypatch, timing="fast-poll"
+    ) as child:
+        rig, bench = child.rig, child.rig.bench
+        await child.start()
+        await child.status()
+        start = START | {"idTag": "NATIVE_TIMER"}
+        answer = await bench.call(child.socket, uuid.uuid4().hex, "StartTransaction", start)
+        assert answer[0] == 3 and answer[2]["idTagInfo"]["status"] == "Accepted"
+        local = answer[2]["transactionId"]
+        await child.delivered(local)
+        active = await child.status(lambda status: bool(status.get("stop_target")))
+        target, revision = active["stop_target"], active["control_revision"]
+        identifier, path = uuid.uuid4().hex, rig.prepared.config.journal
+        intent = child.durable()["metadata"]["managed_control_intent"]
+        with closing(sqlite3.connect(path, isolation_level=None)) as db:
+            db.execute(
+                "CREATE TRIGGER refuse_late_stop_reply BEFORE INSERT ON owner_command_wires "
+                f"WHEN NEW.request='{identifier}' AND NEW.action='RemoteStopTransaction' AND NEW.reply='Rejected' "
+                "BEGIN SELECT RAISE(ABORT,'Stop reply publication unavailable'); END"
+            )
+            db.execute(
+                "CREATE TRIGGER refuse_late_stop_receipt BEFORE UPDATE ON managed_requests "
+                f"WHEN NEW.id='{identifier}' AND NEW.state='failed' "
+                "BEGIN SELECT RAISE(ABORT,'Stop receipt publication unavailable'); END"
+            )
+
+        send, device_answer = child.socket.send, bench.firmware.answer
+        held = asyncio.get_running_loop().create_future()
+
+        # The independent simulated charger rejects the original Stop, then withholds only that exact response.
+        def reject_stop(action, payload):
+            if action == "RemoteStopTransaction":
+                assert payload == {"transactionId": local}
+                return {"status": "Rejected"}
+            return device_answer(action, payload)
+
+        # Withhold the genuine Stop rejection until the independent closing report is committed.
+        async def hold_stop_reply(raw):
+            frame = json.loads(raw)
+            if frame[0] == 3 and frame[2] == {"status": "Rejected"} and any(
+                call[1] == frame[1] and call[2] == "RemoteStopTransaction" for call in bench.device_calls
+            ):
+                held.set_result((frame[1], raw))
+                return
+            await send(raw)
+
+        with monkeypatch.context() as peer:
+            peer.setattr(child.socket, "send", hold_stop_reply)
+            peer.setattr(bench.firmware, "answer", reject_stop)
+            response = await child.request("stop_session", id=identifier, revision=revision, target=target)
+            assert response["ok"] and response["result"]["state"] == "accepted"
+            wire, rejected = await asyncio.wait_for(held, 3)
+            stop = {"transactionId": local, "meterStop": 1100, "timestamp": "2026-01-01T00:01:00Z"}
+            assert (await bench.call(child.socket, uuid.uuid4().hex, "StopTransaction", stop))[0] == 3
+            closed = await child.delivered(local, closed=True)
+            await child.status(lambda status: status.get("charging_session_open") is False)
+            row = next(row for row in child.durable()["requests"] if row["id"] == identifier)
+            assert row["state"] == "running" and json.loads(row["result"])["_session_stop"]["closure_verified"] is True
+
+            checkpoint = f"retained_transaction_reply_owner:{wire}"
+            await send(rejected)
+            await until(lambda: checkpoint in child.durable()["metadata"])
+            durable = child.durable()
+            saved = durable["metadata"][checkpoint]
+            assert (saved["request"], saved["wire"], saved["local"], saved["reply"]) == (
+                identifier, wire, local, "Rejected"
+            )
+            assert next(row for row in durable["requests"] if row["id"] == identifier)["state"] == "running"
+            assert durable["transactions"] == [closed] and json.loads(closed["stop"]) == stop
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                assert not db.execute(
+                    "SELECT 1 FROM owner_command_wires WHERE request=? AND reply='Rejected'", (identifier,)
+                ).fetchone()
+            await child.kill()
+
+        with closing(sqlite3.connect(path, isolation_level=None)) as db:
+            db.execute("DROP TRIGGER refuse_late_stop_reply")
+            db.execute("DROP TRIGGER refuse_late_stop_receipt")
+        await child.start()
+        await child.status(lambda status: status.get("healthy") and status.get("charging_session_open") is False)
+        failed = (await child.request("receipt", request_id=identifier))["result"]
+        assert (failed["id"], failed["action"], failed["revision"], failed["target"]) == (
+            identifier, "stop_session", revision, target
+        )
+        assert failed["state"] == "failed" and failed["result"]["classification"] == "stop_rejected"
+        assert failed["result"]["accepted_at"] == response["result"]["result"]["accepted_at"]
+        assert "session_stopped" not in failed["result"]
+        assert (await child.delivered(local, closed=True)) == closed
+        assert child.durable()["metadata"]["managed_control_intent"] == intent
+        assert [(frame[1], frame[3]) for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"] == [
+            (wire, {"transactionId": local})
+        ]
+        assert len(child.kills) == 1 and child.kills[0]["pid"] != child.process.pid
+
+
 # Intent: only a shutdown Stop proved unissued can be followed by another Stop after process death.
 # Why: an older claim or an actual dispatch without a saved reply can still own the same physical session.
 @pytest.mark.recovery_replay
