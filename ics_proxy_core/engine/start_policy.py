@@ -55,12 +55,13 @@ def owner_start_seconds(
         return None
     if issued:
         receipt, control = journal.starts.receipt(), journal.get("control", {})
+        expected_limit = 0 if receipt.get("held_at_zero") is True else lease.current_a
         if (
             lease.start_scope is None
             or not control_scope_matches(gateway, (lease.start_scope, lease.control_revision))
             or journal.active() is not None
             or not gateway.controls.ready
-            or gateway.controls.desired() != lease.current_a
+            or gateway.controls.desired() != expected_limit
             or control.get("start_pending") is not True
             or not journal.starts.pending_owner_tag(tag)
             or receipt.get("request_id") != lease.identifier

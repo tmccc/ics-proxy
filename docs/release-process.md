@@ -114,9 +114,12 @@ Resolve interrupted vendor authorization checks on the build that recorded them 
 ## Qualify the overnight outage schedule
 
 Production builds block new automatic outage Starts until the commissioned firmware can end a proxy-started
-session independently. The native timer can end charger-owned sessions. A proxy-issued Stop at 06:00 verifies
-cutoff with the proxy available. For the outage path, use independent charger readings while the proxy is
-unavailable.
+session independently. The prototype holds zero while opening a session, binds the charger's actual
+transaction number, and records an accepted charger-side timer before raising the ceiling. If the exact
+timer reply or the journal write is missing, it keeps the zero hold. A replacement connection must
+stop the exact session before offering it positive current. The native timer can end charger-owned
+sessions. A proxy-issued Stop at 06:00 verifies cutoff with the proxy available. For the outage path,
+use independent charger readings while the proxy is unavailable.
 
 Qualify a candidate at the agreed site current. Check an unsynchronized start after host power loss, loss of
 synchronization before Start, and an in-window vendor outage. For the cutoff case, retain evidence that the

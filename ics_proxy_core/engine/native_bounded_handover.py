@@ -1014,24 +1014,50 @@ class NativeBoundedHandover:
     ) -> str | Pending:
         if authority != self.authority() or sequence != self.last_resolved_read:
             raise AuditSupersededError("outgoing validation crossed a newer native observation or authority")
+        journal, control = self.gateway.journal, self.gateway.controls
+        start = local_start_receipt(journal)
+        claim = journal.control.read().values
+        ticket = claim.get("ticket")
+        held_start = (
+            isinstance(ticket, str)
+            and start.get("ticket") == ticket
+            and start.get("held_at_zero") is True
+            and claim.get("inhibit") is True
+        )
+        arming_cutoff = held_start and action == "DataTransfer" and control.is_arming_scheduled_stop(payload)
         if action in (
             "RemoteStartTransaction",
             "SetChargingProfile",
             "DataTransfer",
         ) and self.book.record_missing_station(native.physical):
             raise DeniedError("the managed station ceiling is missing from the fresh native inventory")
-        if action == "RemoteStartTransaction" and self.gateway.journal.get("managed_mode"):
-            self.book.require_confirmed_station(native.physical.resources, self.gateway.controls.desired())
+        if action == "RemoteStartTransaction" and journal.get("managed_mode"):
+            self.book.require_confirmed_station(native.physical.resources, control.desired())
+            if held_start:
+                decision = self._confirm_send_zero(native, None)
+                if isinstance(decision, Pending):
+                    return decision
+        if arming_cutoff:
+            local = start.get("local")
+            if type(local) is not int:
+                return Pending(Prerequisite.LIFECYCLE, "cutoff arming awaits its exact held session")
+            decision = self._confirm_send_zero(native, local)
+            if isinstance(decision, Pending):
+                return decision
         if action == "SetChargingProfile" and profile_projection(payload)["id"] == HUB_PROFILE_ID:
-            journal = self.gateway.journal
-            release = self.gateway.controls.release_attempt
-            start = local_start_receipt(journal)
+            release = control.release_attempt
             preparing_start = (
-                journal.get("managed_mode")
-                and start.get("stage") == "prepared"
-                and start.get("ticket") == journal.control.read().values.get("ticket")
+                journal.get("managed_mode") and start.get("stage") == "prepared" and start.get("ticket") == ticket
             )
-            if release is not None or preparing_start:
+            if held_start:
+                assert isinstance(ticket, str)
+                local = start.get("local")
+                if type(local) is not int or not control.scheduled_stop_armed(ticket):
+                    return Pending(Prerequisite.SOURCE, "the held Start awaits its accepted charger cutoff")
+                decision = self._confirm_send_zero(native, local)
+                if isinstance(decision, Pending):
+                    return decision
+            elif release is not None or preparing_start:
                 decision = self._confirm_send_zero(native, release.continuing_local if release is not None else None)
                 if isinstance(decision, Pending):
                     return decision
@@ -1040,7 +1066,7 @@ class NativeBoundedHandover:
         decision = self.gateway.controls.decisions.current_profile_decision(self.gateway, action, native)
         if isinstance(decision, Pending):
             return decision
-        if self.positive_guard is not None:
+        if self.positive_guard is not None and not arming_cutoff:
             decision = self.positive_guard(native)
             if isinstance(decision, Pending):
                 return decision

@@ -273,10 +273,13 @@ class ManagedCharging:
                 raise DeniedError("test requires a connected vehicle")
             self.guard(lease)
             tag = lease.owner_start_tag or decisions.choose_start_tag(c.session.gateway, renewed_tag)
+            prepare_cutoff = c.local_schedule.cutoff_preparation(lease)
 
             # Commit the attempt marker with LocalControl's receipt, never before its owned task first executes.
             def prepared() -> None:
                 decisions.prepare_start_publication(self, lease, tag)
+                if prepare_cutoff is not None:
+                    c.local_schedule.mark_charger_cutoff_required(lease)
 
             # This synchronous writer joins the child's transaction; it never opens a nested atomic block.
             def publish(context: StartHandoffContext) -> StartPublication:
@@ -295,6 +298,7 @@ class ManagedCharging:
                 request_id=lease.identifier,
                 on_prepared=prepared,
                 handoff=StartHandoff(publish, committed),
+                prepare_cutoff=prepare_cutoff,
             )
             if result.failure is not None:
                 raise result.failure

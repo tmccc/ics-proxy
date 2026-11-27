@@ -309,10 +309,15 @@ class StartLifecycle:
         self.lease = lease
 
     # Only this effect's current control claim may arm the pending bit before dispatch.
-    def armed(self, ticket: str) -> None:
+    def armed(self, ticket: str, *, held_at_zero: bool = False) -> None:
         j, control = self.journal, self.journal.get("control", {})
         if control.get("ticket") == ticket:
-            j.control.complete(ticket, base=control, inhibit=False, start_pending=True)
+            if held_at_zero:
+                receipt = self.receipt()
+                if receipt.get("ticket") != ticket or control.get("inhibit") is not True:
+                    raise RecoveryRequiredError("scheduled Start lost its zero hold")
+                j.put("local_start_receipt", {**receipt, "held_at_zero": True})
+            j.control.complete(ticket, base=control, inhibit=held_at_zero, start_pending=True)
 
     # A proven operator outcome clears only the Start projection while retaining the supplied restrictive claim.
     def operator_control(self, control: dict[str, Any]) -> None:

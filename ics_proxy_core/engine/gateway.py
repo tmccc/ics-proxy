@@ -52,7 +52,7 @@ from .policy import DeniedError, Policy, integer, number
 from .rpc import InboundCache, Peer, RegistrationDeferredError, Sender, UnavailableError, profile_status, reply_as
 from .security import SecurityError
 from .start_handoff import NativeStartReport as NativeStartReport
-from .start_handoff import OwnedStartResult, StartHandoff
+from .start_handoff import OwnedStartResult, PrepareScheduledStop, StartHandoff
 from .stop_settlement import StopPredecessors
 from .store import ConflictError, Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
 from .vendor_read_recovery import recover_legacy_vendor_read
@@ -1401,9 +1401,16 @@ class Gateway:
         request_id: str | None = None,
         on_prepared: Callable[[], None] | None = None,
         handoff: StartHandoff | None = None,
+        prepare_cutoff: PrepareScheduledStop | None = None,
     ) -> OwnedStartResult:
         return await self.controls.decisions.start_managed_result(
-            self, tag, guard, request_id=request_id, on_prepared=on_prepared, handoff=handoff
+            self,
+            tag,
+            guard,
+            request_id=request_id,
+            on_prepared=on_prepared,
+            handoff=handoff,
+            prepare_cutoff=prepare_cutoff,
         )
 
     # A local Stop can carry the current owner Pause through introduction to its exact wire reply.

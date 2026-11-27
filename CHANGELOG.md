@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Arm an exact charger-side cutoff under a zero hold before an automatic overnight Start can offer current
+  in the prototype. Production admission remains gated on independent charger testing.
+- Verify the saved state of a checkpointed pre-update backup with a read-only rollback check.
+- Keep local charging history visible in Home Assistant when proxy status is fresh and charger telemetry is stale.
+
 ## 0.3.0-rc2
 
 - Check Linux clock synchronization before admitting or sending a proxy-run overnight Start.

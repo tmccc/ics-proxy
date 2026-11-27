@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from ..frames import Frame
 from .connection_scope import CloudAttemptScope
 from .managed_intent import ControlIntent
+
+
+@dataclass(frozen=True)
+class ScheduledStop:
+    """Arm an exact charger-native cutoff while the opened session is held at zero."""
+
+    payload: dict[str, Any]
+    guard: Callable[[], None]
+    record: Callable[[Frame], None]
+
+
+type PrepareScheduledStop = Callable[[str], Awaitable[ScheduledStop]]
 
 
 @dataclass(frozen=True)

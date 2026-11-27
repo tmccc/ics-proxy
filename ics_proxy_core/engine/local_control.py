@@ -9,6 +9,7 @@ import sys
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from typing import Any
@@ -44,6 +45,8 @@ from .rpc import Peer, UnavailableError, ValidationPreemptedError, profile_statu
 from .security import SecurityError
 from .start_handoff import (
     OwnedStartResult,
+    PrepareScheduledStop,
+    ScheduledStop,
     StartAttempt,
     StartHandoff,
     StartHandoffContext,
@@ -61,6 +64,15 @@ class ControlSupersededError(DeniedError):
 
 class _StopAlreadyHandledError(Exception):
     """The exact session closed or an earlier Stop was accepted during outgoing validation."""
+
+
+@dataclass
+class _ScheduledStopOperation:
+    """The exact timer belongs to this live Start's ticket until publication or rollback."""
+
+    ticket: str
+    stop: ScheduledStop
+    armed: bool = False
 
 
 # Translate genuine technical failures once at the executor boundary; ordinary prerequisites never enter here.
@@ -137,6 +149,7 @@ class LocalControl:
         self.decisions = ControlDecisions(self)
         self._release_ticket: str | None = None
         self._unsent_release: tuple[str, dict[str, Any]] | None = None
+        self._scheduled_stop: _ScheduledStopOperation | None = None
         self.release_attempt: ReleaseAttempt | None = None
         self.authorize: Callable[[str], bool] | None = None
         self.owner_start_seconds: Callable[[str, str | None], int | None] = lambda _tag, _request: None
@@ -278,6 +291,21 @@ class LocalControl:
     # The journal's Start owner binds evidence inside the actual lifecycle transaction.
     def bind_start(self, tag: str, local: int) -> None:
         self.journal.starts.bind(tag, local)
+
+    # The independently audited wire boundary can recognize only this owned timer payload.
+    def is_arming_scheduled_stop(self, payload: dict[str, Any]) -> bool:
+        operation = self._scheduled_stop
+        return (
+            operation is not None
+            and not operation.armed
+            and self.journal.get("control", {}).get("ticket") == operation.ticket
+            and payload == operation.stop.payload
+        )
+
+    # The native positive-write gate requires the completed arming phase of this live operation.
+    def scheduled_stop_armed(self, ticket: str) -> bool:
+        operation = self._scheduled_stop
+        return operation is not None and operation.ticket == ticket and operation.armed
 
     # Install the reserved station profile; Accepted confirms receipt, not yet real-device execution or persistence.
     async def _cap(self, call: Call, limit: float, epoch: int, *, guard: Callable[[], None] | None = None) -> Frame:
@@ -765,15 +793,18 @@ class LocalControl:
         scope_guard: Callable[[], None] | None = None,
         scope: CloudAttemptScope | None = None,
         handoff: StartHandoff | None = None,
+        prepare_cutoff: PrepareScheduledStop | None = None,
     ) -> OwnedStartResult:
         if self.policy.allow_local_start or not 6 <= self.policy.max_current_a <= 32:
             raise DeniedError("managed Start requires the restricted installation policy")
         attempt = StartAttempt()
         try:
             await self._owned(
-                self._start_owned(tag, guard, request_id, on_prepared, scope_guard, scope, handoff, attempt)
+                self._start_owned(
+                    tag, guard, request_id, on_prepared, scope_guard, scope, handoff, prepare_cutoff, attempt
+                )
             )
-        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, sqlite3.Error:
+        except DeniedError, SecurityError, RecoveryRequiredError, UnavailableError, TimeoutError, sqlite3.Error:
             if not attempt.finished:
                 raise
         return attempt.result()
@@ -788,6 +819,7 @@ class LocalControl:
         scope_guard: Callable[[], None] | None,
         scope: CloudAttemptScope | None,
         handoff: StartHandoff | None,
+        prepare_cutoff: PrepareScheduledStop | None,
         attempt: StartAttempt,
     ) -> Frame:
         try:
@@ -800,6 +832,7 @@ class LocalControl:
                 scope_guard=scope_guard,
                 scope=scope,
                 handoff=handoff,
+                prepare_cutoff=prepare_cutoff,
                 attempt=attempt,
             )
         finally:
@@ -818,6 +851,7 @@ class LocalControl:
         scope_guard: Callable[[], None] | None = None,
         scope: CloudAttemptScope | None = None,
         handoff: StartHandoff | None = None,
+        prepare_cutoff: PrepareScheduledStop | None = None,
         attempt: StartAttempt | None = None,
     ) -> Frame:
         epoch, ticket, previous = self.peer.decide(
@@ -825,6 +859,7 @@ class LocalControl:
         )
         boot = self.boot()
         restoring_zero = False
+        scheduled_stop: ScheduledStop | None = None
 
         # Positive permission may be revoked; the same exact ticket and Boot still permit its restrictive rollback.
         def check() -> None:
@@ -833,6 +868,10 @@ class LocalControl:
                 scope_guard()
             if not restoring_zero:
                 self.decisions.require_local_start(tag, boot, guard, request_id)
+                if prepare_cutoff is not None and self.journal.get("control", {}).get("inhibit") is not True:
+                    raise RecoveryRequiredError("the scheduled Start lost its zero hold")
+                if scheduled_stop is not None:
+                    scheduled_stop.guard()
 
         # The wire witness is marked before the transport can send this Start.
         def dispatch(action: str) -> None:
@@ -887,10 +926,30 @@ class LocalControl:
         ) as call:
             try:
                 limit = number(previous.get("resume_limit", self.policy.max_current_a), self.policy.max_current_a)
-                await self._cap(call, limit, epoch)
+                if prepare_cutoff is None:
+                    await self._cap(call, limit, epoch)
 
-                self.peer.decide(lambda: self.decisions.arm_local_start(ticket, check))
+                self.peer.decide(
+                    lambda: self.decisions.arm_local_start(ticket, check, held_at_zero=prepare_cutoff is not None)
+                )
                 answer = await call("RemoteStartTransaction", commands.remote_start_transaction(tag, 1))
+                if prepare_cutoff is not None:
+                    if transaction_reply_status(answer) != "Accepted":
+                        raise UnavailableError("transaction start was not confirmed")
+                    stop = scheduled_stop = await prepare_cutoff(ticket)
+                    operation = self._scheduled_stop = _ScheduledStopOperation(ticket, stop)
+                    timer_reply = await call("DataTransfer", stop.payload)
+                    if timer_reply[0] != 3 or timer_reply[2] != {"status": "Accepted", "data": ""}:
+                        raise UnavailableError("the exact scheduled cutoff was not accepted")
+
+                    # Release follows the current timer receipt's durable commit.
+                    def record_cutoff() -> None:
+                        check()
+                        stop.record(timer_reply)
+                        operation.armed = True
+
+                    self.peer.decide(record_cutoff)
+                    await self._cap(call, limit, epoch)
 
                 # Save the wire fact first, then grant control only if the same owner can still publish.
                 def settle(answer: Frame) -> None:
@@ -905,12 +964,14 @@ class LocalControl:
                         if scope is None or handoff is None
                         else StartHandoffContext(request_id, ticket, scope, self._revision, fingerprint(tag.casefold()))
                     )
-                    publication = self.decisions.complete_local_start(ticket, accepted, check, shared, handoff, context)
+                    publication = self.decisions.complete_local_start(
+                        ticket, accepted, check, shared, handoff, context, release_held_start=scheduled_stop is not None
+                    )
                     if attempt is not None and publication is not None:
                         attempt.publication = publication
 
                 self.peer.decide(lambda: settle(answer))
-            except UnavailableError, DeniedError, RecoveryRequiredError, SecurityError, sqlite3.Error:
+            except UnavailableError, DeniedError, RecoveryRequiredError, SecurityError, TimeoutError, sqlite3.Error:
                 # A failed Start can restore only the zero hold owned by its original ticket.
                 def hold() -> None:
                     nonlocal restoring_zero
@@ -930,6 +991,9 @@ class LocalControl:
 
                 self.peer.decide(confirm_rollback, priority=CommandPriority.RESTRICT)
                 raise
+            finally:
+                if self._scheduled_stop is not None and self._scheduled_stop.ticket == ticket:
+                    self._scheduled_stop = None
         return answer
 
     # Releasing local ownership is a physical operation, never removal of the station safety profile.

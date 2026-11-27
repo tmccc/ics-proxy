@@ -2,30 +2,36 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
+from datetime import UTC, datetime
+from functools import partial
 from math import isfinite
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from .command_processor import CommandPriority
-from .connection_scope import control_scope_matches, current_control_scope
+from .connection_scope import ControlScope, control_scope_matches, current_control_scope
 from .local_schedule_cutoff import cutoff
 from .local_schedule_window import ScheduleCutoff, schedule_window
 from .managed_intent import LOCAL_SCHEDULE_OCCURRENCE as OCCURRENCE
 from .managed_intent import ControlIntent
 from .policy import DeniedError
-from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
+from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
 from .rpc import UnavailableError
 from .schedule_clock import host_clock_synchronized
 from .security import SecurityError
 from .session_closure import observe_closure
-from .store import RecoveryRequiredError, fingerprint
+from .start_handoff import ScheduledStop
+from .store import RecoveryRequiredError, encoded, fingerprint
 
 if TYPE_CHECKING:
+    from ..frames import Frame
     from .local_schedule_window import ScheduleWindow
     from .managed import ManagedController
     from .managed_charging import ChargeLease
@@ -70,6 +76,123 @@ class LocalSchedule:
         self.clock_epoch = host_clock_epoch() if timezone is not None else None
         self.expired_request: str | None = None
         self.closed_request: str | None = None
+        self.preparing_charger_cutoff: tuple[str, str, ControlScope] | None = None
+        self.armed_charger_cutoff: tuple[dict[str, Any], ControlScope] | None = None
+
+    def cutoff_preparation(self, lease: ChargeLease) -> Callable[[str], Awaitable[ScheduledStop]] | None:
+        if lease.schedule is None:
+            return None
+        return partial(self.prepare_charger_cutoff, lease)
+
+    # Mark the occurrence in the same transaction as the exact local Start receipt.
+    def mark_charger_cutoff_required(self, lease: ChargeLease) -> None:
+        c, j = self.controller, self.journal
+        occurrence = j.get(OCCURRENCE, {})
+        scope = current_control_scope(c.session.gateway)
+        ticket = j.get("control", {}).get("ticket")
+        if (
+            not j.db.in_transaction
+            or scope is None
+            or not isinstance(ticket, str)
+            or occurrence.get("request") != lease.identifier
+        ):
+            raise RecoveryRequiredError("charger cutoff preparation lost its scheduled Start")
+        j.put(OCCURRENCE, {**occurrence, "charger_cutoff_required": True})
+        self.preparing_charger_cutoff = lease.identifier, ticket, scope
+
+    # Start's reply identifies no session. Wait for the exact journalled StartTransaction.
+    async def prepare_charger_cutoff(self, lease: ChargeLease, ticket: str) -> ScheduledStop:
+        c, j = self.controller, self.journal
+        gateway = c.session.gateway
+        preparation = self.preparing_charger_cutoff
+        if preparation is None or preparation[:2] != (lease.identifier, ticket):
+            raise RecoveryRequiredError("charger cutoff has no live preparation")
+        _, _, scope = preparation
+
+        def current() -> dict[str, Any]:
+            c.charging.guard(lease)
+            occurrence: dict[str, Any] = j.get(OCCURRENCE, {})
+            receipt = j.starts.receipt()
+            if (
+                not control_scope_matches(gateway, scope)
+                or j.get("control", {}).get("ticket") != ticket
+                or occurrence.get("request") != lease.identifier
+                or occurrence.get("charger_cutoff_required") is not True
+                or receipt.get("ticket") != ticket
+                or receipt.get("request_id") != lease.identifier
+                or receipt.get("stage") != "accepted"
+            ):
+                raise RecoveryRequiredError("charger cutoff lost the exact accepted Start")
+            return occurrence
+
+        while (local := current().get("local")) is None:
+            if j.active() is not None:
+                raise RecoveryRequiredError("an unrelated session arrived before the scheduled Start")
+            await asyncio.sleep(0.05)
+        if type(local) is not int:
+            raise RecoveryRequiredError("charger cutoff has an invalid local session")
+
+        occurrence = current()
+        deadline = self._elapsed_deadline(occurrence)
+        if deadline is None:
+            raise RecoveryRequiredError("charger cutoff has no comparable elapsed deadline")
+        now = time.time()
+        stop_at = int(min(occurrence["window"]["ends_at"], now + deadline - time.monotonic()))
+
+        def guard() -> None:
+            occurrence = current()
+            if (
+                occurrence.get("local") != local
+                or j.active() != local
+                or j.starts.receipt().get("local") != local
+                or not j.is_owner_session(local)
+            ):
+                raise RecoveryRequiredError("charger cutoff lost its exact active session")
+            now = time.time()
+            if not now < stop_at <= now + deadline - time.monotonic():
+                raise ScheduleCutoffError("charger cutoff no longer fits the original deadline")
+
+        guard()
+        native = await c.native.read()
+        guard()
+        require_allowed(c.native._confirm_send_zero(native, local))
+        stop_time = datetime.fromtimestamp(stop_at, UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+        payload = {
+            "vendorId": "IoCharger",
+            "messageId": "delayStop",
+            "data": encoded({"transactionId": local, "stopTime": stop_time}),
+        }
+
+        # Retain the reply before any positive cap. Its authority is intentionally process-local.
+        def record(frame: Frame) -> None:
+            guard()
+            proof = {"request": lease.identifier, "local": local, "stop_at": stop_at, "wire": frame[1]}
+            j.put(OCCURRENCE, {**current(), "charger_cutoff_armed": proof})
+            self.armed_charger_cutoff = proof, scope
+
+        return ScheduledStop(payload, guard, record)
+
+    def _current_charger_cutoff(self, occurrence: dict[str, Any]) -> bool:
+        armed = self.armed_charger_cutoff
+        return (
+            armed is not None
+            and occurrence.get("charger_cutoff_armed") == armed[0]
+            and occurrence.get("request") == armed[0]["request"]
+            and occurrence.get("local") == armed[0]["local"]
+            and control_scope_matches(self.controller.session.gateway, armed[1])
+        )
+
+    def _cutoff_preparation_current(self, occurrence: dict[str, Any]) -> bool:
+        c = self.controller
+        lease, preparation = c.charging.lease, self.preparing_charger_cutoff
+        return (
+            lease is not None
+            and preparation is not None
+            and lease.identifier == occurrence.get("request") == preparation[0]
+            and self.journal.get("control", {}).get("ticket") == preparation[1]
+            and c.requests.intent() == ControlIntent(lease.mode, lease.revision)
+            and control_scope_matches(c.session.gateway, preparation[2])
+        )
 
     # Record the exact source of a same-tag session while its independent plan marker is available.
     def observe_native_occurrence(self, native: HandoverEvidence) -> None:
@@ -379,6 +502,13 @@ class LocalSchedule:
         if (
             local is not None
             and local == self.journal.active()
+            and occurrence.get("charger_cutoff_required") is True
+            and not self._current_charger_cutoff(occurrence)
+        ):
+            return Pending(Prerequisite.SOURCE, "the exact charger cutoff is unconfirmed on this connection")
+        if (
+            local is not None
+            and local == self.journal.active()
             and (self._due(occurrence) or c.current.selected() > occurrence["window"]["limit_a"])
         ):
             return Pending(Prerequisite.SOURCE, "the local schedule does not permit positive current")
@@ -571,7 +701,13 @@ class LocalSchedule:
             await self.hold_due_unbound_start()
             return
         active = j.active()
-        if c.stopping or type(local) is not int or not self._due(occurrence):
+        abandoned_cutoff = (
+            active == local
+            and occurrence.get("charger_cutoff_required") is True
+            and not self._current_charger_cutoff(occurrence)
+            and not self._cutoff_preparation_current(occurrence)
+        )
+        if c.stopping or type(local) is not int or not (abandoned_cutoff or self._due(occurrence)):
             return
         if active != local and (active is not None or j.latest_owner_stop_id() != local):
             return

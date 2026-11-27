@@ -78,16 +78,29 @@ def simulate_schedule_clock(monkeypatch):
     return clock
 
 
-def enable_overnight_prototype(monkeypatch):
+def enable_overnight_prototype(monkeypatch, *, charger_cutoff=False):
     monkeypatch.setattr(local_schedule, "AUTOMATIC_OVERNIGHT_START_ENABLED", True)
+    if not charger_cutoff:
+        # Older journals and deferred-report fixtures predate the charger-local timer.
+        monkeypatch.setattr(local_schedule.LocalSchedule, "cutoff_preparation", lambda self, lease: None)
 
 
 # Exercise a cold outage with an actual cached decision for the native timer identity.
 @asynccontextmanager
-async def overnight(tmp_path, tls, unused_tcp_port, monkeypatch, *, manual_pause=False, expired=True, prototype=True):
+async def overnight(
+    tmp_path,
+    tls,
+    unused_tcp_port,
+    monkeypatch,
+    *,
+    manual_pause=False,
+    expired=True,
+    prototype=True,
+    charger_cutoff=False,
+):
     clock = simulate_schedule_clock(monkeypatch)
     if prototype:
-        enable_overnight_prototype(monkeypatch)
+        enable_overnight_prototype(monkeypatch, charger_cutoff=charger_cutoff)
     async with managed_bench(
         tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
     ) as rig:

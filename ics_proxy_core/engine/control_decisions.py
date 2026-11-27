@@ -18,7 +18,7 @@ from ..constants import HUB_PROFILE_ID
 from ..frames import Frame
 from .command_processor import CommandPriority
 from .connection_scope import ControlScope, control_scope_matches, current_control_scope, current_scope
-from .control_state import ControlState
+from .control_state import ControlCompletion, ControlState
 from .current_policy import (
     CurrentSelection,
     attempt_key,
@@ -77,7 +77,14 @@ from .release_attempt import ReleaseAttempt
 from .rpc import UnavailableError
 from .schedule_control import ScheduleControl
 from .security import SecurityError, StaleEvidenceError
-from .start_handoff import NativeStartReport, OwnedStartResult, StartHandoff, StartHandoffContext, StartPublication
+from .start_handoff import (
+    NativeStartReport,
+    OwnedStartResult,
+    PrepareScheduledStop,
+    StartHandoff,
+    StartHandoffContext,
+    StartPublication,
+)
 from .start_policy import ACTIVE, owner_tag_separate, start_refusal
 from .start_settlement import RetirementCandidate, StartFailureAction, StartFailureFacts, settle_start
 from .stop_settlement import StopPredecessors, predecessor_stop_reply
@@ -1914,6 +1921,7 @@ class ControlDecisions:
         request_id: str | None = None,
         on_prepared: Callable[[], None] | None = None,
         handoff: StartHandoff | None = None,
+        prepare_cutoff: PrepareScheduledStop | None = None,
     ) -> OwnedStartResult:
         connection = current_control_scope(gateway)
 
@@ -1937,6 +1945,7 @@ class ControlDecisions:
             scope_guard=source,
             scope=connection[0] if connection is not None else None,
             handoff=handoff,
+            prepare_cutoff=prepare_cutoff,
         )
 
     # Claim and prepare the exact local Start in one transaction before native or wire work.
@@ -1990,10 +1999,10 @@ class ControlDecisions:
             raise DeniedError("authorization changed before forwarding a local start")
 
     # Arm only the current ticket after its ceiling and current authorization agree.
-    def arm_local_start(self, ticket: str, check: Callable[[], None]) -> None:
+    def arm_local_start(self, ticket: str, check: Callable[[], None], *, held_at_zero: bool = False) -> None:
         check()
         with self.journal.atomic():
-            self.journal.starts.armed(ticket)
+            self.journal.starts.armed(ticket, held_at_zero=held_at_zero)
 
     # A real lifecycle that arrived in the meantime supersedes the pending outgoing Start.
     def issue_local_start(self, ticket: str) -> None:
@@ -2010,6 +2019,8 @@ class ControlDecisions:
         shared: bool,
         handoff: StartHandoff | None,
         context: StartHandoffContext | None,
+        *,
+        release_held_start: bool = False,
     ) -> StartPublication | None:
         if not accepted:
             raise UnavailableError("transaction start was not confirmed")
@@ -2021,7 +2032,12 @@ class ControlDecisions:
                 if context is None:
                     raise RecoveryRequiredError("managed Start publication lacks its exact Boot scope")
                 publication = handoff.write_in_transaction(context)
-            self.control._complete(ticket, uncertain=False, **({"owner": "shared"} if shared else {}))
+            changes: ControlCompletion = {"uncertain": False}
+            if shared:
+                changes["owner"] = "shared"
+            if release_held_start:
+                changes["inhibit"] = False
+            self.control._complete(ticket, **changes)
         if publication is not None:
             assert handoff is not None
             handoff.committed(publication)
