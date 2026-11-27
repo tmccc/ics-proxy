@@ -30,11 +30,20 @@ ZONE = ZoneInfo("Europe/London")
 # Intent: accept only Linux kernel states that indicate a synchronized clock.
 # Why: a missing or unsynchronized clock cannot establish the civil-time Start window.
 @pytest.mark.parametrize(
-    ("state", "synchronized"), [(None, False), (-1, False), (0, True), (4, True), (5, False), (6, False)]
+    ("state", "blocker"),
+    [
+        (None, "clock_check_unavailable"),
+        (-1, "clock_check_unavailable"),
+        (0, None),
+        (4, None),
+        (5, "clock_unsynchronized"),
+        (6, "clock_check_unavailable"),
+    ],
 )
-def test_host_clock_requires_valid_kernel_sync_state(monkeypatch, state: int | None, synchronized: bool) -> None:
+def test_host_clock_requires_valid_kernel_sync_state(monkeypatch, state: int | None, blocker: str | None) -> None:
     monkeypatch.setattr(schedule_clock, "_ntp_query", lambda: None if state is None else lambda: state)
-    assert schedule_clock.host_clock_synchronized() is synchronized
+    assert schedule_clock.host_clock_blocker() == blocker
+    assert schedule_clock.host_clock_synchronized() is (blocker is None)
 
 
 # Model the native schedule envelope communicated independently by the charger.

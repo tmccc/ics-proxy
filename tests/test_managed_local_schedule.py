@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ics_proxy_core.engine import local_schedule
+from ics_proxy_core.engine import local_schedule, schedule_clock
 from ics_proxy_core.engine.auth_info import tag_key
 from ics_proxy_core.engine.managed import ManagedController
 from ics_proxy_core.engine.managed_intent import AUTOMATIC_PAUSE_CAUSE, LOCAL_SCHEDULE_OCCURRENCE
@@ -75,7 +75,7 @@ def simulate_schedule_clock(monkeypatch):
     monkeypatch.setattr(
         local_schedule, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: monotonic + clock.elapsed)
     )
-    monkeypatch.setattr(local_schedule, "host_clock_synchronized", lambda: clock.synchronized)
+    monkeypatch.setattr(schedule_clock, "_ntp_query", lambda: lambda: 0 if clock.synchronized else 5)
     return clock
 
 
@@ -130,11 +130,12 @@ async def test_outage_schedule_requires_explicit_timezone(tmp_path, tls, unused_
             c, j = test.controller, test.session.journal
             await status(test, lambda value: value.get("local_hold_verified") is True)
             clock.now = MIDNIGHT
+            clock.synchronized = False
             for _ in range(3):
-                await c.tick()
+                assert "overnight_start_blocker" not in refresh_for_read(c, await c.tick())
             intent = c.requests.intent()
             assert c.requests.offline_pause_current(intent)
-            assert c.local_schedule.timezone is None and clock.synchronized
+            assert c.local_schedule.timezone is None
             assert j.get(LOCAL_SCHEDULE_OCCURRENCE) is None and not starts(rig)
             assert rig.bench.firmware.effective_limit() == 0
 
@@ -239,13 +240,25 @@ async def test_offline_schedule_waits_for_host_clock_synchronization(tmp_path, t
             c, j = test.controller, test.session.journal
             await status(test, lambda value: value.get("local_hold_verified") is True)
             clock.synchronized = False
+            published = await c.tick()
+            assert refresh_for_read(c, published)["overnight_start_blocker"] == "clock_unsynchronized"
             clock.step_wall(MIDNIGHT)
             for _ in range(3):
-                await c.tick()
+                published = dict(await c.tick(), running=True, certificate_remaining_seconds=86400)
+                view = refresh_for_read(c, published)
+                assert view["overnight_start_blocker"] == "clock_unsynchronized"
+                assert view["local_hold_verified"] and view["local_healthy"]
             assert j.get(LOCAL_SCHEDULE_OCCURRENCE) is None and not starts(rig)
             assert rig.bench.firmware.effective_limit() == 0
 
+            with monkeypatch.context() as missing_clock:
+                missing_clock.setattr(schedule_clock, "_ntp_query", lambda: None)
+                published = await c.tick()
+                assert refresh_for_read(c, published)["overnight_start_blocker"] == "clock_check_unavailable"
+                assert j.get(LOCAL_SCHEDULE_OCCURRENCE) is None and not starts(rig)
+
             clock.synchronized = True
+            assert "overnight_start_blocker" not in refresh_for_read(c, published)
             await status(test, lambda _: bool(starts(rig)))
             await c.charging.settle()
             assert len(starts(rig)) == 1 and j.get(LOCAL_SCHEDULE_OCCURRENCE)["window"]["starts_at"] == MIDNIGHT
@@ -486,9 +499,13 @@ async def test_cloud_returns_before_local_schedule_sends_start(
         rig.prepared.config = replace(rig.prepared.config, owner_start_tag=OWNER_TAG, owner_schedule_timezone=ZONE.key)
         async with connection(rig, "cloud-return-before-scheduled-start", online=True) as test:
             c, j, bench = test.controller, test.session.journal, rig.bench
-            await healthy(c)
+            published = await healthy(c)
+            clock.synchronized = False
+            assert "overnight_start_blocker" not in refresh_for_read(c, published)
             await bench.vendor_outage()
             assert not test.session.runtime.vendor_registered
+            assert refresh_for_read(c, published)["overnight_start_blocker"] == "clock_unsynchronized"
+            clock.synchronized = True
             await c.tick()
             assert c.requests.intent().mode == "app"
             controls = test.session.gateway.controls
@@ -590,7 +607,9 @@ async def test_offline_schedule_requires_current_permission_and_window(
             await status(test, lambda value: value.get("local_hold_verified") is True)
             assert c.requests.offline_pause_current(c.requests.intent()) is not manual_pause
             clock.now = MIDNIGHT + offset
+            clock.synchronized = not manual_pause
             for _ in range(3):
                 current = await c.tick()
                 assert current["local_hold_verified"] and current["station_ceiling_a"] == current["power_w"] == 0
+                assert "overnight_start_blocker" not in refresh_for_read(c, current)
             assert not starts(rig) and j.get(LOCAL_SCHEDULE_OCCURRENCE) is None

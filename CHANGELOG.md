@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Explain in Home Assistant when the host clock blocks automatic overnight Start during an iCS outage.
+
 ## 0.3.0-rc3
 
 - Enable opt-in automatic overnight Starts during an iCS outage. Arm an exact charger-side cutoff under a

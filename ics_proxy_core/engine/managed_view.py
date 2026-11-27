@@ -673,6 +673,11 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
     except sqlite3.Error:
         result.update(can_start_test=False, can_start=False, can_set_current=False, can_return=False)
     result["start_authorization"] = _reported_start_authorization(c)
+    clock_blocker = c.local_schedule.clock_blocker(intent)
+    if clock_blocker is None:
+        result.pop("overnight_start_blocker", None)
+    else:
+        result["overnight_start_blocker"] = clock_blocker
     result["control_mode"] = control_mode(result, pending_fault if supervising else None, fresh=fresh)
     result.update(delivery_counts(j))
     result["sessions"] = session_history(j)

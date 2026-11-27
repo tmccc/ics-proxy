@@ -57,7 +57,11 @@ Home Assistant Pause uses the protective path when the charger still needs to st
 The client derives availability from fresh proxy data. A vendor outage and a local charger fault have
 different meanings. The proxy can report a locally verified state while the vendor connection is down.
 
-The Control mode sensor (`sensor.ics_proxy_control_mode`) exposes the proxy's recent journaled sessions in its
+The Control mode sensor (`sensor.ics_proxy_control_mode`) shows an `overnight_start_blocker` attribute when an
+unsynchronized clock or an unavailable clock check blocks automatic overnight Start during an iCS outage.
+The attribute clears when the clock check passes, iCS reconnects, or an owner Pause takes precedence.
+
+The same sensor exposes the proxy's recent journaled sessions in its
 `proxy_sessions` attribute. Look for `local_only: true` to find sessions started under local owner authorization.
 Each completed row includes the recorded start, stop and energy in kWh. You can read these rows while the proxy
 status is fresh, including when stale charger telemetry makes the Last session energy sensor unavailable.

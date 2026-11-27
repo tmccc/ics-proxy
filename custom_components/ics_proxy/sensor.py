@@ -12,7 +12,7 @@ from homeassistant.helpers.restore_state import ExtraStoredData, RestoredExtraDa
 
 from . import ProxyEntry
 from .coordinator import ProxyCoordinator
-from .diagnostic_view import diagnostics, explanation
+from .diagnostic_view import diagnostics, explanation, label
 from .entity import ProxyEntity
 
 VALUES = (
@@ -39,6 +39,12 @@ CONTROL_MODE_LABELS = {
     "app_offline": "App / schedule (cloud offline)",
     "attention": "Needs attention",
     "waiting": "Waiting for verification",
+}
+OVERNIGHT_START_BLOCKERS = {
+    "clock_unsynchronized": "Automatic overnight Start is blocked because the proxy host clock is unsynchronized.",
+    "clock_check_unavailable": (
+        "Automatic overnight Start is blocked because the proxy could not check host clock synchronization."
+    ),
 }
 NATIVE_CONTROL_MODES = frozenset(
     {
@@ -238,6 +244,9 @@ class ProxySensor(ProxyEntity, SensorEntity):
             if fresh:
                 # Journal history stays available independently of the charger's live readings.
                 attributes["proxy_sessions"] = self.coordinator.data.get("sessions", [])
+                blocker = label(self.coordinator.data.get("overnight_start_blocker"), OVERNIGHT_START_BLOCKERS)
+                if blocker is not None:
+                    attributes["overnight_start_blocker"] = OVERNIGHT_START_BLOCKERS[blocker]
             return attributes
         return (
             {

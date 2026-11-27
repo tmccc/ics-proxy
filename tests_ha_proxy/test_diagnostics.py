@@ -97,6 +97,54 @@ async def test_actual_control_mode_sensor_explains_start_renewal(actual_hass, pe
     assert entry.runtime_data.data["healthy"] is True
 
 
+# Intent: an automatic outage Pause can also explain why the overnight fallback cannot Start.
+# Why: the same host-clock reading says nothing about other controls or whether the window was missed.
+async def test_actual_control_mode_sensor_explains_overnight_start_clock_block(actual_hass, peer):
+    state = peer["state"]
+    state.update(
+        healthy=False,
+        local_healthy=True,
+        state="local_only",
+        cloud_connected=False,
+        desired_control="paused",
+        control_mode="paused",
+        local_hold_verified=True,
+        owner_control_enabled=False,
+        station_ceiling_a=0,
+        pause_reason="cloud_connection_failed",
+        health_blockers=["cloud_disconnected"],
+        diagnostics=detail() | {"pending_commands": [], "pending_command_count": 0},
+        overnight_start_blocker="clock_unsynchronized",
+    )
+    entry = await setup(actual_hass, peer)
+    entity_id = "sensor.ics_proxy_control_mode"
+    entity = actual_hass.states.get(entity_id)
+    assert entity.state == "Paused locally"
+    assert "host clock is unsynchronized" in entity.attributes["overnight_start_blocker"]
+    assert "cloud connection is unavailable" in entity.attributes["diagnostic_summary"]
+    assert actual_hass.states.get("button.ics_proxy_start").state != "unavailable"
+
+    state.update(overnight_start_blocker="clock_check_unavailable", native_age_seconds=None)
+    await entry.runtime_data.async_refresh()
+    entity = actual_hass.states.get(entity_id)
+    assert "could not check host clock synchronization" in entity.attributes["overnight_start_blocker"]
+
+    state["status_age_seconds"] = 16
+    await entry.runtime_data.async_refresh()
+    assert "overnight_start_blocker" not in actual_hass.states.get(entity_id).attributes
+
+    state["status_age_seconds"] = 0
+    for invalid in (PRIVATE, [PRIVATE]):
+        state["overnight_start_blocker"] = invalid
+        await entry.runtime_data.async_refresh()
+        assert "overnight_start_blocker" not in actual_hass.states.get(entity_id).attributes
+
+    del state["overnight_start_blocker"]
+    await entry.runtime_data.async_refresh()
+    assert "overnight_start_blocker" not in actual_hass.states.get(entity_id).attributes
+    assert set(peer["commands"]) == {"status"}
+
+
 # Intent: fresh status explains a specific wait even when no native sample is safe for the dashboard.
 # Why: the charger can report a valid interim state before both sides of session closure agree.
 async def test_actual_control_mode_explains_exact_owner_closure(actual_hass, peer):

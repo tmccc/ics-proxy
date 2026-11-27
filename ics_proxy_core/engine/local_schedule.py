@@ -24,7 +24,7 @@ from .managed_intent import ControlIntent
 from .policy import DeniedError
 from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
 from .rpc import UnavailableError
-from .schedule_clock import host_clock_synchronized
+from .schedule_clock import host_clock_blocker, host_clock_synchronized
 from .security import SecurityError
 from .session_closure import observe_closure
 from .start_handoff import ScheduledStop
@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from .local_schedule_window import ScheduleWindow
     from .managed import ManagedController
     from .managed_charging import ChargeLease
+    from .schedule_clock import ClockBlocker
     from .start_handoff import OwnedStartResult
     from .trial_handover_evidence import HandoverEvidence
 
@@ -264,17 +265,26 @@ class LocalSchedule:
                 return True
         return False
 
+    # Outage fallback can use shared control or the exact automatic Pause for the current revision.
+    def _outage_permission(self, intent: ControlIntent) -> bool:
+        c = self.controller
+        return not c.session.runtime.vendor_registered and (
+            intent.mode == "app" or c.requests.offline_pause_current(intent)
+        )
+
+    # Civil time cannot establish whether a scheduled window is due until the clock is trusted.
+    def clock_blocker(self, intent: ControlIntent) -> ClockBlocker | None:
+        if self.timezone is not None and self._outage_permission(intent):
+            return host_clock_blocker()
+        return None
+
     # Admission is only from shared control or the exact clean automatic Pause caused by an outage.
     def consider(self, native: HandoverEvidence) -> None:
         if self.timezone is None:
             return
         c = self.controller
         intent, now = c.requests.intent(), time.time()
-        if (
-            c.session.runtime.vendor_registered
-            or (intent.mode != "app" and not c.requests.offline_pause_current(intent))
-            or not host_clock_synchronized()
-        ):
+        if not self._outage_permission(intent) or not host_clock_synchronized():
             return
         window = schedule_window(native, c.native.spec.saved_schedule_digest, self.timezone, now)
         if window is None or c.current.selected() > window.limit_a or not c.charging.available(native, normal=True):
