@@ -83,11 +83,21 @@ python tools/rehearse_proxy_rollback.py --installed-proxy-commit "$INSTALLED_COM
   --ics-ha-python "$HA_PYTHON" --output "$PRIVATE_EVIDENCE"
 ```
 
-The rehearsal includes both a settled-journal rollback and a rollback using a paused predecessor's backup,
-taken before candidate charging activity. Preserve the verified installation and private pre-update journal
-backup across an update. Keep the candidate journal too. Its records may include newer charging sessions,
-receipts and device changes. Reconcile those records before considering a backup restore. A passing simulation
-does not determine whether a particular live journal can be downgraded in place.
+The rehearsal includes a settled-journal rollback and a rollback using a paused predecessor's backup.
+For a newer standalone installation, use the rehearsal to prepare the backup rollback.
+
+1. Before the update, archive the exact predecessor source and its runtime. Take a consistent private SQLite
+   backup of the stopped predecessor journal after verifying a Pause, closed session and zero output.
+   Include committed WAL content if using a physical copy.
+2. If rollback is needed, retain the stopped candidate journal separately and match the archived predecessor
+   to the installed commit in the rehearsal. Verify current charger closure and zero output. Compare any
+   post-update sessions, receipts and device changes with the pre-update state.
+3. Restore a copy of the pre-update backup only after reconciling intervening activity. If the charger state
+   or any intervening outcome remains uncertain, keep the charger paused and use the current build's
+   recovery procedure.
+
+The rehearsal covers those exact builds with synthetic data. The historical checker remains the authority
+for the specific older in-place rollback pairs it recognizes.
 
 Builds from before stable recovery reasons can reject a newer failure record for an unsettled current change.
 Reconcile that change with the build that recorded it before considering a downgrade. The installation
@@ -96,13 +106,14 @@ Resolve interrupted vendor authorization checks on the build that recorded them 
 
 ## Qualify the overnight outage schedule
 
-Production builds block new automatic outage Starts until an authorized test on the commissioned firmware
-verifies that the charger can enforce the cutoff independently. The proxy's elapsed deadline covers a clock
-correction and some service replacements. An unreachable host leaves cutoff to the charger.
+Production builds block new automatic outage Starts until the commissioned firmware can end a proxy-started
+session independently. The native timer can end charger-owned sessions. A proxy-issued Stop at 06:00 verifies
+cutoff with the proxy available. For the outage path, use independent charger readings while the proxy is
+unavailable.
 
-Qualify a candidate at the agreed site current with independent charger session and power readings. Check an
-unsynchronized start after host power loss, loss of synchronization before Start, an in-window vendor outage,
-and a session that still has demand at cutoff with the proxy unavailable across 06:00. A passing cutoff needs
-charger-side evidence that the active session ended and output reached zero before the proxy returned. Verify
-that bringing the proxy back does not start another session in the same window. Retain the redacted evidence
-with the approved source commit and firmware version.
+Qualify a candidate at the agreed site current. Check an unsynchronized start after host power loss, loss of
+synchronization before Start, and an in-window vendor outage. For the cutoff case, retain evidence that the
+proxy started the session, that the vehicle still requested current before the deadline, and that the proxy was
+unavailable across 06:00. Confirm from charger-side readings that the exact session ended and output reached
+zero before the proxy returned. Verify that bringing the proxy back does not start another session in the same
+window. Retain the redacted evidence with the approved source commit and firmware version.

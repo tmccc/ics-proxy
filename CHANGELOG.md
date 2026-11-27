@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.3.0-rc2
+
+- Check Linux clock synchronization before admitting or sending a proxy-run overnight Start.
+- Document independent charger cutoff evidence and the backup rollback procedure for standalone installations.
 - Preserve exact Stop, Pause and closure evidence across delayed charger reports, temporary journal write
   failures and proxy replacement.
 - Recheck charger evidence before restoring current or returning control to iCS. Preserve pending command
