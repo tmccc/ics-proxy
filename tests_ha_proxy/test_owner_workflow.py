@@ -28,8 +28,19 @@ async def verify_pause(proxy, hass, saved, claim, entry_id):
     current = proxy.durable()
     assert current["metadata"]["managed_control_intent"] == {"mode": "paused", "revision": revision}
     assert current["metadata"]["managed_owner_pause"] == claim
-    assert await hass.request("view") == {"entry_id": entry_id, "mode": "Paused locally", "return_available": True}
-    require_zero_held(proxy.rig, len(proxy.rig.bench.device_calls))
+    mark = len(proxy.rig.bench.device_calls)
+    # A newer native audit can retire the direct status sample before Home Assistant reads another one.
+    expected = {"entry_id": entry_id, "mode": "Paused locally", "return_available": True}
+    view = None
+    try:
+        async with asyncio.timeout(10):
+            while (view := await hass.request("view")) != expected:
+                assert view["entry_id"] == entry_id, view
+                assert view["return_available"] is False, view
+                await asyncio.sleep(0.1)
+    except TimeoutError:
+        pytest.fail(f"Home Assistant did not show the verified Pause. Last view: {view}")
+    require_zero_held(proxy.rig, mark)
     assert not starts(proxy.rig)
     return receipt
 
