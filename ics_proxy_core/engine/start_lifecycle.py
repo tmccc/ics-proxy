@@ -184,18 +184,23 @@ class StartLifecycle:
             require_zero()
         except SecurityError, DeniedError, RecoveryRequiredError:
             return False, False
-        try:
-            if unissued is not None:
+        if unissued is not None:
+            try:
                 self.retire(unissued)
-                closed = self.retirement(RetirementRule.CLOSED)
-            if closed is not None:
+            except sqlite3.Error as error:
+                if self.journal.db.in_transaction:
+                    raise
+                raise RecoveryRequiredError("verified unsent Start settlement awaits journal storage") from error
+            closed = self.retirement(RetirementRule.CLOSED)
+        if closed is not None:
+            try:
                 with self.journal.atomic():
                     self.retire(closed)
-                self.lease = None
-        except sqlite3.Error as error:
-            if self.journal.db.in_transaction:
-                raise
-            raise RecoveryRequiredError("verified Start settlement awaits journal storage") from error
+            except sqlite3.Error as error:
+                if self.journal.db.in_transaction:
+                    raise
+                raise RecoveryRequiredError("verified normal Start closure awaits retirement") from error
+            self.lease = None
         return unissued is not None, closed is not None
 
     # Fault supervision needs a native read only when a closed Start still has an unsettled local outcome.

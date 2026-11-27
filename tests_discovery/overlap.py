@@ -136,7 +136,11 @@ class Overlap:
             self.expect(
                 settled.get("state") == "failed"
                 and json.loads(settled["result"])
-                == {"classification": "superseded_by_pause", "superseded_by": self.ids[name]},
+                == {
+                    "accepted_at": json.loads(rows[old_pause]["result"])["accepted_at"],
+                    "classification": "superseded_by_pause",
+                    "superseded_by": self.ids[name],
+                },
                 "older_pause_not_superseded",
             )
             self.terminal[old_pause] = settled
