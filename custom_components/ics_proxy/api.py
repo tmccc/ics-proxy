@@ -98,6 +98,20 @@ async def _reject_redirect(
     return response
 
 
+# A client uses the field advertised by its peer and accepts the original wire name from older proxies.
+def management_owner_binding(status: dict[str, Any]) -> tuple[str, str | None]:
+    legacy = "canvas_owner"
+    field = "management_owner" if "management_owner" in status else legacy
+    owner = status.get(field)
+    if field != legacy and legacy in status and status[legacy] != owner:
+        raise ProxyError("The local proxy reported inconsistent management ownership")
+    if isinstance(owner, str) and re.fullmatch(r"[a-f0-9]{64}", owner):
+        return field, owner
+    if field != legacy or status.get("management_owner_binding") is True:
+        raise ProxyError("The local proxy reported invalid management ownership")
+    return field, None
+
+
 class ProxyClient:
     """Home Assistant shares the host network with the proxy; every connection is literal loopback only."""
 
@@ -130,7 +144,7 @@ class ProxyClient:
                 async with session.ws_connect(
                     f"http://127.0.0.1:{self.port}/management",
                     headers={"Authorization": "Bearer " + self.token},
-                    protocols=["ics-proxy.v1"],
+                    protocols=["ics-proxy.pause.v1", "ics-proxy.v1"] if command == "pause" else ["ics-proxy.v1"],
                     max_msg_size=65536,
                 ) as connection:
                     sending = True

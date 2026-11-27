@@ -95,8 +95,8 @@ async def test_management_status_limit_leaves_pause_available(tmp_path, tls, unu
 
 # Intent: ordinary management connections leave an authenticated owner able to Pause.
 # Why: the reserved Pause budget only helps after the owner can reach the queue.
-@pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy"])
-async def test_management_connections_leave_pause_available(tmp_path, tls, unused_tcp_port_factory, monkeypatch, busy):
+@pytest.mark.parametrize("mode", ["idle", "busy", "busy-with-extra-reader"])
+async def test_management_connections_leave_pause_available(tmp_path, tls, unused_tcp_port_factory, monkeypatch, mode):
     async with adjustable(tmp_path, tls, unused_tcp_port_factory(), monkeypatch) as b:
         c = b.controller
         published = {**await healthy(c), "running": True, "certificate_remaining_seconds": 86400}
@@ -109,36 +109,72 @@ async def test_management_connections_leave_pause_available(tmp_path, tls, unuse
             "proxy": None,
         }
         url = f"ws://127.0.0.1:{port}/management"
-        release, entered = asyncio.Event(), asyncio.Event()
+        release, entered, extra_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
         dashboard_requests, dispatch = 0, api.dispatch
 
         # Hold ordinary dashboard work after it has a connection, leaving the real Pause admission in place.
         async def delayed_dispatch(text, *, pause_only=False):
             nonlocal dashboard_requests
-            if busy and json.loads(text).get("command") == "status":
+            if mode != "idle" and json.loads(text).get("command") == "status":
                 dashboard_requests += 1
                 if dashboard_requests == 4:
                     entered.set()
+                if dashboard_requests == 5:
+                    extra_entered.set()
                 await release.wait()
             return await dispatch(text, pause_only=pause_only)
 
-        monkeypatch.setattr(api, "dispatch", delayed_dispatch)
         try:
+            async with connect(url, **options) as dashboard:
+                status = (await call(dashboard, "status"))["result"]
+                assert status["management_owner_binding"] is True
+                assert status["management_owner"] == status["canvas_owner"]
+                if mode == "idle":
+                    refused_id = uuid.uuid4().hex
+                    refused = await call(
+                        dashboard,
+                        "pause",
+                        id=refused_id,
+                        revision=c.requests.intent().revision,
+                        management_owner="0" * 64,
+                    )
+                    assert refused == {"ok": False, "error": "not_ready"}
+                    assert c.requests.receipt(refused_id)["state"] == "not_found"
+            owner_options = {**options, "subprotocols": ["ics-proxy.pause.v1", "ics-proxy.v1"]}
+            if mode == "busy-with-extra-reader":
+                async with connect(url, **owner_options) as priority:
+                    assert priority.subprotocol == "ics-proxy.pause.v1"
+                    assert await call(priority, "status") == {"ok": False, "error": "not_ready"}
+                    await asyncio.wait_for(priority.wait_closed(), 2)
+            else:
+                owner_options = options
+            monkeypatch.setattr(api, "dispatch", delayed_dispatch)
             async with AsyncExitStack() as clients:
                 dashboards = [await clients.enter_async_context(connect(url, **options)) for _ in range(4)]
-                if busy:
+                if mode == "idle":
+                    await until(lambda: len(api.idle) == 4)
+                else:
                     for client in dashboards:
                         await client.send(json.dumps({"id": uuid.uuid4().hex, "command": "status"}))
                     await asyncio.wait_for(entered.wait(), 2)
-                else:
-                    await until(lambda: len(api.idle) == 4)
+                if mode == "busy-with-extra-reader":
+                    extra = await clients.enter_async_context(connect(url, **options))
+                    await extra.send(json.dumps({"id": uuid.uuid4().hex, "command": "status"}))
+                    await asyncio.wait_for(extra_entered.wait(), 2)
                 identifier = uuid.uuid4().hex
-                async with connect(url, **options) as owner:
-                    reply = await call(owner, "pause", id=identifier, revision=c.requests.intent().revision)
+                owner_field = "canvas_owner" if mode == "idle" else "management_owner"
+                async with connect(url, **owner_options) as owner:
+                    reply = await call(
+                        owner,
+                        "pause",
+                        id=identifier,
+                        revision=c.requests.intent().revision,
+                        **{owner_field: status[owner_field]},
+                    )
                     assert reply["ok"] and reply["result"]["state"] == "accepted"
                     assert (await healthy(c))["local_hold_verified"]
                     assert c.requests.receipt(identifier)["state"] == "completed"
-                    if busy:
+                    if mode != "idle":
                         await asyncio.wait_for(owner.wait_closed(), 2)
                     else:
                         await asyncio.wait_for(dashboards[0].wait_closed(), 2)

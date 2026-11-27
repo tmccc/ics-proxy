@@ -240,8 +240,9 @@ async def run(
             before_send=lambda: require_unplugged(native),
         )
 
-    report_stage("verify_unplugged_managed_pause")
+    report_stage("open_restore_journal")
     with closing(open_native_journal(config.journal, config.identity, spec, require_existing=True)) as journal:
+        report_stage("verify_unplugged_managed_pause")
         book = ResourceBook(journal, prepared.baseline)
         if journal.phase.read().value in ("backend_restore_pending", "complete"):
             if journal.get(MANAGED_RESTORE_INTENT) != spec.digest:
@@ -258,7 +259,9 @@ async def run(
             )
             emit(await finish_restore(handover, patch, report_stage=report_stage))
             return 0
+        report_stage("validate_maintenance_credentials")
         tls = prepare_tls(config)
+        report_stage("verify_unplugged_managed_pause")
         await prepare_cleanup(book, spec, observe, patch)
     # The durable cleanup phase also fences a service restart between the two exclusive journal opens.
     session = TrialSession(
@@ -269,18 +272,23 @@ async def run(
         allow_unplugged_native=True,
         require_existing_journal=True,
     )
+    restore_failed = False
     try:
         if session.journal.get(MANAGED_RESTORE_INTENT) != spec.digest:
             raise RecoveryRequiredError("cleanup does not belong to this managed restoration")
         if session.journal.phase.read().value == "rollback":
             await cleanup_profiles(session, report_stage)
         result = await finish_restore(session.native_bounded, patch, session.runtime.close, report_stage=report_stage)
+    except BaseException:
+        restore_failed = True
+        raise
     finally:
         try:
             await session.close()
         except Exception:
-            report_stage("close_maintenance_session")
-            raise
+            if not restore_failed:
+                report_stage("close_maintenance_session")
+                raise
     emit(result)
     return 0
 
@@ -306,13 +314,15 @@ def main() -> int:
         )
     except Exception as error:
         reason, next_step = restore_guidance(stage, error)
-        emit({
-            "restore_failed": type(error).__name__,
-            "complete": False,
-            "restore_stage": stage,
-            "restore_reason": reason,
-            "next_step": next_step,
-        })
+        emit(
+            {
+                "restore_failed": type(error).__name__,
+                "complete": False,
+                "restore_stage": stage,
+                "restore_reason": reason,
+                "next_step": next_step,
+            }
+        )
         return 1
 
 

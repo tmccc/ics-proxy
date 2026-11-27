@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Show the vendor restore stage, a reason code and the next action when restoration stops.
+- Reserve a management connection for Pause and bind Home Assistant controls to the commissioned proxy reported
+  in the status used for the request.
+
 - Let a Home Assistant session Stop join an unanswered Pause Stop for the same session when the charger is
   verified at zero. A queued vendor Stop can use the recorded replies for its original session after closure.
 - Keep verified closure separate from the charger’s Stop reply. Save closure when the receipt write fails and

@@ -66,7 +66,7 @@ class ProxyButton(ProxyEntity, ButtonEntity):
     # A deliberately chosen action uses one request id; a timeout refreshes status without repeating the write.
     async def async_press(self) -> None:
         try:
-            await self.coordinator.client.command(self.action, self.coordinator.data["control_revision"])
+            await self.coordinator.command(self.action, self.coordinator.data["control_revision"])
         except ProxyError as error:
             raise HomeAssistantError(str(error)) from None
         finally:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import re
 import sqlite3
@@ -17,6 +18,7 @@ from typing import Any
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
+from websockets.typing import Subprotocol
 
 from .command_processor import CommandPriority
 from .ics import unique_object
@@ -25,8 +27,12 @@ from .managed_view import refresh_for_read, session_history
 from .policy import DeniedError
 from .rpc import UnavailableError
 from .security import TRANSPORT_LOG, SecurityError, authorization_matches
-from .store import RecoveryRequiredError
+from .store import RecoveryRequiredError, encoded
 from .trial_config import private_json
+
+PAUSE_SUBPROTOCOL = Subprotocol("ics-proxy.pause.v1")
+MANAGEMENT_OWNER_FIELD = "management_owner"
+LEGACY_MANAGEMENT_OWNER_FIELD = "canvas_owner"
 
 
 @dataclass(frozen=True, repr=False)
@@ -58,16 +64,24 @@ class ManagementSettings:
 
 
 class ManagementServer:
-    """Four local clients share ordinary work, with one short-lived reservation for Pause."""
+    """Ordinary work and clients that negotiate Pause have separate connection capacity."""
 
     # A status provider is a private in-process snapshot, rather than a new native observation on every UI refresh.
     def __init__(
         self, settings: ManagementSettings, controller: ManagedController, status: Callable[[], dict[str, Any]]
     ) -> None:
         self.settings, self.controller, self.status = settings, controller, status
+        # Preserve the original identity domain so outstanding bindings survive an executable upgrade.
+        identity = (
+            "ics-proxy canvas owner v1",
+            controller.session.journal.identity,
+            controller.native.spec.hardware_identity,
+        )
+        self._management_owner = hmac.digest(settings.token.encode(), encoded(identity).encode(), "sha256").hex()
         self.server: Server | None = None
         self.clients: set[ServerConnection] = set()
         self.pause_client: ServerConnection | None = None
+        self.legacy_pause_client: ServerConnection | None = None
         self.idle: dict[ServerConnection, None] = {}
         self.recent: deque[float] = deque()
         self.recent_pauses: deque[float] = deque()
@@ -106,9 +120,15 @@ class ManagementServer:
             self.limit_requests(self.recent)
             raise SecurityError("management identifier is invalid")
         command = value.get("command")
+        fields = {"id", "command", "revision"}
+        owner_fields = {MANAGEMENT_OWNER_FIELD, LEGACY_MANAGEMENT_OWNER_FIELD} & value.keys()
+        marker = value[next(iter(owner_fields))] if len(owner_fields) == 1 else None
+        owner = marker if isinstance(marker, str) and re.fullmatch(r"[a-f0-9]{64}", marker) else None
+        fields.update(owner_fields)
         pause = (
             command == "pause"
-            and set(value) == {"id", "command", "revision"}
+            and set(value) == fields
+            and (not owner_fields or owner is not None)
             and type(value["revision"]) is int
             and 0 <= value["revision"] < 2**53
         )
@@ -122,7 +142,6 @@ class ManagementServer:
             if not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):
                 raise SecurityError("management receipt identifier is invalid")
             return self.read_only(value["id"], command, request_id=identifier)
-        fields = {"id", "command", "revision"}
         if command == "set_current":
             fields.add("current_a")
         elif command == "stop_session":
@@ -131,6 +150,11 @@ class ManagementServer:
                 raise SecurityError("management Stop target is invalid")
         elif command not in ("pause", "app_control", "start", "start_test", "arm_cloud_test"):
             raise SecurityError("management command is not supported")
+        if owner_fields:
+            if owner is None:
+                raise SecurityError("management owner is invalid")
+            if not hmac.compare_digest(owner, self._management_owner):
+                raise UnavailableError("management owner has changed")
         if set(value) != fields:
             raise SecurityError("management command is not supported")
         try:
@@ -182,6 +206,9 @@ class ManagementServer:
                 result = {"sessions": session_history(self.controller.session.journal)}
             elif command == "status":
                 result = refresh_for_read(self.controller, self.status())
+                result[MANAGEMENT_OWNER_FIELD] = self._management_owner
+                result[LEGACY_MANAGEMENT_OWNER_FIELD] = self._management_owner
+                result["management_owner_binding"] = True
             else:
                 raise SecurityError("management read is not supported")
         except sqlite3.Error:
@@ -191,23 +218,31 @@ class ManagementServer:
     # The network boundary reports fixed classifications only; peer text and bearer credentials are never logged.
     async def handle(self, connection: ServerConnection) -> None:
         displaced = None
-        reserved = False
-        if len(self.clients) >= 4:
-            displaced = next(iter(self.idle), None)
-            if displaced is None:
-                if self.pause_client is not None:
-                    await connection.close(1013, "Busy")
-                    return
-                self.pause_client = connection
-                reserved = True
-            else:
-                self.idle.pop(displaced)
-                self.clients.remove(displaced)
-        self.clients.add(connection)
+        priority = connection.subprotocol == PAUSE_SUBPROTOCOL
+        reserved = priority
+        if priority:
+            if self.pause_client is not None:
+                await connection.close(1013, "Busy")
+                return
+            self.pause_client = connection
+        else:
+            if len(self.clients) >= 4:
+                displaced = next(iter(self.idle), None)
+                if displaced is None:
+                    if self.legacy_pause_client is not None:
+                        await connection.close(1013, "Busy")
+                        return
+                    # Older clients announce the command only in the first frame. Their slot is separate.
+                    self.legacy_pause_client = connection
+                    reserved = True
+                else:
+                    self.idle.pop(displaced)
+                    self.clients.remove(displaced)
+            self.clients.add(connection)
         try:
             if displaced is not None:
                 await displaced.close(1013, "Idle connection replaced")
-            while connection in self.clients:
+            while priority or connection in self.clients:
                 if not reserved:
                     self.idle[connection] = None
                 try:
@@ -218,7 +253,7 @@ class ManagementServer:
                     return
                 finally:
                     self.idle.pop(connection, None)
-                if connection not in self.clients:
+                if not priority and connection not in self.clients:
                     return  # A displaced reader cannot admit work after releasing its slot.
                 try:
                     response = await self.dispatch(text, pause_only=reserved)
@@ -236,6 +271,8 @@ class ManagementServer:
             self.clients.discard(connection)
             if self.pause_client is connection:
                 self.pause_client = None
+            if self.legacy_pause_client is connection:
+                self.legacy_pause_client = None
 
     # Management owns a separate loopback socket and cannot replace or retire either OCPP connection.
     async def start(self) -> None:
@@ -244,7 +281,7 @@ class ManagementServer:
             "127.0.0.1",
             self.settings.port,
             process_request=self.authorize,
-            subprotocols=["ics-proxy.v1"],
+            subprotocols=[PAUSE_SUBPROTOCOL, Subprotocol("ics-proxy.v1")],
             compression=None,
             max_size=2048,
             max_queue=4,

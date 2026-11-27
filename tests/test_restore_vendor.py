@@ -22,7 +22,7 @@ from ics_proxy_core.engine.security import SecurityError, StaleEvidenceError
 from ics_proxy_core.engine.store import RecoveryRequiredError
 from ics_proxy_core.engine.trial_session import save_private
 from ics_proxy_core.frames import basic_auth_header
-from tests.charge_rig import actual_stop, positive_flow
+from tests.charge_rig import actual_stop, positive_flow, ready
 from tests.current_rig import commissioned
 from tests.handover_helpers import NativeVehiclePeer
 from tests.managed_rig import starts
@@ -146,9 +146,18 @@ def journal_facts(path):
 
 async def failed_restore_cli(action, config, spec, native_port=80):
     child = await asyncio.create_subprocess_exec(
-        sys.executable, "-B", restore_vendor.__file__, action,
-        "--config", str(config), "--native-bounded-spec", str(spec), "--native-port", str(native_port),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        sys.executable,
+        "-B",
+        restore_vendor.__file__,
+        action,
+        "--config",
+        str(config),
+        "--native-bounded-spec",
+        str(spec),
+        "--native-port",
+        str(native_port),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
     try:
         stdout, stderr = await asyncio.wait_for(child.communicate(), 8)
@@ -170,6 +179,42 @@ async def test_invalid_restore_inputs_report_the_stage_without_private_paths(tmp
     assert "configuration and commissioning files" in report["next_step"]
 
 
+# Preserve the phase that first interrupted a vendor restore.
+@pytest.mark.parametrize("transfer_failed", [False, True])
+async def test_maintenance_close_preserves_restore_stage(tmp_path, tls, unused_tcp_port, monkeypatch, transfer_failed):
+    async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, cli_route=True, native_peer=RestorePeer) as test:
+        await stop_paused(test)
+        rig = test.rig
+        config, spec = tmp_path / "trial.json", spec_file(tmp_path, rig)
+        stages = []
+        close = restore_vendor.TrialSession.close
+
+        # Bypass profile work to isolate stage reporting during route transfer and close.
+        async def cleanup_profiles(session, report_stage):
+            pass
+
+        # Record the route stage before simulating transfer success or failure.
+        async def finish_restore(handover, patch, close_listener, *, report_stage):
+            report_stage("restore_original_route")
+            if transfer_failed:
+                raise NativeTransportUnavailableError("test route observation interrupted")
+            return {"complete": True}
+
+        # Close the real session before injecting a cleanup error.
+        async def close_with_error(session):
+            await close(session)
+            raise OSError("test maintenance cleanup failure")
+
+        with monkeypatch.context() as restore:
+            restore.setattr(restore_vendor, "cleanup_profiles", cleanup_profiles)
+            restore.setattr(restore_vendor, "finish_restore", finish_restore)
+            restore.setattr(restore_vendor.TrialSession, "close", close_with_error)
+            error = NativeTransportUnavailableError if transfer_failed else OSError
+            with pytest.raises(error):
+                await run("restore", config, spec, rig.prepared.observer.port, report_stage=stages.append)
+            assert stages[-1] == ("restore_original_route" if transfer_failed else "close_maintenance_session")
+
+
 # Intent: input checks run offline and restoration refuses an already-owned journal before contacting the charger.
 # Why: a running proxy can keep operating while an installer checks inputs, and it must remain the only owner.
 async def test_restore_check_is_offline(tmp_path, tls, unused_tcp_port, monkeypatch):
@@ -185,7 +230,7 @@ async def test_restore_check_is_offline(tmp_path, tls, unused_tcp_port, monkeypa
             await run("restore", config, spec, port)
         report = await failed_restore_cli("restore", config, spec, port)
         assert report["restore_failed"] == "RecoveryRequiredError"
-        assert report["restore_stage"] == "verify_unplugged_managed_pause"
+        assert report["restore_stage"] == "open_restore_journal"
         assert report["restore_reason"] == "journal_in_use"
         assert "Stop the proxy service" in report["next_step"]
         assert peer.requests == reads and not peer.writes
@@ -512,6 +557,8 @@ async def test_restore_from_managed32_keeps_history(
             "complete": True,
         }
         stages = {
+            "open_restore_journal",
+            "validate_maintenance_credentials",
             "verify_unplugged_managed_pause",
             "verify_6_a_and_remove_proxy_profiles",
             "restore_original_route",

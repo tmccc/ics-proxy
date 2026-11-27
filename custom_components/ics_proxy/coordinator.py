@@ -14,7 +14,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import ProxyClient, ProxyError
+from .api import ProxyClient, ProxyError, management_owner_binding
 from .diagnostic_view import explanation
 from .notification import notice_for
 
@@ -30,6 +30,13 @@ def usable_age(value: Any) -> bool:
 
 class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """A deliberate pause is normal; prolonged faults produce one persistent HA notification until recovery."""
+
+    async def command(self, action: str, revision: int, **fields: Any) -> None:
+        """Use the same status for the control revision and the commissioned destination."""
+        field, owner = management_owner_binding(self.data or {})
+        if owner is not None:
+            fields[field] = owner
+        await self.client.command(action, revision, **fields)
 
     # Setup and refresh only read status; neither HA restart nor unload sends any control command.
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:

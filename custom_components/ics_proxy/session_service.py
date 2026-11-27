@@ -57,7 +57,7 @@ def register_session_service(hass: HomeAssistant) -> None:
                 return response
             fields = {"target": target}
         try:
-            await coordinator.client.command(
+            await coordinator.command(
                 action, revision, report_reference=record_reference if include_reference else None, **fields
             )
             response["confirmed"] = True
