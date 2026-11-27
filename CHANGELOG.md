@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Arm an exact charger-side cutoff under a zero hold before an automatic overnight Start can offer current
-  in the prototype. Production admission remains gated on independent charger testing.
+- Enable opt-in automatic overnight Starts during an iCS outage. Arm an exact charger-side cutoff under a
+  zero hold before offering current.
 - Verify the saved state of a checkpointed pre-update backup with a read-only rollback check.
 - Keep local charging history visible in Home Assistant when proxy status is fresh and charger telemetry is stale.
 

@@ -107,19 +107,21 @@ supports those records.
 
 ### The midnight schedule during a vendor outage
 
-The proxy blocks new automatic overnight Starts during a vendor outage pending an independent charger cutoff.
-See [release qualification](release-process.md#qualify-the-overnight-outage-schedule). The commissioned
-charger schedule and manual owner Start follow their usual authorization rules.
+To opt in to automatic overnight Starts during an iCS outage, set `owner_schedule_timezone` to an IANA time
+zone such as `Europe/London` in the private service configuration, alongside the dedicated `owner_start_tag`.
+The proxy recognizes a single commissioned daily midnight-to-06:00 plan, using local civil time on
+clock-change days. It checks Linux kernel NTP synchronization at admission and immediately before sending
+Start. An unavailable or unsynchronized clock blocks a new automatic Start. The kernel can continue to
+report synchronization during holdover.
 
-Keep any existing `owner_schedule_timezone` setting so the proxy can reconcile occurrences already in its
-journal. It identifies the local civil midnight and 06:00 endpoints, including on clock-change days. A previous
-occurrence retains its cutoff and exact session identity. The proxy requests a zero hold and Stop when that
-cutoff is due and verifies closure separately from the charger’s reply. If the host or charger connection is
-down, the proxy can act once it recovers.
+The proxy holds charging at zero while it opens the session. It uses the exact charger transaction number
+to arm a charger-side timer and can offer current after it records the timer acknowledgement. While connected,
+the proxy also requests zero and Stop at cutoff if the session is still open. The journal preserves the cutoff
+and session identity for recovery, and the proxy verifies closure separately from the charger’s reply.
+A replacement connection requests Stop for the exact session if the timer belongs to the previous connection.
 
-The prototype checks Linux kernel NTP synchronization at admission and immediately before sending Start.
-An unavailable or unsynchronized clock blocks a new Start. The service can start and recover during a time
-outage. The kernel can continue to report synchronization during holdover.
+The [overnight verification procedure](release-process.md#qualify-the-overnight-outage-schedule) covers
+direct observation of the charger’s cutoff while the proxy is offline.
 
 ## Run the service
 

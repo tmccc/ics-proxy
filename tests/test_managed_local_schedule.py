@@ -78,11 +78,9 @@ def simulate_schedule_clock(monkeypatch):
     return clock
 
 
-def enable_overnight_prototype(monkeypatch, *, charger_cutoff=False):
-    monkeypatch.setattr(local_schedule, "AUTOMATIC_OVERNIGHT_START_ENABLED", True)
-    if not charger_cutoff:
-        # Older journals and deferred-report fixtures predate the charger-local timer.
-        monkeypatch.setattr(local_schedule.LocalSchedule, "cutoff_preparation", lambda self, lease: None)
+def use_legacy_overnight_start(monkeypatch):
+    # Older journals and deferred-report fixtures predate the charger-local timer.
+    monkeypatch.setattr(local_schedule.LocalSchedule, "cutoff_preparation", lambda self, lease: None)
 
 
 # Exercise a cold outage with an actual cached decision for the native timer identity.
@@ -95,16 +93,18 @@ async def overnight(
     *,
     manual_pause=False,
     expired=True,
-    prototype=True,
+    configured=True,
     charger_cutoff=False,
 ):
     clock = simulate_schedule_clock(monkeypatch)
-    if prototype:
-        enable_overnight_prototype(monkeypatch, charger_cutoff=charger_cutoff)
+    if not charger_cutoff:
+        use_legacy_overnight_start(monkeypatch)
     async with managed_bench(
         tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
     ) as rig:
-        rig.prepared.config = replace(rig.prepared.config, owner_start_tag=OWNER_TAG, owner_schedule_timezone=ZONE.key)
+        rig.prepared.config = replace(
+            rig.prepared.config, owner_start_tag=OWNER_TAG, owner_schedule_timezone=ZONE.key if configured else None
+        )
         async with connection(rig, "online-introduction", online=True) as initial:
             c, j = initial.controller, initial.session.journal
             await healthy(c)
@@ -121,9 +121,9 @@ async def overnight(
         yield rig, clock
 
 
-async def test_production_outage_holds_automatic_overnight_start(tmp_path, tls, unused_tcp_port, monkeypatch):
-    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch, prototype=False) as (rig, clock):
-        async with connection(rig, "production-outage") as test:
+async def test_outage_schedule_requires_explicit_timezone(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch, configured=False) as (rig, clock):
+        async with connection(rig, "outage-without-schedule") as test:
             c, j = test.controller, test.session.journal
             await status(test, lambda value: value.get("local_hold_verified") is True)
             clock.now = MIDNIGHT
@@ -131,7 +131,7 @@ async def test_production_outage_holds_automatic_overnight_start(tmp_path, tls, 
                 await c.tick()
             intent = c.requests.intent()
             assert c.requests.offline_pause_current(intent)
-            assert c.local_schedule.timezone == ZONE.key and clock.synchronized
+            assert c.local_schedule.timezone is None and clock.synchronized
             assert j.get(LOCAL_SCHEDULE_OCCURRENCE) is None and not starts(rig)
             assert rig.bench.firmware.effective_limit() == 0
 
@@ -141,7 +141,7 @@ async def test_production_outage_holds_automatic_overnight_start(tmp_path, tls, 
             window = local_schedule.schedule_window(sample, c.native.spec.saved_schedule_digest, ZONE.key, clock.now)
             assert window is not None
             identifier = uuid.uuid4().hex
-            with pytest.raises(DeniedError, match="requires a verified charger cutoff"):
+            with pytest.raises(DeniedError, match="requires a configured time zone"):
                 c.charging.accept(identifier, "start", intent.revision, schedule=window)
             assert j.outcomes.owner(identifier) is None and j.get(LOCAL_SCHEDULE_OCCURRENCE) is None
 
@@ -282,7 +282,7 @@ async def test_native_daily_start_uses_the_outage_window(
 ):
     used_window = source != "different"
     clock = simulate_schedule_clock(monkeypatch)
-    enable_overnight_prototype(monkeypatch)
+    use_legacy_overnight_start(monkeypatch)
     async with (
         managed_bench(
             tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
@@ -472,7 +472,7 @@ async def test_cloud_returns_before_local_schedule_sends_start(
     tmp_path, tls, unused_tcp_port, monkeypatch, explicit_pause, reply_limit, flap
 ):
     clock = simulate_schedule_clock(monkeypatch)
-    enable_overnight_prototype(monkeypatch)
+    use_legacy_overnight_start(monkeypatch)
     async with managed_bench(
         tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
     ) as rig:

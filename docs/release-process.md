@@ -113,17 +113,14 @@ Resolve interrupted vendor authorization checks on the build that recorded them 
 
 ## Qualify the overnight outage schedule
 
-Production builds block new automatic outage Starts until the commissioned firmware can end a proxy-started
-session independently. The prototype holds zero while opening a session, binds the charger's actual
-transaction number, and records an accepted charger-side timer before raising the ceiling. If the exact
-timer reply or the journal write is missing, it keeps the zero hold. A replacement connection must
-stop the exact session before offering it positive current. The native timer can end charger-owned
-sessions. A proxy-issued Stop at 06:00 verifies cutoff with the proxy available. For the outage path,
-use independent charger readings while the proxy is unavailable.
+Automatic Starts during an iCS outage use the site's
+[opt-in configuration](commissioning.md#the-midnight-schedule-during-a-vendor-outage). A timer acknowledgement
+records the charger's acceptance of the timer for the exact transaction. A proxy-issued Stop at 06:00 verifies
+cutoff with the proxy available. An offline cutoff trial observes the charger's timer execution directly.
 
-Qualify a candidate at the agreed site current. Check an unsynchronized start after host power loss, loss of
-synchronization before Start, and an in-window vendor outage. For the cutoff case, retain evidence that the
-proxy started the session, that the vehicle still requested current before the deadline, and that the proxy was
-unavailable across 06:00. Confirm from charger-side readings that the exact session ended and output reached
-zero before the proxy returned. Verify that bringing the proxy back does not start another session in the same
-window. Retain the redacted evidence with the approved source commit and firmware version.
+To verify cutoff at the agreed site current, record that the proxy started the session, that the vehicle
+still requested current before the deadline, and that the proxy was unavailable across 06:00. Check
+charger-side readings for the exact session ending and output reaching zero before the proxy returns.
+After reconnecting, check that the proxy does not start another session for that window. Retain the redacted
+evidence with the source commit and firmware version. The clock cases cover an unsynchronized host after
+power loss and a loss of synchronization before Start.

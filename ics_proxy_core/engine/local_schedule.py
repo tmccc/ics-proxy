@@ -42,8 +42,6 @@ if TYPE_CHECKING:
 NATIVE_OCCURRENCE = "managed_native_schedule_occurrence"
 SCHEDULE_CUTOFF = "schedule_cutoff"
 _SCHEDULE_CLOSURE = "managed_local_schedule_native_closure"
-# New proxy-owned occurrences need a charger-enforced cutoff verified on hardware.
-AUTOMATIC_OVERNIGHT_START_ENABLED = False
 
 
 class ScheduleCloudReturnedError(DeniedError):
@@ -263,13 +261,12 @@ class LocalSchedule:
 
     # Admission is only from shared control or the exact clean automatic Pause caused by an outage.
     def consider(self, native: HandoverEvidence) -> None:
-        if not AUTOMATIC_OVERNIGHT_START_ENABLED:
+        if self.timezone is None:
             return
         c = self.controller
         intent, now = c.requests.intent(), time.time()
         if (
-            self.timezone is None
-            or c.session.runtime.vendor_registered
+            c.session.runtime.vendor_registered
             or (intent.mode != "app" and not c.requests.offline_pause_current(intent))
             or not host_clock_synchronized()
         ):
@@ -325,8 +322,8 @@ class LocalSchedule:
 
     # Sample both clocks before admission so a later wall-clock correction cannot extend this occurrence.
     def sample_cutoff(self, window: ScheduleWindow) -> tuple[float, ScheduleCutoff]:
-        if not AUTOMATIC_OVERNIGHT_START_ENABLED:
-            raise DeniedError("automatic overnight Start requires a verified charger cutoff")
+        if self.timezone is None:
+            raise DeniedError("automatic overnight Start requires a configured time zone")
         if not host_clock_synchronized():
             raise DeniedError("the host clock is not synchronized for scheduled Start")
         elapsed = time.monotonic()

@@ -28,10 +28,10 @@ from tests.runtime_rig import until
 from tests.test_managed_local_schedule import (
     MIDNIGHT,
     connection,
-    enable_overnight_prototype,
     overnight,
     simulate_schedule_clock,
     status,
+    use_legacy_overnight_start,
 )
 from tests.test_managed_offline_owner import OWNER_TAG
 from tests.test_managed_vendor_catchup import CatchupBench
@@ -341,7 +341,6 @@ async def test_cutoff_retains_elapsed_deadline_across_replacement(
             monkeypatch.setattr(
                 local_schedule, "host_clock_epoch", lambda: "next-clock" if clock_epoch == "changed" else None
             )
-        monkeypatch.setattr(local_schedule, "AUTOMATIC_OVERNIGHT_START_ENABLED", False)
         async with connection(rig, "cutoff-after-replacement") as test:
             j = test.session.journal
             await status(test, lambda _: bool(stops(bench)))
@@ -456,7 +455,7 @@ async def test_unsent_schedule_cutoff_recovers_app_authority(
     tmp_path, tls, unused_tcp_port, monkeypatch, cutoff_first, resume
 ):
     clock = simulate_schedule_clock(monkeypatch)
-    enable_overnight_prototype(monkeypatch)
+    use_legacy_overnight_start(monkeypatch)
     if cutoff_first == "lease-timer-first":
         monkeypatch.setattr(
             managed_charging,
