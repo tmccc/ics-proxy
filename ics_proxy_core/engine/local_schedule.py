@@ -77,6 +77,7 @@ class LocalSchedule:
         self.preparing_charger_cutoff: tuple[str, str, ControlScope] | None = None
         self.armed_charger_cutoff: tuple[dict[str, Any], ControlScope] | None = None
 
+    # Only an automatic scheduled Start needs to arm a charger-side timer.
     def cutoff_preparation(self, lease: ChargeLease) -> Callable[[str], Awaitable[ScheduledStop]] | None:
         if lease.schedule is None:
             return None
@@ -107,6 +108,7 @@ class LocalSchedule:
             raise RecoveryRequiredError("charger cutoff has no live preparation")
         _, _, scope = preparation
 
+        # Require the same accepted Start receipt and control scope before using the occurrence.
         def current() -> dict[str, Any]:
             c.charging.guard(lease)
             occurrence: dict[str, Any] = j.get(OCCURRENCE, {})
@@ -137,6 +139,7 @@ class LocalSchedule:
         now = time.time()
         stop_at = int(min(occurrence["window"]["ends_at"], now + deadline - time.monotonic()))
 
+        # Keep the cutoff bound to the live owner session and original elapsed deadline.
         def guard() -> None:
             occurrence = current()
             if (
@@ -170,6 +173,7 @@ class LocalSchedule:
 
         return ScheduledStop(payload, guard, record)
 
+    # Match the durable timer proof to the process-local charger scope that holds it.
     def _current_charger_cutoff(self, occurrence: dict[str, Any]) -> bool:
         armed = self.armed_charger_cutoff
         return (
@@ -180,6 +184,7 @@ class LocalSchedule:
             and control_scope_matches(self.controller.session.gateway, armed[1])
         )
 
+    # A replacement controller cannot continue the former lease's in-flight timer preparation.
     def _cutoff_preparation_current(self, occurrence: dict[str, Any]) -> bool:
         c = self.controller
         lease, preparation = c.charging.lease, self.preparing_charger_cutoff

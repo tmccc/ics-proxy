@@ -188,6 +188,7 @@ def schema_digest(db: sqlite3.Connection) -> str:
     return hashlib.sha256(json.dumps([version, application, objects], separators=(",", ":")).encode()).hexdigest()
 
 
+# Refuse a backup whose state could still depend on journal sidecar files.
 def require_checkpointed(path: Path) -> None:
     require(
         not any(os.path.lexists(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal")),

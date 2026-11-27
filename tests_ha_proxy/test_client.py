@@ -535,7 +535,8 @@ async def test_stale_readings_are_unavailable_and_alerts_are_debounced(actual_ha
     assert not coordinator.notified and coordinator.problem_since is None
 
 
-# Journaled owner sessions stay readable when only native charger telemetry is stale.
+# Intent: keep journaled owner sessions visible with fresh proxy status and stale charger readings.
+# Why: saved energy history remains useful during lost telemetry, subject to normal proxy-status freshness.
 async def test_local_session_history_needs_fresh_proxy_status_but_not_native_readings(actual_hass, peer):
     local_session = dict(peer["state"]["sessions"][0], cloud_acknowledged=False, local_only=True)
     peer["state"]["sessions"] = [local_session]

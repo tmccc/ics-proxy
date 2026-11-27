@@ -72,7 +72,8 @@ def test_stopped_journal_does_not_write_sidecars(tmp_path, committed_wal):
     assert {file.name: file.read_bytes() for file in tmp_path.iterdir()} == before
 
 
-# A standalone predecessor's checkpoint carries a verified owner Pause independently of the installation copy.
+# Intent: verify the saved Pause, shutdown and session evidence in a checkpointed predecessor backup.
+# Why: rollback preparation needs trustworthy backup evidence without altering the archived journal.
 async def test_verify_checkpointed_pre_update_backup(tmp_path, tls, unused_tcp_port_factory, monkeypatch, capsys):
     port = unused_tcp_port_factory
     async with process_rig(tmp_path, tls, port(), port(), monkeypatch, timing="fast-poll") as proxy:

@@ -15,6 +15,7 @@ from tools import ics_predeployment  # noqa: E402
 from tools.qualification_snapshot import freeze  # noqa: E402
 
 
+# Freeze the candidate and rehearse against the exact installed predecessor in private scratch.
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--installed-proxy-commit", required=True, help="verified full commit of the installed proxy")

@@ -21,11 +21,13 @@ CUTOFF = MIDNIGHT + 6 * 3600
 class ChargerTimer:
     """The simulated charger keeps the timer in its own state."""
 
+    # Keep the ordinary firmware responder and install a timer only after its command arrives.
     def __init__(self, firmware, reply):
         self.firmware, self.reply = firmware, reply
         self.answer = firmware.answer
         self.armed = None
 
+    # Require the exact active transaction and observe zero current when the timer is armed.
     def respond(self, action, payload):
         if action != "DataTransfer" or payload["messageId"] != "delayStop":
             return self.answer(action, payload)
@@ -40,6 +42,7 @@ class ChargerTimer:
         self.armed = data["transactionId"], datetime.fromisoformat(data["stopTime"]).timestamp()
         return {"status": "Accepted", "data": ""}
 
+    # Fire the native timer without involving the proxy or affecting a replacement transaction.
     def expire(self, now):
         assert self.armed is not None
         local, cutoff = self.armed
@@ -48,6 +51,7 @@ class ChargerTimer:
             self.firmware.requested_current = 0
 
 
+# Poll the controller until a charger-level Stop identifies the target transaction.
 async def stop_targets(test):
     bench = test.rig.bench
     async with asyncio.timeout(6):
@@ -57,6 +61,8 @@ async def stop_targets(test):
     return {frame[3]["transactionId"] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"}
 
 
+# Intent: arm the exact session cutoff before releasing the zero hold, including when replies or authority change.
+# Why: verified current must depend on the accepted charger timer, which can expire while the proxy is offline.
 @pytest.mark.parametrize(
     "outcome", ["armed", "rejected", "malformed", "lost-ack", "write-refused", "pause", "replacement"]
 )
@@ -68,6 +74,7 @@ async def test_charger_local_cutoff_requires_armed_zero_hold(tmp_path, tls, unus
         monkeypatch.setattr(firmware, "answer", timer.respond)
         timer_replied, release_reply = asyncio.Event(), asyncio.Event()
 
+        # Pause the device reply at the timer boundary so the test can inspect or change authority.
         async def hold_reply(action, payload):
             if action == "DataTransfer" and payload["messageId"] == "delayStop":
                 timer_replied.set()

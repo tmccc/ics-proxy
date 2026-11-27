@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0-rc3
+
 - Enable opt-in automatic overnight Starts during an iCS outage. Arm an exact charger-side cutoff under a
   zero hold before offering current.
 - Verify the saved state of a checkpointed pre-update backup with a read-only rollback check.

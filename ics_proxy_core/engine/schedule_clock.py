@@ -7,6 +7,7 @@ from collections.abc import Callable
 from functools import cache
 
 
+# Resolve the Linux clock query once so a platform without it can fail closed at admission.
 @cache
 def _ntp_query() -> Callable[[], int] | None:
     if sys.platform != "linux":

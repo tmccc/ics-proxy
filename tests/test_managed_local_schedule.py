@@ -68,6 +68,7 @@ async def status(test, predicate):
             await asyncio.sleep(0.02)
 
 
+# Control civil time, elapsed time and synchronization only in the schedule module.
 def simulate_schedule_clock(monkeypatch):
     clock = SchedulerClock(MIDNIGHT - 60)
     monotonic = time.monotonic()
@@ -78,8 +79,8 @@ def simulate_schedule_clock(monkeypatch):
     return clock
 
 
+# Exercise older journals and deferred-report fixtures that predate the charger-local timer.
 def use_legacy_overnight_start(monkeypatch):
-    # Older journals and deferred-report fixtures predate the charger-local timer.
     monkeypatch.setattr(local_schedule.LocalSchedule, "cutoff_preparation", lambda self, lease: None)
 
 
@@ -121,6 +122,8 @@ async def overnight(
         yield rig, clock
 
 
+# Intent: require an explicit time zone for automatic Start while preserving manual owner Start.
+# Why: an outage or an owner tag alone does not establish a site schedule.
 async def test_outage_schedule_requires_explicit_timezone(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch, configured=False) as (rig, clock):
         async with connection(rig, "outage-without-schedule") as test:
@@ -228,6 +231,8 @@ async def test_offline_schedule_uses_exact_owner_session_once(tmp_path, tls, unu
             assert len(starts(rig)) == 1 and replacement.session.journal.active() is None
 
 
+# Intent: defer an automatic Start until the host clock synchronizes.
+# Why: entering the time window while unsynchronized cannot establish that midnight has arrived.
 async def test_offline_schedule_waits_for_host_clock_synchronization(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
         async with connection(rig, "unsynchronized-offline-boot") as test:
@@ -246,6 +251,8 @@ async def test_offline_schedule_waits_for_host_clock_synchronization(tmp_path, t
             assert len(starts(rig)) == 1 and j.get(LOCAL_SCHEDULE_OCCURRENCE)["window"]["starts_at"] == MIDNIGHT
 
 
+# Intent: refuse an unsent automatic Start if the clock loses synchronization during preparation.
+# Why: a synchronized clock at admission cannot justify sending after its evidence has expired.
 async def test_offline_schedule_rechecks_host_clock_at_start_wire(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
         async with connection(rig, "clock-lost-before-start") as test:

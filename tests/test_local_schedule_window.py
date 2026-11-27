@@ -27,6 +27,8 @@ from tests.trial_helpers import config_files
 ZONE = ZoneInfo("Europe/London")
 
 
+# Intent: accept only Linux kernel states that indicate a synchronized clock.
+# Why: a missing or unsynchronized clock cannot establish the civil-time Start window.
 @pytest.mark.parametrize(
     ("state", "synchronized"), [(None, False), (-1, False), (0, True), (4, True), (5, False), (6, False)]
 )

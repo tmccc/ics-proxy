@@ -94,7 +94,8 @@ async def test_canvas_stop_is_single_use_at_the_same_revision(actual_hass, peer,
     assert peer["commands"].count("stop_session") == 2
 
 
-# The legacy alias cannot make an inconsistent current management owner usable.
+# Intent: withdraw display commands when the proxy reports conflicting owner aliases.
+# Why: an old field must not make an inconsistent charger destination actionable.
 async def test_conflicting_management_owners_disable_session_commands(actual_hass, peer, frame_clock):
     peer["state"].update(management_owner=OWNER, canvas_owner=OWNER, management_owner_binding=True)
     entry = await setup_proxy(actual_hass, peer["port"])
