@@ -88,7 +88,7 @@ For a newer standalone installation, use the rehearsal to prepare the backup rol
 
 1. Before the update, archive the exact predecessor source and its runtime. Take a consistent private SQLite
    backup of the stopped predecessor journal after verifying a Pause, closed session and zero output.
-   Include committed WAL content if using a physical copy.
+   Preserve committed WAL content in any raw archive. Use a checkpointed copy for the verifier below.
 2. If rollback is needed, retain the stopped candidate journal separately and match the archived predecessor
    to the installed commit in the rehearsal. Verify current charger closure and zero output. Compare any
    post-update sessions, receipts and device changes with the pre-update state.
@@ -96,7 +96,14 @@ For a newer standalone installation, use the rehearsal to prepare the backup rol
    or any intervening outcome remains uncertain, keep the charger paused and use the current build's
    recovery procedure.
 
-The rehearsal covers those exact builds with synthetic data. The historical checker remains the authority
+Verify the saved state of a checkpointed predecessor backup before considering it for restoration.
+
+```bash
+python tools/check_proxy_rollback.py --config "$PRIVATE_CONFIG" --pre-update-backup "$PRE_UPDATE_BACKUP"
+```
+
+A `backup_verified` result covers the backup's saved Pause, shutdown and settled lifecycle. Check the
+exact-build rehearsal and current charger state separately. The historical checker remains the authority
 for the specific older in-place rollback pairs it recognizes.
 
 Builds from before stable recovery reasons can reject a newer failure record for an unsettled current change.

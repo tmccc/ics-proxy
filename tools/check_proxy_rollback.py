@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Modified for the standalone iCS proxy repository.
-"""Check the stopped journal and immutable builds for the rehearsed standalone rollback."""
+"""Check a rehearsed historical rollback or inspect a stopped standalone backup."""
 
 from __future__ import annotations
 
@@ -24,9 +24,11 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ics_proxy_core.constants import HUB_PROFILE_ID  # noqa: E402
 from ics_proxy_core.engine.control_state import ControlState  # noqa: E402
+from ics_proxy_core.engine.ics import unique_object  # noqa: E402
 from ics_proxy_core.engine.managed_intent import (  # noqa: E402
     decode_intent,
     decode_pause_claim,
+    decode_pause_request,
     resolved_timed_starts,
 )
 from ics_proxy_core.engine.native_history import indexed  # noqa: E402
@@ -39,6 +41,8 @@ from ics_proxy_core.engine.store import RecoveryRequiredError, fingerprint  # no
 from ics_proxy_core.engine.trial_config import TrialConfig  # noqa: E402
 from ics_proxy_core.engine.trial_evidence import profile_projection  # noqa: E402
 from ics_proxy_core.engine.trial_session import validate_state_path  # noqa: E402
+from tools.managed_incident import identifier as receipt_id  # noqa: E402
+from tools.managed_incident import read_journal, same_snapshot_version  # noqa: E402
 from tools.rollback_recovery_state import RECOVERY_METADATA, recovery_history_settled  # noqa: E402
 
 
@@ -133,6 +137,15 @@ class RollbackCheck:
     pause_revision: int | None = None
 
 
+@dataclass(frozen=True)
+class BackupCheck:
+    """Offline facts about an archived journal prepared for a separate rollback rehearsal."""
+
+    backup_verified: bool
+    reason: str
+    pause_revision: int | None = None
+
+
 class RollbackRefusedError(ValueError):
     """A fixed classification that excludes saved request bodies and private paths."""
 
@@ -175,9 +188,16 @@ def schema_digest(db: sqlite3.Connection) -> str:
     return hashlib.sha256(json.dumps([version, application, objects], separators=(",", ":")).encode()).hexdigest()
 
 
+def require_checkpointed(path: Path) -> None:
+    require(
+        not any(os.path.lexists(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal")),
+        "backup_needs_checkpoint",
+    )
+
+
 # Lock the stopped owner and read a private copy so SQLite cannot modify the journal's sidecars.
 @contextmanager
-def stopped_journal(path: Path):
+def stopped_journal(path: Path, *, checkpointed_backup: bool = False):
     info = path.lstat()
     require(
         stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077, "journal_unavailable"
@@ -202,18 +222,46 @@ def stopped_journal(path: Path):
             os.path.samestat(info, path.lstat()) and os.path.samestat(held, lock_path.lstat()),
             "journal_unavailable",
         )
+        if checkpointed_backup:
+            require_checkpointed(path)
         with tempfile.TemporaryDirectory(prefix="ics-rollback-") as directory:
             snapshot = Path(directory) / "journal.sqlite"
             shutil.copyfile(path, snapshot)
             # Retain uncheckpointed WAL and interrupted rollback evidence. SQLite rebuilds shared memory locally.
-            for suffix in ("-wal", "-journal"):
-                source = Path(str(path) + suffix)
-                if source.exists():
-                    shutil.copyfile(source, Path(str(snapshot) + suffix))
+            if checkpointed_backup:
+                require_checkpointed(path)
+                require(same_snapshot_version(info, path.lstat()), "backup_changed")
+            else:
+                for suffix in ("-wal", "-journal"):
+                    source = Path(str(path) + suffix)
+                    if source.exists():
+                        shutil.copyfile(source, Path(str(snapshot) + suffix))
             with closing(sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as db:
                 db.execute("PRAGMA query_only=ON")
                 db.execute("BEGIN")
                 yield db
+
+
+# Archived copies may omit the owner lock. Read a stable private copy without creating one.
+@contextmanager
+def checkpointed_backup(path: Path):
+    validate_state_path(path)
+    lock = Path(str(path) + ".lock")
+    if os.path.lexists(lock):
+        with stopped_journal(path, checkpointed_backup=True) as db:
+            yield db
+        return
+    require_checkpointed(path)
+    source, parent = path.lstat(), path.parent.stat()
+    with read_journal(path) as db:
+        require_checkpointed(path)
+        require(
+            not os.path.lexists(lock)
+            and same_snapshot_version(source, path.lstat())
+            and same_snapshot_version(parent, path.parent.stat()),
+            "backup_changed",
+        )
+        yield db
 
 
 # Keep known allocation and both configured identities tied to the preserved transaction ledger.
@@ -491,6 +539,179 @@ def check_snapshot(
     return intent.revision
 
 
+# A downloaded or copied standalone journal can legitimately contain unforwarded, locally owned sessions.
+def require_backup_lifecycles(db: sqlite3.Connection, meta: dict[str, Any]) -> None:
+    owner_tables = dict(
+        db.execute("SELECT name,type FROM sqlite_schema WHERE name IN ('owner_sessions','owner_meter_values')")
+    )
+    require(
+        not owner_tables or owner_tables == {"owner_sessions": "table", "owner_meter_values": "table"},
+        "backup_owner_schema_unverified",
+    )
+    require(
+        db.execute(
+            "SELECT 1 FROM transactions WHERE stop IS NULL "
+            "OR json_type(start,'$.connectorId') IS NOT 'integer' "
+            "OR json_extract(start,'$.connectorId') IS NOT connector "
+            "OR json_type(stop,'$.transactionId') IS NOT 'integer' "
+            "OR json_extract(stop,'$.transactionId') IS NOT local LIMIT 1"
+        ).fetchone()
+        is None
+        and db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone() is None
+        and db.execute("SELECT 1 FROM delivery_replies LIMIT 1").fetchone() is None,
+        "unresolved_lifecycle_delivery",
+    )
+    if owner_tables:
+        lifecycle = "FROM transactions t LEFT JOIN owner_sessions o ON o.local=t.local"
+        require(
+            db.execute(f"SELECT 1 {lifecycle} WHERE (t.vendor IS NULL) != (o.local IS NOT NULL) LIMIT 1").fetchone()
+            is None,
+            "unresolved_lifecycle_delivery",
+        )
+    else:
+        lifecycle = "FROM transactions t"
+        require(
+            db.execute(f"SELECT 1 {lifecycle} WHERE t.vendor IS NULL LIMIT 1").fetchone() is None,
+            "unresolved_lifecycle_delivery",
+        )
+    receipt = meta.get("local_start_receipt", {})
+    require(isinstance(receipt, dict) and meta.get(DEFERRED_START, {}) == {}, "unresolved_start")
+    if not receipt:
+        return
+    stage, local, request = (receipt.get(key) for key in ("stage", "local", "request_id"))
+    require(
+        receipt_id(request) is not None
+        and db.execute(
+            "SELECT 1 FROM managed_requests WHERE id=? AND action IN ('start','start_test') "
+            "AND state IN ('completed','failed')",
+            (request,),
+        ).fetchone()
+        is not None,
+        "unresolved_start",
+    )
+    if stage == "accepted":
+        row = db.execute("SELECT vendor,start FROM transactions WHERE local=?", (local,)).fetchone()
+        tag = json.loads(row[1], object_pairs_hook=unique_object).get("idTag") if row is not None else None
+        require(
+            type(local) is int
+            and row is not None
+            and (row[0] is None) == (receipt.get("owner_authorized") is True)
+            and isinstance(tag, str)
+            and receipt.get("digest") == fingerprint(tag.casefold()),
+            "unresolved_start",
+        )
+    else:
+        require(stage in ("rejected", "unsent") and local is None, "unresolved_start")
+
+
+# Bind the verified Pause receipt and the final shutdown hold, which may have separate physical tickets.
+def require_backup_pause(db: sqlite3.Connection, meta: dict[str, Any], ceiling: int) -> int:
+    control = meta.get("control")
+    shutdown = meta.get("trial_shutdown_attempt")
+    require(isinstance(control, dict) and isinstance(shutdown, dict), "settled_shutdown_required")
+    intent = decode_intent(meta.get("managed_control_intent"))
+    claim = decode_pause_claim(meta.get("managed_owner_pause"))
+    ticket = receipt_id(control.get("ticket"))
+    resume = control.get("resume_limit")
+    shutdown_target = shutdown.get("local")
+    require(
+        ControlState(control).explicit_local_hold
+        and control.get("uncertain") is False
+        and control.get("start_pending", False) is False
+        and type(resume) in (int, float)
+        and 6 <= resume <= ceiling
+        and int(resume) == resume
+        and ticket is not None
+        and shutdown.get("ticket") == ticket
+        and receipt_id(shutdown.get("id")) is not None
+        and shutdown.get("state") == "verified"
+        and (
+            shutdown_target is None
+            or type(shutdown_target) is int
+            and db.execute(
+                "SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (shutdown_target,)
+            ).fetchone()
+            is not None
+        )
+        and meta.get("trial_shutdown_uncertain", False) is False,
+        "settled_shutdown_required",
+    )
+    row = db.execute(
+        "SELECT id,state,result FROM managed_requests WHERE action='pause' ORDER BY rowid DESC LIMIT 1"
+    ).fetchone()
+    require(
+        receipt_id(claim.ticket) is not None
+        and claim.owns(intent, claim.ticket)
+        and row is not None
+        and row[1] == "completed"
+        and receipt_id(row[0]) is not None,
+        "settled_owner_pause_required",
+    )
+    result = json.loads(row[2], object_pairs_hook=unique_object)
+    pause = decode_pause_request(row[0], result) if isinstance(result, dict) else None
+    require(
+        pause is not None
+        and result.get("pause_verified") is True
+        and pause.revision == intent.revision
+        and pause.hold == claim.ticket
+        and (
+            pause.local is None
+            or db.execute("SELECT 1 FROM transactions WHERE local=? AND stop IS NOT NULL", (pause.local,)).fetchone()
+            is not None
+        ),
+        "settled_owner_pause_required",
+    )
+    return intent.revision
+
+
+# Check the archived state only. A verified backup leaves live charger and build checks to their own procedures.
+def check_rollback_backup(config: TrialConfig, backup: Path) -> BackupCheck:
+    try:
+        require(backup.resolve() != config.journal.resolve(), "backup_requires_distinct_path")
+        with checkpointed_backup(backup) as db:
+            require(
+                db.execute("PRAGMA integrity_check(1)").fetchone() == ("ok",)
+                and db.execute("PRAGMA foreign_key_check").fetchone() is None,
+                "journal_integrity_unverified",
+            )
+            meta = {
+                key: json.loads(value, object_pairs_hook=unique_object)
+                for key, value in db.execute("SELECT key,value FROM meta")
+            }
+            require_installation(db, meta)
+            require_allocation(db, config, meta)
+            revision = require_backup_pause(db, meta, require_current_preparation(meta))
+            require_backup_lifecycles(db, meta)
+            require_settled_requests(db, meta, migrated=True, revision=revision)
+            require(
+                meta.get("managed_control_fault") is None
+                and meta.get("vendor_start_grant", {}) == {}
+                and db.execute("SELECT 1 FROM mutations WHERE state!='confirmed' LIMIT 1").fetchone() is None
+                and db.execute(
+                    "SELECT 1 FROM trial_resources WHERE state NOT IN ('confirmed','absent_verified') LIMIT 1"
+                ).fetchone()
+                is None,
+                "unresolved_device_change",
+            )
+            for key, states in (
+                ("managed_test_charge", ("completed",)),
+                ("managed_current_change", ("completed", "cancelled")),
+                ("managed_ordinary_recovery", ("complete",)),
+            ):
+                value = meta.get(key, {})
+                require(
+                    isinstance(value, dict) and (not value or value.get("state") in states),
+                    "unresolved_device_change",
+                )
+            if RECOVERY_METADATA.intersection(meta):
+                require(recovery_history_settled(db, meta, revision), "unsettled_vendor_recovery")
+        return BackupCheck(True, "settled_checkpointed_backup", revision)
+    except RollbackRefusedError as error:
+        return BackupCheck(False, str(error))
+    except AttributeError, KeyError, OSError, RuntimeError, sqlite3.Error, ValueError, TypeError, OverflowError:
+        return BackupCheck(False, "journal_unavailable_or_malformed")
+
+
 # Give a classified read-only result. The check never launches either build or changes a configuration.
 def check_rollback(config: TrialConfig, current: Path, previous: Path) -> RollbackCheck:
     build = None
@@ -527,17 +748,32 @@ def check_rollback(config: TrialConfig, current: Path, previous: Path) -> Rollba
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--current-root", required=True, type=Path)
-    parser.add_argument("--previous-root", required=True, type=Path)
+    parser.add_argument("--current-root", type=Path)
+    parser.add_argument("--previous-root", type=Path)
+    parser.add_argument("--pre-update-backup", type=Path, help="inspect a private, checkpointed standalone backup")
     args = parser.parse_args(argv)
+    backup = args.pre_update_backup
+    if backup is not None and (args.current_root is not None or args.previous_root is not None):
+        parser.error("--pre-update-backup is separate from --current-root and --previous-root")
+    if backup is None and (args.current_root is None or args.previous_root is None):
+        parser.error("provide --pre-update-backup or both --current-root and --previous-root")
     try:
         config = TrialConfig.load(args.config)
     except OSError, ValueError, SecurityError:
-        result = RollbackCheck(False, "configuration_unavailable")
+        result = (
+            RollbackCheck(False, "configuration_unavailable")
+            if backup is None
+            else BackupCheck(False, "configuration_unavailable")
+        )
     else:
-        result = check_rollback(config, args.current_root, args.previous_root)
+        result = (
+            check_rollback(config, args.current_root, args.previous_root)
+            if backup is None
+            else check_rollback_backup(config, backup)
+        )
     print(json.dumps(asdict(result), sort_keys=True))
-    return 0 if result.allowed else 1
+    verified = result.backup_verified if isinstance(result, BackupCheck) else result.allowed
+    return 0 if verified else 1
 
 
 if __name__ == "__main__":

@@ -12,10 +12,11 @@ import pytest
 
 from ics_proxy_core.engine.store import Journal, fingerprint
 from tests.process_helpers import process_rig
+from tests.prototype_rig import START
 from tests.tls_support import tls as tls
 from tests_installation.migrated_layout import seed_old_layout
 from tools import check_proxy_rollback as rollback
-from tools.check_proxy_rollback import RollbackRefusedError, check_snapshot, stopped_journal
+from tools.check_proxy_rollback import RollbackRefusedError, check_rollback_backup, check_snapshot, stopped_journal
 
 
 # Intent: reject a rollback journal if its database, lock, or sidecars have hard links.
@@ -69,6 +70,92 @@ def test_stopped_journal_does_not_write_sidecars(tmp_path, committed_wal):
     with stopped_journal(path) as db:
         assert db.execute("SELECT value FROM meta WHERE key='example'").fetchone() == (json.dumps(expected),)
     assert {file.name: file.read_bytes() for file in tmp_path.iterdir()} == before
+
+
+# A standalone predecessor's checkpoint carries a verified owner Pause independently of the installation copy.
+async def test_verify_checkpointed_pre_update_backup(tmp_path, tls, unused_tcp_port_factory, monkeypatch, capsys):
+    port = unused_tcp_port_factory
+    async with process_rig(tmp_path, tls, port(), port(), monkeypatch, timing="fast-poll") as proxy:
+        await proxy.start()
+        status = await proxy.status()
+        paused = await proxy.request("pause", revision=status["control_revision"])
+        await proxy.completed_control(paused["result"]["id"])
+        status = await proxy.status(lambda state: state["local_hold_verified"])
+        await proxy.close()
+        config = proxy.rig.prepared.config
+
+    archive = tmp_path / "archive"
+    archive.mkdir(mode=0o700)
+    backup = archive / "backup.sqlite"
+    shutil.copy2(config.journal, backup)
+    expected = {
+        "backup_verified": True,
+        "reason": "settled_checkpointed_backup",
+        "pause_revision": status["control_revision"],
+    }
+    before = backup.read_bytes()
+    assert rollback.main(["--config", str(tmp_path / "trial.json"), "--pre-update-backup", str(backup)]) == 0
+    assert json.loads(capsys.readouterr().out) == expected
+    assert backup.read_bytes() == before and list(archive.iterdir()) == [backup]
+    assert check_rollback_backup(config, config.journal).reason == "backup_requires_distinct_path"
+
+    lock = backup.with_suffix(".sqlite.lock")
+    lock.touch(mode=0o600)
+    assert check_rollback_backup(config, backup).backup_verified
+    with closing(Journal(backup, config.identity)):
+        assert check_rollback_backup(config, backup).reason == "journal_owner_running"
+    backup.write_bytes(before)
+    lock.unlink()
+    wal = backup.with_suffix(".sqlite-wal")
+    wal.touch(mode=0o600)
+    assert check_rollback_backup(config, backup).reason == "backup_needs_checkpoint"
+    wal.unlink()
+
+    for statement, reason in (
+        ("DELETE FROM meta WHERE key='trial_shutdown_attempt'", "settled_shutdown_required"),
+        ("UPDATE managed_requests SET result='{}' WHERE action='pause'", "settled_owner_pause_required"),
+        (
+            "INSERT INTO transactions(local,connector,start) VALUES(100,1,'{}')",
+            "unresolved_lifecycle_delivery",
+        ),
+        (
+            "INSERT INTO transactions(local,connector,start,stop) VALUES(100,1,'{}','{}')",
+            "unresolved_lifecycle_delivery",
+        ),
+    ):
+        backup.write_bytes(before)
+        with closing(sqlite3.connect(backup)) as db, db:
+            db.execute(statement)
+        changed = backup.read_bytes()
+        assert check_rollback_backup(config, backup).reason == reason
+        assert backup.read_bytes() == changed and list(archive.iterdir()) == [backup]
+
+    backup.write_bytes(before)
+    with closing(Journal(backup, config.identity)) as journal:
+        start = {**START, "idTag": "OWNER_TEST"}
+        local = journal.start("backup-local-start", start, owner_authorized=True)["transactionId"]
+        journal.stop(
+            "backup-local-stop", {"transactionId": local, "timestamp": "2026-01-01T00:01:00Z", "meterStop": 1001}
+        )
+        request = "a" * 32
+        journal.db.execute("INSERT INTO managed_requests VALUES(?,'start',0,'completed','{}')", (request,))
+        journal.put(
+            "local_start_receipt",
+            {
+                "stage": "accepted",
+                "request_id": request,
+                "local": local,
+                "owner_authorized": True,
+                "digest": fingerprint("owner_test"),
+            },
+        )
+    assert check_rollback_backup(config, backup).backup_verified
+    with closing(sqlite3.connect(backup)) as db, db:
+        db.execute("UPDATE transactions SET stop=json_set(stop,'$.transactionId',0) WHERE local=?", (local,))
+    assert check_rollback_backup(config, backup).reason == "unresolved_lifecycle_delivery"
+
+    backup.write_bytes(b"invalid SQLite backup")
+    assert check_rollback_backup(config, backup).reason == "journal_unavailable_or_malformed"
 
 
 # Save the same immutable timed-Start outcome and later verified Pause found in the installed journal.
