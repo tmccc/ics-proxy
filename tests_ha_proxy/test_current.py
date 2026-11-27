@@ -159,7 +159,7 @@ async def test_current_selection_keeps_the_initiating_destination(actual_hass, c
     with pytest.raises(HomeAssistantError, match="could not confirm this request"):
         await hass.services.async_call("number", "set_value", selection, blocking=True)
     assert state["requested_current_a"] == state["native_limit_a"] == state["station_ceiling_a"] == 6
-    assert entry.runtime_data.canvas_owner == replacement
+    assert entry.runtime_data.management_owner == replacement
 
     await hass.services.async_call("number", "set_value", selection, blocking=True)
     assert state["requested_current_a"] == state["native_limit_a"] == state["station_ceiling_a"] == 16

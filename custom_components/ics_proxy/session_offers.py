@@ -1,4 +1,4 @@
-"""Entry-owned command offers and elapsed feedback for the display."""
+"""Entry-owned session command offers and feedback for rendered controls."""
 
 from __future__ import annotations
 
@@ -16,14 +16,14 @@ if TYPE_CHECKING:
     from .coordinator import ProxyCoordinator
 
 TIMEOUT_FEEDBACK_SECONDS = 20
-type CanvasAction = Literal["start", "stop"]
+type SessionAction = Literal["start", "stop"]
 
 
 @dataclass(frozen=True, slots=True)
-class CanvasBinding:
+class SessionCommandBinding:
     """The service fields verified by the current status."""
 
-    action: CanvasAction
+    action: SessionAction
     owner: str
     revision: int
     target: str | None = None
@@ -35,19 +35,19 @@ class CanvasBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class CanvasOffer:
+class SessionCommandOffer:
     """One generation identifies one displayed opportunity to submit."""
 
-    binding: CanvasBinding
+    binding: SessionCommandBinding
     generation: str
 
 
-class CanvasCommands:
+class SessionCommandOffers:
     # Track one displayed offer and its outstanding claim for this integration entry.
     def __init__(self, coordinator: ProxyCoordinator) -> None:
         self.coordinator = coordinator
-        self.offer: CanvasOffer | None = None
-        self.pending: CanvasOffer | None = None
+        self.offer: SessionCommandOffer | None = None
+        self.pending: SessionCommandOffer | None = None
         self._claim_valid = False
         self._timeout: tuple[str | None, str] | None = None
         self._cancel_timeout: Callable[[], None] | None = None
@@ -58,13 +58,13 @@ class CanvasCommands:
     def _scope(self) -> tuple[str, int] | None:
         coordinator = self.coordinator
         data = coordinator.data or {}
-        owner, revision = coordinator.canvas_owner, data.get("control_revision")
+        owner, revision = coordinator.management_owner, data.get("control_revision")
         if (
             self._retired
             or not coordinator.entry_is_current()
             or not coordinator.last_update_success
             or owner is None
-            or data.get("canvas_owner") != owner
+            or data.get("management_owner") != owner
             or type(revision) is not int
             or not 0 <= revision < 2**53
         ):
@@ -72,21 +72,21 @@ class CanvasCommands:
         return owner, revision
 
     # A current local snapshot is required even for a Stop during a cloud outage.
-    def _binding(self, scope: tuple[str, int] | None) -> CanvasBinding | None:
+    def _binding(self, scope: tuple[str, int] | None) -> SessionCommandBinding | None:
         if scope is None or not self.coordinator.fresh_native:
             return None
         owner, revision = scope
         data = self.coordinator.data or {}
         session, target = data.get("charging_session_open"), data.get("stop_target")
         if session is True and isinstance(target, str) and re.fullmatch(r"[a-f0-9]{64}", target):
-            return CanvasBinding("stop", owner, revision, target)
+            return SessionCommandBinding("stop", owner, revision, target)
         if session is False and data.get("can_start") is True and self.coordinator.fresh_local_healthy:
-            return CanvasBinding("start", owner, revision)
+            return SessionCommandBinding("start", owner, revision)
         return None
 
     # Keep a generation across harmless reads. Loss of authority retires it immediately.
     def observe(self) -> None:
-        if self._timeout is not None and self._timeout[0] != self.coordinator.canvas_owner:
+        if self._timeout is not None and self._timeout[0] != self.coordinator.management_owner:
             self._clear_timeout()
         if self.coordinator.data is not self._awaiting_refresh:
             self._awaiting_refresh = None
@@ -96,7 +96,7 @@ class CanvasCommands:
         if binding is None or self.pending is not None or self._awaiting_refresh is not None:
             self.offer = None
         elif self.offer is None or self.offer.binding != binding:
-            self.offer = CanvasOffer(binding, uuid4().hex)
+            self.offer = SessionCommandOffer(binding, uuid4().hex)
 
     # Render the versioned display state, withholding offers while telemetry is unavailable.
     @property
@@ -116,7 +116,7 @@ class CanvasCommands:
         return f"v2:{feedback}:{offer.binding.action}:{offer.generation}" if offer else f"v2:{feedback}:none:-"
 
     # Consumption and pending feedback occur before the first await of the management request.
-    def claim(self, action: CanvasAction, generation: str) -> CanvasOffer | None:
+    def claim(self, action: SessionAction, generation: str) -> SessionCommandOffer | None:
         self.observe()
         offer = self.offer
         if offer is None or offer.generation != generation or offer.binding.action != action:
@@ -128,17 +128,17 @@ class CanvasCommands:
         return offer
 
     # Recheck the exact claimed offer and its current authority at the write boundary.
-    def owns(self, claim: CanvasOffer) -> bool:
+    def owns(self, claim: SessionCommandOffer) -> bool:
         return self.pending is claim and self._claim_valid and self._binding(self._scope()) == claim.binding
 
     # A new offer needs a status read after the command outcome, even if the same action is still safe.
-    def finish(self, claim: CanvasOffer, confirmed: bool, before_refresh: dict[str, Any] | None) -> None:
+    def finish(self, claim: SessionCommandOffer, confirmed: bool, before_refresh: dict[str, Any] | None) -> None:
         if self.pending is not claim or self._retired:
             return
         self.pending = None
         self._claim_valid = False
         self._awaiting_refresh = before_refresh
-        if not confirmed and claim.binding.owner == self.coordinator.canvas_owner:
+        if not confirmed and claim.binding.owner == self.coordinator.management_owner:
             self._show_timeout(claim.binding.pending_feedback)
         self.coordinator.async_update_listeners()
 
@@ -149,7 +149,7 @@ class CanvasCommands:
             pending_feedback = state.split(":")[1]
         if (
             isinstance(owner, str)
-            and owner == self.coordinator.canvas_owner
+            and owner == self.coordinator.management_owner
             and isinstance(pending_feedback, str)
             and pending_feedback in ("starting", "stopping")
             and state in (f"v2:{pending_feedback}:none:-", "v2:unavailable:none:-")
@@ -159,7 +159,7 @@ class CanvasCommands:
     # Show an unconfirmed action for a bounded period for this management owner.
     def _show_timeout(self, pending_feedback: str) -> None:
         self._clear_timeout()
-        timeout = (self.coordinator.canvas_owner, f"{pending_feedback}_timeout")
+        timeout = (self.coordinator.management_owner, f"{pending_feedback}_timeout")
         self._timeout = timeout
 
         # Retire feedback only when this callback still owns the active timeout.

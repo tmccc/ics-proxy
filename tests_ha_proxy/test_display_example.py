@@ -385,7 +385,7 @@ async def test_ordinary_start_does_not_reach_a_replacement_destination(actual_ha
             await hass.services.async_call("button", "press", {"entity_id": "button.ics_proxy_start"}, blocking=True)
     (refused,) = [request for request in peer["requests"] if request["command"] == "start"]
     assert refused["canvas_owner"] == CANVAS_OWNER and refused["revision"] == REVISION
-    assert entry.runtime_data.canvas_owner == REPLACEMENT_OWNER
+    assert entry.runtime_data.management_owner == REPLACEMENT_OWNER
     assert peer["state"]["charging_session_open"] is False
 
     assert (await call_session_command(hass, "start"))["confirmed"] is True
@@ -547,7 +547,7 @@ async def test_other_ordinary_commands_keep_the_initiating_destination(
         with pytest.raises(HomeAssistantError, match="could not confirm this request"):
             await issue()
     assert state[effect] == original
-    assert entry.runtime_data.canvas_owner == REPLACEMENT_OWNER
+    assert entry.runtime_data.management_owner == REPLACEMENT_OWNER
 
     result = await issue()
     if action == "stop_session":
@@ -612,7 +612,7 @@ async def test_canvas_rejects_replacement_at_the_same_endpoint(
     assert (result["request_reference"] is None) is observed
     assert peer["state"]["charging_session_open"] is (not starting)
     assert entry.runtime_data is runtime and runtime.client.port == peer["port"]
-    assert runtime.canvas_owner == REPLACEMENT_OWNER
+    assert runtime.management_owner == REPLACEMENT_OWNER
 
     # A frame stamped in the observation's whole second can still precede it.
     result = await call_session_command(actual_hass, action, canvas_rendered_at_epoch=wall, **fields)
@@ -871,7 +871,7 @@ async def test_canvas_write_rejects_inflight_entry_reload(actual_hass, canvas_pe
     async def reload_entry():
         assert await hass.config_entries.async_reload(entry.entry_id)
         assert entry.runtime_data is not original
-        assert entry.runtime_data.canvas_owner == CANVAS_OWNER
+        assert entry.runtime_data.management_owner == CANVAS_OWNER
         assert entry.runtime_data.data["control_revision"] == REVISION
 
     peer["before_handshake"] = reload_entry

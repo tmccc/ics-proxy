@@ -31,6 +31,8 @@ from .store import RecoveryRequiredError, encoded
 from .trial_config import private_json
 
 PAUSE_SUBPROTOCOL = Subprotocol("ics-proxy.pause.v1")
+MANAGEMENT_OWNER_FIELD = "management_owner"
+LEGACY_MANAGEMENT_OWNER_FIELD = "canvas_owner"
 
 
 @dataclass(frozen=True, repr=False)
@@ -69,13 +71,13 @@ class ManagementServer:
         self, settings: ManagementSettings, controller: ManagedController, status: Callable[[], dict[str, Any]]
     ) -> None:
         self.settings, self.controller, self.status = settings, controller, status
-        # Bind management writes to the commissioned destination without publishing charger identifiers.
+        # Preserve the original identity domain so outstanding bindings survive an executable upgrade.
         identity = (
             "ics-proxy canvas owner v1",
             controller.session.journal.identity,
             controller.native.spec.hardware_identity,
         )
-        self._canvas_owner = hmac.digest(settings.token.encode(), encoded(identity).encode(), "sha256").hex()
+        self._management_owner = hmac.digest(settings.token.encode(), encoded(identity).encode(), "sha256").hex()
         self.server: Server | None = None
         self.clients: set[ServerConnection] = set()
         self.pause_client: ServerConnection | None = None
@@ -119,15 +121,14 @@ class ManagementServer:
             raise SecurityError("management identifier is invalid")
         command = value.get("command")
         fields = {"id", "command", "revision"}
-        has_owner = "canvas_owner" in value
-        marker = value.get("canvas_owner")
+        owner_fields = {MANAGEMENT_OWNER_FIELD, LEGACY_MANAGEMENT_OWNER_FIELD} & value.keys()
+        marker = value[next(iter(owner_fields))] if len(owner_fields) == 1 else None
         owner = marker if isinstance(marker, str) and re.fullmatch(r"[a-f0-9]{64}", marker) else None
-        if has_owner:
-            fields.add("canvas_owner")
+        fields.update(owner_fields)
         pause = (
             command == "pause"
             and set(value) == fields
-            and (not has_owner or owner is not None)
+            and (not owner_fields or owner is not None)
             and type(value["revision"]) is int
             and 0 <= value["revision"] < 2**53
         )
@@ -149,10 +150,10 @@ class ManagementServer:
                 raise SecurityError("management Stop target is invalid")
         elif command not in ("pause", "app_control", "start", "start_test", "arm_cloud_test"):
             raise SecurityError("management command is not supported")
-        if has_owner:
+        if owner_fields:
             if owner is None:
                 raise SecurityError("management owner is invalid")
-            if not hmac.compare_digest(owner, self._canvas_owner):
+            if not hmac.compare_digest(owner, self._management_owner):
                 raise UnavailableError("management owner has changed")
         if set(value) != fields:
             raise SecurityError("management command is not supported")
@@ -205,7 +206,8 @@ class ManagementServer:
                 result = {"sessions": session_history(self.controller.session.journal)}
             elif command == "status":
                 result = refresh_for_read(self.controller, self.status())
-                result["canvas_owner"] = self._canvas_owner
+                result[MANAGEMENT_OWNER_FIELD] = self._management_owner
+                result[LEGACY_MANAGEMENT_OWNER_FIELD] = self._management_owner
                 result["management_owner_binding"] = True
             else:
                 raise SecurityError("management read is not supported")

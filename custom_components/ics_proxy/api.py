@@ -51,6 +51,8 @@ def _history(value: object, *, proxy: bool = False) -> tuple[list[dict[str, Any]
         item = {"started_at": row["started_at"], "stopped_at": stopped, "energy_kwh": energy}
         if proxy and type(row.get("cloud_acknowledged")) is bool:
             item["cloud_acknowledged"] = row["cloud_acknowledged"]
+        if proxy and row.get("local_only") is True and item.get("cloud_acknowledged") is False:
+            item["local_only"] = True
         rows.append(item)
     return rows, len(rows) == len(value)
 
@@ -74,6 +76,20 @@ def _latest_history_energy(rows: list[dict[str, Any]]) -> tuple[int | float | No
 
 class ProxyError(Exception):
     """A fixed safe error, without credentials, URLs or raw peer bodies."""
+
+
+# A client uses the field advertised by its peer and accepts the original wire name from older proxies.
+def management_owner_binding(status: dict[str, Any]) -> tuple[str, str | None]:
+    legacy = "canvas_owner"
+    field = "management_owner" if "management_owner" in status else legacy
+    owner = status.get(field)
+    if field != legacy and legacy in status and status[legacy] != owner:
+        raise ProxyError("The local proxy reported inconsistent management ownership")
+    if isinstance(owner, str) and re.fullmatch(r"[a-f0-9]{64}", owner):
+        return field, owner
+    if field != legacy or status.get("management_owner_binding") is True:
+        raise ProxyError("The local proxy reported invalid management ownership")
+    return field, None
 
 
 class UnknownCommandOutcomeError(ProxyError):

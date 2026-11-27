@@ -43,14 +43,18 @@ async def test_management_pause_overtakes_queued_current(tmp_path, tls, unused_t
         api = ManagementServer(ManagementSettings(19001, tmp_path / "unused", TOKEN), c, lambda: published)
         current, pause = uuid.uuid4().hex, uuid.uuid4().hex
         revision = c.requests.intent().revision
-        owner = api.read_only(uuid.uuid4().hex, "status")["result"]["canvas_owner"]
+        status = api.read_only(uuid.uuid4().hex, "status")["result"]
+        owner = status["management_owner"]
+        assert status["canvas_owner"] == owner
         another_owner = ("1" if owner[0] != "1" else "2") + owner[1:]
         selection = {"id": current, "command": "set_current", "revision": revision, "current_a": 16}
         with pytest.raises(managed_api.UnavailableError, match="management owner has changed"):
-            await api.dispatch(json.dumps({**selection, "canvas_owner": another_owner}))
+            await api.dispatch(json.dumps({**selection, "management_owner": another_owner}))
+        with pytest.raises(managed_api.SecurityError, match="management owner is invalid"):
+            await api.dispatch(json.dumps({**selection, "management_owner": owner, "canvas_owner": another_owner}))
         assert c.requests.receipt(current)["state"] == "not_found"
         ordinary = asyncio.create_task(
-            api.dispatch(json.dumps({**selection, "canvas_owner": owner})),
+            api.dispatch(json.dumps({**selection, "management_owner": owner})),
             eager_start=True,
         )
         restrictive = asyncio.create_task(

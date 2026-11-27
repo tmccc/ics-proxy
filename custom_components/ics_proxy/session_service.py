@@ -31,9 +31,9 @@ def register_session_service(hass: HomeAssistant) -> None:
             wall_offset = offset
         else:
             wall_offset = max(wall_offset, offset)
-        if owner is None or owner != coordinator.canvas_owner or coordinator.canvas_activation is None:
+        if owner is None or owner != coordinator.management_owner or coordinator.frame_activation is None:
             return False
-        activated_wall, activated_elapsed = coordinator.canvas_activation
+        activated_wall, activated_elapsed = coordinator.frame_activation
         # A clock adjustment can occur while the replacement entry is loading.
         activated_through = int(max(activated_wall, activated_elapsed + wall_offset))
         return (
@@ -62,22 +62,22 @@ def register_session_service(hass: HomeAssistant) -> None:
         include_reference = call.data.get("include_request_reference", False)
         if include_reference:
             response["request_reference"] = None
-        frame_epoch = call.data.get("canvas_rendered_at_epoch")
+        frame_epoch = call.data.get("rendered_at_epoch", call.data.get("canvas_rendered_at_epoch"))
         coordinator = active_coordinator()
         if coordinator is None:
             return response
-        owner = coordinator.canvas_owner if frame_epoch is not None else None
+        owner = coordinator.management_owner if frame_epoch is not None else None
         if frame_epoch is not None and not frame_is_current(frame_epoch, coordinator, owner):
             return response
         action = call.data["action"]
         target = call.data.get("target")
         requested_revision = call.data.get("revision")
-        generation = call.data.get("canvas_generation")
+        generation = call.data.get("command_generation", call.data.get("canvas_generation"))
         claim = None
         if generation is not None:
             if frame_epoch is None or target is not None or requested_revision is not None:
                 return response
-            claim = coordinator.canvas_commands.claim("start" if action == "start" else "stop", generation)
+            claim = coordinator.session_offers.claim("start" if action == "start" else "stop", generation)
             if claim is None:
                 return response
             target, revision = claim.binding.target, claim.binding.revision
@@ -86,7 +86,7 @@ def register_session_service(hass: HomeAssistant) -> None:
         if type(revision) is not int:
             return response
 
-        # Reuse the same current control checks before connecting and after a canvas connection opens.
+        # Reuse the same current control checks before and after opening a connection for the frame.
         def request_is_current() -> bool:
             data = coordinator.data or {}
             current_revision = data.get("control_revision")
@@ -117,11 +117,11 @@ def register_session_service(hass: HomeAssistant) -> None:
             response["request_reference"] = reference
 
         # The frame or its current control can expire while Home Assistant opens the management connection.
-        def require_current_canvas() -> None:
+        def require_current_frame() -> None:
             if (
                 not frame_is_current(frame_epoch, coordinator, owner)
                 or active_coordinator() is not coordinator
-                or not (coordinator.canvas_commands.owns(claim) if claim is not None else request_is_current())
+                or not (coordinator.session_offers.owns(claim) if claim is not None else request_is_current())
             ):
                 raise ProxyError("The display request is no longer current")
 
@@ -131,7 +131,7 @@ def register_session_service(hass: HomeAssistant) -> None:
                 action,
                 revision,
                 report_reference=record_reference if include_reference else None,
-                before_write=require_current_canvas if frame_epoch is not None else None,
+                before_write=require_current_frame if frame_epoch is not None else None,
                 **fields,
             )
             response["confirmed"] = True
@@ -143,7 +143,7 @@ def register_session_service(hass: HomeAssistant) -> None:
                 await coordinator.async_refresh()
             finally:
                 if claim is not None:
-                    coordinator.canvas_commands.finish(claim, response["confirmed"] is True, before_refresh)
+                    coordinator.session_offers.finish(claim, response["confirmed"] is True, before_refresh)
         return response
 
     hass.services.async_register(
@@ -155,8 +155,12 @@ def register_session_service(hass: HomeAssistant) -> None:
                 vol.Required("action"): vol.In(("start", "stop_session")),
                 vol.Optional("target"): vol.Match(r"[a-f0-9]{64}\Z"),
                 vol.Optional("revision"): vol.All(int, vol.Range(min=0, max=2**53 - 1)),
-                vol.Optional("canvas_rendered_at_epoch"): vol.All(int, vol.Range(min=1, max=FRAME_MAX_EPOCH)),
-                vol.Optional("canvas_generation"): vol.Match(r"[a-f0-9]{32}\Z"),
+                vol.Exclusive("rendered_at_epoch", "render_epoch"): vol.All(int, vol.Range(min=1, max=FRAME_MAX_EPOCH)),
+                vol.Exclusive("canvas_rendered_at_epoch", "render_epoch"): vol.All(
+                    int, vol.Range(min=1, max=FRAME_MAX_EPOCH)
+                ),
+                vol.Exclusive("command_generation", "generation"): vol.Match(r"[a-f0-9]{32}\Z"),
+                vol.Exclusive("canvas_generation", "generation"): vol.Match(r"[a-f0-9]{32}\Z"),
                 vol.Optional("include_request_reference"): bool,
             }
         ),

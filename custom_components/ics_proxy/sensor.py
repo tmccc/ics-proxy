@@ -80,12 +80,12 @@ class DisplayCommandSensor(ProxyEntity, SensorEntity, RestoreEntity):
     # Expose the coordinator's current versioned display command view.
     @property
     def native_value(self) -> str:
-        return self.coordinator.canvas_commands.state
+        return self.coordinator.session_offers.state
 
     # Persist the owner and phase of an unfinished display action for reload feedback.
     @property
     def extra_restore_state_data(self) -> ExtraStoredData | None:
-        pending = self.coordinator.canvas_commands.pending
+        pending = self.coordinator.session_offers.pending
         if pending is None:
             return None
         return RestoredExtraData(
@@ -99,7 +99,7 @@ class DisplayCommandSensor(ProxyEntity, SensorEntity, RestoreEntity):
         stored = await self.async_get_last_extra_data()
         if last is not None and stored is not None:
             data = stored.as_dict()
-            self.coordinator.canvas_commands.restore_interrupted(
+            self.coordinator.session_offers.restore_interrupted(
                 last.state, data.get("pending_owner"), data.get("pending_feedback")
             )
 

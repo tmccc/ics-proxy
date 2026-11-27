@@ -45,8 +45,10 @@ brightness components, a fallback dashboard, and the Home Assistant renderer int
    the earlier action fields. The old request helper and its expiry script can be removed after their last legacy
    display is upgraded.
 
-The display calls `ics_proxy.session_command` with `action`, `canvas_generation`, and
-`canvas_rendered_at_epoch`. The integration supplies the original revision and Stop target to the proxy.
+The automation maps the display touch event to `ics_proxy.session_command` with `action`, `command_generation`,
+and `rendered_at_epoch`. The integration supplies the original revision and Stop target to the proxy. Install the
+updated integration before installing this automation. The integration still accepts the field names used by
+earlier releases of the automation.
 If the display says **Charger buttons unavailable**, check that the automation is enabled, the template sensor
 shows an eligible action, the preview reports the Cars & Charger view with no active notification, and the latest
 frame has downloaded.

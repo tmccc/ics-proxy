@@ -29,7 +29,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ProxyEntry) -> bool | No
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    coordinator.mark_canvas_activation()
+    coordinator.mark_frame_activation()
     if (MAJOR_VERSION, MINOR_VERSION) < (2026, 11):
         return True
     return None

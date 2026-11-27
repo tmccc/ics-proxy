@@ -46,8 +46,11 @@ async def submit(hass, action, generation, **fields):
 
 # Intent: retire the exact offer before a network await and regenerate only after updated readiness.
 # Why: a Stop can finish without advancing the proxy's control revision.
-async def test_canvas_stop_is_single_use_at_the_same_revision(actual_hass, peer, frame_clock):
+@pytest.mark.parametrize("owner_field", ["management_owner", "canvas_owner"], ids=["current", "legacy"])
+async def test_canvas_stop_is_single_use_at_the_same_revision(actual_hass, peer, frame_clock, owner_field):
     peer["state"].update(canvas_owner=OWNER, charging_session_open=True, stop_target=TARGET, can_start=False)
+    if owner_field == "management_owner":
+        peer["state"].update(management_owner=OWNER, management_owner_binding=True)
     entry = await setup_proxy(actual_hass, peer["port"])
     previous = offer(actual_hass, "stop")
     await entry.runtime_data.async_refresh()
@@ -76,7 +79,8 @@ async def test_canvas_stop_is_single_use_at_the_same_revision(actual_hass, peer,
     assert await command == {"confirmed": True}
     assert offer(actual_hass, "start") != previous
     (request,) = [item for item in peer["requests"] if item["command"] == "stop_session"]
-    assert (request["revision"], request["target"], request["canvas_owner"]) == (0, TARGET, OWNER)
+    assert (request["revision"], request["target"], request[owner_field]) == (0, TARGET, OWNER)
+    assert {"management_owner", "canvas_owner"} & request.keys() == {owner_field}
     assert peer["state"]["control_revision"] == 0
 
     peer["state"].update(charging_session_open=True, stop_target=TARGET, can_start=False)
@@ -88,6 +92,20 @@ async def test_canvas_stop_is_single_use_at_the_same_revision(actual_hass, peer,
     frame_clock.now = 1004
     assert await submit(actual_hass, "stop_session", replacement, canvas_rendered_at_epoch=1003) == {"confirmed": True}
     assert peer["commands"].count("stop_session") == 2
+
+
+# The legacy alias cannot make an inconsistent current management owner usable.
+async def test_conflicting_management_owners_disable_session_commands(actual_hass, peer, frame_clock):
+    peer["state"].update(management_owner=OWNER, canvas_owner=OWNER, management_owner_binding=True)
+    entry = await setup_proxy(actual_hass, peer["port"])
+    previous = offer(actual_hass, "start")
+    frame_clock.now = 1002
+    peer["state"]["canvas_owner"] = NEW_OWNER
+    await entry.runtime_data.async_refresh()
+
+    assert actual_hass.states.get(ENTITY).state == "v2:unavailable:none:-"
+    assert await submit(actual_hass, "start", previous, rendered_at_epoch=1001) == {"confirmed": False}
+    assert "start" not in peer["commands"]
 
 
 # Intent: invalidate a claimed offer if the observed charger owner changes during the handshake.
@@ -136,7 +154,7 @@ async def test_canvas_claim_stays_retired_after_status_reconnect(actual_hass, pe
 # Intent: retain unconfirmed feedback while a native telemetry gap disables display controls.
 # Why: the user still needs the outcome even if the charger cannot provide a fresh reading.
 async def test_canvas_feedback_expires_after_an_unconfirmed_same_revision(actual_hass, peer, frame_clock, monkeypatch):
-    from custom_components.ics_proxy import canvas_command
+    from custom_components.ics_proxy import session_offers
 
     timers = []
 
@@ -146,7 +164,7 @@ async def test_canvas_feedback_expires_after_an_unconfirmed_same_revision(actual
         timers.append(expire)
         return lambda: None
 
-    monkeypatch.setattr(canvas_command, "async_call_later", schedule)
+    monkeypatch.setattr(session_offers, "async_call_later", schedule)
     fresh = dict(native_age_seconds=0, charging_session_open=True, stop_target=TARGET)
     withdrawn = dict.fromkeys(fresh)
     peer["state"].update(canvas_owner=OWNER, can_start=False, **fresh)
@@ -227,9 +245,9 @@ async def test_canvas_reload_restores_only_interrupted_feedback(
     ids=["legacy_pending", "already_timed_out", "offer", "invalid_feedback"],
 )
 def test_canvas_restore_accepts_only_saved_pending_feedback(monkeypatch, state, pending_feedback, restored_feedback):
-    from custom_components.ics_proxy.canvas_command import CanvasCommands
+    from custom_components.ics_proxy.session_offers import SessionCommandOffers
 
-    commands = CanvasCommands(SimpleNamespace(canvas_owner=OWNER))
+    commands = SessionCommandOffers(SimpleNamespace(management_owner=OWNER))
     restored = []
     monkeypatch.setattr(commands, "_show_timeout", restored.append)
 

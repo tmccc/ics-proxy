@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import time
 from collections.abc import Callable
 from datetime import timedelta
@@ -16,10 +15,10 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import ProxyClient, ProxyError
-from .canvas_command import CanvasCommands
+from .api import ProxyClient, ProxyError, management_owner_binding
 from .diagnostic_view import explanation
 from .notification import notice_for
+from .session_offers import SessionCommandOffers
 
 DOMAIN = "ics_proxy"
 LOGGER = logging.getLogger(__name__)
@@ -50,16 +49,16 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.notice_generation = self.notice.claim(lambda: time.monotonic())
         self.notification_id = self.notice.notification_id
         self.received_at = time.monotonic()
-        self.canvas_owner: str | None = None
-        self.canvas_activation: tuple[float, float] | None = None
-        self.canvas_commands = CanvasCommands(self)
+        self.management_owner: str | None = None
+        self.frame_activation: tuple[float, float] | None = None
+        self.session_offers = SessionCommandOffers(self)
         self.cancel_timer = None
         entry.async_on_unload(self.cancel_expiry)
-        entry.async_on_unload(self.canvas_commands.retire)
+        entry.async_on_unload(self.session_offers.retire)
 
     # Require a new frame after entry activation or the first observation of a different owner.
-    def mark_canvas_activation(self) -> None:
-        self.canvas_activation = frame_clock() if self.canvas_owner is not None else None
+    def mark_frame_activation(self) -> None:
+        self.frame_activation = frame_clock() if self.management_owner is not None else None
 
     # Availability and actual writes use the same entry and notification generation.
     def entry_is_current(self) -> bool:
@@ -75,7 +74,7 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Recompute display command offers before publishing the update to entities.
     @callback
     def async_update_listeners(self) -> None:
-        self.canvas_commands.observe()
+        self.session_offers.observe()
         super().async_update_listeners()
 
     # Keep a write bound to its original status and integration generation across the WebSocket handshake.
@@ -83,11 +82,11 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self, action: str, revision: int, *, before_write: Callable[[], None] | None = None, **fields: Any
     ) -> None:
         status = self.data or {}
-        owner = status.get("canvas_owner")
+        owner = status.get("management_owner")
         if owner is not None and (
             action in ("start", "stop_session") or status.get("management_owner_binding") is True
         ):
-            fields["canvas_owner"] = owner
+            fields[status["_management_owner_field"]] = owner
 
         # HA records a disable before queued unload work can invalidate the coordinator generation.
         def require_current_entry() -> None:
@@ -200,6 +199,7 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         started = time.monotonic()
         try:
             value = dict(await self.client.request("status"))
+            owner_field, owner = management_owner_binding(value)
         except ProxyError:
             value = None
         if not self.entry_is_current():
@@ -207,13 +207,12 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if value is None:
             self.update_notification(False, unavailable=True)
             raise UpdateFailed("The local charger proxy is unavailable")
-        owner = value.get("canvas_owner")
-        if not isinstance(owner, str) or not re.fullmatch(r"[a-f0-9]{64}", owner):
-            owner = None
-        value["canvas_owner"] = owner
-        if owner != self.canvas_owner:
-            self.canvas_owner = owner
-            self.mark_canvas_activation()
+        # Keep the wire field with this snapshot so a later write uses the field that its peer advertised.
+        value["management_owner"] = owner
+        value["_management_owner_field"] = owner_field
+        if owner != self.management_owner:
+            self.management_owner = owner
+            self.mark_frame_activation()
         self.received_at = time.monotonic()
         transit = max(0, self.received_at - started)
         for key in AGE_FIELDS:

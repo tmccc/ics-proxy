@@ -55,5 +55,5 @@ actions:
   - action: ics_proxy.session_command
     data: >-
       {{ {'action': 'start' if touch_action == 'start' else 'stop_session',
-          'canvas_generation': frame_control.split(':')[2], 'canvas_rendered_at_epoch': canvas_rendered_at} }}
+          'command_generation': frame_control.split(':')[2], 'rendered_at_epoch': canvas_rendered_at} }}
     response_variable: proxy_result
