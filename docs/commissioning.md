@@ -101,21 +101,30 @@ control follow their existing authorization and recovery rules. The saved timer 
 control below.
 
 Sessions started under this local authorization stay in the proxy journal with their charger reports and are
-available through the proxy's history. Keep the journal when updating the service. A downgrade involving locally
-authorized sessions needs a rehearsed build and journal pair that supports those records.
+available through the proxy's history, flagged as `local_only`. Their energy totals are available there.
+These sessions do not appear in the iCS app, because iCS did not authorize them. Keep the journal when updating
+the service. A downgrade involving locally authorized sessions needs a rehearsed build and journal pair that
+supports those records.
 
 ### The midnight schedule during a vendor outage
 
-With `owner_start_tag` set, configure `owner_schedule_timezone` with the installation's IANA time zone, such as
-`Europe/London`, to let the proxy run the commissioned daily midnight–06:00 plan when iCS is disconnected.
-The proxy requires fresh evidence of the exact saved single-connector Fast plan. It uses the selected current
-within the plan and commissioned ceiling. The endpoints are local civil time, including on clock-change days.
+The proxy-run outage schedule is a release candidate. Leave `owner_schedule_timezone` unset on production
+installations until the [cutoff rehearsal](release-process.md#qualify-the-overnight-outage-schedule) passes.
+
+On a test installation with `owner_start_tag` set, `owner_schedule_timezone` identifies the plan's IANA time
+zone, such as `Europe/London`. The proxy uses local civil midnight and 06:00, including on clock-change days.
+It requires fresh evidence of the exact saved single-connector Fast plan and a selected current within the
+commissioned ceiling and plan limit. Use a Linux host whose time service updates kernel NTP synchronization
+state. An unavailable or unsynchronized clock blocks a new automatic Start. A synchronized kernel can continue
+to report synchronization during holdover. The rest of the proxy can start and recover during a time outage.
 
 The proxy can start from app and schedule mode or from a clean automatic outage hold. A Pause requested by
 the owner stays in effect. The journal permits one scheduled charger Start per window, including across
 replacement and after a manual Stop. It can retry a preflight once after verifying it had no charger effects.
-On the first control pass at or after 06:00 the proxy requests a zero
-hold and Stop for the exact session it started. It verifies closure separately from the charger’s reply.
+On the first control pass at or after 06:00 the proxy requests a zero hold and Stop for the exact
+session it started. An elapsed deadline can bring the stop forward after a wall-clock correction. The proxy
+verifies closure separately from the charger’s reply. If the host or charger connection is down at cutoff,
+the proxy can act only once it recovers. A proxy-started session has no verified charger-enforced cutoff.
 Normal iCS app and native schedule authorization apply when iCS is connected.
 
 ## Run the service

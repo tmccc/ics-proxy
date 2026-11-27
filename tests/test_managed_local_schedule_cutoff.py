@@ -22,10 +22,10 @@ from ics_proxy_core.engine.managed_view import refresh_for_read
 from ics_proxy_core.engine.native_http import NativeTransportUnavailableError
 from ics_proxy_core.engine.recovery_contracts import Pending
 from tests.managed_rig import healthy, introduced, managed_bench, starts
-from tests.native_schedule_support import ZONE, SchedulePeer, SchedulerClock
+from tests.native_schedule_support import ZONE, SchedulePeer
 from tests.prototype_rig import BOOT, START
 from tests.runtime_rig import until
-from tests.test_managed_local_schedule import MIDNIGHT, connection, overnight, status
+from tests.test_managed_local_schedule import MIDNIGHT, connection, overnight, simulate_schedule_clock, status
 from tests.test_managed_offline_owner import OWNER_TAG
 from tests.test_managed_vendor_catchup import CatchupBench
 from tests.tls_support import tls as tls
@@ -286,7 +286,8 @@ async def test_cutoff_uses_elapsed_time_after_scheduled_receipt_read(
             assert c.requests.receipt(occurrence["request"])["result"]["local_session_verified"]
             assert bench.firmware.effective_limit() == 6 and not stops(bench)
 
-            # Correct the civil clock backward before the first cutoff poll while elapsed time continues.
+            # The civil clock loses trust and steps backward while elapsed time continues.
+            clock.synchronized = False
             clock.now = MIDNIGHT + 6 * 3600
             clock.step_wall(MIDNIGHT + 6 * 3600 - 60)
             await c.tick()
@@ -446,11 +447,7 @@ async def test_cutoff_restricts_issued_start_before_report(tmp_path, tls, unused
 async def test_unsent_schedule_cutoff_recovers_app_authority(
     tmp_path, tls, unused_tcp_port, monkeypatch, cutoff_first, resume
 ):
-    clock = SchedulerClock(MIDNIGHT - 60)
-    base = time.monotonic()
-    monkeypatch.setattr(
-        local_schedule, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: base + clock.elapsed)
-    )
+    clock = simulate_schedule_clock(monkeypatch)
     if cutoff_first == "lease-timer-first":
         monkeypatch.setattr(
             managed_charging,

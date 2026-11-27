@@ -68,14 +68,20 @@ async def status(test, predicate):
             await asyncio.sleep(0.02)
 
 
-# Exercise a cold outage with an actual cached decision for the native timer identity.
-@asynccontextmanager
-async def overnight(tmp_path, tls, unused_tcp_port, monkeypatch, *, manual_pause=False, expired=True):
+def simulate_schedule_clock(monkeypatch):
     clock = SchedulerClock(MIDNIGHT - 60)
     monotonic = time.monotonic()
     monkeypatch.setattr(
         local_schedule, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: monotonic + clock.elapsed)
     )
+    monkeypatch.setattr(local_schedule, "host_clock_synchronized", lambda: clock.synchronized)
+    return clock
+
+
+# Exercise a cold outage with an actual cached decision for the native timer identity.
+@asynccontextmanager
+async def overnight(tmp_path, tls, unused_tcp_port, monkeypatch, *, manual_pause=False, expired=True):
+    clock = simulate_schedule_clock(monkeypatch)
     async with managed_bench(
         tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
     ) as rig:
@@ -172,6 +178,47 @@ async def test_offline_schedule_uses_exact_owner_session_once(tmp_path, tls, unu
             assert len(starts(rig)) == 1 and replacement.session.journal.active() is None
 
 
+async def test_offline_schedule_waits_for_host_clock_synchronization(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "unsynchronized-offline-boot") as test:
+            c, j = test.controller, test.session.journal
+            await status(test, lambda value: value.get("local_hold_verified") is True)
+            clock.synchronized = False
+            clock.step_wall(MIDNIGHT)
+            for _ in range(3):
+                await c.tick()
+            assert j.get(LOCAL_SCHEDULE_OCCURRENCE) is None and not starts(rig)
+            assert rig.bench.firmware.effective_limit() == 0
+
+            clock.synchronized = True
+            await status(test, lambda _: bool(starts(rig)))
+            await c.charging.settle()
+            assert len(starts(rig)) == 1 and j.get(LOCAL_SCHEDULE_OCCURRENCE)["window"]["starts_at"] == MIDNIGHT
+
+
+async def test_offline_schedule_rechecks_host_clock_at_start_wire(tmp_path, tls, unused_tcp_port, monkeypatch):
+    async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch) as (rig, clock):
+        async with connection(rig, "clock-lost-before-start") as test:
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            await status(test, lambda value: value.get("local_hold_verified") is True)
+
+            # The charger applies the positive profile before answering. The actual Start is still unsent.
+            async def lose_clock_after_profile(action, payload):
+                if action == "SetChargingProfile":
+                    schedule = payload["csChargingProfiles"]["chargingSchedule"]
+                    if schedule["chargingSchedulePeriod"][0]["limit"] > 0:
+                        clock.synchronized = False
+
+            bench.before_reply = lose_clock_after_profile
+            clock.now = MIDNIGHT
+            await c.tick()
+            await c.charging.settle()
+            assert not clock.synchronized
+            assert not starts(rig) and j.active() is None
+            assert j.starts.receipt()["stage"] == "unsent"
+            assert bench.firmware.effective_limit() == 0
+
+
 # Intent: a completed same-tag run can use the fallback window even when no audit saw its native plan marker.
 # Why: an outage must not restart the day's run; only an independently identified different source can leave it unused.
 @pytest.mark.parametrize("restart", [False, True], ids=["same-process", "replacement"])
@@ -184,11 +231,7 @@ async def test_native_daily_start_uses_the_outage_window(
     tmp_path, tls, unused_tcp_port, monkeypatch, restart, source, app_stop
 ):
     used_window = source != "different"
-    clock = SchedulerClock(MIDNIGHT - 60)
-    monotonic = time.monotonic()
-    monkeypatch.setattr(
-        local_schedule, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: monotonic + clock.elapsed)
-    )
+    clock = simulate_schedule_clock(monkeypatch)
     async with (
         managed_bench(
             tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
@@ -377,11 +420,7 @@ async def test_overlapping_timezone_change_does_not_repeat_local_occurrence(
 async def test_cloud_returns_before_local_schedule_sends_start(
     tmp_path, tls, unused_tcp_port, monkeypatch, explicit_pause, reply_limit, flap
 ):
-    clock = SchedulerClock(MIDNIGHT - 60)
-    monotonic = time.monotonic()
-    monkeypatch.setattr(
-        local_schedule, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: monotonic + clock.elapsed)
-    )
+    clock = simulate_schedule_clock(monkeypatch)
     async with managed_bench(
         tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
     ) as rig:

@@ -1,6 +1,7 @@
 [Unit]
 Description=iCS local charging proxy
-After=network-online.target
+# Let the host restore its clock before launch. Scheduled Start checks synchronization at runtime.
+After=network-online.target time-set.target
 Wants=network-online.target
 
 [Service]

@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from ics_proxy_core.engine import schedule_clock
 from ics_proxy_core.engine.local_schedule_window import ScheduleWindow, schedule_window
 from ics_proxy_core.engine.security import SecurityError
 from ics_proxy_core.engine.store import fingerprint
@@ -24,6 +25,14 @@ from tests.tls_support import tls as tls
 from tests.trial_helpers import config_files
 
 ZONE = ZoneInfo("Europe/London")
+
+
+@pytest.mark.parametrize(
+    ("state", "synchronized"), [(None, False), (-1, False), (0, True), (4, True), (5, False), (6, False)]
+)
+def test_host_clock_requires_valid_kernel_sync_state(monkeypatch, state: int | None, synchronized: bool) -> None:
+    monkeypatch.setattr(schedule_clock, "_ntp_query", lambda: None if state is None else lambda: state)
+    assert schedule_clock.host_clock_synchronized() is synchronized
 
 
 # Model the native schedule envelope communicated independently by the charger.

@@ -20,6 +20,7 @@ from .managed_intent import ControlIntent
 from .policy import DeniedError
 from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite
 from .rpc import UnavailableError
+from .schedule_clock import host_clock_synchronized
 from .security import SecurityError
 from .session_closure import observe_closure
 from .store import RecoveryRequiredError, fingerprint
@@ -142,8 +143,8 @@ class LocalSchedule:
         if (
             self.timezone is None
             or c.session.runtime.vendor_registered
-            or intent.mode != "app"
-            and not c.requests.offline_pause_current(intent)
+            or (intent.mode != "app" and not c.requests.offline_pause_current(intent))
+            or not host_clock_synchronized()
         ):
             return
         window = schedule_window(native, c.native.spec.saved_schedule_digest, self.timezone, now)
@@ -197,6 +198,8 @@ class LocalSchedule:
 
     # Sample both clocks before admission so a later wall-clock correction cannot extend this occurrence.
     def sample_cutoff(self, window: ScheduleWindow) -> tuple[float, ScheduleCutoff]:
+        if not host_clock_synchronized():
+            raise DeniedError("the host clock is not synchronized for scheduled Start")
         elapsed = time.monotonic()
         now = time.time()
         if not window.starts_at <= now < window.ends_at:
@@ -244,6 +247,8 @@ class LocalSchedule:
             raise DeniedError("local schedule occurrence no longer owns Start")
         if self._elapsed(occurrence, now):
             raise ScheduleCutoffError("local schedule window reached its cutoff")
+        if not finishing_initial_zero and not host_clock_synchronized():
+            raise DeniedError("the host clock is not synchronized for scheduled Start")
         if c.session.runtime.vendor_registered and not original_dispatched and not finishing_initial_zero:
             raise ScheduleCloudReturnedError("iCS returned before the local schedule issued Start")
 
