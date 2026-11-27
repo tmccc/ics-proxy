@@ -257,12 +257,14 @@ class NativeBoundedHandover:
                 self.last_resolved_read = sequence
                 return True
 
+            # Withdraw the previous freshness only if this outcome still owns the observation order.
             def invalidate() -> bool:
                 if not resolve():
                     return False
                 self.last_verified_at = 0
                 return True
 
+            # Accept the outcome only under the Boot and journal authority captured before the native read.
             def current() -> bool:
                 return resolve() and before == self.authority()
 

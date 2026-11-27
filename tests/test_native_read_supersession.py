@@ -23,6 +23,8 @@ from tests.prototype_rig import START
 from tests.tls_support import tls as tls
 
 
+# Intent: cancel a newer native read before an older, independently retrieved sample can settle.
+# Why: cancellation must withdraw the cached proof and prevent the older sample from authorizing new work.
 async def test_newer_cancelled_audit_fences_an_older_complete_sample(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         c, native = b.controller, b.controller.native
@@ -33,6 +35,7 @@ async def test_newer_cancelled_audit_fences_an_older_complete_sample(tmp_path, t
         release_new = asyncio.Event()
         gates = iter(zip(entered, (release_old, release_new), strict=True))
 
+        # Fetch each real sample independently, then let the test control when it reaches the decision owner.
         async def hold_complete_observation():
             waiting, release = next(gates)
             sample = await observe()

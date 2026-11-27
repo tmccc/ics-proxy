@@ -545,6 +545,7 @@ async def test_pause_during_retained_ceiling_check_is_not_a_native_fault(tmp_pat
 
 
 # Intent: an accepted Pause can dispatch zero while the retained positive ceiling audit is still waiting.
+# Why: reading a retained positive ceiling must yield to a queued Pause before zero can reach the charger.
 async def test_pause_preempts_waiting_retained_ceiling_audit(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with commissioned(tmp_path, tls, unused_tcp_port, monkeypatch, 16) as b:
         c, g, rig = b.controller, b.session.gateway, b.rig
@@ -553,6 +554,7 @@ async def test_pause_preempts_waiting_retained_ceiling_audit(tmp_path, tls, unus
         assert audit is not None
         entered, retired, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
+        # Hold the positive audit until Pause interrupts it and let the original audit handle any zero checks.
         async def delay_positive_read(limit):
             if limit > 0:
                 entered.set()

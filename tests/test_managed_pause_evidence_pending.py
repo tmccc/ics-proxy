@@ -10,6 +10,8 @@ from tests.managed_rig import healthy
 from tests.tls_support import tls as tls
 
 
+# Intent: hold a real Pause pending until the independent connector reading agrees with the station at zero.
+# Why: register lag must neither latch a fault nor erase an earlier proved configuration contradiction.
 async def test_pause_awaits_connector_limit_after_station_zero(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         c, j, bench, peer = b.controller, b.session.journal, b.rig.bench, b.rig.peer
@@ -18,6 +20,7 @@ async def test_pause_awaits_connector_limit_after_station_zero(tmp_path, tls, un
         pause, revision = uuid.uuid4().hex, c.requests.intent().revision
         native = peer.native
 
+        # Keep the previous connector limit briefly while the peer reports the genuine zero profile and meter.
         def lagging_limit(key):
             value = native(key)
             if key == "CONNECTOR" and bench.firmware.effective_limit() == 0:
