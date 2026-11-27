@@ -220,12 +220,13 @@ class ProxySensor(ProxyEntity, SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any] | None:
         if self.key == "control_mode":
             detail = diagnostics(self.coordinator.data.get("diagnostics"))
-            return {
+            fresh = self.service_fresh and self.coordinator.last_update_success
+            attributes = {
                 "test_charge": self.charge_test_progress,
                 "local_charge": self.local_charge_progress,
                 "diagnostic_summary": explanation(
                     self.coordinator.data,
-                    fresh=self.service_fresh and self.coordinator.last_update_success,
+                    fresh=fresh,
                     native_fresh=self.native_fresh,
                 ),
                 "diagnostic_details": {
@@ -234,6 +235,10 @@ class ProxySensor(ProxyEntity, SensorEntity):
                     if key in detail
                 },
             }
+            if fresh:
+                # Journal history stays available independently of the charger's live readings.
+                attributes["proxy_sessions"] = self.coordinator.data.get("sessions", [])
+            return attributes
         return (
             {
                 "charger_sessions": self.coordinator.data.get("charger_sessions", []),

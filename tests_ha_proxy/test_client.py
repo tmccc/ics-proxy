@@ -535,6 +535,27 @@ async def test_stale_readings_are_unavailable_and_alerts_are_debounced(actual_ha
     assert not coordinator.notified and coordinator.problem_since is None
 
 
+# Journaled owner sessions stay readable when only native charger telemetry is stale.
+async def test_local_session_history_needs_fresh_proxy_status_but_not_native_readings(actual_hass, peer):
+    local_session = dict(peer["state"]["sessions"][0], cloud_acknowledged=False, local_only=True)
+    peer["state"]["sessions"] = [local_session]
+    hass = actual_hass
+    entry = await setup(hass, peer)
+    coordinator = entry.runtime_data
+    mode = "sensor.ics_proxy_control_mode"
+    energy = "sensor.ics_proxy_last_session_energy"
+
+    assert hass.states.get(energy).attributes["proxy_sessions"] == [local_session]
+    peer["state"].update(native_age_seconds=90, healthy=False, state="degraded")
+    await coordinator.async_refresh()
+    assert hass.states.get(energy).state == "unavailable"
+    assert hass.states.get(mode).attributes["proxy_sessions"] == [local_session]
+
+    peer["state"]["status_age_seconds"] = 90
+    await coordinator.async_refresh()
+    assert "proxy_sessions" not in hass.states.get(mode).attributes
+
+
 # Intent: a dropped reply or explicit unknown result is resolved by reading the original Pause receipt.
 # Why: the saved result can confirm the hold without issuing a second Pause.
 @pytest.mark.parametrize("drop_reply", [True, False], ids=["dropped-reply", "unknown-outcome"])
