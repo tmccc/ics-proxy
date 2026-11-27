@@ -2,7 +2,10 @@
 
 ## Unreleased
 
+## 0.3.0-rc4
+
 - Explain in Home Assistant when the host clock blocks automatic overnight Start during an iCS outage.
+- Fix an intermittent Pause restart test by waiting for Home Assistant to verify the saved Pause.
 
 ## 0.3.0-rc3
 

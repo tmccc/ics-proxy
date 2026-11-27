@@ -1,6 +1,6 @@
 [project]
 name = "ics-proxy"
-version = "0.3.0rc3"
+version = "0.3.0rc4"
 description = "Local OCPP 1.6 proxy for supported iCS charge points with a Home Assistant client"
 requires-python = ">=3.14"
 license = { text = "Apache-2.0" }
