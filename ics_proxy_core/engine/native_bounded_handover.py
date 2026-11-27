@@ -244,23 +244,27 @@ class NativeBoundedHandover:
 
         # Interpret a complete HTTP result or failure in the decision that can publish its evidence.
         def settle(sample: HandoverEvidence | BaseException) -> HandoverEvidence | Pending:
-            content_current = False
+            sample_current = False
             strict_complete = False
             owner_closure_wait = False
             resource_error: NativeContentError | None = None
             observed_route = route
 
-            # Only the newest resolved read may invalidate freshness; an older outcome cannot erase its successor.
-            def invalidate() -> None:
-                if sequence >= self.last_resolved_read:
-                    self.last_verified_at = 0
-
-            # Resolve failed or complete reads without letting an older HTTP result publish newer authority.
-            def current() -> bool:
+            # Every terminal outcome fences older in-flight reads, even when it cannot establish freshness.
+            def resolve() -> bool:
                 if sequence < self.last_resolved_read:
                     return False
                 self.last_resolved_read = sequence
-                return before == self.authority()
+                return True
+
+            def invalidate() -> bool:
+                if not resolve():
+                    return False
+                self.last_verified_at = 0
+                return True
+
+            def current() -> bool:
+                return resolve() and before == self.authority()
 
             try:
                 if isinstance(sample, BaseException):
@@ -271,7 +275,7 @@ class NativeBoundedHandover:
                         "native bounded audit was superseded by local authority",
                         reason=CurrentFailureReason.NATIVE_AUDIT_SUPERSEDED,
                     )
-                content_current = True
+                sample_current = True
                 observed_route = self.initial_listener_route(native) if allow_original_route else route
                 measured = self._inspect(native, route=observed_route)
                 if not native.is_fresh(5):
@@ -330,7 +334,7 @@ class NativeBoundedHandover:
             except NativeContentError as error:
                 invalidate()
                 # An adapter refusal may arrive after a newer Boot; validate its authority before freezing it as strict.
-                if not content_current and not current():
+                if not sample_current and not current():
                     if repair is not None:
                         repair.finish(attempt, "superseded")
                     raise AuditSupersededError("native content refusal was superseded by local authority") from error
@@ -353,7 +357,7 @@ class NativeBoundedHandover:
                 raise
             except (NativeTransportUnavailableError, StaleEvidenceError) as error:
                 invalidate()
-                applicable = current()
+                applicable = sample_current or current()
                 if repair is not None:
                     repair.finish(attempt, "availability" if applicable else "superseded")
                 if not applicable:
@@ -373,9 +377,11 @@ class NativeBoundedHandover:
                 raise
             except (SecurityError, DeniedError, RecoveryRequiredError, UnavailableError, TimeoutError) as error:
                 invalidate()
-                applicable = current()
+                applicable = sample_current or current()
                 if repair is not None:
                     repair.finish(attempt, "readiness" if applicable else "superseded")
+                if not applicable and not isinstance(error, AuditSupersededError):
+                    raise AuditSupersededError("native observation was superseded by local authority") from error
                 if applicable and as_result and isinstance(error, NativeReadinessError):
                     recovery, journal = gateway.controls.decisions.recovery, gateway.journal
                     local, active = error.native.physical.native_transaction_id, journal.active()
@@ -398,9 +404,9 @@ class NativeBoundedHandover:
                 # A read failure that prevented comparison leaves an honest unknown fence, never an invented verdict.
                 raise
             except asyncio.CancelledError:
-                invalidate()
+                newest = invalidate()
                 if repair is not None:
-                    repair.finish(attempt, "availability")
+                    repair.finish(attempt, "availability" if newest else "superseded")
                 raise
             if repair is not None:
                 repair.finish(attempt, "validated")

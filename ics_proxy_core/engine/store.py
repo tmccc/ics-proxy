@@ -894,8 +894,10 @@ class Journal:
                 raise ConflictError("cloud transaction still belongs to another undelivered local lifecycle")
             try:
                 self.db.execute("UPDATE transactions SET vendor=? WHERE local=?", (vendor, item.transaction))
-            except sqlite3.IntegrityError:
-                raise ConflictError("cloud transaction already belongs to another local session") from None
+            except sqlite3.IntegrityError as error:
+                if getattr(error, "sqlite_errorcode", None) != sqlite3.SQLITE_CONSTRAINT_UNIQUE:
+                    raise
+                raise ConflictError("cloud transaction already belongs to another local session") from error
             from .managed_start_delivery import retire_start_retry
 
             retire_start_retry(self, item.token, item.transaction, fingerprint(item.payload))

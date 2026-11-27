@@ -18,6 +18,7 @@ from typing import Any
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
+from websockets.typing import Subprotocol
 
 from .command_processor import CommandPriority
 from .ics import unique_object
@@ -28,6 +29,8 @@ from .rpc import UnavailableError
 from .security import TRANSPORT_LOG, SecurityError, authorization_matches
 from .store import RecoveryRequiredError, encoded
 from .trial_config import private_json
+
+PAUSE_SUBPROTOCOL = Subprotocol("ics-proxy.pause.v1")
 
 
 @dataclass(frozen=True, repr=False)
@@ -59,7 +62,7 @@ class ManagementSettings:
 
 
 class ManagementServer:
-    """Four local clients share ordinary work, with one short-lived reservation for Pause."""
+    """Ordinary work and clients that negotiate Pause have separate connection capacity."""
 
     # A status provider is a private in-process snapshot, rather than a new native observation on every UI refresh.
     def __init__(
@@ -76,6 +79,7 @@ class ManagementServer:
         self.server: Server | None = None
         self.clients: set[ServerConnection] = set()
         self.pause_client: ServerConnection | None = None
+        self.legacy_pause_client: ServerConnection | None = None
         self.idle: dict[ServerConnection, None] = {}
         self.recent: deque[float] = deque()
         self.recent_pauses: deque[float] = deque()
@@ -212,23 +216,31 @@ class ManagementServer:
     # The network boundary reports fixed classifications only; peer text and bearer credentials are never logged.
     async def handle(self, connection: ServerConnection) -> None:
         displaced = None
-        reserved = False
-        if len(self.clients) >= 4:
-            displaced = next(iter(self.idle), None)
-            if displaced is None:
-                if self.pause_client is not None:
-                    await connection.close(1013, "Busy")
-                    return
-                self.pause_client = connection
-                reserved = True
-            else:
-                self.idle.pop(displaced)
-                self.clients.remove(displaced)
-        self.clients.add(connection)
+        priority = connection.subprotocol == PAUSE_SUBPROTOCOL
+        reserved = priority
+        if priority:
+            if self.pause_client is not None:
+                await connection.close(1013, "Busy")
+                return
+            self.pause_client = connection
+        else:
+            if len(self.clients) >= 4:
+                displaced = next(iter(self.idle), None)
+                if displaced is None:
+                    if self.legacy_pause_client is not None:
+                        await connection.close(1013, "Busy")
+                        return
+                    # Older clients announce the command only in the first frame. Their slot is separate.
+                    self.legacy_pause_client = connection
+                    reserved = True
+                else:
+                    self.idle.pop(displaced)
+                    self.clients.remove(displaced)
+            self.clients.add(connection)
         try:
             if displaced is not None:
                 await displaced.close(1013, "Idle connection replaced")
-            while connection in self.clients:
+            while priority or connection in self.clients:
                 if not reserved:
                     self.idle[connection] = None
                 try:
@@ -239,7 +251,7 @@ class ManagementServer:
                     return
                 finally:
                     self.idle.pop(connection, None)
-                if connection not in self.clients:
+                if not priority and connection not in self.clients:
                     return  # A displaced reader cannot admit work after releasing its slot.
                 try:
                     response = await self.dispatch(text, pause_only=reserved)
@@ -257,6 +269,8 @@ class ManagementServer:
             self.clients.discard(connection)
             if self.pause_client is connection:
                 self.pause_client = None
+            if self.legacy_pause_client is connection:
+                self.legacy_pause_client = None
 
     # Management owns a separate loopback socket and cannot replace or retire either OCPP connection.
     async def start(self) -> None:
@@ -265,7 +279,7 @@ class ManagementServer:
             "127.0.0.1",
             self.settings.port,
             process_request=self.authorize,
-            subprotocols=["ics-proxy.v1"],
+            subprotocols=[PAUSE_SUBPROTOCOL, Subprotocol("ics-proxy.v1")],
             compression=None,
             max_size=2048,
             max_queue=4,

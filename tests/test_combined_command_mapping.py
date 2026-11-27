@@ -19,14 +19,16 @@ from ics_proxy_core.engine.trial_session import save_private
 from ics_proxy_core.frames import build_call_error
 from tests import conftest as _core_setup  # noqa: F401 - load the HA-free source package.
 from tests.charge_rig import ChargeRig
-from tests.cloud_start_helpers import two_later_sessions
+from tests.cloud_start_helpers import StartReplyBench, two_later_sessions
 from tests.connected_rig import strategy_file
 from tests.handover_helpers import crash
-from tests.managed_rig import healthy, starts
+from tests.managed_rig import healthy, managed_bench, starts
 from tests.prototype_rig import START
 from tests.runtime_rig import until
 from tests.test_combined_recovery_proofs import selected_service
+from tests.test_managed_debt_reconciliation import repair_overlapping_history
 from tests.test_managed_stop_reply_recovery import pause, running
+from tests.test_native_history_recovery import closed_records
 from tests.tls_support import tls as tls
 from tests.trial_peer import Bench
 from tools import reconcile_managed_debt as debt_tool
@@ -276,6 +278,35 @@ def observe_completed_commands(monkeypatch):
 
     monkeypatch.setattr(Bench, "read_charger", read_charger)
     return completed
+
+
+# Intent: archive a missing original history row while retaining exact unresolved command and delivery records.
+# Why: each repair must be able to begin at verified zero when the other still owns its evidence.
+async def test_archive_history_before_combined_recovery(tmp_path, tls, unused_tcp_port, monkeypatch, capsys):
+    original = closed_records()
+    completed = observe_completed_commands(monkeypatch)
+    async with managed_bench(
+        tmp_path, tls, unused_tcp_port, bench_type=StartReplyBench, initial_history=original, cli_route=True
+    ) as rig:
+        async with running(rig, "combined-recovery-with-history") as (s, c, sock):
+            await healthy(c)
+            local, backend, observed = await fail_one_cycle(ChargeRig(rig, s, c, sock), completed, True, True, 0)
+
+        config, strategy = tmp_path / "trial.json", strategy_file(rig, tmp_path)
+        before = committed_state(rig.prepared.config.journal)
+        await repair_overlapping_history(rig, config, strategy, monkeypatch, capsys, original, "before-writes", KIND)
+        after = committed_state(rig.prepared.config.journal)
+        for key in ("mutations", "transactions", "outbox"):
+            assert before[key] == after[key]
+
+        proof_id = await reconcile_cycle(rig, tmp_path, capsys, local, backend, observed, True, True)
+        async with running(rig, "combined-recovery-history-archived") as (s, c, _):
+            await until(lambda: s.journal.next_delivery() is None)
+            assert s.journal.get(KEY)[proof_id]["proof"]["wire_ack"] is not None
+            assert s.journal.vendor_id(local) == backend["answer"]["transactionId"]
+            assert rig.bench.firmware.effective_limit() == 0
+            await pause(c)
+            assert (await healthy(c))["local_hold_verified"]
 
 
 # Intent: each separate failure and the combined failure recover through actual tools, real Stop ACK and fresh Pause.

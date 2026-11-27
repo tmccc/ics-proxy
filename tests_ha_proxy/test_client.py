@@ -431,7 +431,7 @@ async def test_deferred_pause_receipt_keeps_acceptance_classification(actual_has
     await setup(actual_hass, peer)
     peer["pending_receipt"], peer["receipt_delay"] = True, delay
     if delay:
-        with pytest.raises(HomeAssistantError, match="request was recorded; physical confirmation is still pending"):
+        with pytest.raises(HomeAssistantError, match="Its saved result could not be read"):
             await actual_hass.services.async_call(
                 "button", "press", {"entity_id": "button.ics_proxy_pause"}, blocking=True
             )

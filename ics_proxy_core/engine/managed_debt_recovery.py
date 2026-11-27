@@ -720,7 +720,12 @@ def vendor_history_recovery_scope(
         kind = proof["kind"]
     else:
         proof = None
-        kind = "vendor-write" if write else "vendor-start"
+        head = j.next_delivery()
+        if write and head is not None and head.action == "StartTransaction" and head.state == "ambiguous":
+            # Archive history while the exact combined command and delivery retain their debt.
+            kind = COMBINED_KIND
+        else:
+            kind = "vendor-write" if write else "vendor-start"
     if fault and (repair_pending(j, fault) or repair_revoked(j, fault)):
         raise RecoveryRequiredError("vendor history recovery requires settled native repair evidence")
     snapshot = debt_snapshot(j, spec, kind)
@@ -739,6 +744,8 @@ def vendor_history_recovery_scope(
         raise RecoveryRequiredError("history repair requires a recorded uncertain vendor outcome")
     if proof is not None:
         return {"kind": kind, "proof": identifier}
+    if kind == COMBINED_KIND:
+        return {"kind": kind, **combined_candidate(j, snapshot)}
     candidate = vendor_candidate(snapshot) if write else vendor_start_candidate(snapshot)
     return {"kind": kind, **candidate}
 

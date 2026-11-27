@@ -24,6 +24,11 @@ AUTOMATIC_PAUSE_CAUSE = "managed_automatic_pause_cause"
 LOCAL_SCHEDULE_OCCURRENCE = "managed_owner_schedule_occurrence"
 RELEASE_PAUSE_ACK = "managed_release_pause_acknowledgement"
 PAUSE_RELEASE_PROOF = "_release_ack"
+PAUSE_OUTCOME = (
+    "CASE WHEN json_valid(result) THEN CASE WHEN json_type(result,'$.accepted_at') IN ('integer','real') "
+    "THEN json_set(:outcome,'$.accepted_at',result -> '$.accepted_at') ELSE :outcome END "
+    "ELSE :outcome END"
+)
 RETURN_OUTCOME = (
     "CASE WHEN action='app_control' AND json_valid(result) THEN CASE "
     "WHEN json_type(result,'$._return')='object' "
@@ -595,21 +600,21 @@ class ManagedRequests:
     # A newer owner's decision ends the prior receipt while its issued Stop can still settle.
     def _supersede_pauses(self, identifier: str, classification: str, *, include_running: bool = False) -> None:
         db = self.journal.db
-        pending = "action='pause' AND (state IN ('accepted','uncertain') OR (? AND state='running'))"
+        pending = "action='pause' AND (state IN ('accepted','uncertain') OR (:include_running AND state='running'))"
         outcome = {"classification": classification, "superseded_by": identifier}
         for request, raw in db.execute(
             f"SELECT id,result FROM managed_requests WHERE {pending} AND CASE WHEN json_valid(result) THEN "
             f"json_type(result,'$._stop')='object' OR json_type(result,'$.{PAUSE_STOP_HISTORY}')='object' END",
-            (include_running,),
+            {"include_running": include_running},
         ).fetchall():
             if history := self.journal.outcomes.pending_pause_stop_claims(request, json.loads(raw)):
                 db.execute(
-                    "UPDATE managed_requests SET state='failed',result=? WHERE id=?",
-                    (json.dumps(outcome | {PAUSE_STOP_HISTORY: history}), request),
+                    f"UPDATE managed_requests SET state='failed',result={PAUSE_OUTCOME} WHERE id=:id",
+                    {"outcome": json.dumps(outcome | {PAUSE_STOP_HISTORY: history}), "id": request},
                 )
         db.execute(
-            f"UPDATE managed_requests SET state='failed',result=? WHERE {pending}",
-            (json.dumps(outcome), include_running),
+            f"UPDATE managed_requests SET state='failed',result={PAUSE_OUTCOME} WHERE {pending}",
+            {"outcome": json.dumps(outcome), "include_running": include_running},
         )
 
     # Test-stop revocation follows its caller's induced Pause and claim, without consuming replacement uncertainty.
@@ -817,7 +822,7 @@ class ManagedRequests:
                 "SELECT result FROM managed_requests WHERE id=?", (request.identifier,)
             ).fetchone()
             prior = json.loads(row["result"])
-            keys = ("_pause", "_stop", PAUSE_STOP_HISTORY, PAUSE_RELEASE_PROOF)
+            keys = ("accepted_at", "_pause", "_stop", PAUSE_STOP_HISTORY, PAUSE_RELEASE_PROOF)
             result.update({key: prior[key] for key in keys if key in prior})
             self.journal.db.execute(
                 "UPDATE managed_requests SET state='completed',result=? "
@@ -826,7 +831,7 @@ class ManagedRequests:
             )
             return
         self.journal.db.execute(
-            "UPDATE managed_requests SET state='completed',result=? "
+            f"UPDATE managed_requests SET state='completed',result={PAUSE_OUTCOME} "
             "WHERE action='pause' AND state IN ('accepted','uncertain') AND json_extract(result,'$._pause') IS NULL",
-            (json.dumps(result),),
+            {"outcome": json.dumps(result)},
         )

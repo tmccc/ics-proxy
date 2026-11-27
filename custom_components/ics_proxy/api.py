@@ -119,6 +119,9 @@ class ProxyClient:
     ) -> dict[str, Any]:
         identifier = fields.pop("id", uuid.uuid4().hex)
         sending = False
+        protocols = ["ics-proxy.v1"]
+        if command == "pause":
+            protocols.insert(0, "ics-proxy.pause.v1")
         try:
             connector = self.session.connector
             if connector is None or connector.closed:
@@ -133,7 +136,7 @@ class ProxyClient:
                 async with session.ws_connect(
                     f"http://127.0.0.1:{self.port}/management",
                     headers={"Authorization": "Bearer " + self.token},
-                    protocols=["ics-proxy.v1"],
+                    protocols=protocols,
                     max_msg_size=65536,
                 ) as connection:
                     if before_write is not None:
@@ -274,6 +277,7 @@ class ProxyClient:
             raise ProxyError("The local charger proxy returned an invalid command receipt")
         receipt_id = identifier
         followed: set[str] = set()
+        reading_receipt = False
         try:
             # Both local Start commands can spend up to 60 seconds waiting for physical confirmation.
             async with asyncio.timeout(70 if action in ("start", "start_test") else 25):
@@ -298,7 +302,9 @@ class ProxyClient:
                         receipt_id = newer
                     else:
                         break
+                    reading_receipt = True
                     receipt = await self._receipt(receipt_id)
+                    reading_receipt = False
                     if receipt_id == identifier:
                         matched = matches(receipt, lookup=True)
                     else:
@@ -310,13 +316,17 @@ class ProxyClient:
         except TimeoutError, ProxyError:
             if receipt is None:
                 raise UnknownCommandOutcomeError(_UNKNOWN_OUTCOME) from None
-            raise ProxyError("The request was recorded; physical confirmation is still pending") from None
+            if reading_receipt:
+                raise ProxyError("The request was recorded. Its saved result could not be read.") from None
+            raise ProxyError("The request was recorded. The last saved result was still pending.") from None
         if receipt.get("state") == "uncertain":
             raise ProxyError(
                 "The proxy recorded the request. The charger outcome is uncertain. Check the charger status."
             )
         result = receipt.get("result")
         if receipt.get("state") == "failed" and isinstance(result, dict):
+            if action == "pause" and result.get("classification") == "superseded_by_start":
+                raise ProxyError("A later Start replaced this Pause request.")
             if action == "app_control" and result.get("classification") == "return_not_sent":
                 raise ProxyError("Return to app / schedule stopped before sending the release command.")
         if receipt.get("state") != "completed":

@@ -20,10 +20,9 @@ def test_start_retry_clock_corrections_remain_bounded(tmp_path, monkeypatch):
         j.start("first", START)
         item = j.next_delivery()
         j.mark_sent(item)
-        assert not delivery.record_start_error(j, item, [4, item.token, "InternalError", "synthetic", {}])
-        item = j.next_delivery()
         waits = {}
-        assert delivery.retry_deferred(j, item, waits)
+        assert not delivery.record_start_error(j, item, [4, item.token, "InternalError", "synthetic", {}], waits=waits)
+        item = j.next_delivery()
         clock.update(wall=100000.0, elapsed=60.0)
         assert delivery.retry_deferred(j, item, waits)
         clock.update(wall=-100000.0, elapsed=109.0)

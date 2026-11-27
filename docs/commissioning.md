@@ -215,6 +215,10 @@ the history tool can clear that exact fault while keeping strict history checkin
 missing history and a saved vendor acknowledgement for a Stop report, the proxy can finish recording that
 report as acknowledged before checking whether history repair is available.
 
+When an uncertain vendor Start and its ambiguous delivery overlap with missing original history,
+acknowledge the history omission first. The acknowledgement retains the unresolved command and
+delivery for their separate reconciliation. Both steps require the existing verified zero hold.
+
 ## Roll back software
 
 [Software rollback](release-process.md) concerns the proxy build and its journal while the charger stays on the

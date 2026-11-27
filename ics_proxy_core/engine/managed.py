@@ -125,10 +125,11 @@ class ManagedController:
             session.journal, lambda fault: release_evidence(self, fault) is not None
         )
 
-    # A periodic sample belongs to one Boot, control generation, and position in the charger lifecycle.
+    # A periodic sample belongs to one Boot and lifecycle, and a newer failed audit can withdraw it.
     def current_native_sample(self) -> HandoverEvidence | None:
         if (
             self.latest_native is not None
+            and self.native.last_verified_at != 0
             and control_scope_matches(self.session.gateway, self.latest_native_scope)
             and self.latest_native_lifecycle == self.session.journal.lifecycle_position()
         ):
@@ -429,6 +430,19 @@ class ManagedController:
     async def return_requested(self, identifier: str, revision: int) -> None:
         await self.session.gateway.controls.decisions.run_requested_return(self, identifier, revision)
 
+    # A confirmed station zero can precede the connector limit updating while the meter shows no draw.
+    def _pause_output_pending(self, native: HandoverEvidence) -> bool:
+        g, j = self.session.gateway, self.session.journal
+        return (
+            native.output_limit_a > 0
+            and not any(native.currents_a + native.powers_w)
+            and g.current_boot_seen(g._charger_epoch)
+            and self.requests.intent().mode == "paused"
+            and j.control.read().local_hold
+            and native.physical.native_transaction_id == j.active()
+            and self.native.station_zero_refusal(list(native.physical.resources)) is None
+        )
+
     # Resource settling, a complete native audit and closure agreement each have their own bounded wait.
     async def settled_native(self) -> HandoverEvidence:
         async with asyncio.timeout(15):
@@ -493,6 +507,8 @@ class ManagedController:
                         raise StationCeilingLostError("the known charging session lost its owned station ceiling")
                     raise SecurityError("managed local station ceiling is absent or unconfirmed")
                 native.physical.require_fresh(self.session.journal.identity, 5)
+                if self._pause_output_pending(native):
+                    raise NativeReadinessError("requested Pause awaits the native connector limit at zero", native)
                 self.native.require_selected_output(native)
                 if measured.exceeded:
                     raise MeasuredOutputLimitError(native, measured, self.native.spec.digest, self.current.selected())
@@ -699,6 +715,9 @@ class ManagedController:
     def _record_refused_observation(self, error: Exception) -> PollStatus:
         if self.stopping:
             return PollStatus("stopping")
+        if isinstance(error, NativeReadinessError) and self._pause_output_pending(error.native):
+            self.latest_native = None
+            return PollStatus("reconciling")
         # Only a fully settled typed measurement can make this entire hard-failure run recoverable.
         measured_only = isinstance(error, MeasuredOutputLimitError)
         self.strict_failure_seen = self.strict_failure_seen or not measured_only

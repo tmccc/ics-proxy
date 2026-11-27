@@ -283,7 +283,7 @@ async def test_raw_reply_failures_never_retry_and_later_recover(actual_hass, pee
                 looked_up = True
         else:
             message = (
-                "The request was recorded; physical confirmation is still pending"
+                "Its saved result could not be read"
                 if position == "receipt"
                 else "The local charger proxy could not confirm this request"
             )

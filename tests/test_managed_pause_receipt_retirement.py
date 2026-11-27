@@ -26,7 +26,7 @@ async def test_normal_start_retires_unconfirmed_pause(tmp_path, tls, unused_tcp_
             await introduced(rig, session, charger, "pause-receipt-boot")
             await healthy(c)
             old, revision = uuid.uuid4().hex, c.requests.intent().revision
-            c.command(old, "pause", revision)
+            accepted_at = c.command(old, "pause", revision)["result"]["accepted_at"]
             await until(lambda: c.pause_task is not None and c.pause_task.done())
             await c.pause_task
             native = await rig.prepared.observer.observe_handover()
@@ -37,6 +37,7 @@ async def test_normal_start_retires_unconfirmed_pause(tmp_path, tls, unused_tcp_
             await c.charging.settle()
             receipt = c.requests.receipt(old)
             assert receipt["state"] == "failed" and receipt["result"] == {
+                "accepted_at": accepted_at,
                 "classification": "superseded_by_start",
                 "superseded_by": start,
             }
@@ -48,8 +49,10 @@ async def test_normal_start_retires_unconfirmed_pause(tmp_path, tls, unused_tcp_
             local = await positive_flow(test)
             assert (await healthy(c))["current_a"] == 6 and c.requests.receipt(old) == receipt
             fresh = uuid.uuid4().hex
-            c.command(fresh, "pause", c.requests.intent().revision)
+            fresh_at = c.command(fresh, "pause", c.requests.intent().revision)["result"]["accepted_at"]
             assert (await actual_stop(test, local))["local_hold_verified"]
-            assert c.requests.receipt(fresh)["state"] == "completed" and c.requests.receipt(old) == receipt
+            completed = c.requests.receipt(fresh)
+            assert completed["state"] == "completed" and completed["result"]["accepted_at"] == fresh_at
+            assert c.requests.receipt(old) == receipt
             assert rig.bench.firmware.effective_limit() == 0
         await session.close()

@@ -205,7 +205,6 @@ class Gateway:
         self._inbound = InboundCache(journal=journal)
         self._observations = ObservationReceipts(journal)
         self._start_retry_waits: dict[str, tuple[str, float]] = {}
-        self._late_delivery_token: str | None = None
         self.failures: list[str] = []
 
     # Install the same decision queue on both peers and the existing local command owner.
@@ -1509,7 +1508,6 @@ class Gateway:
                         sent = False
                         received_reply: DeliveryReply | None = None
                         await_late = can_send is not None and item.action == "StartTransaction"
-                        sender = self.vendor.sender
 
                         # Persist possible delivery inside the CALL gate, immediately before send.
                         def before_send() -> None:
@@ -1543,8 +1541,7 @@ class Gateway:
                             keep_late_reply=await_late,
                         )
                     except UnavailableError:
-                        if await_late and sent and received_reply is None and self.vendor.sender is sender:
-                            self._late_delivery_token = item.token
+                        if sent and received_reply is None and self._start_reply_window_open(item):
                             self.decide(lambda: self._interrupted_delivery(item, None, True))
                             raise RecoveryRequiredError("cloud Start is awaiting its original reply") from None
                         self.decide(lambda: self._interrupted_delivery(item, received_reply, sent))
@@ -1668,17 +1665,20 @@ class Gateway:
                         current_head = self.journal.next_delivery()
                         assert current_head is not None
                         item = current_head
-                    self._latch_late_delivery(item)
-                    supersede_unknown_start_retry(self.journal, item)
+                    self._hold_unanswered_start(item)
             elif item.action == "StartTransaction":
                 with self.journal.atomic():
                     latch_start_delivery_fault(self.journal)
             raise RecoveryRequiredError("cloud delivery requires explicit reconciliation")
         return item
 
-    # Preserve provenance only for the exact Start that can still receive its original cloud reply.
-    def _latch_late_delivery(self, item: Delivery) -> None:
-        if item.action == "StartTransaction" and item.token == self._late_delivery_token:
+    # A matching reply can still settle this Start while its original receiver owns the window.
+    def _start_reply_window_open(self, item: Delivery) -> bool:
+        return item.action == "StartTransaction" and item.token in self.vendor.reply_windows()
+
+    # Hold charging at zero during the reply window. Only expiry or retirement ends an unanswered approval.
+    def _hold_unanswered_start(self, item: Delivery) -> None:
+        if self._start_reply_window_open(item):
             latch_start_delivery_fault(
                 self.journal,
                 {
@@ -1687,6 +1687,8 @@ class Gateway:
                     "late_delivery_token": item.token,
                 },
             )
+        else:
+            supersede_unknown_start_retry(self.journal, item)
 
     # Retain an actual interrupted reply, or distinguish a safely retryable unanswered request.
     def _interrupted_delivery(self, item: Delivery, received_reply: DeliveryReply | None, sent: bool) -> None:
@@ -1701,8 +1703,7 @@ class Gateway:
                     )
                     current_head = self.journal.next_delivery()
                     if current_head is not None:
-                        self._latch_late_delivery(current_head)
-                        supersede_unknown_start_retry(self.journal, current_head)
+                        self._hold_unanswered_start(current_head)
             except sqlite3.Error:
                 # Preserve cancellation/peer failure; recover the unanswered head on the next flush.
                 pass
@@ -1755,7 +1756,9 @@ class Gateway:
             if item.action == "StopTransaction":
                 reject_stop_reply(self.journal, item, answer, reason="cloud_call_error")
                 raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
-            if item.action == "StartTransaction" and not record_start_error(self.journal, item, answer):
+            if item.action == "StartTransaction" and not record_start_error(
+                self.journal, item, answer, waits=self._start_retry_waits
+            ):
                 return "deferred"
             raise RecoveryRequiredError("cloud rejected a retained lifecycle event")
         if item.action == "StopTransaction" and not stop_result_shape_supported(answer[2]):

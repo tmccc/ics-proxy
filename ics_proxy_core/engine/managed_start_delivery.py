@@ -127,7 +127,9 @@ def retry_deferred(j: Journal, item: Delivery, waits: dict[str, tuple[str, float
 
 
 # A correlated CALLERROR allows bounded retransmission; a lost reply remains ambiguous and never reaches this path.
-def record_start_error(j: Journal, item: Delivery, answer: Any) -> bool:
+def record_start_error(
+    j: Journal, item: Delivery, answer: Any, *, waits: dict[str, tuple[str, float]] | None = None
+) -> bool:
     records = j.get(RETRIES, {})
     previous = records.get(item.token, {})
     errors = previous.get("errors", 0)
@@ -135,12 +137,14 @@ def record_start_error(j: Journal, item: Delivery, answer: Any) -> bool:
         raise RecoveryRequiredError("Start refusal has no valid remaining retry budget")
     count = errors + 1
     exhausted = count >= ATTEMPTS
+    wait = RETRY_INTERVAL * count
+    deadline = time.monotonic() + wait
     record = {
         "local": item.transaction,
         "payload_digest": fingerprint(item.payload),
         "reply_digest": fingerprint(answer),
         "errors": count,
-        "next_epoch": time.time() + RETRY_INTERVAL * count,
+        "next_epoch": time.time() + wait,
     }
     with j.atomic():
         head = j.next_delivery()
@@ -177,6 +181,8 @@ def record_start_error(j: Journal, item: Delivery, answer: Any) -> bool:
                     or {"classification": "owner_control_or_delivery_uncertain", "at_epoch": time.time()},
                 )
             latch_start_delivery_fault(j)
+    if not exhausted and waits is not None:
+        waits[item.token] = (fingerprint(record), deadline)
     return exhausted
 
 

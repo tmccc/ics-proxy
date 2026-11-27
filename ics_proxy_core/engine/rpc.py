@@ -492,29 +492,47 @@ class Peer:
 
             yield call
 
-    # Bound native preparation independently, retiring its sockets promptly on Stop, disconnect or cancellation.
+    # Run the same preparation lifecycle for RPC validation and a retained profile's independent read.
     async def _validate(
         self, action: str, payload: dict[str, Any], future: asyncio.Future[Frame], preemptible: bool
     ) -> Guard | GateDecision | None:
         if self.validate_send is None:
             return None
-        validation = asyncio.ensure_future(self.validate_send(action, payload))
+        return await self.wait_for_validation(
+            self.validate_send(action, payload),
+            preemptible=preemptible,
+            peer_reply=future,
+            timeout=self.validation_timeout,
+        )
+
+    # Retire native preparation and its sockets before yielding the outgoing gate to restrictive work.
+    async def wait_for_validation[T](
+        self,
+        preparation: Awaitable[T],
+        *,
+        preemptible: bool,
+        peer_reply: asyncio.Future[Frame] | None = None,
+        timeout: float | None = None,
+    ) -> T:
+        validation = asyncio.ensure_future(preparation)
         signal = self.gate.restrictive_waiting if preemptible else asyncio.Event()
         restrictive = asyncio.create_task(signal.wait())
         cancellation: asyncio.CancelledError | None = None
         try:
-            async with asyncio.timeout(self.validation_timeout):
+            async with asyncio.timeout(timeout):
                 while True:
-                    done, _ = await asyncio.wait((validation, restrictive, future), return_when=asyncio.FIRST_COMPLETED)
+                    waiters = (validation, restrictive) if peer_reply is None else (validation, restrictive, peer_reply)
+                    done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
                     # A completed strict/storage refusal precedes simultaneous preemption.
                     validated = validation in done
-                    decision = validation.result() if validated else None
+                    if validated:
+                        validation.result()
                     if signal.is_set():
                         raise ValidationPreemptedError(
                             "request was not sent; restrictive control superseded validation"
                         )
-                    if future in done:
-                        future.result()  # A retired peer's exception must terminate its audit before any dispatch.
+                    if peer_reply is not None and peer_reply in done:
+                        peer_reply.result()  # A retired peer's exception must terminate its audit before any dispatch.
                         raise UnavailableError("request was not sent; peer replied before dispatch")
                     if validated:
                         break
@@ -549,7 +567,7 @@ class Peer:
                 raise failure  # Native cancellation can itself fail required durable audit publication.
         if preemptible and self.gate.restrictive_waiting.is_set():
             raise ValidationPreemptedError("request was not sent; restrictive control superseded validation")
-        return decision
+        return validation.result()
 
     # Send one request only while the caller owns the outgoing gate.
     async def _call_locked(

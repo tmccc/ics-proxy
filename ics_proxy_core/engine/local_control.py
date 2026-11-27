@@ -461,7 +461,14 @@ class LocalControl:
             if self.ready:
                 return
             if self.ceiling_needs_recheck() and self.require_retained_station is not None:
-                await self.require_retained_station(limit)
+                if limit == 0:
+                    await self.require_retained_station(limit)
+                else:
+                    try:
+                        await self.peer.wait_for_validation(self.require_retained_station(limit), preemptible=True)
+                    except ValidationPreemptedError:
+                        check()  # An accepted Pause has superseded this positive operation's owner.
+                        raise
                 try:
                     pending = await self._verify_ceiling_result(call, limit, check)
                 except ExcessiveCompositeError:

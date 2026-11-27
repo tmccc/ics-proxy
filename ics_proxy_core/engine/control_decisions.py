@@ -205,7 +205,8 @@ class ControlDecisions:
     # Attach the decision owner to the local executor's existing journal and peer.
     def __init__(self, control: LocalControl) -> None:
         self.control, self.journal, self.peer = control, control.journal, control.peer
-        self._protective_stop: tuple[int, str | None, int, str] | None = None
+        self._protective_stop_scope: tuple[int, str | None, int] | None = None
+        self._protective_stop_tickets: set[str] = set()
         self.schedule = ScheduleControl(self)
         self.recovery = RecoveryControl(self)
         self.shutdown_requested = False
@@ -2320,11 +2321,8 @@ class ControlDecisions:
         def accepted() -> bool:
             if not protective:
                 return self.journal.outcomes.accepted_stop(local)
-            scope = self._protective_stop
-            return (
-                scope is not None
-                and scope[:3] == (local, self.control.boot(), self.control._revision)
-                and self.journal.outcomes.accepted_stop(local, ticket=scope[3])
+            return self._protective_stop_scope == (local, self.control.boot(), self.control._revision) and any(
+                self.journal.outcomes.accepted_stop(local, ticket=ticket) for ticket in self._protective_stop_tickets
             )
 
         return self.peer.decide(accepted, priority=CommandPriority.RESTRICT)
@@ -2542,7 +2540,19 @@ class ControlDecisions:
         if self._stop_send_decision(local, boot, protective=protective, reuse=reuse) is not StopDecision.SEND:
             return False
         if protective:
-            self._protective_stop = local, boot, self.control._revision, ticket
+            scope = (local, boot, self.control._revision)
+            windows = frozenset(self.peer.reply_windows())
+            # A preceding acceptance has already been checked above. Keep earlier tickets only while
+            # their exact replies can still arrive under this same protection.
+            self._protective_stop_tickets = {
+                prior
+                for prior in self._protective_stop_tickets
+                if scope == self._protective_stop_scope
+                and windows
+                and any(wire.wire in windows for wire in self.journal.outcomes.owner_wires("ticket", prior))
+            }
+            self._protective_stop_tickets.add(ticket)
+            self._protective_stop_scope = scope
         return True
 
     # Use the same predecessors at admission and when reconsidering an unbound request at the wire.
@@ -2927,16 +2937,21 @@ class ControlDecisions:
             except RecoveryRequiredError:
                 pass  # Unknown Start and lifecycle facts remain authoritative even at fresh native zero.
             else:
-                with j.atomic():
-                    c.require_paused(native)
-                    require_settled_debt(c)
-                    for record in records:
-                        complete_record(c, record)
-                    if internal:
-                        g.controls._complete(j.get("control")["ticket"], uncertain=False)
-                        intent = c.requests.intent()
-                        if c.local_schedule.cutoff_pause_unsent(intent):
-                            record_automatic_pause(j, intent, "local_charge")
+                try:
+                    with j.atomic():
+                        c.require_paused(native)
+                        require_settled_debt(c)
+                        for record in records:
+                            complete_record(c, record)
+                        if internal:
+                            g.controls._complete(j.get("control")["ticket"], uncertain=False)
+                            intent = c.requests.intent()
+                            if c.local_schedule.cutoff_pause_unsent(intent):
+                                record_automatic_pause(j, intent, "local_charge")
+                except sqlite3.Error as error:
+                    if j.db.in_transaction:
+                        raise
+                    raise RecoveryRequiredError("verified Pause settlement awaits journal storage") from error
                 if any(isinstance(record, RetirementCandidate) for record in records):
                     j.starts.set_lease(None)
                     c.charging.changed.set()
