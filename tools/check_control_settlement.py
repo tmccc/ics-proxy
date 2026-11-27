@@ -34,9 +34,7 @@ INCIDENT_WAL = "tests/test_managed_incident.py::test_incident_respects_the_publi
 PAUSE_OVERLAP = (
     "tests/test_managed_cloud_zero_controls.py::test_local_pause_and_cloud_stop_share_unanswered_stop_at_zero"
 )
-PAUSE_RECONNECT = (
-    "tests/test_issued_pause_reconnect.py::test_newer_pause_stops_open_session_after_charger_reconnect"
-)
+PAUSE_RECONNECT = "tests/test_issued_pause_reconnect.py::test_newer_pause_stops_open_session_after_charger_reconnect"
 REBASE_TEST = (
     "tests/test_managed_observed_freshness.py::test_expired_session_stop_sample_stays_expired_after_wall_rebase"
 )

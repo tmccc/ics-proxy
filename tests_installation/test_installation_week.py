@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -54,6 +55,55 @@ def assert_same_pause_receipt(receipt, expected, saved):
         assert result == public_result
         normalized.append({**value, "revision": saved["revision"], "result": result})
     assert normalized[0] == normalized[1]
+
+
+# A stopped fixture must leave a complete main database before copying or replacing it.
+def require_checkpointed(journal):
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not journal.with_name(journal.name + suffix).exists()
+
+
+# Rehearse the pre-update backup path while the charger stays closed under the same explicit Pause.
+async def rehearse_paused_backup(week, hass, journal, original, builds):
+    current, previous, layout, previous_python = builds
+    proxy = week.proxy
+    request_ids = {row["id"] for row in proxy.durable()["requests"]}
+    await press_button(hass, "pause")
+    paused = await proxy.status(lambda state: state.get("local_hold_verified") is True and state.get("power_w") == 0)
+    snapshot = proxy.durable()
+    (saved_pause,) = [row for row in snapshot["requests"] if row["id"] not in request_ids]
+    assert saved_pause["action"] == "pause" and saved_pause["state"] == "completed"
+    pause = await proxy.completed_control(saved_pause["id"])
+    await proxy.close()
+    assert proxy.process.returncode == 0
+    require_checkpointed(journal)
+    backup = journal.with_name("pre-update.db")
+    shutil.copy2(journal, backup)
+
+    mark = len(week.bench.device_calls)
+    await proxy.start(source=current)
+    verify_build(proxy, current, journal, original, layout)
+    await proxy.status(lambda state: state.get("local_hold_verified") is True and state.get("power_w") == 0)
+    week.verify_history()
+    await proxy.close()
+    assert proxy.process.returncode == 0
+    require_checkpointed(journal)
+    # Keep both exact database versions; the earlier service gets a fresh copy of the backup.
+    journal.rename(journal.with_name("after-update.db"))
+    shutil.copy2(backup, journal)
+    restored = journal.stat()
+
+    await proxy.start(source=previous, python=previous_python)
+    verify_build(proxy, previous, journal, restored, layout, previous_python)
+    recovered = await proxy.status(
+        lambda state: state.get("local_hold_verified") is True and state.get("can_return") is True
+    )
+    assert recovered["control_revision"] == paused["control_revision"]
+    assert recovered["requested_current_a"] == paused["requested_current_a"] and recovered["power_w"] == 0
+    assert_same_pause_receipt(await proxy.completed_control(pause["id"]), pause, saved_pause)
+    assert proxy.durable()["requests"] == snapshot["requests"]
+    week.verify_history()
+    require_zero_held(proxy.rig, mark)
 
 
 # Intent: retain the same week of charging, owner controls, and migrated journal while updating and going back.
@@ -148,3 +198,4 @@ async def test_week_on_migrated_installation(tmp_path, model_tls, unused_tcp_por
         assert saved_pause in proxy.durable()["requests"]
         assert len(week.bench.history) == len(week.starting_history) + 7
         verify_build(proxy, previous, journal, original, layout, previous_python)
+        await rehearse_paused_backup(week, hass, journal, original, builds)

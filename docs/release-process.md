@@ -74,11 +74,36 @@ deployment environment, including its OpenSSL settings.
 Stop and restart with the configured service manager in the authorized window.
 Confirm the installed source fingerprint, current setting, state, vendor availability and preserved charging records.
 
-The rollback checker accepts only exact historical build and journal pairs with rehearsed compatibility. It refuses
-unsupported pairs. Preserve the verified installation and private journal backup across an update. A pending or
-uncertain charger outcome must be reconciled before a rollback can safely use a previous journal.
+The stopped-journal rollback checker accepts only exact historical build and journal pairs with rehearsed
+compatibility. For a standalone candidate, rehearse the exact installed and candidate source with synthetic
+charger state before the update.
+
+```bash
+python tools/rehearse_proxy_rollback.py --installed-proxy-commit "$INSTALLED_COMMIT" \
+  --ics-ha-python "$HA_PYTHON" --output "$PRIVATE_EVIDENCE"
+```
+
+The rehearsal includes both a settled-journal rollback and a rollback using a paused predecessor's backup,
+taken before candidate charging activity. Preserve the verified installation and private pre-update journal
+backup across an update. Keep the candidate journal too. Its records may include newer charging sessions,
+receipts and device changes. Reconcile those records before considering a backup restore. A passing simulation
+does not determine whether a particular live journal can be downgraded in place.
 
 Builds from before stable recovery reasons can reject a newer failure record for an unsettled current change.
 Reconcile that change with the build that recorded it before considering a downgrade. The installation
 rehearsal covers a settled journal and does not establish downgrade compatibility for every failure state.
 Resolve interrupted vendor authorization checks on the build that recorded them before considering a downgrade.
+
+
+## Qualify the overnight outage schedule
+
+Keep automatic outage Start off in production until the charger can enforce the cutoff independently and an
+authorized test on the commissioned firmware verifies it. The proxy's elapsed deadline covers a clock correction
+and some service replacements. It cannot stop a charger from an unreachable host.
+
+Qualify a candidate at the agreed site current with independent charger session and power readings. Check an
+unsynchronized start after host power loss, loss of synchronization before Start, an in-window vendor outage,
+and a session that still has demand at cutoff with the proxy unavailable across 06:00. A passing cutoff needs
+charger-side evidence that the active session ended and output reached zero before the proxy returned. Verify
+that bringing the proxy back does not start another session in the same window. Retain the redacted evidence
+with the approved source commit and firmware version.

@@ -2,8 +2,15 @@
 
 ## Unreleased
 
-- Let the proxy run the commissioned midnight–06:00 schedule during an iCS outage when configured for local
-  schedule control. It retries one proved unsent preflight and applies zero and an exact-session Stop at cutoff.
+- Require a synchronized host clock before a proxy-run overnight Start, including the final charger send.
+  Keep the existing elapsed cutoff active when synchronization is lost. Hold production rollout until the
+  charger can enforce cutoff while the proxy is unavailable.
+- Identify locally authorized sessions in proxy history so they can be distinguished from vendor sessions
+  still awaiting delivery.
+- Bind management writes to the commissioned proxy and reserve a separate connection for Pause. Use generic
+  session-control fields in Home Assistant and keep earlier automation fields working.
+- Report the vendor restoration stage, reason and next action without exposing private installation data.
+- Rehearse rollback of exact standalone builds with a settled journal and a pre-upgrade backup.
 - Support opt-in owner Start while iCS is disconnected. Retain the locally authorized session and its charger
   reports in the proxy journal, including across a service restart.
 - Let a Home Assistant session Stop join an unanswered Pause Stop for the same session when the charger is
