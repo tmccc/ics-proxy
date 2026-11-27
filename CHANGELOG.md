@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.3.0-rc1
+
+- Rehearse rollback of exact standalone builds with a settled journal and a pre-upgrade backup.
+- Identify locally authorized sessions in proxy history and preserve rejected Start evidence across replacement.
 - Show the vendor restore stage, a reason code and the next action when restoration stops.
 - Reserve a management connection for Pause and bind Home Assistant controls to the commissioned proxy reported
   in the status used for the request.
