@@ -273,7 +273,8 @@ async def test_held_status_after_terminal_cleanup_before_reactivation(actual_has
         await cleanup_tasks([read])
 
 
-# HA records the disable before taking the setup lock, so an outstanding reply can arrive before unload.
+# Intent: discard an outstanding status response after HA records disable and before unload starts.
+# Why: the disabled entry must stop publishing state and notifications even while its setup lock is held.
 @pytest.mark.parametrize("status_failure", [False, True], ids=["healthy-reply", "closed-socket"])
 async def test_held_status_after_disable_before_unload(actual_hass, peer, monkeypatch, status_failure):
     hass = actual_hass

@@ -535,6 +535,7 @@ async def test_process_recovers_checkpointed_late_stop_rejection(
                 return {"status": "Rejected"}
             return device_answer(action, payload)
 
+        # Withhold the genuine Stop rejection until the independent closing report is committed.
         async def hold_stop_reply(raw):
             frame = json.loads(raw)
             if frame[0] == 3 and frame[2] == {"status": "Rejected"} and any(

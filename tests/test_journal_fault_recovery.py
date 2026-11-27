@@ -163,7 +163,8 @@ def test_owner_start_rejection_survives_refused_reply_writes(tmp_path, replace_p
         check(recovered)
 
 
-# An independent report must not consume a rejected Start whose receipt write still fails after replacement.
+# Intent: use retained Start rejection evidence while its receipt write still fails after reopening.
+# Why: a separate charger report must keep its own lifecycle while the rejected receipt awaits publication.
 @pytest.mark.parametrize("wire_write_refused", [False, True], ids=["wire", "checkpoint"])
 def test_retained_start_rejection_does_not_bind_independent_lifecycle(tmp_path, wire_write_refused):
     path = tmp_path / "owner-start-binding.db"

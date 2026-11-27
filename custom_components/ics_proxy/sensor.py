@@ -68,17 +68,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ProxyEntry, add_entities
 class DisplayCommandSensor(ProxyEntity, SensorEntity, RestoreEntity):
     """Expose one versioned view for rendering and the live display controls."""
 
+    # Give the display command state a stable entity identity across reloads.
     def __init__(self, coordinator: ProxyCoordinator) -> None:
         super().__init__(coordinator, "sensor", "display_command", "Display command")
 
+    # Keep the entity readable so the display can render explicit unavailable feedback.
     @property
     def available(self) -> bool:
         return True
 
+    # Expose the coordinator's current versioned display command view.
     @property
     def native_value(self) -> str:
         return self.coordinator.canvas_commands.state
 
+    # Persist the owner and phase of an unfinished display action for reload feedback.
     @property
     def extra_restore_state_data(self) -> ExtraStoredData | None:
         pending = self.coordinator.canvas_commands.pending
@@ -88,6 +92,7 @@ class DisplayCommandSensor(ProxyEntity, SensorEntity, RestoreEntity):
             {"pending_owner": pending.binding.owner, "pending_feedback": pending.binding.pending_feedback}
         )
 
+    # Restore feedback using the saved state and its ownership metadata together.
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         last = await self.async_get_last_state()

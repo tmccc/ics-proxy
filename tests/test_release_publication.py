@@ -12,6 +12,7 @@ import json
 import sqlite3
 import sys
 import uuid
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -460,7 +461,10 @@ async def test_cancelled_poll_cannot_abandon_owned_return_publication(tmp_path, 
             await asyncio.gather(polling, return_exceptions=True)
             assert polling.cancelled() and not child.cancelled() and not completion.cancelled()
             assert not attempt.finished and completion in g.controls._completions
-            assert b.session.book.before_positive_release is attempt.positive_guard
+            guard = b.session.book.before_positive_release
+            assert isinstance(guard, partial) and guard.func == g.controls.decisions.release_positive_decision
+            guarded_controller, guarded_attempt = guard.args
+            assert guarded_controller is c and guarded_attempt is attempt
             # A second real poll observes ownership; it cannot prepare another zero/release while this ACK is held.
             mark, ticket = len(b.rig.bench.device_calls), j.get("control")["ticket"]
             pending = await asyncio.wait_for(c.tick(), 1)

@@ -15,6 +15,7 @@ NEW_OWNER = "c" * 64
 TARGET = "b" * 64
 
 
+# Give the display coordinator a controlled clock for checking frame age.
 @pytest.fixture
 def frame_clock(monkeypatch):
     from custom_components.ics_proxy import coordinator
@@ -24,6 +25,7 @@ def frame_clock(monkeypatch):
     return clock
 
 
+# Extract the generation of the expected action and feedback from the display entity.
 def offer(hass, action, feedback="idle"):
     value = hass.states.get(ENTITY).state
     match = re.fullmatch(rf"v2:{feedback}:{action}:([a-f0-9]{{32}})", value)
@@ -31,6 +33,7 @@ def offer(hass, action, feedback="idle"):
     return match[1]
 
 
+# Route a displayed action through the real integration service and return its confirmation.
 async def submit(hass, action, generation, **fields):
     return await hass.services.async_call(
         "ics_proxy",
@@ -53,6 +56,7 @@ async def test_canvas_stop_is_single_use_at_the_same_revision(actual_hass, peer,
 
     entered, release = asyncio.Event(), asyncio.Event()
 
+    # Hold the network handshake while checking that the displayed Stop was already consumed.
     async def wait_for_write():
         entered.set()
         await release.wait()
@@ -94,6 +98,7 @@ async def test_canvas_claim_keeps_its_owner_at_write(actual_hass, peer, frame_cl
     previous = offer(actual_hass, "start")
     frame_clock.now = 1002
 
+    # Publish a new management owner before the held command can write.
     async def replace_owner():
         peer["state"]["canvas_owner"] = NEW_OWNER
         await entry.runtime_data.async_refresh()
@@ -113,6 +118,7 @@ async def test_canvas_claim_stays_retired_after_status_reconnect(actual_hass, pe
     previous = offer(actual_hass, "start")
     frame_clock.now = 1002
 
+    # Observe status loss and recovery during the handshake without changing the management owner.
     async def reconnect():
         peer["status_failure"] = True
         await entry.runtime_data.async_refresh()
@@ -134,6 +140,7 @@ async def test_canvas_feedback_expires_after_an_unconfirmed_same_revision(actual
 
     timers = []
 
+    # Capture the feedback expiry so the test can trigger it directly.
     def schedule(hass, elapsed, expire):
         assert elapsed == 20
         timers.append(expire)
@@ -182,6 +189,7 @@ async def test_canvas_reload_restores_only_interrupted_feedback(
     frame_clock.now = 1002
     entered, release = asyncio.Event(), asyncio.Event()
 
+    # Hold the Start handshake across the integration reload.
     async def wait_for_write():
         entered.set()
         await release.wait()
@@ -206,6 +214,8 @@ async def test_canvas_reload_restores_only_interrupted_feedback(
     assert "start" not in peer["commands"]
 
 
+# Intent: restore only genuine saved pending feedback, including the older entity-state format.
+# Why: stale offers and prior timeout states must not masquerade as an interrupted request.
 @pytest.mark.parametrize(
     "state, pending_feedback, restored_feedback",
     [

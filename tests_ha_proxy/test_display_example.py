@@ -77,6 +77,8 @@ def test_display_sends_the_freshness_of_the_pressed_frame():
 
 
 # The renderer prefetches only entity IDs it reads directly from its template.
+# Intent: confirm the renderer and the ESPHome configuration consume the same command entity.
+# Why: the pictured control and its submitted generation must come from one view.
 def test_renderer_and_firmware_use_the_same_command_entity():
     view = (PROJECT / "view.html.jinja").read_text()
     references = re.findall(r"""\b(?:states|state_attr|is_state)\(\s*['"]([^'"]+)['"]""", view)
@@ -91,6 +93,8 @@ def test_renderer_and_firmware_use_the_same_command_entity():
     assert not any(sensor["platform"] == "homeassistant" for sensor in package.get("sensor", []))
 
 
+# Intent: keep the Home Assistant time sync at the same interval as the image download.
+# Why: the firmware compares a rendered frame's timestamp against that synchronized clock.
 def test_display_resynchronizes_its_clock_at_the_download_interval():
     package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
     clock = next(source for source in package["time"] if source["id"] == "canvas_ha_time")
@@ -99,6 +103,7 @@ def test_display_resynchronizes_its_clock_at_the_download_interval():
     assert clock["update_interval"] == image["update_interval"] == "10s"
 
 
+# Load the published automation and readiness helper into real Home Assistant.
 async def install_display(hass):
     await asyncio.gather(condition.async_setup(hass), trigger.async_setup(hass))
     config = yaml.safe_load((PROJECT / "controls.yaml").read_text())
@@ -111,6 +116,7 @@ async def install_display(hass):
     hass.states.async_set("sensor.ics_display_screen_source", "Home Assistant")
 
 
+# Provide a renderer frame with optional routing or freshness variations.
 def publish_display_preview(hass, rendered_at, **overrides):
     attributes = {
         "assigned_views": [VIEW],
@@ -121,6 +127,7 @@ def publish_display_preview(hass, rendered_at, **overrides):
     hass.states.async_set(IMAGE, rendered_at.isoformat(), attributes | overrides)
 
 
+# Send a touch event with the timestamp and generation of the pressed frame.
 def send_display_tap(hass, action, generation, *, age=1, frame=None, **overrides):
     stamp = int(dt_util.now().timestamp()) if frame is None else frame
     data = {
@@ -135,6 +142,7 @@ def send_display_tap(hass, action, generation, *, age=1, frame=None, **overrides
     hass.bus.async_fire("esphome.general_display_touch", data | overrides)
 
 
+# Wait for the display helper's expected feedback and validate its action generation.
 async def display_state(hass, feedback, action):
     async with asyncio.timeout(5):
         while True:
@@ -149,7 +157,8 @@ async def display_state(hass, feedback, action):
             await asyncio.sleep(0.01)
 
 
-# The actual template, automation, integration, and management peer share the same offer.
+# Intent: exercise the published renderer and touch automation through the real integration service.
+# Why: readiness shown on screen must match what the integration can send to the management peer.
 async def test_public_display_example_with_actual_ha(actual_hass, canvas_peer, monkeypatch):
     from custom_components.ics_proxy import coordinator
 
@@ -177,6 +186,7 @@ async def test_public_display_example_with_actual_ha(actual_hass, canvas_peer, m
     # New preview timestamps must not change the helper and trigger another render.
     control_changes = []
 
+    # Observe publications of the helper state during unrelated preview updates.
     @callback
     def record_control_change(event):
         control_changes.append(event)
@@ -254,6 +264,8 @@ async def test_public_display_example_with_actual_ha(actual_hass, canvas_peer, m
     assert peer["commands"].count("start") == 1
 
 
+# Intent: reject Start and Stop taps rendered before a wall-clock adjustment.
+# Why: a clock jump can make an old tap look current under the same displayed generation.
 @pytest.mark.parametrize("starting", [True, False], ids=["start", "stop"])
 @pytest.mark.parametrize("clock_change", ["rewind", "forward", "forward_then_rewind"])
 async def test_display_service_rejects_pre_adjustment_frames(
@@ -274,6 +286,7 @@ async def test_display_service_rejects_pre_adjustment_frames(
     action = "start" if starting else "stop_session"
     generation = await display_state(hass, "idle", "start" if starting else "stop")
 
+    # Submit the same offer with each frame timestamp through the real service.
     async def tap_frame(epoch):
         result = await call_session_command(hass, action, canvas_generation=generation, canvas_rendered_at_epoch=epoch)
         return result["confirmed"]
@@ -298,6 +311,8 @@ async def test_display_service_rejects_pre_adjustment_frames(
     assert command.get("target") == (None if starting else TARGET)
 
 
+# Intent: require a new displayed Start generation after a reload or entry replacement.
+# Why: the replacement may report the same owner and revision while old touch frames are still in transit.
 @pytest.mark.parametrize("operation", ["reload", "remove-add"])
 async def test_display_rejects_start_frame_from_before_entry_replacement(
     actual_hass, canvas_peer, replacement_peer, monkeypatch, operation

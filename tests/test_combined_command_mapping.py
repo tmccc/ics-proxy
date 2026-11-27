@@ -35,6 +35,8 @@ from tools import reconcile_managed_delivery as delivery_tool
 KIND = "vendor-start-mapping"
 
 
+# Intent: accept unrelated closed owner history and reject unrelated unmapped cloud debt.
+# Why: recovery must isolate one cloud mapping obligation before it can apply the candidate.
 @pytest.mark.parametrize("owner_authorized", [True, False], ids=["closed-owner-session", "orphaned-cloud-session"])
 def test_combined_candidate_distinguishes_closed_owner_history_from_unmapped_cloud_debt(tmp_path, owner_authorized):
     with closing(Journal(tmp_path / "state.db", "SYNTHETIC")) as journal:

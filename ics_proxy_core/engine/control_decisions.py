@@ -1102,6 +1102,7 @@ class ControlDecisions:
         native = await c.native.read_result(owned=True)
         native_authority, sequence = c.native.authority(), c.native.last_resolved_read
 
+        # Recheck the observed ceiling and ownership inside the decision turn before restoring the receipt.
         def settle() -> tuple[bool, Pending | None]:
             if worker._settling_overlap != proof:
                 return True, Pending(Prerequisite.SUPERSEDED, "current recovery verification was superseded")

@@ -1323,6 +1323,7 @@ async def test_cold_history_omission_with_saved_delivery_reply(
             await until(lambda: journal.fault.read({}).get("late_delivery_token") == held.token)
         held.release.set()
 
+        # Verify the exact held reply through the normal or late-delivery recovery record.
         def check_saved_reply(current: Journal) -> None:
             if not late:
                 assert_retained(current, held, saved=True)

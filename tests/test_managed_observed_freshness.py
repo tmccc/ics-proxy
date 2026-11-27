@@ -66,6 +66,7 @@ async def test_charger_lifecycle_change_retires_older_live_measurement(
 
 
 # Intent: a newer native audit retires older displayed power even when the same session and wall time remain.
+# Why: a newer observation can supersede the displayed sample even when both audits share a timestamp.
 async def test_auxiliary_audit_retires_older_displayed_power(tmp_path, tls, unused_tcp_port, monkeypatch):
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch) as b:
         c, journal = b.controller, b.session.journal

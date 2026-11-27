@@ -416,6 +416,7 @@ async def test_backend_confirmation_requires_fresh_offline_then_online(
         observe = handover.observe
         elapsed = 0
 
+        # Let a genuine online observation age past the monotonic deadline.
         async def expired_online_observation() -> HandoverEvidence:
             nonlocal elapsed
             sample = await observe()

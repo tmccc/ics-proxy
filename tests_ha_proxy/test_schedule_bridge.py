@@ -140,8 +140,16 @@ async def test_full_vehicle_pause_return(tmp_path, tls, unused_tcp_port_factory,
                         pause.cancel()
                         with suppress(asyncio.CancelledError):
                             await pause
-                paused = await client.request("status")
-                assert paused["local_hold_verified"] and paused["station_ceiling_a"] == 0
+                assert b.session.journal.active() is None and b.device.effective_limit() == 0
+                # The completed receipt can precede publication of a matching native observation.
+                async with asyncio.timeout(4):
+                    while True:
+                        paused = await client.request("status")
+                        assert paused["desired_control"] == "paused"
+                        assert paused["control_revision"] == initial["control_revision"] + 1
+                        if paused["local_hold_verified"] and paused["station_ceiling_a"] == 0:
+                            break
+                        await asyncio.sleep(0.05)
                 await client.command("app_control", paused["control_revision"])
                 shared = await client.request("status")
                 assert shared["desired_control"] == "app" and shared["station_ceiling_a"] == 6

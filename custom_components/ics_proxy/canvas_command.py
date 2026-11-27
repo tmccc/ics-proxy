@@ -28,6 +28,7 @@ class CanvasBinding:
     revision: int
     target: str | None = None
 
+    # Use the action's in-progress phase for display feedback.
     @property
     def pending_feedback(self) -> str:
         return "starting" if self.action == "start" else "stopping"
@@ -42,6 +43,7 @@ class CanvasOffer:
 
 
 class CanvasCommands:
+    # Track one displayed offer and its outstanding claim for this integration entry.
     def __init__(self, coordinator: ProxyCoordinator) -> None:
         self.coordinator = coordinator
         self.offer: CanvasOffer | None = None
@@ -52,6 +54,7 @@ class CanvasCommands:
         self._awaiting_refresh: dict[str, Any] | None = None
         self._retired = False
 
+    # Bind display offers to the current management owner and revision.
     def _scope(self) -> tuple[str, int] | None:
         coordinator = self.coordinator
         data = coordinator.data or {}
@@ -95,6 +98,7 @@ class CanvasCommands:
         elif self.offer is None or self.offer.binding != binding:
             self.offer = CanvasOffer(binding, uuid4().hex)
 
+    # Render the versioned display state, withholding offers while telemetry is unavailable.
     @property
     def state(self) -> str:
         scope = self._scope()
@@ -123,6 +127,7 @@ class CanvasCommands:
         self.coordinator.async_update_listeners()
         return offer
 
+    # Recheck the exact claimed offer and its current authority at the write boundary.
     def owns(self, claim: CanvasOffer) -> bool:
         return self.pending is claim and self._claim_valid and self._binding(self._scope()) == claim.binding
 
@@ -137,6 +142,7 @@ class CanvasCommands:
             self._show_timeout(claim.binding.pending_feedback)
         self.coordinator.async_update_listeners()
 
+    # Recover timeout feedback only for a saved pending action on the current owner.
     def restore_interrupted(self, state: str, owner: object, pending_feedback: object) -> None:
         # Older saved state carries the pending phase only in the entity state.
         if pending_feedback is None and state in ("v2:starting:none:-", "v2:stopping:none:-"):
@@ -150,11 +156,13 @@ class CanvasCommands:
         ):
             self._show_timeout(pending_feedback)
 
+    # Show an unconfirmed action for a bounded period for this management owner.
     def _show_timeout(self, pending_feedback: str) -> None:
         self._clear_timeout()
         timeout = (self.coordinator.canvas_owner, f"{pending_feedback}_timeout")
         self._timeout = timeout
 
+        # Retire feedback only when this callback still owns the active timeout.
         @callback
         def expire(_now: datetime) -> None:
             if self._timeout is timeout:
@@ -164,12 +172,14 @@ class CanvasCommands:
 
         self._cancel_timeout = async_call_later(self.coordinator.hass, TIMEOUT_FEEDBACK_SECONDS, expire)
 
+    # Cancel the scheduled expiry when its associated feedback is discarded.
     def _clear_timeout(self) -> None:
         if self._cancel_timeout is not None:
             self._cancel_timeout()
         self._timeout = None
         self._cancel_timeout = None
 
+    # Invalidate current and claimed offers when the integration entry unloads.
     @callback
     def retire(self) -> None:
         self._retired = True

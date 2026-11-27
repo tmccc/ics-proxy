@@ -107,6 +107,7 @@ class RestoreReason(Enum):
         "Keep the proxy stopped and the car unplugged. Review the restore instructions for this stage before retrying.",
     )
 
+    # Associate each restore reason with its public code and operator guidance.
     def __init__(self, code: str, next_step: str) -> None:
         self.code = code
         self.next_step = next_step
@@ -115,6 +116,7 @@ class RestoreReason(Enum):
 class RestoreRefusalError(RecoveryRequiredError):
     """A restore precondition failed for a known reason."""
 
+    # Retain the classified reason for the report alongside the internal error detail.
     def __init__(self, reason: RestoreReason, detail: str) -> None:
         super().__init__(detail)
         self.reason = reason
@@ -126,6 +128,7 @@ class RestoreFailure:
     reason: RestoreReason
     error_name: str
 
+    # Classify a failed restore stage without carrying exception details into the public report.
     @classmethod
     def capture(cls, stage: RestoreStage, error: Exception) -> RestoreFailure:
         if isinstance(error, RestoreRefusalError):

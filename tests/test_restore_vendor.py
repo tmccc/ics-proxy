@@ -259,7 +259,8 @@ def test_restore_guidance_matches_observed_stage_without_private_details(stage, 
     assert hint in report["next_step"] and "private fixture detail" not in json.dumps(report)
 
 
-# Intent: report invalid restore inputs with the stage and a corrective action.
+# Intent: report the original restore error and stage when closing the maintenance session also fails.
+# Why: a close failure should identify the close stage only when it is the first failure.
 @pytest.mark.parametrize("transfer_failed", [False, True])
 async def test_maintenance_close_preserves_restore_stage(tmp_path, tls, unused_tcp_port, monkeypatch, transfer_failed):
     async with ready(tmp_path, tls, unused_tcp_port, monkeypatch, cli_route=True, native_peer=RestorePeer) as test:
@@ -269,15 +270,18 @@ async def test_maintenance_close_preserves_restore_stage(tmp_path, tls, unused_t
         stages = []
         close = restore_vendor.TrialSession.close
 
+        # Bypass profile work to isolate stage reporting during route transfer and close.
         async def cleanup_profiles(session):
             pass
 
+        # Record the route stage before simulating transfer success or failure.
         async def finish_restore(handover, patch, close_listener, *, report_stage):
             report_stage(RestoreStage.RESTORE_ORIGINAL_ROUTE)
             if transfer_failed:
                 raise NativeTransportUnavailableError("test route observation interrupted")
             return {"complete": True}
 
+        # Close the real session before injecting a cleanup error.
         async def close_with_error(session):
             await close(session)
             raise OSError("test maintenance cleanup failure")
@@ -292,6 +296,7 @@ async def test_maintenance_close_preserves_restore_stage(tmp_path, tls, unused_t
             assert stages[-1] == ("restore_original_route" if transfer_failed else "close_maintenance_session")
 
 
+# Intent: report invalid restore inputs with the validation stage and a corrective action.
 # Why: the operator needs enough information to fix the configuration without exposing private paths.
 async def test_invalid_restore_inputs_report_the_stage_without_private_paths(tmp_path):
     report = await failed_restore_cli("check", tmp_path / "private-config.json", tmp_path / "private-spec.json")
@@ -364,6 +369,7 @@ async def test_restore_reports_native_snapshot_deadline(tmp_path, tls, unused_tc
         config, spec = tmp_path / "trial.json", spec_file(tmp_path, rig)
         stages = []
 
+        # Return the device identity, then yield so the aggregate read can reach its deadline.
         async def read(observer, action, data=None):
             if action == "getConfig":
                 return {"Id": observer.config.identity, "bPSN": observer.config.hardware_identity}
@@ -382,15 +388,18 @@ async def test_restore_reports_native_snapshot_deadline(tmp_path, tls, unused_tc
 
 
 # Intent: preserve the distinct vendor failure when completed native reads show that the backend stays offline.
+# Why: an offline vendor connection needs different recovery guidance from a failed native read.
 async def test_restore_reports_vendor_wait_deadline(monkeypatch):
     journal = SimpleNamespace(
         phase=SimpleNamespace(read=lambda: SimpleNamespace(value="backend_restore_pending")),
         get=lambda *args: {"route_restored": True},
     )
 
+    # Keep native observations succeeding while the vendor connection stays offline.
     async def observe_backend():
         return {"original_backend_connected": False}
 
+    # Fail the test if restoration tries to change settings before the vendor is verified.
     async def patch(*args):
         pytest.fail("restore attempted to change settings while the vendor link was offline")
 

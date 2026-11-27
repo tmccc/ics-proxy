@@ -378,13 +378,15 @@ async def test_priority_stop_preempts_only_validation(boundary):
         await asyncio.gather(positive, *([] if stopped is None else [stopped]), return_exceptions=True)
 
 
-# A canceled Stop leaves the ordinary audit running and able to observe the next Stop or disconnect.
+# Intent: keep a Start audit interruptible after the first queued Stop is cancelled.
+# Why: a later Stop or peer disconnect still needs to retire the audit before anything can be sent.
 @pytest.mark.parametrize("interruption", ["stop", "disconnect"])
 async def test_validation_keeps_watching_after_queued_stop_cancels(interruption):
     peer = Peer("charger", 2)
     entered, release, retired = asyncio.Event(), asyncio.Event(), asyncio.Event()
     sent = []
 
+    # Hold the Start audit open and signal when it retires.
     async def validate(action, payload):
         if action == "RemoteStartTransaction":
             entered.set()
@@ -393,6 +395,7 @@ async def test_validation_keeps_watching_after_queued_stop_cancels(interruption)
             finally:
                 retired.set()
 
+    # Acknowledge each command that reaches the simulated wire and record its action.
     async def sender(raw):
         frame = decode(raw)
         sent.append(frame[2])

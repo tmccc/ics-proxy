@@ -72,6 +72,7 @@ class ProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             and self.notice.generation == self.notice_generation
         )
 
+    # Recompute display command offers before publishing the update to entities.
     @callback
     def async_update_listeners(self) -> None:
         self.canvas_commands.observe()

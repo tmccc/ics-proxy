@@ -218,6 +218,7 @@ class NativeHistoryReading:
     meter_start: int | None
     meter_stop: int | None
 
+    # Accept each native history field only within its expected type and bounds.
     @classmethod
     def read(cls, record: dict[str, Any], as_of: float) -> NativeHistoryReading:
         identifier, start, stop = record.get("transactionId"), record.get("startTime"), record.get("stopTime")
@@ -232,6 +233,7 @@ class NativeHistoryReading:
             last if type(last) is int and 0 <= last <= 10**12 else None,
         )
 
+    # Require a complete row and ordered times and meter readings for a closed session.
     @property
     def valid(self) -> bool:
         return (
@@ -243,6 +245,7 @@ class NativeHistoryReading:
             and (self.stop == 0 or (self.stop >= self.start and self.meter_stop >= self.meter_start))
         )
 
+    # Convert the meter delta to kWh only for a valid, completed session.
     @property
     def energy(self) -> float | None:
         if self.stop and self.valid and self.meter_start is not None and self.meter_stop is not None:

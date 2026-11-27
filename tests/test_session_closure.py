@@ -9,6 +9,8 @@ from ics_proxy_core.engine.trial_evidence import Evidence
 from ics_proxy_core.engine.trial_handover_evidence import HandoverEvidence
 
 
+# Intent: classify journal and native session agreement across closure orderings and draw readings.
+# Why: only fresh, consistent observations can verify the session state.
 @pytest.mark.parametrize(
     ("active", "native_id", "native_open", "draw", "position"),
     [

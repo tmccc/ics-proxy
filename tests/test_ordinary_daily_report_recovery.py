@@ -132,6 +132,7 @@ async def test_held_daily_report_rechecks_its_native_sample_at_commit(tmp_path, 
         counter = j.get("next_transaction")
         expired = False
 
+        # Invalidate native evidence just before the daily report decision.
         async def with_newer_unavailable_observation(decision):
             nonlocal expired
             if not expired:

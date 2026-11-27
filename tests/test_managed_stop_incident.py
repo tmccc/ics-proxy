@@ -148,7 +148,8 @@ def test_missing_wire_reply_column_preserves_stop_lifecycle(tmp_path, vendor):
     assert report["wire"]["reply"] == "unknown"
 
 
-# The identity, binding and actual reply survive a damaged request state.
+# Intent: retain the Stop identity, lifecycle binding and accepted reply when its request state is unreadable.
+# Why: each piece of incident evidence can remain useful when another field is damaged.
 @pytest.mark.parametrize("vendor", [False, True], ids=["owner", "vendor"])
 def test_unreadable_stop_request_state_preserves_other_evidence(tmp_path, vendor):
     path, events = tmp_path / "journal.db", tmp_path / "events.jsonl"

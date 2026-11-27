@@ -188,6 +188,7 @@ def evidence_rows(db: sqlite3.Connection, sql: str, parameters: tuple[Any, ...] 
         return None
 
 
+# Identify which optional journal projections the snapshot can supply.
 def journal_tables(db: sqlite3.Connection) -> set[str]:
     return {name for (name,) in db.execute("SELECT name FROM sqlite_schema WHERE type='table'")}
 

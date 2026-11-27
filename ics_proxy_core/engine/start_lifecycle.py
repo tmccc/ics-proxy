@@ -650,6 +650,7 @@ class StartLifecycle:
             for wire in self.journal.outcomes.owner_wires("ticket", ticket)
         )
 
+    # Match a pending local Start only while its control claim is still outstanding.
     def pending_local_tag(self, tag: str) -> bool:
         return bool(self.journal.get("control", {}).get("start_pending")) and self._matches_pending_receipt(
             self.receipt(), tag

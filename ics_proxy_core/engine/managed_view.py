@@ -191,6 +191,7 @@ class ChargerHistorySummary:
     latest_completion_known: bool
 
 
+# Summarize redacted history and expose the latest energy only when its completion is known.
 def summarize_charger_history(
     records: tuple[dict[str, Any], ...], latest_closed: int | None = None, *, as_of: float | None = None
 ) -> ChargerHistorySummary:

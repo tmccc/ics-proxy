@@ -130,7 +130,13 @@ class ScheduleControl:
         if catalogue is None:
             return
         plan = original_current_plan(n, original)
-        if plan is not None and plan["kindType"] == "Recurring" and plan["idTag"].casefold() == tag.casefold():
+        plan_tag = plan.get("idTag") if plan is not None else None
+        if (
+            plan is not None
+            and plan.get("kindType") == "Recurring"
+            and isinstance(plan_tag, str)
+            and plan_tag.casefold() == tag.casefold()
+        ):
             # This exact report belongs to the commissioned schedule. Its command candidates remain outstanding.
             j.put("managed_deferred_start", {})
             return

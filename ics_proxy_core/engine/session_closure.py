@@ -27,6 +27,7 @@ class ClosingReport:
     local: int
     body: str
 
+    # Require an in-range local ID and a string body before binding a saved closing report.
     @classmethod
     def from_record(cls, local: object, body: object) -> ClosingReport | None:
         if type(local) is int and 0 < local < 2**63 and isinstance(body, str):
@@ -41,10 +42,12 @@ class ClosureObservation:
     position: ClosurePosition
     fresh: bool
 
+    # Require a fresh sample that agrees with the journal's idle state.
     @property
     def confirms_idle(self) -> bool:
         return self.fresh and self.position is ClosurePosition.IDLE
 
+    # Accept fresh agreement for either a shared open session or confirmed idle.
     @property
     def matches_journal(self) -> bool:
         return self.fresh and self.position in (ClosurePosition.OPEN, ClosurePosition.IDLE)

@@ -554,7 +554,8 @@ def test_incident_reads_the_exact_saved_start_reply(tmp_path, wire_reply, shown,
     assert result["waiting_for_evidence"] == [waiting]
 
 
-# A matching request and ticket do not make a malformed row a valid transaction Start.
+# Intent: reject stored Start replies whose wire, Boot, session or limit fields fail validation.
+# Why: a matching request and ticket alone cannot prove that the charger replied to the original Start.
 @pytest.mark.parametrize(
     "override",
     [{"wire": "bad-wire"}, {"boot": "bad-boot"}, {"local": 42}, {"limit": 6}],
