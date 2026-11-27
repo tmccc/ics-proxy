@@ -154,6 +154,7 @@ def session_history(journal: Journal) -> list[dict[str, Any]]:
                 "started_at": start.get("timestamp"),
                 "stopped_at": stop.get("timestamp") if stop else None,
                 "energy_kwh": (stop["meterStop"] - start["meterStart"]) / 1000 if stop else None,
+                **({"local_only": True} if journal.is_owner_session(row["local"]) else {}),
                 "cloud_acknowledged": row["vendor"] is not None
                 and not journal.db.execute(
                     "SELECT 1 FROM outbox WHERE local=? AND action IN ('StartTransaction','StopTransaction') LIMIT 1",

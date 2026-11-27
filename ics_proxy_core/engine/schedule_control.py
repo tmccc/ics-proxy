@@ -86,12 +86,7 @@ class ScheduleControl:
         j = self.journal
         digest = fingerprint(tag.casefold())
         owner, vendor = j.starts.receipt(), j.get("vendor_start_grant", {})
-        local_match = bool(
-            j.get("control", {}).get("start_pending")
-            and owner.get("local") is None
-            and owner.get("stage") in ("issued", "accepted")
-            and owner.get("digest") == digest
-        )
+        local_match = j.starts.pending_local_tag(tag)
         cloud_match = bool(
             vendor.get("prepared") is not True
             and vendor.get("local") is None

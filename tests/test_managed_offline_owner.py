@@ -164,6 +164,10 @@ async def test_two_local_sessions_and_process_replacement_with_expired_vendor_ap
             assert retained_meters(child, local) == [meter]
         assert len(starts(child.rig)) == 2
 
+        history = (await child.request("history"))["result"]["sessions"]
+        assert len(history) >= 2
+        assert all(row["local_only"] and row["cloud_acknowledged"] is False for row in history[:2])
+
         bench.vendor_available = True
         await child.status(lambda value: value.get("cloud_connected") is True and not value["pending_observations"])
         assert child.durable()["transactions"] == snapshot["transactions"]

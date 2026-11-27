@@ -50,6 +50,8 @@ def _history(value: object, *, proxy: bool = False) -> tuple[list[dict[str, Any]
         item = {"started_at": row["started_at"], "stopped_at": stopped, "energy_kwh": energy}
         if proxy and type(row.get("cloud_acknowledged")) is bool:
             item["cloud_acknowledged"] = row["cloud_acknowledged"]
+        if proxy and row.get("local_only") is True and item.get("cloud_acknowledged") is False:
+            item["local_only"] = True
         rows.append(item)
     return rows, len(rows) == len(value)
 

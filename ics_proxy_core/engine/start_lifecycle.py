@@ -612,17 +612,37 @@ class StartLifecycle:
             },
         )
 
+    # Independent wire evidence can already disprove a pending receipt whose rejection still awaits publication.
+    def _matches_pending_receipt(self, receipt: dict[str, Any], tag: str) -> bool:
+        if (
+            receipt.get("stage") not in ("issued", "accepted")
+            or receipt.get("local") is not None
+            or receipt.get("digest") != fingerprint(tag.casefold())
+        ):
+            return False
+        ticket, request = receipt.get("ticket"), receipt.get("request_id")
+        if receipt["stage"] == "accepted" or not isinstance(ticket, str):
+            return True
+        return self.pending_reply != (ticket, request, "Rejected") and not any(
+            wire.action == "RemoteStartTransaction"
+            and ("request_id" not in receipt or wire.request == request)
+            and wire.reply == "Rejected"
+            for wire in self.journal.outcomes.owner_wires("ticket", ticket)
+        )
+
+    def pending_local_tag(self, tag: str) -> bool:
+        return bool(self.journal.get("control", {}).get("start_pending")) and self._matches_pending_receipt(
+            self.receipt(), tag
+        )
+
     # An issued owner Start can still report under verified zero after positive authority was revoked.
     def pending_owner_tag(self, tag: str) -> bool:
         receipt = self.receipt()
         return (
             receipt.get("owner_authorized") is True
-            and receipt.get("stage") in ("issued", "accepted")
-            and receipt.get("local") is None
             and isinstance(receipt.get("request_id"), str)
             and isinstance(receipt.get("ticket"), str)
-            and receipt.get("digest") == fingerprint(tag.casefold())
-            and self.pending_reply != (receipt["ticket"], receipt["request_id"], "Rejected")
+            and self._matches_pending_receipt(receipt, tag)
         )
 
     # Issue once and settle only the original issued Start, independently of any newer Pause.
@@ -765,12 +785,7 @@ class StartLifecycle:
     def bind(self, tag: str, local: int) -> None:
         j = self.journal
         control, receipt = j.get("control", {}), self.receipt()
-        if (
-            control.get("start_pending")
-            and receipt.get("local") is None
-            and receipt.get("digest") == fingerprint(tag.casefold())
-            and receipt.get("stage") in ("issued", "accepted")
-        ):
+        if control.get("start_pending") and self._matches_pending_receipt(receipt, tag):
             intent = j.get("managed_control_intent", {})
             j.put(
                 "local_start_receipt",

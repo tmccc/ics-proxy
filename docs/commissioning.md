@@ -100,8 +100,9 @@ closure. Cloud availability and charging readiness are reported separately. The 
 Return to app control follow their existing authorization and recovery rules.
 
 Sessions started under this local authorization stay in the proxy journal with their charger reports and are
-available through the proxy's history. Keep the journal when updating the service. A downgrade involving locally
-authorized sessions needs a rehearsed build and journal pair that supports those records.
+available through the proxy's history, flagged as `local_only`. Their energy totals are available there.
+These sessions do not appear in the iCS app, because iCS did not authorize them. Keep the journal when updating
+the service. Before a downgrade, verify that the previous build supports the journal and its local sessions.
 
 ## Run the service
 
