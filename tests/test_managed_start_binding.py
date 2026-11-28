@@ -109,7 +109,14 @@ async def test_same_tag_recovery(tmp_path, tls, unused_tcp_port, monkeypatch, be
         for _ in range(4):
             await b.c.tick()
         assert (await healthy(b.c))["local_hold_verified"]
-        b.c.command(uuid.uuid4().hex, "app_control", b.c.requests.intent().revision)
+        returning = uuid.uuid4().hex
+        assert b.c.command(returning, "app_control", b.c.requests.intent().revision)["state"] == "accepted"
+        # The verified Pause can still report healthy while this Return is pending.
+        async with asyncio.timeout(5):
+            while b.c.requests.receipt(returning)["state"] in ("accepted", "running"):
+                await b.c.tick()
+                await asyncio.sleep(0.01)
+        assert b.c.requests.receipt(returning)["state"] == "completed"
         assert (await healthy(b.c))["station_ceiling_a"] == 6
         await b.c.charging.close()
         await crash(b.session)
