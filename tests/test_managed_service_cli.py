@@ -138,6 +138,7 @@ def healthy_status(now: float) -> dict[str, Any]:
     }
 
 
+# Provide stable same-boot elapsed times for tests that control the wall clock separately.
 @pytest.fixture
 def elapsed_health(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(managed_proxy, "host_clock_epoch", lambda: "current-boot-and-namespace")
@@ -203,6 +204,8 @@ def test_health_rejects_stale_or_incomplete_report(
     assert not managed_proxy.health(path, 10000)["healthy"]
 
 
+# Intent: keep both saved observations stale after a wall-clock rewind.
+# Why: a stalled publisher cannot make its old healthy report current again.
 def test_health_clock_rewind_does_not_revive_an_old_report(tmp_path, monkeypatch, elapsed_health):
     path = tmp_path / "status.json"
     save_private(path, healthy_status(10000) | elapsed_health)
@@ -217,6 +220,8 @@ def test_health_clock_rewind_does_not_revive_an_old_report(tmp_path, monkeypatch
     assert {"status_stale", "native_stale"} <= set(rewound["health_blockers"])
 
 
+# Intent: reject missing, malformed, foreign or stale elapsed evidence from saved reports.
+# Why: the health command can compare elapsed time only for valid observations from its own boot and namespace.
 @pytest.mark.parametrize(
     ("change", "blocker"),
     [
@@ -239,6 +244,8 @@ def test_health_requires_current_elapsed_evidence(tmp_path, elapsed_health, chan
     assert not result["healthy"] and blocker in result["health_blockers"]
 
 
+# Intent: deduct elapsed age from the saved certificate allowance after wall-clock correction.
+# Why: clock changes must not make an expiring certificate appear to have more validity left.
 def test_health_clock_rewind_does_not_extend_the_saved_certificate_allowance(tmp_path, monkeypatch, elapsed_health):
     path = tmp_path / "status.json"
     save_private(path, healthy_status(10000) | elapsed_health | {"certificate_remaining_seconds": 1805})
@@ -248,6 +255,8 @@ def test_health_clock_rewind_does_not_extend_the_saved_certificate_allowance(tmp
     assert "certificate_validity_insufficient" in managed_proxy.health(path, 9998)["health_blockers"]
 
 
+# Intent: read elapsed timestamps from the actual periodic publisher and its final shutdown report.
+# Why: the file CLI needs this proof while the public live status keeps its existing schema.
 async def test_health_cli_uses_elapsed_evidence_from_the_real_report_writer(
     tmp_path, tls, unused_tcp_port_factory, monkeypatch, capsys
 ):

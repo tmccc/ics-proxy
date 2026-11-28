@@ -123,7 +123,8 @@ def recoverable_stop(local):
     return malformed, corrected, native
 
 
-# A failed outbox insertion cannot publish reconstructed closure, and a later retry still uses one vendor Stop.
+# Intent: roll back reconstructed closure when its vendor Stop cannot be enqueued, then retry once.
+# Why: a closed local row without the matching vendor delivery would strand the two histories.
 def test_malformed_stop_recovery_rolls_back_with_delivery_failure(tmp_path):
     journal = Journal(tmp_path / "recovery.db", "OFFLINE001")
     try:
@@ -170,7 +171,8 @@ def test_malformed_stop_recovery_rolls_back_with_delivery_failure(tmp_path):
         journal.close()
 
 
-# An actual corrected report that arrives first owns closure, even if a native recovery was being prepared.
+# Intent: let a genuine corrected report close the session before a pending native recovery does.
+# Why: independent recovery must not overwrite an accepted charger report or duplicate vendor delivery.
 def test_genuine_stop_wins_before_malformed_report_recovery(tmp_path):
     journal = Journal(tmp_path / "recovery.db", "OFFLINE001")
     try:

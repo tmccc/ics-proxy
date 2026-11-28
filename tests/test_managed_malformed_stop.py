@@ -21,15 +21,18 @@ from tests.test_managed_vendor_catchup import CatchupBench
 from tests.tls_support import tls as tls
 
 
+# Use the whole-second UTC format emitted by the charger fixture.
 def report_time(value: datetime) -> str:
     return value.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+# Read the durable Stop for the exact local transaction.
 def stop_body(journal, local):
     row = journal.db.execute("SELECT stop FROM transactions WHERE local=?", (local,)).fetchone()
     return json.loads(row[0]) if row[0] is not None else None
 
 
+# End the physical session at zero without sending an OCPP Stop.
 def close_native(bench, peer):
     bench.firmware.active = None
     bench.firmware.requested_current = 0
@@ -38,6 +41,7 @@ def close_native(bench, peer):
     bench.cp, bench.connection = "B", "Plug"
 
 
+# Build independent charger history from the correct Start and Stop measurements.
 def native_history_row(start, stop):
     return {
         "transactionId": stop["transactionId"],
@@ -52,6 +56,7 @@ def native_history_row(start, stop):
     }
 
 
+# Start and verify a local owner session while the simulated vendor is offline.
 async def owner_start(test, started_at, count, *, meter_start=START["meterStart"]):
     controller, journal = test.controller, test.session.journal
     bench, peer = test.rig.bench, test.rig.peer
@@ -77,6 +82,8 @@ async def owner_start(test, started_at, count, *, meter_start=START["meterStart"
     return local, start
 
 
+# Intent: verify exact physical closure and one iCS acknowledgement before a later mapped Start.
+# Why: a rejected Stop must neither strand a closed session nor authorize Start on contradictory evidence.
 @pytest.mark.parametrize("fault", ["meter", "timestamp", "meter_after_rewind"])
 async def test_malformed_mapped_stop_waits_for_exact_native_closure_and_cloud_ack(
     tmp_path, tls, unused_tcp_port, monkeypatch, fault
@@ -98,9 +105,11 @@ async def test_malformed_mapped_stop_waits_for_exact_native_closure_and_cloud_ac
             else {"meterStop": START["meterStart"] - 1}
         )
 
+        # Send the same charger Stop under either a reused or a new request ID.
         async def send_stop(body, token=None):
             return await bench.call(test.charger, token or uuid.uuid4().hex, "StopTransaction", body)
 
+        # Count just the Stop reports actually sent to the vendor.
         def vendor_stops():
             return [frame for frame in bench.lifecycle_wires if frame[2] == "StopTransaction"]
 
@@ -174,6 +183,8 @@ async def test_malformed_mapped_stop_waits_for_exact_native_closure_and_cloud_ac
         ) != local
 
 
+# Intent: require the wire timestamp to corroborate reversed charger times within the same second.
+# Why: a matching whole second alone cannot distinguish a confirmed rewind from contradictory milliseconds.
 @pytest.mark.parametrize(
     ("reported_time", "recovered"),
     [
@@ -193,6 +204,8 @@ def test_malformed_stop_recovery_requires_corroboration_for_same_second_rewind(r
     assert result == (stop if recovered else None)
 
 
+# Intent: recover an exact owner Stop after the proxy process and journal owner change.
+# Why: an offline local session must release the next Start even if the charger never retries before restart.
 async def test_local_owner_malformed_stop_recovery_survives_proxy_replacement(
     tmp_path, tls, unused_tcp_port, monkeypatch
 ):

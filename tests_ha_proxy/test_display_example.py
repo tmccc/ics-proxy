@@ -127,6 +127,8 @@ async def install_display(hass):
     hass.states.async_set("sensor.ics_display_screen_source", "Home Assistant")
 
 
+# Intent: echo the requesting device's valid token together with the current display offer.
+# Why: old replies and events from another display cannot establish freshness after reconnecting.
 async def test_display_refresh_replies_with_the_current_view_and_request_identifier(actual_hass):
     hass = actual_hass
     await install_display(hass)

@@ -636,6 +636,7 @@ async def test_failed_scheduled_cutoff_keeps_automatic_pause_until_closed(
         profile_refused = False
         allow_timer = scenario == "profile-refused"
 
+        # Refuse the timer or the first positive profile after verifying the charger is still held at zero.
         def answer_start_work(action, payload):
             nonlocal profile_refused
             if action == "DataTransfer" and payload.get("messageId") == "delayStop":
