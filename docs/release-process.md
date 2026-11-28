@@ -120,9 +120,11 @@ Automatic Starts during an iCS outage use the site's
 records the charger's acceptance of the timer for the exact transaction. A proxy-issued Stop at 06:00 verifies
 cutoff with the proxy available. An offline cutoff trial observes the charger's timer execution directly.
 
-To verify cutoff at the agreed site current, record that the proxy started the session, that the vehicle
-still requested current before the deadline, and that the proxy was unavailable across 06:00. Check
-charger-side readings for the exact session ending and output reaching zero before the proxy returns.
+To verify cutoff at the agreed site current, record that the physical charger reported the new session while
+the proxy held its offer at 0 A. Retain the charger timer acknowledgement before the proxy offered positive
+current. Record that the vehicle still requested current before the deadline and that the proxy was unavailable
+across 06:00. Use charger-side readings to verify that the same session ended and output reached zero before the
+proxy returned.
 After reconnecting, check that the proxy does not start another session for that window. Retain the redacted
 evidence with the source commit and firmware version. The clock cases cover an unsynchronized host after
 power loss and a loss of synchronization before Start.

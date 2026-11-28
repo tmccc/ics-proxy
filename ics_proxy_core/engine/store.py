@@ -502,17 +502,24 @@ class Journal:
 
     # Observations keep their normal publication identity and commit with their receipt.
     def _retain_owner_meter(self, local: int, payload: dict[str, Any]) -> str:
-        sequence = self.db.execute(
-            "SELECT COALESCE(MAX(sequence),0)+1 FROM owner_meter_values WHERE local=?", (local,)
-        ).fetchone()[0]
-        if sequence > self.capacity:
-            raise RecoveryRequiredError("local session observation capacity reached; event was not accepted")
         token = "e-" + uuid.uuid4().hex
-        self.db.execute(
-            "INSERT INTO owner_meter_values(local,sequence,token,payload) VALUES(?,?,?,?)",
-            (local, sequence, token, encoded(payload)),
-        )
+        with nullcontext() if self.db.in_transaction else self.atomic():
+            self.db.execute(
+                "INSERT INTO owner_meter_values(local,sequence,token,payload) "
+                "SELECT ?,COALESCE(MAX(sequence),0)+1,?,? FROM owner_meter_values WHERE local=?",
+                (local, token, encoded(payload), local),
+            )
+            self._trim_owner_meters()
         return token
+
+    # Roll over the raw sample window when accepting a sample, preserving history on open or idle upgrade.
+    def _trim_owner_meters(self) -> None:
+        self.db.execute(
+            "DELETE FROM owner_meter_values WHERE (local,sequence) IN ("
+            "SELECT local,sequence FROM owner_meter_values ORDER BY local,sequence "
+            "LIMIT MAX(0,(SELECT COUNT(*) FROM owner_meter_values)-?))",
+            (max(1, self.capacity),),
+        )
 
     # Scope CALL-id reuse to a newly authenticated charger connection, while lifecycle bodies retain their identity.
     def connection_epoch(self) -> int:

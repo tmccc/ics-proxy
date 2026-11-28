@@ -1609,6 +1609,9 @@ class ControlDecisions:
                     and receipt.get("local") is None
                     and receipt.get("stage") in ("issued", "accepted")
                 )
+                preserve_automatic = not ownership.requested and controller.local_schedule.unreported_pause_current(
+                    saved, intent
+                )
                 if not ownership.supersedes(saved.get("revision")):
                     occurrence = (
                         controller.local_schedule.due_owner_occurrence(saved["id"]) if intent.mode == "app" else None
@@ -1616,10 +1619,10 @@ class ControlDecisions:
                     if occurrence is not None:
                         record_cutoff_pause(controller, occurrence, intent)
                     else:
-                        if not preserve:
+                        if not preserve and not preserve_automatic:
                             write_intent(self.journal, intent, "paused", coalesce=refused)
                         self._claim_internal_pause(controller, "test", saved["id"])
-                self.journal.starts.interrupted(saved, preserve)
+                self.journal.starts.interrupted(saved, preserve or preserve_automatic)
         self.journal.starts.retire_refused()
 
     # Record the protective Pause independently of any subsequent timed-test result.
@@ -1668,7 +1671,9 @@ class ControlDecisions:
                 and charging.state().get("independent_seen") is True
             )
             if intent.mode != "paused" and not preserve:
-                automatic_return = allow_schedule_return and intent == ControlIntent("app", lease.revision)
+                automatic_return = intent == ControlIntent("app", lease.revision) and (
+                    allow_schedule_return or c.local_schedule.accepted_unreported_at_zero(lease)
+                )
                 self._claim_test_pause(c, intent, lease.identifier)
                 if automatic_return:
                     record_automatic_pause(j, c.requests.intent(), "local_charge")

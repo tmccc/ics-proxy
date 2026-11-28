@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import date, datetime, time
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -61,6 +61,25 @@ class ScheduleCutoff:
     deadline: float
 
 
+# A forward clock change can skip midnight. The two fold projections bracket the start of the civil date.
+def _start_of_day(day: date, zone: ZoneInfo) -> float | None:
+    midnight = datetime.combine(day, time.min, zone)
+    stamp = midnight.timestamp()
+    if datetime.fromtimestamp(stamp, zone) == midnight:
+        return stamp
+
+    before, after = sorted((int(midnight.replace(fold=1).timestamp()), int(stamp)))
+    if not datetime.fromtimestamp(before, zone).date() < day <= datetime.fromtimestamp(after, zone).date():
+        return None
+    while after - before > 1:
+        middle = (before + after) // 2
+        if datetime.fromtimestamp(middle, zone).date() < day:
+            before = middle
+        else:
+            after = middle
+    return float(after) if datetime.fromtimestamp(after, zone).date() == day else None
+
+
 def schedule_window(native: HandoverEvidence, expected_digest: str, timezone: str, now: float) -> ScheduleWindow | None:
     """Recognize a single intact daily plan during the half-open local midnight–06:00 window."""
     schedule = native.saved_schedule
@@ -85,11 +104,11 @@ def schedule_window(native: HandoverEvidence, expected_digest: str, timezone: st
         utc_time(plan["validTime"])
         zone = ZoneInfo(timezone)
         today = datetime.fromtimestamp(now, zone).date()
-        start = datetime.combine(today, time.min, zone)
+        starts_at = _start_of_day(today, zone)
         end = datetime.combine(today, time(6), zone)
-        starts_at, ends_at = start.timestamp(), end.timestamp()
-        # Use civil endpoints through clock changes. A nonexistent endpoint cannot authorize this day.
-        if datetime.fromtimestamp(starts_at, zone) != start or datetime.fromtimestamp(ends_at, zone) != end:
+        ends_at = end.timestamp()
+        # Preserve the exact civil cutoff. A nonexistent 06:00 cannot authorize an occurrence.
+        if starts_at is None or datetime.fromtimestamp(ends_at, zone) != end:
             return None
     except OSError, OverflowError, RecursionError, TypeError, ValueError, ZoneInfoNotFoundError:
         return None

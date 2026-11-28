@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 import pytest
 
 from ics_proxy_core.engine import managed_start_delivery
+from ics_proxy_core.engine.managed_view import session_history
 from ics_proxy_core.frames import build_call
 from tests.observation_helpers import ObservationTLS, observation_payload, observation_suffix
 from tests.prototype_rig import BOOT, START
@@ -88,6 +89,70 @@ async def test_pending_timed_retry_has_one_canonical_receipt(tmp_path, tls):
         await peer.flush()
         assert len([f for f in peer.cloud_calls if f[2] == "MeterValues"]) == 1
         await observation_suffix(peer, local)
+
+
+# Intent: accept MeterValues beyond the owner sample cap and retain retries even when their raw payload is evicted.
+# Why: long sessions and delayed historical reports must not stop accepting telemetry or interfere with lifecycle data.
+async def test_owner_meter_window_rolls_over_without_losing_receipts(tmp_path, tls):
+    async with ObservationTLS(tmp_path / "state.db", tls, capacity=2) as peer:
+        first = peer.j.start("owner-start", START, owner_authorized=True)["transactionId"]
+        action, meter = observation_payload("meter-transaction", first)
+        for call_id in ("first-sample", "second-sample"):
+            assert (await peer.call(call_id, action, meter))[0] == 3
+
+        peer.j.db.execute(
+            "CREATE TEMP TRIGGER refuse_owner_trim BEFORE DELETE ON owner_meter_values "
+            "BEGIN SELECT RAISE(ABORT,'synthetic owner-meter trim failure'); END"
+        )
+        reply = await peer.call("third-sample", action, meter)
+        assert reply[:3] == [4, "third-sample", "InternalError"]
+        assert [row[0] for row in peer.j.db.execute("SELECT sequence FROM owner_meter_values ORDER BY sequence")] == [
+            1,
+            2,
+        ]
+        assert peer.j.db.execute("SELECT 1 FROM observation_receipts WHERE token='third-sample'").fetchone() is None
+        peer.j.db.execute("DROP TRIGGER refuse_owner_trim")
+        assert (await peer.call("third-sample", action, meter))[0] == 3
+        assert [row[0] for row in peer.j.db.execute("SELECT sequence FROM owner_meter_values ORDER BY sequence")] == [
+            2,
+            3,
+        ]
+
+        first_stop = {"transactionId": first, "meterStop": 1300, "timestamp": "2026-01-01T00:02:00Z"}
+        assert (await peer.call("owner-stop", "StopTransaction", first_stop))[0] == 3
+        second_start = START | {"timestamp": "2026-01-01T00:03:00Z"}
+        second = peer.j.start("owner-next-start", second_start, owner_authorized=True)["transactionId"]
+        _, second_meter = observation_payload("meter-transaction", second)
+        second_meter["meterValue"][0]["timestamp"] = "2026-01-01T00:04:00Z"
+        for call_id in ("next-sample", "last-sample"):
+            assert (await peer.call(call_id, action, second_meter))[0] == 3
+        rows = [
+            tuple(row)
+            for row in peer.j.db.execute("SELECT local,sequence,token FROM owner_meter_values ORDER BY sequence")
+        ]
+        assert [(local, sequence) for local, sequence, _ in rows] == [(second, 1), (second, 2)]
+
+        # A late old-session sample is acknowledged with its own token even when its raw row falls outside the window.
+        assert (await peer.call("late-sample", action, meter))[0] == 3
+        receipt = peer.j.db.execute("SELECT publication FROM observation_receipts WHERE token='late-sample'").fetchone()
+        assert receipt["publication"] not in {token for _, _, token in rows}
+        await peer.replace(restart=True, boot=True)
+        assert (await peer.call("late-sample", action, meter))[0] == 3
+        conflicting = meter | {
+            "meterValue": [{"timestamp": "2026-01-01T00:01:00Z", "sampledValue": [{"value": "1301"}]}]
+        }
+        assert (await peer.call("late-sample", action, conflicting))[0] == 4
+        assert [
+            tuple(row)
+            for row in peer.j.db.execute("SELECT local,sequence,token FROM owner_meter_values ORDER BY sequence")
+        ] == rows
+        assert (
+            peer.j.db.execute("SELECT publication FROM observation_receipts WHERE token='late-sample'").fetchone()[0]
+            == receipt[0]
+        )
+
+        assert session_history(peer.j)[1]["energy_kwh"] == 0.3 and peer.j.active() == second
+        assert peer.j.next_delivery() is None
 
 
 # Intent: an unsuccessful Boot write cannot advance the untimed observation generation.

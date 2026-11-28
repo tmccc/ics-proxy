@@ -77,6 +77,39 @@ def test_owner_session_schema_follows_committed_start(tmp_path: Path) -> None:
         Journal(path, "SYNTHETIC")
 
 
+# Intent: retain old samples on open and roll over their larger window at the next accepted report.
+# Why: upgrading an idle service should preserve its data, then normal metering bounds raw storage.
+def test_existing_owner_samples_are_trimmed_without_touching_history(tmp_path: Path) -> None:
+    path = tmp_path / "state.db"
+    with closing(Journal(path, "SYNTHETIC", capacity=10)) as journal:
+        for number in range(3):
+            start = START | {"timestamp": f"2026-01-01T00:0{number}:00Z"}
+            local = journal.start(f"owner-start-{number}", start, owner_authorized=True)["transactionId"]
+            for value in range(3):
+                meter = {
+                    "connectorId": 1,
+                    "transactionId": local,
+                    "meterValue": [{"timestamp": start["timestamp"], "sampledValue": [{"value": str(1000 + value)}]}],
+                }
+                journal.enqueue("MeterValues", meter, local)
+            journal.stop(
+                f"owner-stop-{number}", {"transactionId": local, "timestamp": start["timestamp"], "meterStop": 1200}
+            )
+        queued = journal.enqueue("StatusNotification", {"status": "Available"})
+        history = session_history(journal)
+        assert journal.db.execute("SELECT COUNT(*) FROM owner_meter_values").fetchone()[0] == 9
+
+    with closing(Journal(path, "SYNTHETIC", capacity=2)) as journal:
+        assert journal.db.execute("SELECT COUNT(*) FROM owner_meter_values").fetchone()[0] == 9
+        journal.enqueue("MeterValues", {"transactionId": local, "meterValue": [3]}, local)
+        assert [
+            tuple(r) for r in journal.db.execute("SELECT local,sequence FROM owner_meter_values ORDER BY sequence")
+        ] == [(local, 3), (local, 4)]
+        assert session_history(journal) == history
+        assert all(row["local_only"] and row["energy_kwh"] == 0.2 for row in history)
+        assert journal.next_delivery().token == queued
+
+
 # Intent: the native history view preserves measured values, strips private fields and rejects invalid rows.
 # Why: replacing the cloud cache must not leak tags or display guessed/stale session values.
 def test_native_history_is_redacted_bounded_and_validated() -> None:

@@ -726,6 +726,104 @@ async def test_failed_scheduled_cutoff_keeps_automatic_pause_until_closed(
             await status(test, lambda _: len(starts(rig)) == 2)
 
 
+# Intent: retain automatic recovery for an accepted scheduled Start whose real report arrives after expiry.
+# Why: following the accepted Start at zero keeps its lifecycle debt without silently making it an owner Pause.
+@pytest.mark.parametrize(
+    ("boundary", "restart", "owner_pause"),
+    [
+        ("cutoff", False, False),
+        ("startup-timeout", False, False),
+        ("cutoff", False, True),
+        ("startup-timeout", True, False),
+        ("startup-timeout", True, True),
+    ],
+)
+async def test_unreported_scheduled_start_keeps_automatic_pause_until_closed(
+    tmp_path, tls, unused_tcp_port, monkeypatch, boundary, restart, owner_pause
+):
+    clock = simulate_schedule_clock(monkeypatch)
+    async with managed_bench(
+        tmp_path, tls, unused_tcp_port, native_peer=SchedulePeer, bench_type=CatchupBench, time_zone=ZONE.key
+    ) as rig:
+        rig.prepared.config = replace(rig.prepared.config, owner_start_tag=OWNER_TAG, owner_schedule_timezone=ZONE.key)
+        async with AsyncExitStack() as connections:
+            test = await connections.enter_async_context(connection(rig, "unreported-owner-start", online=True))
+            c, j, bench = test.controller, test.session.journal, rig.bench
+            await healthy(c)
+            await bench.vendor_outage()
+            await status(test, lambda view: view.get("cloud_connected") is False)
+            assert c.requests.intent().mode == "app"
+            sent_limits = len(bench.received_limits)
+            cutoff = MIDNIGHT + 6 * 3600
+            clock.step_wall(cutoff - 40)
+            await status(test, lambda _: j.starts.receipt().get("stage") == "accepted")
+            original = j.starts.receipt()
+            assert original["held_at_zero"] and original["local"] is None
+            report = START | {"idTag": OWNER_TAG, "timestamp": datetime.fromtimestamp(clock.now, UTC).isoformat()}
+            authorised = await bench.call(test.charger, uuid.uuid4().hex, "Authorize", {"idTag": OWNER_TAG})
+            assert authorised[0] == 3 and authorised[2]["idTagInfo"]["status"] == "Accepted"
+            if boundary == "cutoff":
+                clock.step_wall(cutoff)
+            else:
+                lease = c.charging.lease
+                assert lease is not None
+                lease.deadline = time.monotonic() - 1
+                c.charging.changed.set()
+            await status(test, lambda _: c.requests.intent().mode == "paused")
+            await asyncio.wait_for(c.charging.settle(), 8)
+            paused = c.requests.intent()
+            assert c.requests.offline_pause_current(paused)
+            assert j.get(AUTOMATIC_PAUSE_CAUSE) == {"revision": paused.revision, "cause": "local_charge"}
+
+            if owner_pause:
+                c.command(uuid.uuid4().hex, "pause", paused.revision)
+                assert not c.requests.offline_pause_current(c.requests.intent())
+                assert c.pause_task is not None
+                await c.pause_task
+            held = c.requests.intent()
+            if restart:
+                await connections.aclose()
+                test = await connections.enter_async_context(connection(rig, "unreported-owner-restart"))
+                c, j = test.controller, test.session.journal
+                assert c.requests.intent() == held
+                assert c.requests.offline_pause_current(held) is not owner_pause
+
+            bench.vendor_available = True
+            await until(lambda: test.session.runtime.vendor_registered, timeout=20)
+            for _ in range(3):
+                await c.tick()
+            assert j.starts.receipt() == original and j.get("control")["start_pending"] and j.active() is None
+            assert c.requests.intent().mode == "paused" and not any(bench.received_limits[sent_limits:])
+
+            opened = await bench.call(test.charger, uuid.uuid4().hex, "StartTransaction", report)
+            assert opened[0] == 3 and opened[2]["idTagInfo"]["status"] == "Accepted", opened
+            local = opened[2]["transactionId"]
+            assert j.starts.receipt()["local"] == j.active() == local
+            rig.peer.plan_session = (local, 987654)
+            rig.peer.paused, rig.peer.permission_enabled = False, True
+            bench.cp, bench.connection = "C", "Charging"
+            bench.firmware.requested_current = 32
+            await status(test, lambda _: bench.remote_stop.is_set())
+            assert bench.firmware.effective_limit() == 0 and not any(bench.received_limits[sent_limits:])
+
+            bench.firmware.active = None
+            stop = {
+                "transactionId": local,
+                "timestamp": datetime.fromtimestamp(clock.now + 1, UTC).isoformat(),
+                "meterStop": report["meterStart"],
+            }
+            assert (await bench.call(test.charger, uuid.uuid4().hex, "StopTransaction", stop))[0] == 3
+            await status(
+                test,
+                lambda view: (
+                    c.requests.intent().mode == ("paused" if owner_pause else "app")
+                    and view.get("station_ceiling_a") == (0 if owner_pause else 6)
+                ),
+            )
+            assert j.active() is None and j.outcomes.stop_report_closed(local)
+            assert len(starts(rig)) == 1
+
+
 # Intent: pass through an eligible civil boundary without local authorization if the owner paused or it is too late.
 # Why: schedule configuration cannot override the current manual hold or begin a session at the tariff cutoff.
 @pytest.mark.parametrize(("manual_pause", "offset"), [(True, 0), (False, 6 * 3600)], ids=["manual-pause", "cutoff"])

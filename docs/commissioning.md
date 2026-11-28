@@ -101,6 +101,9 @@ control follow their existing authorization and recovery rules.
 
 Sessions started under this local authorization stay in the proxy journal with their charger reports and are
 available through the proxy's history, flagged as `local_only`. Their energy totals are available there.
+When accepting an owner meter report, the journal keeps up to 10,000 raw reports by default across all owner
+sessions, favoring newer transactions. An existing journal is trimmed on the next accepted owner meter report.
+Session energy is calculated from the Start and Stop meter readings.
 These sessions do not appear in the iCS app, because iCS did not authorize them. Keep the journal when updating
 the service. A downgrade involving locally authorized sessions needs a rehearsed build and journal pair that
 supports those records.
@@ -109,11 +112,16 @@ supports those records.
 
 To opt in to automatic overnight Starts during an iCS outage, set `owner_schedule_timezone` to an IANA time
 zone such as `Europe/London` in the private service configuration, alongside the dedicated `owner_start_tag`.
-The proxy recognizes a single commissioned daily midnight-to-06:00 plan, using local civil time on
-clock-change days. It skips automatic Start for a day when the clock change removes either endpoint.
-It checks Linux kernel NTP synchronization at admission and immediately before sending
-Start. An unavailable or unsynchronized clock blocks a new automatic Start. The kernel can continue to
-report synchronization during holdover.
+The proxy recognizes a single commissioned daily midnight-to-06:00 plan, using local civil time. If a clock
+change skips midnight, the window opens at the first real instant of that date. A repeated midnight is part of
+one window. The 06:00 cutoff stays fixed, and a day without a valid 06:00 has no automatic Start window.
+
+The proxy checks Linux kernel NTP synchronization at admission and immediately before sending Start. An unavailable
+or unsynchronized clock blocks a new automatic Start. When the host loses its time sources, Linux can keep reporting
+synchronization while its estimated maximum error grows. With an initial estimate near zero and no further updates,
+the kernel limit is reached in about nine hours. The actual interval depends on the clock service and its error
+estimate. A local time source can keep synchronization available during an internet outage.
+See the [Linux timekeeping code](https://github.com/torvalds/linux/blob/master/kernel/time/ntp.c).
 
 The proxy holds charging at zero while it opens the session. It uses the exact charger transaction number
 to arm a charger-side timer just before the schedule deadline. The timer uses whole seconds, with a short margin
@@ -124,7 +132,11 @@ connection requests Stop for the exact session if the timer belongs to the previ
 
 If an automatic Start from app or schedule control fails after the charger accepted it, the proxy can return to
 app or schedule control automatically. It verifies the rollback to zero and session closure, then waits for iCS
-to reconnect and the usual recovery checks to pass. An owner-requested Pause still requires an owner action.
+to reconnect and the usual recovery checks to pass. If the charger accepted the Start at zero and its transaction
+report is delayed, the automatic Pause keeps the offer at zero until the pending Start is resolved. A restart
+while the report is pending preserves the recorded automatic Pause. A matching late report and verified closure
+allow automatic Return. If the report never arrives, the recorded Start stays pending until independent evidence
+supports [reconciliation](#reconcile-a-recorded-outcome). An owner-requested Pause still requires an owner action.
 
 The [overnight verification procedure](release-process.md#qualify-the-overnight-outage-schedule) covers
 direct observation of the charger’s cutoff while the proxy is offline.

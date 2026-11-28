@@ -19,7 +19,7 @@ from .connection_scope import ControlScope, control_scope_matches, current_contr
 from .local_schedule_cutoff import cutoff
 from .local_schedule_window import ScheduleCutoff, schedule_window
 from .managed_intent import LOCAL_SCHEDULE_OCCURRENCE as OCCURRENCE
-from .managed_intent import ControlIntent
+from .managed_intent import ControlIntent, automatic_pause_cause
 from .policy import DeniedError
 from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
 from .rpc import UnavailableError
@@ -481,6 +481,65 @@ class LocalSchedule:
             and j.get("control", {}).get("ticket") == ticket
             and gateway.controls.ready
             and gateway.controls.desired() == 0
+        )
+
+    # Only an exact accepted scheduled Start issued under zero can carry its unresolved report forward.
+    def _unreported_timer_start(
+        self, identifier: str, occurrence: dict[str, Any], receipt: dict[str, Any], control: dict[str, Any]
+    ) -> bool:
+        return (
+            occurrence.get("request") == receipt.get("request_id") == identifier
+            and occurrence.get("charger_cutoff_required") is True
+            and occurrence.get("local") is None
+            and occurrence.get("stop_revision") is None
+            and receipt.get("stage") == "accepted"
+            and receipt.get("owner_authorized") is True
+            and receipt.get("held_at_zero") is True
+            and receipt.get("local") is None
+            and control.get("start_pending") is True
+            and control.get("owner") == "local"
+            and control.get("inhibit") is True
+            and self.journal.active() is None
+            and not self.journal.fault.latched()
+        )
+
+    # Remember that the schedule owns this Pause while the accepted Start still owes its report.
+    def accepted_unreported_at_zero(self, lease: ChargeLease) -> bool:
+        if lease.schedule is None:
+            return False
+        c, j = self.controller, self.journal
+        occurrence, receipt, control = j.get(OCCURRENCE, {}), j.starts.receipt(), j.get("control", {})
+        controls = c.session.gateway.controls
+        return (
+            self._cutoff_preparation_current(occurrence)
+            and occurrence.get("window") == asdict(lease.schedule)
+            and receipt.get("ticket") == control.get("ticket")
+            and self._unreported_timer_start(lease.identifier, occurrence, receipt, control)
+            and controls.ready
+            and controls.desired() == 0
+        )
+
+    # A restart can renew the exact saved restrictive claim without changing its automatic Pause revision.
+    def unreported_pause_current(self, saved: dict[str, Any], intent: ControlIntent) -> bool:
+        c, j = self.controller, self.journal
+        if not c.requests.offline_pause_current(intent) or automatic_pause_cause(j, intent) != "local_charge":
+            return False
+        identifier, hold = saved.get("id"), j.get("managed_internal_pause", {})
+        control = j.get("control", {})
+        return (
+            isinstance(identifier, str)
+            and saved.get("kind") == "normal"
+            and saved.get("source") == "local"
+            and saved.get("state") == "stopping"
+            and saved.get("expired_normal") is True
+            and type(saved.get("revision")) is int
+            and saved["revision"] + 1 == intent.revision
+            and hold.get("id") == identifier
+            and hold.get("source") == "test"
+            and hold.get("revision") == intent.revision
+            and isinstance(hold.get("ticket"), str)
+            and hold["ticket"] == control.get("ticket")
+            and self._unreported_timer_start(identifier, j.get(OCCURRENCE, {}), j.starts.receipt(), control)
         )
 
     # If expiry won the wire race, the existing internally owned Pause can prove its own fresh zero later.

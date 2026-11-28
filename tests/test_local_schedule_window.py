@@ -88,6 +88,62 @@ def test_commissioned_window_uses_civil_endpoints(month: int, day: int, elapsed_
     assert schedule_window(native, native.saved_schedule_digest, ZONE.key, ends_at) is None
 
 
+# Intent: open a shortened occurrence at the first real instant of a day whose midnight was skipped.
+# Why: projecting midnight through the gap can overshoot when the clock jumps from the previous evening.
+@pytest.mark.parametrize(
+    ("timezone", "first", "elapsed_seconds"),
+    [
+        ("Africa/Cairo", (2026, 4, 24, 1, 0, 0), 5 * 3600),
+        ("America/Toronto", (1919, 3, 31, 0, 30, 0), 5 * 3600 + 30 * 60),
+        ("Africa/Monrovia", (1972, 1, 7, 0, 44, 30), 5 * 3600 + 15 * 60 + 30),
+    ],
+)
+def test_skipped_midnight_starts_at_first_real_instant(
+    timezone: str, first: tuple[int, int, int, int, int, int], elapsed_seconds: int
+) -> None:
+    native = evidence(ORIGINAL_PLAN)
+    zone = ZoneInfo(timezone)
+    starts_at = datetime(*first, tzinfo=zone).timestamp()
+    ends_at = datetime(*first[:3], 6, tzinfo=zone).timestamp()
+    expected = ScheduleWindow(
+        ORIGINAL_PLAN["planId"],
+        native.saved_schedule_digest,
+        starts_at,
+        ends_at,
+        ORIGINAL_PLAN["limitCurrent"] / 10,
+        fingerprint(ORIGINAL_PLAN["idTag"].casefold()),
+    )
+    assert ends_at - starts_at == elapsed_seconds
+    assert schedule_window(native, native.saved_schedule_digest, zone.key, starts_at - 0.01) is None
+    assert schedule_window(native, native.saved_schedule_digest, zone.key, starts_at) == expected
+    assert schedule_window(native, native.saved_schedule_digest, zone.key, ends_at - 0.01) == expected
+    assert schedule_window(native, native.saved_schedule_digest, zone.key, ends_at) is None
+
+
+# Intent: treat both readings of a repeated midnight as one occurrence.
+# Why: reentering midnight must never spend a second scheduled Start on the same civil date.
+def test_repeated_midnight_keeps_the_first_occurrence() -> None:
+    native = evidence(ORIGINAL_PLAN)
+    zone = ZoneInfo("America/Havana")
+    midnight = datetime(2025, 11, 2, tzinfo=zone)
+    first, second = midnight.timestamp(), midnight.replace(fold=1).timestamp()
+    assert second > first
+    window = schedule_window(native, native.saved_schedule_digest, zone.key, first)
+    assert window is not None and window.starts_at == first
+    assert schedule_window(native, native.saved_schedule_digest, zone.key, second) == window
+
+
+# Intent: leave overnight Start unavailable when the clock skips over 06:00.
+# Why: the configured civil cutoff must exist before the proxy can offer current.
+def test_skipped_cutoff_keeps_schedule_unavailable() -> None:
+    native = evidence(ORIGINAL_PLAN)
+    zone = ZoneInfo("Antarctica/Casey")
+    cutoff = datetime(2018, 10, 7, 6, tzinfo=zone)
+    assert datetime.fromtimestamp(cutoff.timestamp(), zone) != cutoff
+    before_jump = datetime(2018, 10, 7, 3, tzinfo=zone).timestamp()
+    assert schedule_window(native, native.saved_schedule_digest, zone.key, before_jump) is None
+
+
 # Intent: refuse other plan shapes even when they are reflected in the commissioned digest supplied by the test.
 # Why: the local fallback can enforce the known daily current and cutoff semantics for this native format.
 @pytest.mark.parametrize(
