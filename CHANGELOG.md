@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0-rc5
+
 - Leave time for clock sampling differences when arming the charger-side overnight cutoff.
 - Preserve automatic recovery when an accepted overnight Start fails before publication and the proxy verifies
   rollback to zero.
