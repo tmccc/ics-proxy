@@ -49,8 +49,11 @@ int main() {
   assert(pressed_before_wrap.render_age_ms(500, 2001) == 2000);
 
   const std::string first(32, 'a'), next(32, 'b');
+  const std::string read_one(32, 'c'), read_two(32, 'd'), read_three(32, 'e');
   const std::string start = "v2:start:" + first;
   const std::string stop = "v2:stop:" + next;
+  const std::string start_view = "v2:idle:start:" + first;
+  const std::string stop_view = "v2:idle:stop:" + next;
   const auto older = parse_canvas_marker("d51a1000003e8" + std::string(14, '0'));
   const auto start_image = parse_canvas_marker("d51a0000003e8d52a1" + first);
   const auto stop_image = parse_canvas_marker("d51a0000003e9d52a2" + next);
@@ -66,48 +69,76 @@ int main() {
   assert(CanvasControlState::parse("v2:idle:start:-").feedback == ChargerFeedback::UNKNOWN);
 
   CanvasControlView view;
-  view.observe("v2:idle:start:" + first);
+  view.observe(start_view);
   assert(view.allows(ChargerButton::START, start_image.control));
   assert(!view.allows(ChargerButton::STOP, start_image.control));
   assert(!view.allows(ChargerButton::START, older.control));
   view.submitted(start, last_ms - 499);
-  view.observe("v2:idle:start:" + first);
+  view.observe(start_view);
   assert(!view.allows(ChargerButton::START, start));
-  assert(!view.needs_recheck(2499) && view.needs_recheck(2500));
-  view.recheck_sent(2500);
-  assert(!view.needs_recheck(2501));
-  view.observe("v2:idle:start:" + first);
+  assert(!view.needs_refresh(2499) && view.needs_refresh(2500));
+  view.request_refresh(read_one, 2500);
+  assert(!view.needs_refresh(2501));
+  view.observe(start_view);
+  view.observe_refresh(read_two + ':' + start_view);
+  assert(!view.allows(ChargerButton::START, start));
+  view.observe_refresh(read_one + ':' + start_view);
   assert(view.allows(ChargerButton::START, start));
 
-  // Pending feedback wins even if a same-generation admission read was already requested.
+  // Pending feedback wins even if a same-generation reply is in flight.
   view.submitted(start, 3000);
-  view.recheck_sent(6000);
+  view.request_refresh(read_two, 6000);
   view.observe("v2:starting:none:-");
+  view.observe_refresh(read_two + ':' + start_view);
+  assert(view.state().feedback == ChargerFeedback::STARTING);
+  assert(!view.allows(ChargerButton::START, start));
   view.invalidate();
-  view.observe("v2:idle:start:" + first);
-  assert(!view.needs_recheck(12000) && !view.allows(ChargerButton::START, start));
+  view.observe(start_view);
+  assert(!view.needs_refresh(12000) && !view.allows(ChargerButton::START, start));
   view.observe("v2:starting_timeout:stop:" + next);
   assert(!view.allows(ChargerButton::START, start));
   assert(view.allows(ChargerButton::STOP, stop_image.control));
-  view.observe("v2:idle:start:" + first);
+  view.observe(start_view);
   assert(!view.allows(ChargerButton::START, start));
-  view.observe("v2:idle:stop:" + next);
+  view.observe(stop_view);
 
-  // Reconnect requires a new read before an unacknowledged submission can be retried.
-  view.submitted(stop, 13000);
-  view.recheck_sent(16000);
-  view.invalidate();
-  assert(!view.needs_recheck(19000) && !view.allows(ChargerButton::STOP, stop));
-  view.observe("v2:idle:stop:" + next);
-  assert(view.needs_recheck(19000) && !view.allows(ChargerButton::STOP, stop));
-  view.recheck_sent(19000);
-  assert(!view.allows(ChargerButton::STOP, stop));
-  view.observe("v2:idle:stop:" + next);
-  assert(view.allows(ChargerButton::STOP, stop));
-  view.observe("v2:unavailable:none:-");
-  assert(!view.allows(ChargerButton::STOP, stop));
+  // The surviving socket's queued state and any reply to a previous read cannot reopen an old button.
+  CanvasControlView reconnect;
+  reconnect.invalidate(true);
+  assert(reconnect.needs_refresh(13000));
+  reconnect.request_refresh(read_one, 13000);
+  reconnect.observe(stop_view);
+  assert(reconnect.state().feedback == ChargerFeedback::UNKNOWN && !reconnect.allows(ChargerButton::STOP, stop));
+  assert(!reconnect.needs_refresh(15999) && reconnect.needs_refresh(16000));
+  reconnect.request_refresh(read_two, 16000);
+  reconnect.observe_refresh(read_one + ':' + stop_view);
+  reconnect.observe_refresh(read_two + ':' + "malformed");
+  assert(!reconnect.allows(ChargerButton::STOP, stop));
+  reconnect.invalidate(true);
+  reconnect.request_refresh(read_three, 16500);
+  reconnect.observe_refresh(read_two + ':' + stop_view);
+  assert(!reconnect.allows(ChargerButton::STOP, stop));
+  reconnect.observe_refresh(read_three + ':' + start_view);
+  assert(!reconnect.allows(ChargerButton::STOP, stop) && reconnect.allows(ChargerButton::START, start));
+  reconnect.observe(stop_view);
+  assert(reconnect.allows(ChargerButton::STOP, stop));
+
+  // A reconnect read sent shortly after a tap cannot also serve as its admission recheck.
+  reconnect.submitted(stop, 17000);
+  reconnect.invalidate(true);
+  reconnect.request_refresh(read_one, 17100);
+  reconnect.observe_refresh(read_one + ':' + stop_view);
+  assert(!reconnect.needs_refresh(19999) && reconnect.needs_refresh(20000));
+  reconnect.request_refresh(read_two, 20000);
+  reconnect.observe(stop_view);
+  reconnect.observe_refresh(read_one + ':' + stop_view);
+  assert(!reconnect.allows(ChargerButton::STOP, stop));
+  reconnect.observe_refresh(read_two + ':' + stop_view);
+  assert(reconnect.allows(ChargerButton::STOP, stop));
+  reconnect.observe("v2:unavailable:none:-");
+  assert(!reconnect.allows(ChargerButton::STOP, stop));
   const std::string after_reconnect(32, 'c');
-  view.observe("v2:idle:stop:" + after_reconnect);
-  assert(!view.allows(ChargerButton::STOP, stop_image.control));
-  assert(view.allows(ChargerButton::STOP, "v2:stop:" + after_reconnect));
+  reconnect.observe("v2:idle:stop:" + after_reconnect);
+  assert(!reconnect.allows(ChargerButton::STOP, stop_image.control));
+  assert(reconnect.allows(ChargerButton::STOP, "v2:stop:" + after_reconnect));
 }

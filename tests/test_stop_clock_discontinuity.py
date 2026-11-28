@@ -107,3 +107,82 @@ def test_stop_clock_relaxation_preserves_durable_identity_and_meter_guards(tmp_p
         assert not journal.db.execute("SELECT 1 FROM transaction_clock_discontinuities").fetchone()
     finally:
         journal.close()
+
+
+# Give the native proof fractional precision beyond the charger's ordinary Stop report.
+def recoverable_stop(local):
+    instant = datetime.fromisoformat(START["timestamp"]) + timedelta(minutes=1, milliseconds=123)
+    corrected = {"transactionId": local, "meterStop": START["meterStart"] + 1, "timestamp": instant.isoformat()}
+    malformed = corrected | {"meterStop": START["meterStart"] - 1}
+    native = {
+        "transactionId": local,
+        "meterStop": corrected["meterStop"],
+        "stopTime": int(instant.timestamp()),
+        "stopMs": 123,
+    }
+    return malformed, corrected, native
+
+
+# A failed outbox insertion cannot publish reconstructed closure, and a later retry still uses one vendor Stop.
+def test_malformed_stop_recovery_rolls_back_with_delivery_failure(tmp_path):
+    journal = Journal(tmp_path / "recovery.db", "OFFLINE001")
+    try:
+        local = journal.start("start", START)["transactionId"]
+        malformed, corrected, native = recoverable_stop(local)
+        journal.record_malformed_stop(local, malformed, "meter_regression")
+        candidate = journal.malformed_stop(local)
+        journal.db.execute(
+            "CREATE TRIGGER no_stop BEFORE INSERT ON outbox WHEN NEW.action='StopTransaction' "
+            "BEGIN SELECT RAISE(ABORT,'synthetic disk refusal'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="synthetic disk refusal"):
+            journal.stop("native:recovery", corrected, recovered_native=native)
+        assert journal.active() == local
+        assert journal.malformed_stop(local) == candidate
+        assert journal.receipt("native:recovery", "StopTransaction", corrected) is None
+        assert journal.acknowledge_recovered_stop("bad-stop", malformed) is None
+        assert not journal.pending_recovered_cloud_stop()
+
+        journal.db.execute("DROP TRIGGER no_stop")
+        assert journal.stop("native:recovery", corrected, recovered_native=native) == {}
+        assert journal.active() is None and journal.pending_recovered_cloud_stop()
+        assert journal.acknowledge_recovered_stop("bad-stop", malformed) == {}
+        assert (
+            journal.acknowledge_recovered_stop(
+                "late-corrected", corrected | {"timestamp": "2026-01-01T01:01:00+01:00", "reason": "Local"}
+            )
+            == {}
+        )
+        assert (
+            journal.acknowledge_recovered_stop(
+                "late-conflicting", corrected | {"timestamp": "2026-01-01T00:01:00.124Z"}
+            )
+            is None
+        )
+        start = journal.next_delivery()
+        assert start is not None and start.action == "StartTransaction"
+        journal.acknowledge(start, {"transactionId": 42, "idTagInfo": {"status": "Accepted"}})
+        stop = journal.next_delivery()
+        assert stop is not None and stop.action == "StopTransaction" and stop.payload == corrected
+        journal.acknowledge(stop, {})
+        assert journal.next_delivery() is None and not journal.pending_recovered_cloud_stop()
+    finally:
+        journal.close()
+
+
+# An actual corrected report that arrives first owns closure, even if a native recovery was being prepared.
+def test_genuine_stop_wins_before_malformed_report_recovery(tmp_path):
+    journal = Journal(tmp_path / "recovery.db", "OFFLINE001")
+    try:
+        local = journal.start("start", START)["transactionId"]
+        malformed, corrected, native = recoverable_stop(local)
+        journal.record_malformed_stop(local, malformed, "meter_regression")
+        actual = corrected | {"reason": "Local"}
+        assert journal.stop("corrected-stop", actual) == {}
+        assert journal.malformed_stop(local) is None and not journal.pending_recovered_cloud_stop()
+        with pytest.raises(ConflictError, match="previously accepted stop"):
+            journal.stop("native:recovery", corrected, recovered_native=native)
+        stop_reports = journal.db.execute("SELECT payload FROM outbox WHERE action='StopTransaction'").fetchall()
+        assert [json.loads(row[0]) for row in stop_reports] == [actual]
+    finally:
+        journal.close()

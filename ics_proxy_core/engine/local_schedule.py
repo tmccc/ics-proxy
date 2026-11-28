@@ -10,11 +10,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from datetime import UTC, datetime
 from functools import partial
-from math import isfinite
-from pathlib import Path
+from math import floor, isfinite
 from typing import TYPE_CHECKING, Any
-from uuid import UUID
 
+from .command_outcomes import transaction_reply_status
 from .command_processor import CommandPriority
 from .connection_scope import ControlScope, control_scope_matches, current_control_scope
 from .local_schedule_cutoff import cutoff
@@ -24,7 +23,7 @@ from .managed_intent import ControlIntent
 from .policy import DeniedError
 from .recovery_contracts import ALLOW, GateDecision, Pending, Prerequisite, require_allowed
 from .rpc import UnavailableError
-from .schedule_clock import host_clock_blocker, host_clock_synchronized
+from .schedule_clock import host_clock_blocker, host_clock_epoch, host_clock_synchronized
 from .security import SecurityError
 from .session_closure import observe_closure
 from .start_handoff import ScheduledStop
@@ -51,16 +50,6 @@ class ScheduleCloudReturnedError(DeniedError):
 
 class ScheduleCutoffError(DeniedError):
     """The exact admitted overnight window reached its cutoff."""
-
-
-# A persisted elapsed deadline can only be compared within the same host boot and time namespace.
-def host_clock_epoch() -> str | None:
-    try:
-        boot = UUID(Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip())
-        namespace = Path("/proc/self/ns/time").stat()
-    except OSError, ValueError:
-        return None
-    return fingerprint([boot.hex, namespace.st_dev, namespace.st_ino])
 
 
 class LocalSchedule:
@@ -138,7 +127,9 @@ class LocalSchedule:
         if deadline is None:
             raise RecoveryRequiredError("charger cutoff has no comparable elapsed deadline")
         now = time.time()
-        stop_at = int(min(occurrence["window"]["ends_at"], now + deadline - time.monotonic()))
+        remaining = deadline - time.monotonic()
+        # The charger accepts whole seconds. Leave a second for clock sampling differences at later guards.
+        stop_at = floor(min(occurrence["window"]["ends_at"], now + remaining) - 1)
 
         # Keep the cutoff bound to the live owner session and original elapsed deadline.
         def guard() -> None:
@@ -151,7 +142,7 @@ class LocalSchedule:
             ):
                 raise RecoveryRequiredError("charger cutoff lost its exact active session")
             now = time.time()
-            if not now < stop_at <= now + deadline - time.monotonic():
+            if not 0 < stop_at - now <= deadline - time.monotonic():
                 raise ScheduleCutoffError("charger cutoff no longer fits the original deadline")
 
         guard()
@@ -453,6 +444,43 @@ class LocalSchedule:
             and control_scope_matches(gateway, (lease.start_scope, lease.control_revision))
             and self._unsent_receipt(lease.identifier, state, receipt)
             and receipt["ticket"] == receipt.get("settled_ticket") == control.get("ticket")
+        )
+
+    # A failed Start belongs to the schedule only while the accepted session and its rollback still agree.
+    def verified_failed_schedule_zero(self, lease: ChargeLease, result: OwnedStartResult | None) -> bool:
+        c, j = self.controller, self.journal
+        gateway = c.session.gateway
+        if (
+            lease.schedule is None
+            or lease.mode != "app"
+            or c.requests.intent() != ControlIntent("app", lease.revision)
+            or result is None
+            or not result.remote_start_dispatched
+            or result.answer is None
+            or transaction_reply_status(result.answer) != "Accepted"
+            or not result.zero_verified
+            or result.publication is not None
+            or lease.start_scope is None
+            or not control_scope_matches(gateway, (lease.start_scope, lease.control_revision))
+            or j.fault.latched()
+        ):
+            return False
+        occurrence, receipt = j.get(OCCURRENCE, {}), j.starts.receipt()
+        local, ticket = occurrence.get("local"), receipt.get("ticket")
+        return (
+            occurrence.get("request") == receipt.get("request_id") == lease.identifier
+            and occurrence.get("window") == asdict(lease.schedule)
+            and occurrence.get("charger_cutoff_required") is True
+            and occurrence.get("stop_revision") is None
+            and receipt.get("stage") == "accepted"
+            and receipt.get("owner_authorized") is True
+            and receipt.get("local") == local
+            and j.is_owner_session(local)
+            and j.active() in (None, local)
+            and isinstance(ticket, str)
+            and j.get("control", {}).get("ticket") == ticket
+            and gateway.controls.ready
+            and gateway.controls.desired() == 0
         )
 
     # If expiry won the wire race, the existing internally owned Pause can prove its own fresh zero later.

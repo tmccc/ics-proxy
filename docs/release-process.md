@@ -55,7 +55,9 @@ OCPP_QUALIFICATION_REPORT="$QUALIFICATION_BUNDLE" python tools/deploy_ha.py \
 The Docker installer checks the candidate, backs up the previous files, and verifies the installed bytes. An
 authorized restart can be included with `--restart --yes --ha-api-config "$HA_API_CONFIG"`. The private settings
 contain `token_file` and can include `container_port`. The process lock spans configuration validation and restart
-verification. This tool installs the Home Assistant client. The standalone service has its own release procedure.
+verification. The installer updates `custom_components/ics_proxy`. The standalone service has its own release
+procedure. If you use the optional Solar Display 2 example, update its Home Assistant reply sensor and ESPHome
+firmware together using the [display upgrade instructions](../examples/solar-display-2/README.md#installation-and-upgrade).
 
 ## Update the proxy
 

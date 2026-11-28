@@ -66,6 +66,7 @@ def render_poll(
 
 # An unavailable native sample leaves the independently saved proxy history intact.
 def clear_native_sample(status: dict[str, Any]) -> None:
+    status.pop("native_observed_boottime", None)
     status.update(dict.fromkeys((*NATIVE_SAMPLE_FIELDS, "vehicle_connected", "history_records")))
     status.update(charger_sessions=[], charger_history_complete=False, charger_latest_completion_known=False)
     status["last_session_energy_kwh"] = None
@@ -73,11 +74,13 @@ def clear_native_sample(status: dict[str, Any]) -> None:
 
 # Reject booleans and non-finite values before calculating status ages or certificate coverage.
 def finite_number(value: object) -> float | None:
-    return (
-        float(value)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-        else None
-    )
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except OverflowError:
+        return None
+    return numeric if math.isfinite(numeric) else None
 
 
 # A fresh file or API response must still prove the applicable app or intentional zero-hold authority.
@@ -85,6 +88,7 @@ def health_snapshot(
     value: dict[str, Any],
     now: float | None = None,
     *,
+    elapsed_ages: tuple[float, float] | None = None,
     delivery_blocked: bool = False,
     cloud_status_current: bool = True,
 ) -> dict[str, Any]:
@@ -92,8 +96,13 @@ def health_snapshot(
     checked, native = finite_number(value.get("checked_at")), finite_number(value.get("native_observed_at"))
     age = current - checked if checked is not None else math.inf
     native_age = current - native if native is not None else math.inf
+    if elapsed_ages is not None:
+        # A wall-clock rewind must never make saved evidence or its certificate allowance younger.
+        age = max(age, elapsed_ages[0]) if age >= 0 else age
+        native_age = max(native_age, elapsed_ages[1]) if native_age >= 0 else native_age
     remaining = finite_number(value.get("certificate_remaining_seconds"))
-    certificate_valid = remaining is not None and remaining - max(age, 0) > 1800
+    certificate_age = max(age, elapsed_ages[0] if elapsed_ages is not None else 0)
+    certificate_valid = remaining is not None and remaining - certificate_age > 1800
     # Older reports omitted this field. An explicit null means the current command evidence could not be read.
     reconciliation = value.get("operator_reconciliation_required", False)
     paused = value.get("desired_control") == "paused"
@@ -381,6 +390,7 @@ def observed_status(
         "control_revision": c.requests.intent().revision,
         "local_hold_verified": verdict.proof.hold_verified,
         "native_observed_at": native.physical.observed_at,
+        "native_observed_boottime": native.observed_boottime,
         "native_limit_a": native.runtime_user_a,
         "requested_current_a": c.current.selected(),
         "current_capability": managed_current_ceiling(j, c.native.spec) == 32,
@@ -687,4 +697,5 @@ def refresh_for_read(c: ManagedController, published: dict[str, Any]) -> dict[st
         result["diagnostics"] = diagnostic_snapshot(c, result) | {
             key: reported[key] for key in ("timeline", "timeline_scope", "reporting_errors") if key in reported
         }
+    result.pop("native_observed_boottime", None)
     return result

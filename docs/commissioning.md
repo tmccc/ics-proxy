@@ -110,15 +110,21 @@ supports those records.
 To opt in to automatic overnight Starts during an iCS outage, set `owner_schedule_timezone` to an IANA time
 zone such as `Europe/London` in the private service configuration, alongside the dedicated `owner_start_tag`.
 The proxy recognizes a single commissioned daily midnight-to-06:00 plan, using local civil time on
-clock-change days. It checks Linux kernel NTP synchronization at admission and immediately before sending
+clock-change days. It skips automatic Start for a day when the clock change removes either endpoint.
+It checks Linux kernel NTP synchronization at admission and immediately before sending
 Start. An unavailable or unsynchronized clock blocks a new automatic Start. The kernel can continue to
 report synchronization during holdover.
 
 The proxy holds charging at zero while it opens the session. It uses the exact charger transaction number
-to arm a charger-side timer and can offer current after it records the timer acknowledgement. While connected,
-the proxy also requests zero and Stop at cutoff if the session is still open. The journal preserves the cutoff
-and session identity for recovery, and the proxy verifies closure separately from the charger’s reply.
-A replacement connection requests Stop for the exact session if the timer belongs to the previous connection.
+to arm a charger-side timer just before the schedule deadline. The timer uses whole seconds, with a short margin
+for clock sampling. The proxy can offer current after it records the timer acknowledgement. While connected, the
+proxy also requests zero and Stop at cutoff if the session is still open. The journal preserves the cutoff and
+session identity for recovery, and the proxy verifies closure separately from the charger’s reply. A replacement
+connection requests Stop for the exact session if the timer belongs to the previous connection.
+
+If an automatic Start from app or schedule control fails after the charger accepted it, the proxy can return to
+app or schedule control automatically. It verifies the rollback to zero and session closure, then waits for iCS
+to reconnect and the usual recovery checks to pass. An owner-requested Pause still requires an owner action.
 
 The [overnight verification procedure](release-process.md#qualify-the-overnight-outage-schedule) covers
 direct observation of the charger’s cutoff while the proxy is offline.
@@ -137,6 +143,8 @@ status reports `shutdown_uncertain`. Verify the actual charger state before assu
 Run `health` and `incident` as the service account that owns the private configuration and state files. Both
 commands read saved records. `incident` reports the most recent local Start by default.
 It can also read a cleanly stopped, checkpointed journal in a read-only backup directory using a temporary private copy.
+`health` requires fresh proxy and charger observations from the current host boot and the service's Linux time
+namespace. After an upgrade or host restart, the running service must publish a fresh report before the check can pass.
 
 ```bash
 python tools/managed_proxy.py health --config /etc/ics-proxy/proxy.json
@@ -192,6 +200,13 @@ effect. A Pause you requested stays in effect until you deliberately start a new
 **Return to app / schedule** when it becomes available.
 
 ### Reconcile a recorded outcome
+
+If the charger sends a Stop with an invalid meter value or timestamp for a known open session, the proxy retains
+the rejected report. It can close that session from the commissioned charger's fresh native history after verifying
+zero draw and an exact match to the original Start. If the charger clock moved backward, the Stop report must still
+carry a valid timestamp that agrees with the native Stop time. The journal records the clock discontinuity. If iCS
+owns the session, the proxy verifies a zero offer and waits for iCS to acknowledge the recovered Stop before
+admitting another Start. Missing or contradictory history leaves the session awaiting a valid Stop.
 
 Choose the tool that matches the recorded issue. Start with `--help` and `check` to verify the inputs. For a
 command or report, `inspect` shows the exact candidate after the service has stopped.

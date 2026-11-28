@@ -25,6 +25,7 @@ from .connection_scope import (
 from .gateway import Gateway
 from .ics import is_safe_transaction_query
 from .local_control import local_start_receipt
+from .malformed_stop_recovery import recover_malformed_stop
 from .managed_current import managed_current_ceiling
 from .managed_intent import OWNER_PAUSE, decode_intent, decode_pause_claim
 from .managed_native_repair import NativeRepairAudits, RepairAttempt
@@ -42,6 +43,7 @@ from .native_http import NativeTransportUnavailableError
 from .policy import DeniedError
 from .recovery_contracts import ALLOW, GateDecision, Guard, Pending, Prerequisite, require_allowed
 from .rpc import IntroductionDeferredError, UnavailableError
+from .schedule_clock import host_boottime
 from .security import SecurityError, StaleEvidenceError
 from .session_closure import observe_closure
 from .station import StationChoice
@@ -64,7 +66,7 @@ class NativeSessionPendingError(RecoveryRequiredError):
 
 
 class NativeBoundedHandover:
-    """This mode permits bounded charging; it never infers vehicle pause or manufactures transaction closure."""
+    """Bounded charging uses the charger's independently observed configuration and lifecycle."""
 
     # The explicit immutable specification and ordinary ledger bind this mode independently of vehicle permission.
     def __init__(
@@ -319,6 +321,8 @@ class NativeBoundedHandover:
                     audit_history(
                         gateway.journal, self.spec.digest, list(native.history), gateway.policy.allow_local_start
                     )
+                    if observed_route == "trial" and not measured.exceeded:
+                        recover_malformed_stop(self, native)
                     if self.command_source_observer is not None:
                         self.command_source_observer(native)
                     gateway.controls.decisions.schedule.record_current_source(native, gateway.boot_observation)
@@ -442,6 +446,7 @@ class NativeBoundedHandover:
             try:
                 async with asyncio.timeout(15):
                     started = time.monotonic()
+                    started_boottime = host_boottime()
                     native = await self.observe()
             except TimeoutError as error:
                 raise NativeTransportUnavailableError("complete native observation exceeded its deadline") from error
@@ -458,7 +463,7 @@ class NativeBoundedHandover:
         ) as error:
             failure = error
             return gateway.decide(lambda: settle(failure))
-        native = replace(native, observed_monotonic=started)
+        native = replace(native, observed_monotonic=started, observed_boottime=started_boottime)
         return gateway.decide(lambda: settle(native))
 
     # Compose immutable checks before a private measured verdict; it is never usable positive authority.

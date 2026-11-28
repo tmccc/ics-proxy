@@ -64,7 +64,7 @@ async def stop_targets(test):
 # Intent: arm the exact session cutoff before releasing the zero hold, including when replies or authority change.
 # Why: verified current must depend on the accepted charger timer, which can expire while the proxy is offline.
 @pytest.mark.parametrize(
-    "outcome", ["armed", "rejected", "malformed", "lost-ack", "write-refused", "pause", "replacement"]
+    "outcome", ["armed", "rejected", "malformed", "lost-ack", "write-refused", "pause", "replacement", "clock-shift"]
 )
 async def test_charger_local_cutoff_requires_armed_zero_hold(tmp_path, tls, unused_tcp_port, monkeypatch, outcome):
     async with overnight(tmp_path, tls, unused_tcp_port, monkeypatch, charger_cutoff=True) as (rig, clock):
@@ -122,6 +122,9 @@ async def test_charger_local_cutoff_requires_armed_zero_hold(tmp_path, tls, unus
                     await until(lambda: timer_wire not in peer._pending, timeout=8)
                 elif outcome == "pause":
                     c.command(uuid.uuid4().hex, "pause", c.requests.intent().revision)
+                elif outcome in ("armed", "clock-shift"):
+                    # Advance elapsed time with no wall change while the exact reply is in flight.
+                    clock.elapsed += 2 if outcome == "clock-shift" else 0.001
                 release_reply.set()
                 await asyncio.wait_for(c.charging.settle(), 8)
 
@@ -135,7 +138,7 @@ async def test_charger_local_cutoff_requires_armed_zero_hold(tmp_path, tls, unus
                     return
 
                 assert occurrence["charger_cutoff_armed"]["local"] == local
-                assert timer.armed == (local, CUTOFF)
+                assert timer.armed == (local, CUTOFF - 1)
                 assert firmware.current > 0
                 await status(test, lambda value: value.get("power_w", 0) > 0)
 
@@ -148,9 +151,9 @@ async def test_charger_local_cutoff_requires_armed_zero_hold(tmp_path, tls, unus
                     assert firmware.current == 0
                     assert not any(bench.received_limits[before:])
                 return
-            timer.expire(CUTOFF - 1)
+            timer.expire(CUTOFF - 2)
             assert firmware.current > 0
-            timer.expire(CUTOFF)
+            timer.expire(CUTOFF - 1)
             assert firmware.active is None and firmware.current == 0
             assert not bench.remote_stop.is_set()
         finally:

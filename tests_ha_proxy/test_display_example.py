@@ -24,6 +24,9 @@ replacement_peer = peer
 PROJECT = Path(__file__).resolve().parents[1] / "examples" / "solar-display-2"
 AUTOMATION = "automation.general_display_2_ics_charger_buttons"
 DISPLAY_VIEW = "sensor.general_display_2_ics_control"
+DISPLAY_REPLY = "sensor.general_display_2_ics_control_reply"
+DISPLAY_REQUEST = "esphome.general_display_ics_view_request"
+DISPLAY_DEVICE = "replace-with-esphome-device-id"
 IMAGE = "image.ics_display_preview"
 VIEW = "replace-with-editor-view-id"
 TARGET = "b" * 64
@@ -88,8 +91,16 @@ def test_renderer_and_firmware_use_the_same_command_entity():
     assert "input_select.general_display_2_ics_request" not in references
     package = yaml.load((PROJECT / "esphome-canvas.yaml.example").read_text(), Loader=yaml.BaseLoader)
     assert package["substitutions"]["canvas_ics_view_entity"] == DISPLAY_VIEW
+    assert package["substitutions"]["canvas_ics_view_reply_entity"] == DISPLAY_REPLY
     command_sources = [sensor for sensor in package["text_sensor"] if sensor["platform"] == "homeassistant"]
-    assert [sensor["entity_id"] for sensor in command_sources] == ["${canvas_ics_view_entity}"]
+    assert [sensor["entity_id"] for sensor in command_sources] == [
+        "${canvas_ics_view_entity}",
+        "${canvas_ics_view_reply_entity}",
+    ]
+    refresh = next(script for script in package["script"] if script["id"] == "refresh_canvas_ics_view")
+    event = refresh["then"][0]["if"]["then"][0]["homeassistant.event"]
+    assert event["event"] == DISPLAY_REQUEST
+    assert event["data"]["display"] == "${canvas_display_id}"
     assert not any(sensor["platform"] == "homeassistant" for sensor in package.get("sensor", []))
 
 
@@ -116,6 +127,30 @@ async def install_display(hass):
     hass.states.async_set("sensor.ics_display_screen_source", "Home Assistant")
 
 
+async def test_display_refresh_replies_with_the_current_view_and_request_identifier(actual_hass):
+    hass = actual_hass
+    await install_display(hass)
+    before = hass.states.get(DISPLAY_REPLY).state
+    request = "c" * 32
+    event = {"display": "general_display_2", "device_id": DISPLAY_DEVICE, "request": request}
+    for override in ({"device_id": "other"}, {"display": "other"}, {"request": "A" * 32}, {"request": 3}):
+        hass.bus.async_fire(DISPLAY_REQUEST, event | override)
+    await hass.async_block_till_done()
+    assert hass.states.get(DISPLAY_REPLY).state == before
+
+    stop = "v2:idle:stop:" + "b" * 32
+    hass.states.async_set(DISPLAY_VIEW, stop)
+    hass.bus.async_fire(DISPLAY_REQUEST, event)
+    await hass.async_block_till_done()
+    assert hass.states.get(DISPLAY_REPLY).state == f"{request}:{stop}"
+
+    followup = "d" * 32
+    hass.states.async_set(DISPLAY_VIEW, "unknown")
+    hass.bus.async_fire(DISPLAY_REQUEST, event | {"request": followup})
+    await hass.async_block_till_done()
+    assert hass.states.get(DISPLAY_REPLY).state == f"{followup}:v2:unavailable:none:-"
+
+
 # Provide a renderer frame with optional routing or freshness variations.
 def publish_display_preview(hass, rendered_at, **overrides):
     attributes = {
@@ -132,7 +167,7 @@ def send_display_tap(hass, action, generation, *, age=1, frame=None, **overrides
     stamp = int(dt_util.now().timestamp()) if frame is None else frame
     data = {
         "display": "general_display_2",
-        "device_id": "replace-with-esphome-device-id",
+        "device_id": DISPLAY_DEVICE,
         "x": "120" if action == "start" else "352",
         "y": "396",
         "canvas_age_seconds": str(age),

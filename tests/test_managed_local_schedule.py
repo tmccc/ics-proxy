@@ -595,6 +595,136 @@ async def test_cloud_returns_before_local_schedule_sends_start(
                 assert c.requests.receipt(pause)["state"] == "completed"
 
 
+# Intent: let an exact failed charger timer return to the app only after the issued Start is reconciled.
+# Why: a failed unattended Start must not become an owner Pause or release current while its Stop report is missing.
+@pytest.mark.parametrize("scenario", ["warm-outage", "cold-outage", "owner-pause", "next-night", "profile-refused"])
+async def test_failed_scheduled_cutoff_keeps_automatic_pause_until_closed(
+    tmp_path, tls, unused_tcp_port, monkeypatch, scenario
+):
+    async with AsyncExitStack() as stack:
+        if scenario == "cold-outage":
+            rig, clock = await stack.enter_async_context(
+                overnight(tmp_path, tls, unused_tcp_port, monkeypatch, charger_cutoff=True)
+            )
+            test = await stack.enter_async_context(connection(rig, "cutoff-cold-outage"))
+            await status(test, lambda value: value.get("local_hold_verified") is True)
+        else:
+            clock = simulate_schedule_clock(monkeypatch)
+            rig = await stack.enter_async_context(
+                managed_bench(
+                    tmp_path,
+                    tls,
+                    unused_tcp_port,
+                    native_peer=SchedulePeer,
+                    bench_type=CatchupBench,
+                    time_zone=ZONE.key,
+                )
+            )
+            rig.prepared.config = replace(
+                rig.prepared.config, owner_start_tag=OWNER_TAG, owner_schedule_timezone=ZONE.key
+            )
+            test = await stack.enter_async_context(connection(rig, "cutoff-warm-outage", online=True))
+            await healthy(test.controller)
+            await rig.bench.vendor_outage()
+            await status(test, lambda value: value.get("cloud_connected") is False)
+
+        c, j, bench = test.controller, test.session.journal, rig.bench
+        intent = c.requests.intent()
+        assert intent.mode == ("paused" if scenario == "cold-outage" else "app")
+        firmware = bench.firmware
+        answer = firmware.answer
+        profile_refused = False
+        allow_timer = scenario == "profile-refused"
+
+        def answer_start_work(action, payload):
+            nonlocal profile_refused
+            if action == "DataTransfer" and payload.get("messageId") == "delayStop":
+                assert json.loads(payload["data"])["transactionId"] == firmware.active
+                assert firmware.effective_limit() == 0
+                return {"status": "Accepted" if allow_timer else "Rejected", "data": ""}
+            if allow_timer and not profile_refused and action == "SetChargingProfile":
+                schedule = payload["csChargingProfiles"]["chargingSchedule"]
+                if schedule["chargingSchedulePeriod"][0]["limit"] > 0:
+                    profile_refused = True
+                    return {"status": "Rejected"}
+            return answer(action, payload)
+
+        monkeypatch.setattr(firmware, "answer", answer_start_work)
+        sent_limits = len(bench.received_limits)
+        clock.now = MIDNIGHT
+        await status(test, lambda _: bool(starts(rig)))
+        report = START | {"idTag": OWNER_TAG, "timestamp": datetime.fromtimestamp(clock.now, UTC).isoformat()}
+        approved = await bench.call(test.charger, uuid.uuid4().hex, "Authorize", {"idTag": OWNER_TAG})
+        assert approved[2]["idTagInfo"]["status"] == "Accepted"
+        opened = await bench.call(test.charger, uuid.uuid4().hex, "StartTransaction", report)
+        assert opened[0] == 3 and opened[2]["idTagInfo"]["status"] == "Accepted", opened
+        local = opened[2]["transactionId"]
+        await asyncio.wait_for(c.charging.settle(), 8)
+
+        timer = j.get(LOCAL_SCHEDULE_OCCURRENCE).get("charger_cutoff_armed")
+        if allow_timer:
+            assert timer["local"] == local and profile_refused
+        else:
+            assert timer is None
+        expected_positive = [6] if allow_timer else []
+        paused = c.requests.intent()
+        assert c.requests.offline_pause_current(paused)
+        expected_cause = "cloud_connection_failed" if scenario == "cold-outage" else "local_charge"
+        assert paused.revision == intent.revision + (intent.mode == "app")
+        assert j.get(AUTOMATIC_PAUSE_CAUSE) == {"revision": paused.revision, "cause": expected_cause}
+        assert [limit for limit in bench.received_limits[sent_limits:] if limit > 0] == expected_positive
+        assert firmware.effective_limit() == firmware.current == 0
+
+        owner_pause = scenario == "owner-pause"
+        if owner_pause:
+            c.command(uuid.uuid4().hex, "pause", paused.revision)
+            assert not c.requests.offline_pause_current(c.requests.intent())
+        async with asyncio.timeout(6):
+            while not bench.remote_stop.is_set():
+                await c.tick()
+                await asyncio.sleep(0.02)
+        assert {frame[3]["transactionId"] for frame in bench.device_calls if frame[2] == "RemoteStopTransaction"} == {
+            local
+        }
+
+        offline_next_night = scenario == "next-night"
+        if not offline_next_night:
+            bench.vendor_available = True
+            await until(lambda: test.session.runtime.vendor_registered, timeout=20)
+
+        # A physically closed charger is insufficient while the real Stop report is missing.
+        firmware.active = None
+        await c.tick()
+        assert j.active() == local and c.requests.intent().mode == "paused"
+        assert firmware.effective_limit() == firmware.current == 0
+        assert [limit for limit in bench.received_limits[sent_limits:] if limit > 0] == expected_positive
+
+        stop = {
+            "transactionId": local,
+            "timestamp": datetime.fromtimestamp(clock.now + 1, UTC).isoformat(),
+            "meterStop": report["meterStart"],
+        }
+        assert (await bench.call(test.charger, uuid.uuid4().hex, "StopTransaction", stop))[0] == 3
+        remains_paused = owner_pause or offline_next_night
+        await status(
+            test,
+            lambda value: (
+                c.requests.intent().mode == ("paused" if remains_paused else "app")
+                and value.get("station_ceiling_a") == (0 if remains_paused else 6)
+            ),
+        )
+        assert j.active() is None and j.outcomes.stop_report_closed(local)
+        assert len(starts(rig)) == 1
+        if offline_next_night:
+            assert c.requests.offline_pause_current(paused)
+            assert not test.session.runtime.vendor_registered
+            for _ in range(3):
+                await c.tick()
+            assert len(starts(rig)) == 1
+            clock.now = MIDNIGHT + 24 * 3600
+            await status(test, lambda _: len(starts(rig)) == 2)
+
+
 # Intent: pass through an eligible civil boundary without local authorization if the owner paused or it is too late.
 # Why: schedule configuration cannot override the current manual hold or begin a session at the tariff cutoff.
 @pytest.mark.parametrize(("manual_pause", "offset"), [(True, 0), (False, 6 * 3600)], ids=["manual-pause", "cutoff"])

@@ -13,3 +13,22 @@ template:
              and state_attr(image, 'current_view_id') == view
              and state_attr(image, 'rendered_view_id') == view
              and state_attr(image, 'notification_active') == false else 'v2:unavailable:none:-' }}
+  - triggers:
+      - trigger: event
+        event_type: esphome.general_display_ics_view_request
+        event_data:
+          display: general_display_2
+          device_id: "replace-with-esphome-device-id"
+    conditions:
+      - condition: template
+        value_template: >-
+          {% set request = trigger.event.data.get('request') -%}
+          {{ request is string and request | length == 32
+             and request | reject('in', '0123456789abcdef') | list | length == 0 }}
+    sensor:
+      - name: General Display 2 ICS Control Reply
+        unique_id: general_display_2_ics_control_reply
+        default_entity_id: sensor.general_display_2_ics_control_reply
+        state: >-
+          {% set current = states('sensor.general_display_2_ics_control') -%}
+          {{ trigger.event.data.request ~ ':' ~ (current if current.startswith('v2:') else 'v2:unavailable:none:-') }}

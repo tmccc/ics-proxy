@@ -1,13 +1,36 @@
-"""Read the host's kernel synchronization state for civil-time Start decisions."""
+"""Read host clock evidence for local scheduling and saved status."""
 
 from __future__ import annotations
 
 import sys
+import time
 from collections.abc import Callable
 from functools import cache
+from pathlib import Path
 from typing import Literal
+from uuid import UUID
+
+from .store import fingerprint
 
 type ClockBlocker = Literal["clock_unsynchronized", "clock_check_unavailable"]
+
+
+def host_clock_epoch() -> str | None:
+    """Identify the boot and time namespace in which an elapsed reading was taken."""
+    try:
+        boot = UUID(Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip())
+        namespace = Path("/proc/self/ns/time").stat()
+    except OSError, ValueError:
+        return None
+    return fingerprint([boot.hex, namespace.st_dev, namespace.st_ino])
+
+
+def host_boottime() -> float | None:
+    """Read elapsed time since boot, including time spent suspended."""
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    except AttributeError, OSError:
+        return None
 
 
 # Resolve the Linux clock query once so a platform without it can fail closed at admission.

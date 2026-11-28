@@ -34,6 +34,7 @@ from tests.connected_rig import connected_bench, strategy_file
 from tests.management_peer import TOKEN, call
 from tests.prototype_rig import BOOT
 from tests.runtime_rig import FAST, until
+from tests.service_recovery_helpers import running_service
 from tests.test_native_repair_storage import refused_write
 from tests.test_ordinary_legacy_transport_recovery import legacy_fault
 from tests.tls_support import tls as tls
@@ -137,11 +138,24 @@ def healthy_status(now: float) -> dict[str, Any]:
     }
 
 
+@pytest.fixture
+def elapsed_health(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    monkeypatch.setattr(managed_proxy, "host_clock_epoch", lambda: "current-boot-and-namespace")
+    monkeypatch.setattr(managed_proxy, "host_boottime", lambda: 1000)
+    return {
+        "elapsed_freshness": {
+            "clock_epoch": "current-boot-and-namespace",
+            "checked_boottime": 999,
+            "native_observed_boottime": 998,
+        }
+    }
+
+
 # Intent: fresh measured health is accepted without constructing a socket or opening journal ownership.
 # Why: independent service monitoring must remain a read-only file operation.
-def test_health_is_fresh_and_dormant(tmp_path: Path, monkeypatch: Any) -> None:
+def test_health_is_fresh_and_dormant(tmp_path: Path, monkeypatch: Any, elapsed_health: dict[str, Any]) -> None:
     path = tmp_path / "status.json"
-    save_private(path, healthy_status(10000))
+    save_private(path, healthy_status(10000) | elapsed_health)
 
     # A health command has no reason to resolve an endpoint or create a transport.
     def deny(*args: Any, **kwargs: Any) -> None:
@@ -181,10 +195,83 @@ def test_health_is_fresh_and_dormant(tmp_path: Path, monkeypatch: Any) -> None:
         {"native_observed_at": None},
     ],
 )
-def test_health_rejects_stale_or_incomplete_report(tmp_path: Path, change: dict[str, Any]) -> None:
+def test_health_rejects_stale_or_incomplete_report(
+    tmp_path: Path, change: dict[str, Any], elapsed_health: dict[str, Any]
+) -> None:
     path = tmp_path / "status.json"
-    save_private(path, healthy_status(10000) | change)
+    save_private(path, healthy_status(10000) | elapsed_health | change)
     assert not managed_proxy.health(path, 10000)["healthy"]
+
+
+def test_health_clock_rewind_does_not_revive_an_old_report(tmp_path, monkeypatch, elapsed_health):
+    path = tmp_path / "status.json"
+    save_private(path, healthy_status(10000) | elapsed_health)
+    assert managed_proxy.health(path, 10000)["healthy"]
+
+    monkeypatch.setattr(managed_proxy, "host_boottime", lambda: 1300)
+    assert not managed_proxy.health(path, 10300)["healthy"]
+    monkeypatch.setattr(managed_proxy, "host_boottime", lambda: 1301)
+    rewound = managed_proxy.health(path, 10001)
+    assert not rewound["healthy"] and not rewound["local_healthy"]
+    assert (rewound["status_age_seconds"], rewound["native_age_seconds"]) == (302, 303)
+    assert {"status_stale", "native_stale"} <= set(rewound["health_blockers"])
+
+
+@pytest.mark.parametrize(
+    ("change", "blocker"),
+    [
+        (None, "status_stale"),
+        ({"clock_epoch": "different-boot-or-namespace"}, "status_stale"),
+        ({"checked_boottime": 1001}, "status_stale"),
+        ({"checked_boottime": 10**400}, "status_stale"),
+        ({"native_observed_boottime": 983}, "native_stale"),
+        ({"native_observed_boottime": 1000}, "native_stale"),
+        ({"native_observed_boottime": True}, "native_stale"),
+    ],
+)
+def test_health_requires_current_elapsed_evidence(tmp_path, elapsed_health, change, blocker):
+    path = tmp_path / "status.json"
+    status = healthy_status(10000)
+    if change is not None:
+        status["elapsed_freshness"] = elapsed_health["elapsed_freshness"] | change
+    save_private(path, status)
+    result = managed_proxy.health(path, 10000)
+    assert not result["healthy"] and blocker in result["health_blockers"]
+
+
+def test_health_clock_rewind_does_not_extend_the_saved_certificate_allowance(tmp_path, monkeypatch, elapsed_health):
+    path = tmp_path / "status.json"
+    save_private(path, healthy_status(10000) | elapsed_health | {"certificate_remaining_seconds": 1805})
+    monkeypatch.setattr(managed_proxy, "host_boottime", lambda: 1005)
+    result = managed_proxy.health(path, 10000)
+    assert not result["healthy"] and result["health_blockers"] == ["certificate_validity_insufficient"]
+    assert "certificate_validity_insufficient" in managed_proxy.health(path, 9998)["health_blockers"]
+
+
+async def test_health_cli_uses_elapsed_evidence_from_the_real_report_writer(
+    tmp_path, tls, unused_tcp_port_factory, monkeypatch, capsys
+):
+    async with running_service(tmp_path, tls, unused_tcp_port_factory, monkeypatch, 6) as service:
+        status = await service.published(state="healthy")
+        evidence = status["elapsed_freshness"]
+        assert 0 < evidence["native_observed_boottime"] <= evidence["checked_boottime"]
+        assert evidence["clock_epoch"] == managed_proxy.host_clock_epoch()
+        live = (await call(service.api, "status"))["result"]
+        assert "elapsed_freshness" not in live and "native_observed_boottime" not in live
+        args = ["health", "--config", str(tmp_path / "trial.json")]
+        assert managed_proxy.main(args) == 0
+        assert json.loads(capsys.readouterr().out)["healthy"]
+
+        with monkeypatch.context() as patch:
+            patch.setattr(managed_proxy, "host_boottime", lambda: evidence["checked_boottime"] + 300)
+            assert managed_proxy.main(args) == 1
+        result = json.loads(capsys.readouterr().out)
+        assert not result["healthy"] and {"status_stale", "native_stale"} <= set(result["health_blockers"])
+
+    assert managed_proxy.main(args) == 1
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["state"] == "stopped" and "service_not_running" in stopped["health_blockers"]
+    assert 0 <= stopped["status_age_seconds"] <= 45 and "status_stale" not in stopped["health_blockers"]
 
 
 # Intent: health failures leave a nonzero exit status and never quote malformed private JSON/parser content.
@@ -205,10 +292,10 @@ def test_health_cli_classifies_private_parse_failure(
 # Intent: ordinary degraded health exits1 without opening a journal or attempting charger commands.
 # Why: systemd/independent monitors need to distinguish an unhealthy report from a successful cached status read.
 def test_health_cli_stale_report_returns_failure(
-    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], capsys: Any
+    tmp_path: Path, tls: tuple[ssl.SSLContext, ssl.SSLContext, Path], capsys: Any, elapsed_health: dict[str, Any]
 ) -> None:
     config, path = config_files(tmp_path, 19876, 19877)
-    save_private(config.journal.with_suffix(".status.json"), healthy_status(time.time() - 60))
+    save_private(config.journal.with_suffix(".status.json"), healthy_status(time.time() - 60) | elapsed_health)
     assert managed_proxy.main(["health", "--config", str(path)]) == 1
     assert not json.loads(capsys.readouterr().out)["healthy"]
     assert not config.journal.exists()

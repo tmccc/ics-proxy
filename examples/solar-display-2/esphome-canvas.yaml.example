@@ -3,6 +3,8 @@
 # changes happen in the GeekMagic editor and need no firmware update.
 substitutions:
   canvas_ics_view_entity: sensor.general_display_2_ics_control
+  canvas_ics_view_reply_entity: sensor.general_display_2_ics_control_reply
+  canvas_display_id: general_display_2
 
 http_request:
   id: canvas_http
@@ -19,7 +21,6 @@ api:
     - lambda: |-
         if (solar_display::is_home_assistant_client(client_info)) {
           ++id(canvas_ha_connections);
-          id(canvas_ics_view_read_pending) = false;
           id(canvas_pressed_control).clear();
           solar_display::canvas_frame().control_view().invalidate();
           id(canvas_ics_view).publish_state("");
@@ -29,9 +30,8 @@ api:
     - lambda: |-
         if (solar_display::is_home_assistant_client(client_info)) {
           if (id(canvas_ha_connections) != 0) --id(canvas_ha_connections);
-          solar_display::canvas_frame().control_view().invalidate();
+          solar_display::canvas_frame().control_view().invalidate(id(canvas_ha_connections) == 1);
           id(canvas_pressed_control).clear();
-          id(canvas_ics_view_read_pending) = id(canvas_ha_connections) == 1;
           if (id(canvas_ha_connections) == 0) {
             id(check_canvas_freshness).execute();
           } else if (id(canvas_ha_connections) == 1) {
@@ -120,10 +120,6 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: "0"
-  - id: canvas_ics_view_read_pending
-    type: bool
-    restore_value: false
-    initial_value: "false"
   - id: canvas_image_ready
     type: bool
     restore_value: false
@@ -185,8 +181,18 @@ text_sensor:
     internal: true
     on_value:
       - lambda: |-
-          if (id(canvas_ha_connections) == 1 && !id(canvas_ics_view_read_pending)) {
+          if (id(canvas_ha_connections) == 1) {
             solar_display::canvas_frame().control_view().observe(x);
+          }
+      - script.execute: show_ics_request_feedback
+  - platform: homeassistant
+    id: canvas_ics_view_reply
+    entity_id: ${canvas_ics_view_reply_entity}
+    internal: true
+    on_value:
+      - lambda: |-
+          if (id(canvas_ha_connections) == 1) {
+            solar_display::canvas_frame().control_view().observe_refresh(x);
           }
       - script.execute: show_ics_request_feedback
   - platform: template
@@ -201,30 +207,27 @@ script:
   - id: refresh_canvas_ics_view
     mode: restart
     then:
-      - lambda: |-
-          auto &pending = id(canvas_ics_view_read_pending);
-          auto &view = solar_display::canvas_frame().control_view();
-          const uint32_t now = millis();
-          const bool retry = view.needs_recheck(now);
-          auto *server = api::global_api_server;
-          if ((!pending && !retry) || id(canvas_ha_connections) != 1 ||
-              !server->is_connected_with_state_subscription()) return;
+      - if:
+          condition:
+            lambda: |-
+              auto &view = solar_display::canvas_frame().control_view();
+              const uint32_t now = millis();
+              if (id(canvas_ha_connections) != 1 || !view.needs_refresh(now) ||
+                  !api::global_api_server->is_connected_with_state_subscription()) return false;
 
-          // An old socket can deliver queued state after the replacement's initial state.
-          // Read the surviving client's current view before enabling the displayed control.
-          for (const auto &client : server->active_clients()) {
-            if (!client->is_authenticated() || client->is_marked_for_removal() ||
-                !solar_display::is_home_assistant_client(client->get_name())) continue;
-
-            api::SubscribeHomeAssistantStateResponse read;
-            read.entity_id = StringRef("${canvas_ics_view_entity}");
-            read.once = true;
-            if (client->send_message(read)) {
-              pending = false;
-              if (retry) view.recheck_sent(now);
-            }
-            return;
-          }
+              // The reply must match this request even if old states are still queued.
+              constexpr size_t request_bytes = 16;
+              std::array<uint8_t, request_bytes> bytes;
+              if (!random_bytes(bytes.data(), bytes.size())) return false;
+              char request[format_hex_size(request_bytes)];
+              view.request_refresh(format_hex_to(request, bytes), now);
+              return true;
+          then:
+            - homeassistant.event:
+                event: esphome.general_display_ics_view_request
+                data:
+                  display: ${canvas_display_id}
+                  request: !lambda return solar_display::canvas_frame().control_view().refresh_request();
   - id: show_ics_request_feedback
     mode: restart
     then:
@@ -503,7 +506,7 @@ lvgl:
                     - homeassistant.event:
                         event: esphome.general_display_touch
                         data:
-                          display: general_display_2
+                          display: ${canvas_display_id}
                           x: !lambda return to_string(id(canvas_touch_x));
                           y: !lambda return to_string(id(canvas_touch_y));
                           canvas_age_seconds: !lambda return to_string(id(canvas_touch_age_seconds));

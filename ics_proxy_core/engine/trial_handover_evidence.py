@@ -40,6 +40,7 @@ class HandoverEvidence:
     saved_schedule: dict[str, Any] | None = None
     session_plan_id: int | None = None
     observed_monotonic: float | None = field(default=None, compare=False)
+    observed_boottime: float | None = field(default=None, compare=False)
 
     # Keep the epoch check and bound the elapsed lifetime even if the system clock changes.
     def is_fresh(self, max_age: float) -> bool:

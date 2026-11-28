@@ -7,6 +7,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "esphome/components/image/image.h"
 #include "esphome/core/helpers.h"
@@ -113,27 +114,35 @@ struct CanvasControlState {
 // Compare the single live offer with the image. A submitted offer stays unusable while HA processes the tap.
 class CanvasControlView {
  public:
-  static constexpr uint32_t ADMISSION_RECHECK_MS = 3000;
+  static constexpr uint32_t REFRESH_INTERVAL_MS = 3000;
 
   const CanvasControlState &state() const { return this->state_; }
 
-  void invalidate() {
+  void invalidate(bool require_refresh = false) {
     this->state_ = {};
-    // Discard the old connection's recheck while preserving any acknowledgment already observed.
-    this->recheck_sent_ = false;
+    this->refresh_required_ = require_refresh;
+    // Preserve any command acknowledgment, and discard replies to requests on the old topology.
+    this->refresh_request_.clear();
   }
 
   void observe(std::string_view value) {
-    this->state_ = CanvasControlState::parse(value);
-    if (this->submitted_.empty()) return;
-    if (this->state_.feedback == ChargerFeedback::STARTING || this->state_.feedback == ChargerFeedback::STOPPING ||
-        (!this->state_.control.empty() && this->state_.control != this->submitted_)) {
-      this->acknowledged_ = true;
-    }
-    if (this->recheck_sent_ && !this->acknowledged_ && this->state_.actionable_feedback() &&
-        this->state_.control == this->submitted_) {
+    if (!this->refresh_required_) this->observe_(CanvasControlState::parse(value));
+  }
+
+  void observe_refresh(std::string_view value) {
+    if (this->refresh_request_.empty() || !value.starts_with(this->refresh_request_) ||
+        value.size() <= this->refresh_request_.size() || value[this->refresh_request_.size()] != ':') return;
+    auto state = CanvasControlState::parse(value.substr(this->refresh_request_.size() + 1));
+    if (state.feedback == ChargerFeedback::UNKNOWN) return;
+
+    this->refresh_request_.clear();
+    this->refresh_required_ = false;
+    this->observe_(std::move(state));
+    // Only a fresh read of the same offer can show that HA did not admit a tap.
+    if (!this->submitted_.empty() && !this->acknowledged_ && this->state_.actionable_feedback() &&
+        this->state_.control == this->submitted_ &&
+        this->refresh_requested_ms_ - this->submitted_ms_ >= REFRESH_INTERVAL_MS) {
       this->submitted_.clear();
-      this->recheck_sent_ = false;
     }
   }
 
@@ -144,27 +153,43 @@ class CanvasControlView {
 
   void submitted(std::string_view control, uint32_t now) {
     this->submitted_ = control;
-    this->last_recheck_ms_ = now;
-    this->recheck_sent_ = this->acknowledged_ = false;
+    this->submitted_ms_ = now;
+    this->acknowledged_ = false;
+    this->refresh_request_.clear();
   }
 
-  // If HA did not admit a tap, the view may never have changed. Read it again before allowing a deliberate retry.
-  bool needs_recheck(uint32_t now) const {
-    return !this->acknowledged_ && !this->submitted_.empty() && this->state_.control == this->submitted_ &&
-           this->state_.actionable_feedback() && now - this->last_recheck_ms_ >= ADMISSION_RECHECK_MS;
+  bool needs_refresh(uint32_t now) const {
+    if (!this->refresh_request_.empty() && now - this->refresh_requested_ms_ < REFRESH_INTERVAL_MS) return false;
+    return this->refresh_required_ ||
+           (!this->acknowledged_ && !this->submitted_.empty() && this->state_.control == this->submitted_ &&
+            this->state_.actionable_feedback() && now - this->submitted_ms_ >= REFRESH_INTERVAL_MS);
   }
 
-  void recheck_sent(uint32_t now) {
-    this->recheck_sent_ = true;
-    this->last_recheck_ms_ = now;
+  void request_refresh(std::string request, uint32_t now) {
+    this->refresh_request_ = std::move(request);
+    this->refresh_requested_ms_ = now;
   }
+
+  const std::string &refresh_request() const { return this->refresh_request_; }
 
  private:
+  void observe_(CanvasControlState state) {
+    this->state_ = std::move(state);
+    if (!this->submitted_.empty() &&
+        (this->state_.feedback == ChargerFeedback::STARTING || this->state_.feedback == ChargerFeedback::STOPPING ||
+         (!this->state_.control.empty() && this->state_.control != this->submitted_))) {
+      this->acknowledged_ = true;
+      this->refresh_request_.clear();
+    }
+  }
+
   CanvasControlState state_;
   std::string submitted_;
+  std::string refresh_request_;
   bool acknowledged_{false};
-  bool recheck_sent_{false};
-  uint32_t last_recheck_ms_{0};
+  bool refresh_required_{false};
+  uint32_t submitted_ms_{0};
+  uint32_t refresh_requested_ms_{0};
 };
 
 // The server's clock supplies the age at download. Elapsed time keeps that

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Leave time for clock sampling differences when arming the charger-side overnight cutoff.
+- Preserve automatic recovery when an accepted overnight Start fails before publication and the proxy verifies
+  rollback to zero.
+- Recover a malformed Stop from matching charger history after verifying closure at zero, including clock rewinds
+  when the Stop report and charger history agree on the Stop time.
+- Check saved health freshness against the host's elapsed clock so changing the wall clock cannot revive old reports.
+- Require a fresh Home Assistant command view before re-enabling touchscreen buttons after a connection overlap.
+
 ## 0.3.0-rc4
 
 - Explain in Home Assistant when the host clock blocks automatic overnight Start during an iCS outage.

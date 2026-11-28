@@ -1526,10 +1526,11 @@ class ControlDecisions:
                 lease,
                 SCHEDULE_CUTOFF if cutoff else "start_not_confirmed",
                 failure=cause,
-                allow_schedule_return=(
+                allow_schedule_return=(result is None or result.failure is error)
+                and (
                     (cutoff or cloud_returned)
-                    and (result is None or result.failure is error)
                     and c.local_schedule.verified_unsent_zero(lease, result)
+                    or c.local_schedule.verified_failed_schedule_zero(lease, result)
                 ),
             )
         charging.record_failure_diagnostic(cause)
@@ -1751,6 +1752,8 @@ class ControlDecisions:
         # A replay can return its stored result, while a new Start must retain its original introduction.
         def check() -> None:
             gateway._require_epoch("charger", epoch)
+            if gateway.journal.pending_recovered_cloud_stop() and not gateway.journal.known_start(payload):
+                raise UnavailableError("reported Start awaits delivery of the recovered Stop")
             tag = payload.get("idTag")
             if (
                 isinstance(tag, str)
@@ -2085,6 +2088,8 @@ class ControlDecisions:
     def require_vendor_start_idle(self) -> None:
         if self.journal.active() is not None or self.journal.get("control", {}).get("start_pending"):
             raise DeniedError("a transaction is already unresolved on this connector")
+        if self.journal.pending_recovered_cloud_stop():
+            raise UnavailableError("cloud Start awaits delivery of the recovered Stop")
         if self.journal.current_change.read().selecting:
             raise DeniedError("cloud Start awaits verification of the current selection")
 

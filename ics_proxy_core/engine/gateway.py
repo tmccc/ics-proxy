@@ -54,7 +54,15 @@ from .security import SecurityError
 from .start_handoff import NativeStartReport as NativeStartReport
 from .start_handoff import OwnedStartResult, PrepareScheduledStop, StartHandoff
 from .stop_settlement import StopPredecessors
-from .store import ConflictError, Delivery, Journal, RecoveryRequiredError, encoded, fingerprint
+from .store import (
+    ConflictError,
+    Delivery,
+    Journal,
+    RecoveryRequiredError,
+    StopMeterRegressionError,
+    encoded,
+    fingerprint,
+)
 from .vendor_read_recovery import recover_legacy_vendor_read
 
 if TYPE_CHECKING:
@@ -701,6 +709,49 @@ class Gateway:
         self.journal.get("control", {}).get("ticket")
         return self._local_answer(token, action, payload, observation_generation)
 
+    # Keep an exact malformed report for the current managed session while awaiting independent closure.
+    def _record_malformed_stop(self, local: int, payload: dict[str, Any], reason: str) -> None:
+        if self.current_boot_seen(self._charger_epoch) and self.journal.get("managed_mode"):
+            self.journal.record_malformed_stop(local, payload, reason)
+
+    # A recovered Stop has one durable response and one canonical body for vendor delivery.
+    def _stop_report(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
+        j = self.journal
+        local = integer(payload.get("transactionId"))
+        if (answer := j.acknowledge_recovered_stop(token, payload)) is not None:
+            return answer
+
+        reason = "invalid_meter"
+        try:
+            number(payload.get("meterStop"), 1e12)
+            reason = "invalid_timestamp"
+            timestamp(payload.get("timestamp"))
+        except DeniedError:
+            j.receipt(token, "StopTransaction", payload)  # A conflicting CALL id cannot nominate a recovery.
+            self._record_malformed_stop(local, payload, reason)
+            raise
+
+        tag = payload.get("idTag")
+        info = None
+        if self.policy.strict_cloud_authorization and isinstance(tag, str) and not j.is_owner_session(local):
+            try:
+                info = self.auth_info.get(tag)
+            except sqlite3.Error:
+                if j.db.in_transaction:
+                    raise
+                # Tag information is optional. The known transaction still needs its exact Stop recorded.
+        if info is not None and info["status"] == "Accepted" and isinstance(tag, str) and not self._local_tag(tag):
+            try:
+                self.auth_info.require_dynamic(info)
+            except RecoveryRequiredError:
+                info = None
+        response = {"idTagInfo": info} if info is not None else None
+        try:
+            return j.stop(token, payload, self.authorisation.retire, response)
+        except StopMeterRegressionError:
+            self._record_malformed_stop(local, payload, "meter_regression")
+            raise
+
     # Accept local lifecycle messages while leaving opaque exchanges to their actual vendor.
     def _local_answer(
         self, token: str, action: str, payload: dict[str, Any], observation_generation: int | None
@@ -712,29 +763,7 @@ class Gateway:
             allowed = self._tag_allowed(tag)
             return {"idTagInfo": {"status": "Accepted" if allowed else "Invalid"}}
         if action == "StopTransaction":
-            local = integer(payload.get("transactionId"))
-            number(payload.get("meterStop"), 1e12)
-            timestamp(payload.get("timestamp"))
-            tag = payload.get("idTag")
-            info = None
-            if (
-                self.policy.strict_cloud_authorization
-                and isinstance(tag, str)
-                and not self.journal.is_owner_session(local)
-            ):
-                try:
-                    info = self.auth_info.get(tag)
-                except sqlite3.Error:
-                    if self.journal.db.in_transaction:
-                        raise
-                    # Tag information is optional. The known transaction still needs its exact Stop recorded.
-            if info is not None and info["status"] == "Accepted" and isinstance(tag, str) and not self._local_tag(tag):
-                try:
-                    self.auth_info.require_dynamic(info)
-                except RecoveryRequiredError:
-                    info = None
-            response = {"idTagInfo": info} if info is not None else None
-            return self.journal.stop(token, payload, self.authorisation.retire, response)
+            return self._stop_report(token, payload)
         if action in OBSERVATION_ACTIONS:
             assert observation_generation is not None
             validate_observation(action, payload, self.journal, check_history=False)

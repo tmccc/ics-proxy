@@ -14,7 +14,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -35,6 +35,10 @@ class ConflictError(ValueError):
     """A retry contradicts an already accepted fact."""
 
 
+class StopMeterRegressionError(ConflictError):
+    """A closing meter reading is lower than the accepted Start reading."""
+
+
 class StationZeroStorageError(sqlite3.Error):
     """Storing the reserved station-zero profile intent or reply failed."""
 
@@ -51,6 +55,55 @@ def encoded(value: Any) -> str:
 # Fingerprint the complete request; a reused CALL id must not silently change its meaning.
 def fingerprint(value: Any) -> str:
     return hashlib.sha256(encoded(value).encode()).hexdigest()
+
+
+# Compare recovered timestamps in UTC while leaving the wire report's original format untouched.
+def _reported_stop_time(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+    except ValueError, OverflowError:
+        return None
+
+
+# Charger reports can omit the subsecond part that was available in the independent native history.
+def _same_recovered_stop(payload: dict[str, Any], stop: dict[str, Any]) -> bool:
+    from .native_start_attempts import start_millisecond_range
+
+    stamp = payload.get("timestamp")
+    received = _reported_stop_time(stamp)
+    saved = _reported_stop_time(stop.get("timestamp"))
+    meter = payload.get("meterStop")
+    return (
+        isinstance(stamp, str)
+        and received is not None
+        and saved is not None
+        and int(saved.replace(microsecond=0).timestamp()) * 1000 + saved.microsecond // 1000
+        in start_millisecond_range(stamp, received)
+        and type(meter) in (int, float)
+        and meter == stop.get("meterStop")
+    )
+
+
+# The saved native proof must provide the canonical Stop's measured time and meter.
+def _record_supports_recovered_stop(native: dict[str, Any], payload: dict[str, Any]) -> bool:
+    stop_at = _reported_stop_time(payload.get("timestamp"))
+    local, meter = native.get("transactionId"), native.get("meterStop")
+    seconds, milliseconds = native.get("stopTime"), native.get("stopMs", 0)
+    return (
+        stop_at is not None
+        and type(local) is int
+        and local == payload["transactionId"]
+        and type(meter) is int
+        and meter == payload["meterStop"]
+        and type(seconds) is int
+        and seconds == stop_at.replace(microsecond=0).timestamp()
+        and type(milliseconds) is int
+        and 0 <= milliseconds < 1000
+        and milliseconds * 1000 == stop_at.microsecond
+    )
 
 
 # State with another filesystem name cannot share this pathname's SQLite and owner locks.
@@ -653,6 +706,66 @@ class Journal:
             self._owner_schema = True
         return answer
 
+    # Retain one rejected report for the exact open session, even if the charger never retries it.
+    def record_malformed_stop(self, local: int, payload: dict[str, Any], reason: str) -> None:
+        if type(local) is not int or type(payload.get("transactionId")) is not int or payload["transactionId"] != local:
+            return
+        with self.atomic():
+            row = self.db.execute(
+                "SELECT start FROM transactions WHERE local=? AND connector=1 AND stop IS NULL", (local,)
+            ).fetchone()
+            if row is not None and self.malformed_stop(local) is None:
+                self.put(
+                    f"malformed_stop:{local}",
+                    {"report": payload, "start": fingerprint(json.loads(row[0])), "reason": reason, "recovered": False},
+                )
+
+    # An incomplete or unrelated saved report cannot authorize recovery.
+    def malformed_stop(self, local: int) -> dict[str, Any] | None:
+        record = self.get(f"malformed_stop:{local}")
+        if (
+            not isinstance(record, dict)
+            or not isinstance(report := record.get("report"), dict)
+            or type(report.get("transactionId")) is not int
+            or report["transactionId"] != local
+            or not isinstance(record.get("start"), str)
+            or not isinstance(record.get("reason"), str)
+            or type(record.get("recovered")) is not bool
+        ):
+            return None
+        return record
+
+    # Attach the original rejected report or matching corrected facts to the saved local outcome.
+    def acknowledge_recovered_stop(self, token: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        local = payload.get("transactionId")
+        if type(local) is not int or (record := self.malformed_stop(local)) is None or record["recovered"] is not True:
+            return None
+        with self.atomic():
+            row = self.db.execute("SELECT start,stop,stop_info FROM transactions WHERE local=?", (local,)).fetchone()
+            if row is None or row["stop"] is None or record["start"] != fingerprint(json.loads(row["start"])):
+                return None
+            stop = json.loads(row["stop"])
+            if record.get("stop") != fingerprint(stop) or (
+                fingerprint(payload) != fingerprint(record["report"]) and not _same_recovered_stop(payload, stop)
+            ):
+                return None
+            cached = self.receipt(token, "StopTransaction", payload)
+            if cached is not None:
+                return cached
+            answer: dict[str, Any] = json.loads(row["stop_info"] or "{}")
+            self.remember(token, "StopTransaction", payload, answer)
+            return answer
+
+    # Query only retained Stop deliveries and their indexed, per-session evidence.
+    def pending_recovered_cloud_stop(self) -> bool:
+        return (
+            self.db.execute(
+                "SELECT 1 FROM outbox o JOIN meta m ON m.key='malformed_stop:' || o.local "
+                "WHERE o.action='StopTransaction' AND json_type(m.value,'$.recovered')='true' LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+
     # Accept a stop once without ever clearing some other session on the connector.
     def stop(
         self,
@@ -660,6 +773,8 @@ class Journal:
         payload: dict[str, Any],
         closed: Callable[[int], None] | None = None,
         info: dict[str, Any] | None = None,
+        *,
+        recovered_native: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self.atomic():
             cached = self.receipt(token, "StopTransaction", payload)
@@ -671,9 +786,23 @@ class Journal:
                 raise ConflictError("stop names an unknown transaction")
             start = json.loads(row["start"])
             if payload["meterStop"] < start["meterStart"]:
-                raise ConflictError("stop meter precedes its accepted start")
+                raise StopMeterRegressionError("stop meter precedes its accepted start")
             if row[0] is not None and row[0] != encoded(payload):
                 raise ConflictError("stop contradicts a previously accepted stop")
+            if recovered_native is not None:
+                recovery = self.malformed_stop(local)
+                if (
+                    row[0] is not None
+                    or recovery is None
+                    or recovery["recovered"]
+                    or recovery["start"] != fingerprint(start)
+                    or not _record_supports_recovered_stop(recovered_native, payload)
+                ):
+                    raise ConflictError("native Stop recovery no longer owns the exact open transaction")
+                self.put(
+                    f"malformed_stop:{local}",
+                    {**recovery, "recovered": True, "native": recovered_native, "stop": fingerprint(payload)},
+                )
             if row[0] is None:
                 self.db.execute(
                     "UPDATE transactions SET stop=?,live=0,stop_info=? WHERE local=?",
@@ -698,6 +827,8 @@ class Journal:
                 self.put("vendor_profile_transactions", transactions)
                 if closed is not None:
                     closed(local)
+                if recovered_native is None:
+                    self.db.execute("DELETE FROM meta WHERE key=?", (f"malformed_stop:{local}",))
             answer = (info or {}) if row[0] is None else json.loads(row[2] or "{}")
             self.remember(token, "StopTransaction", payload, answer)
             return answer

@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import signal
 import socket
@@ -22,8 +23,9 @@ sys.path.insert(0, str(ROOT))
 from ics_proxy_core.engine.local_control import join_retirement  # noqa: E402
 from ics_proxy_core.engine.managed import ManagedController  # noqa: E402
 from ics_proxy_core.engine.managed_api import ManagementServer, ManagementSettings  # noqa: E402
-from ics_proxy_core.engine.managed_view import health_snapshot, publish_poll  # noqa: E402
+from ics_proxy_core.engine.managed_view import finite_number, health_snapshot, publish_poll  # noqa: E402
 from ics_proxy_core.engine.policy import DeniedError  # noqa: E402
+from ics_proxy_core.engine.schedule_clock import host_boottime, host_clock_epoch  # noqa: E402
 from ics_proxy_core.engine.security import SecurityError  # noqa: E402
 from ics_proxy_core.engine.store import RecoveryRequiredError  # noqa: E402
 from ics_proxy_core.engine.trial_config import TrialConfig, file_identity, private_json  # noqa: E402
@@ -80,9 +82,22 @@ def event(path: Path, value: dict[str, Any], *, maximum: int = 2 * 1024 * 1024) 
         os.fsync(stream.fileno())
 
 
+# Compare private freshness evidence only in the same boot and time namespace.
+def _saved_ages(proof: object) -> tuple[float, float]:
+    current, epoch = host_boottime(), host_clock_epoch()
+    if not isinstance(proof, dict) or current is None or epoch is None or proof.get("clock_epoch") != epoch:
+        return math.inf, math.inf
+    checked = finite_number(proof.get("checked_boottime"))
+    native = finite_number(proof.get("native_observed_boottime"))
+    if checked is None or not 0 <= checked <= current:
+        return math.inf, math.inf
+    return current - checked, current - native if native is not None and 0 <= native <= checked else math.inf
+
+
 # Human/monitor checks read private status only: no connection, journal ownership or physical command is created.
 def health(path: Path, now: float | None = None) -> dict[str, Any]:
-    return health_snapshot(private_json(path), now)
+    status = private_json(path)
+    return health_snapshot(status, now, elapsed_ages=_saved_ages(status.pop("elapsed_freshness", None)))
 
 
 # Check the same management settings offline and at service startup.
@@ -126,11 +141,25 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
     status_path = prepared.config.journal.with_suffix(".status.json")
     events_path = prepared.config.journal.with_suffix(".events.jsonl")
     started = time.time()
+    clock_epoch = host_clock_epoch()
     reporting = Reporting(ROOT)
     writer: ReportWriter | None = None
     published: dict[str, Any] = {"running": True, "state": "starting"}
     api: ManagementServer | None = None
     incident: IncidentRecorder | None = None
+
+    # Stamp health evidence at poll or shutdown completion, before the report waits for disk.
+    def saved_status(
+        value: dict[str, Any], checked_boottime: float | None, native_observed_boottime: object = None
+    ) -> dict[str, Any]:
+        return dict(
+            value,
+            elapsed_freshness={
+                "clock_epoch": clock_epoch,
+                "checked_boottime": checked_boottime,
+                "native_observed_boottime": native_observed_boottime,
+            },
+        )
 
     # Retire all service users and publish the final report before propagating caller cancellation.
     async def retire() -> bool:
@@ -157,13 +186,16 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
             shutdown_uncertain = (session.final_status or {}).get("shutdown_attempt_uncertain") is not False
             if writer is not None:
                 await writer.close(
-                    {
-                        "running": False,
-                        "state": "stopped",
-                        "checked_at": time.time(),
-                        "pid": os.getpid(),
-                        "shutdown_uncertain": shutdown_uncertain,
-                    }
+                    saved_status(
+                        {
+                            "running": False,
+                            "state": "stopped",
+                            "checked_at": time.time(),
+                            "pid": os.getpid(),
+                            "shutdown_uncertain": shutdown_uncertain,
+                        },
+                        host_boottime(),
+                    )
                 )
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.remove_signal_handler(sig)
@@ -206,6 +238,8 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
                 except OSError:
                     pass  # Retry the optional loopback socket without retiring charger supervision.
             status = await controller.tick()
+            checked_boottime = host_boottime()
+            native_observed_boottime = status.pop("native_observed_boottime", None)
             if api is not None:
                 status["management_available"] = api.server is not None
             previous = reporting.previous
@@ -213,7 +247,7 @@ async def serve(config_path: Path, spec_path: Path, management_path: Path | None
                 controller, status, pid=os.getpid(), started=started, expires=expires, observe=reporting.observe
             )
             if writer is not None:
-                writer.submit(published)
+                writer.submit(saved_status(published, checked_boottime, native_observed_boottime))
             if reporting.previous != previous:
                 notify("STATUS=App/schedule control: " + str(published.get("state")))
             try:

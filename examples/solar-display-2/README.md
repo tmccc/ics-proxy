@@ -20,7 +20,8 @@ return as unconfirmed after reload or restart. A later command always uses a new
 The touchscreen requires a fresh download and an image less than 45 seconds old. A cached response refreshes the
 download time while the image continues to age. A Home Assistant clock step can temporarily withhold a tap until
 a freshly rendered frame satisfies the action's time checks. During overlapping Home Assistant connections, the
-dashboard can stay visible while its buttons wait for a fresh command view from the surviving connection.
+dashboard can stay visible while its buttons wait for a reply to a new command-view request. The reply includes the
+display's request identifier so queued state updates cannot re-enable buttons after the reconnect.
 
 ## Installation and upgrade
 
@@ -29,17 +30,19 @@ brightness components, a fallback dashboard, and the Home Assistant renderer int
 
 1. Add the `template` configuration from [request-helper.yaml](request-helper.yaml) and install the
    [touch automation](controls.yaml). Set the same preview image entity and view ID in both files. Set the actual
-   ESPHome device ID and screen-source sensor in the automation. Point the template sensor at the installed
-   automation and proxy command sensor.
+   ESPHome device ID in both files and the screen-source sensor in the automation. Point the template sensors at
+   the installed automation and proxy command sensor.
 2. Install [view.html.jinja](view.html.jinja) as the display preview template. The renderer needs the literal
    entity ID in its `states()` call to subscribe to the command view. Its optional vehicle cards can use the
    example entity names or local equivalents.
 3. Adapt [esphome-canvas.yaml.example](esphome-canvas.yaml.example) to the board and include
-   [canvas_frame.h](canvas_frame.h). Set `canvas_ics_view_entity` to the display template sensor's entity ID.
+   [canvas_frame.h](canvas_frame.h). Set `canvas_ics_view_entity` and `canvas_ics_view_reply_entity` to the
+   installed template sensors' entity IDs. Use the same display name in `canvas_display_id`, the automation and
+   the reply sensor's event trigger. Enable the ESPHome device's permission to perform Home Assistant actions.
    Keep the image URL and image-scoped authorization in local ESPHome secrets. Set the renderer to update
    every 25 seconds or less with the example's 10-second download interval and 5-second HTTP timeout.
-4. Update the integration, renderer, automation and firmware as a set. Once all four are present, confirm that
-   the touchscreen can show an enabled button only when the rendered offer matches the live command view.
+4. Update the integration, renderer, automation, template sensors and firmware as a set. Confirm that the touchscreen
+   can show an enabled button only when the rendered offer matches the live command view.
    The v2 footer retains the image timestamp in the earlier format so older firmware can still show the dashboard.
    An actionable v2 button requires the matching v2 command view. Existing Home Assistant clients can still use
    the earlier action fields. The old request helper and its expiry script can be removed after their last legacy
@@ -49,9 +52,10 @@ The automation maps the display touch event to `ics_proxy.session_command` with 
 and `rendered_at_epoch`. The integration supplies the original revision and Stop target to the proxy. Install the
 updated integration before installing this automation. The integration still accepts the field names used by
 earlier releases of the automation.
-If the display says **Charger buttons unavailable**, check that the automation is enabled, the template sensor
+If the display says **Charger buttons unavailable**, check that the automation is enabled, the command sensor
 shows an eligible action, the preview reports the Cars & Charger view with no active notification, and the latest
-frame has downloaded.
+frame has downloaded. After a reconnect, also check that the reply sensor is installed and uses the same device ID
+as the touch automation.
 
 Run the offline firmware regression with `python -B examples/solar-display-2/tests/test_canvas_frame.py`.
 It uses `g++` with C++20 and tests the firmware header with a simulated clock.
